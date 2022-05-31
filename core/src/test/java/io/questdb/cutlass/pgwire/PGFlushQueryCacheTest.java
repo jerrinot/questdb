@@ -30,11 +30,15 @@ import org.junit.Test;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.Statement;
 
 import static io.questdb.test.tools.TestUtils.assertEventually;
+import static org.junit.Assert.assertTrue;
 
 public class PGFlushQueryCacheTest extends BasePGTest {
+
+
     @Test
     public void testFlushQueryCache() throws Exception {
         assertMemoryLeak(() -> {
@@ -61,13 +65,42 @@ public class PGFlushQueryCacheTest extends BasePGTest {
                 statement.execute(sql);
 
                 long memAfterJoin = Unsafe.getMemUsed();
-                Assert.assertTrue("Factory used for JOIN should allocate native memory", memAfterJoin > memInitial);
+                assertTrue("Factory used for JOIN should allocate native memory", memAfterJoin > memInitial);
 
                 statement.execute("SELECT flush_query_cache()");
 
                 checkQueryCacheFlushed(memInitial, memAfterJoin);
             }
         });
+    }
+
+
+
+    @Test
+    public void testUpdate() throws Exception {
+        try (
+                PGWireServer ignored = createPGServer(2);
+                Connection connection = getConnection(false, true);
+                Statement statement = connection.createStatement()
+        ) {
+            statement.executeUpdate("CREATE TABLE test\n" +
+                    "AS(\n" +
+                    "    SELECT\n" +
+                    "        x id, false as isValid,\n" +
+                    "        timestamp_sequence(0L, 100000L) ts\n" +
+                    "    FROM long_sequence(1) x)\n" +
+                    "TIMESTAMP(ts)\n" +
+                    "PARTITION BY DAY");
+
+//                statement.executeUpdate("ALTER TABLE test ADD column isValid boolean");
+
+            statement.executeUpdate("UPDATE test set isValid = true");
+
+            ResultSet rs = statement.executeQuery("SELECT isValid from test");
+            while (rs.next()) {
+                assertTrue(rs.getBoolean("isValid"));
+            }
+        }
     }
 
     @Test
@@ -99,7 +132,7 @@ public class PGFlushQueryCacheTest extends BasePGTest {
                 }
 
                 long memAfterJoin = Unsafe.getMemUsed();
-                Assert.assertTrue("Factory used for JOIN should allocate native memory", memAfterJoin > memInitial);
+                assertTrue("Factory used for JOIN should allocate native memory", memAfterJoin > memInitial);
 
                 statement.execute("SELECT flush_query_cache()");
 
@@ -113,7 +146,7 @@ public class PGFlushQueryCacheTest extends BasePGTest {
         // before memory usage drop is measured.
         assertEventually(() -> {
             long memAfterFlush = Unsafe.getMemUsed();
-            Assert.assertTrue(
+            assertTrue(
                     "flush_query_cache() should release native memory: " + memInitial + ", " + memAfterJoin + ", " + memAfterFlush,
                     memAfterFlush < memAfterJoin
             );
