@@ -79,9 +79,9 @@ public class PlainSocket implements Socket {
     @Override
     public int send(long bufferPtr, int bufferLen) {
         int res = nf.sendRaw(fd, bufferPtr, bufferLen);
-        if (quickAck) {
-            nf.setTcpQuickAck(fd, true);
-        }
+//        if (quickAck) {
+//            nf.setTcpQuickAck(fd, true);
+//        }
         return res;
     }
 

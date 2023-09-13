@@ -45,6 +45,7 @@ import io.questdb.std.str.DirectByteCharSequence;
 import org.jetbrains.annotations.NotNull;
 
 public class LineTcpConnectionContext extends IOContext<LineTcpConnectionContext> {
+    private static final boolean QUICK_ACK = Boolean.getBoolean("quickack");
     private static final Log LOG = LogFactory.getLog(LineTcpConnectionContext.class);
     private static final long QUEUE_FULL_LOG_HYSTERESIS_IN_MS = 10_000;
     protected final NetworkFacade nf;
@@ -196,7 +197,9 @@ public class LineTcpConnectionContext extends IOContext<LineTcpConnectionContext
                 throw CairoException.nonCritical().put("failed to start TLS session");
             }
         }
-        socket.setQuickAck(true);
+        if (QUICK_ACK) {
+            socket.setQuickAck(true);
+        }
     }
 
     @Override
