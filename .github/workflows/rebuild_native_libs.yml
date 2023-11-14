@@ -151,9 +151,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Print file sizes before
-        run: |
-          find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \;
+      # - name: Print file sizes before
+      #   run: |
+      #     find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \;
       - name: Restore FreeBSD binary from Cache
         uses: actions/cache/restore@v3
         with:
@@ -193,9 +193,9 @@ jobs:
       - name: Check git status
         run: |
           git status
-      - name: Print file sizes after
-        run: |
-          find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \;
+      # - name: Print file sizes after
+      #   run: |
+      #     find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \;
       - name: Commit the files
         run: |
           git config --global user.name 'GitHub Actions - Rebuild Native Libraries'
