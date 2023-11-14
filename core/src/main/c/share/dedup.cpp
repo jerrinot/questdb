@@ -45,7 +45,7 @@ struct dedup_column {
 };
 #pragma pack(pop)
 
-struct int256 {
+ruct int256 {
     __int128 lo;
     __int128 hi;
 };
