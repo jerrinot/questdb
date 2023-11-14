@@ -207,6 +207,12 @@ jobs:
           git add core/src/main/resources/io/questdb/bin/armlinux/libquestdb.so
           git add core/src/main/resources/io/questdb/bin/windows/libquestdb.dll
           git commit -m "Rebuild Native Libraries"
+      - name: show the refs
+        shell: bash
+        run: |
+          echo github.head_ref ${{ github.head_ref }}
+          echo github.ref ${{ github.ref }}
+          echo github.ref_name ${{ github.ref_name }}        
       - name: Push the files to the current branch
         uses: ad-m/github-push-action@d91a481090679876dfc4178fef17f286781251df
         # Why do we use a commit hash instead of a tag for the github-push-action?
