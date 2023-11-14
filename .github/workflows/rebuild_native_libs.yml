@@ -220,5 +220,5 @@ jobs:
         # d91a48109 is the same as the tag v0.8.0, but it's guaranteed to be immutable.
         # So even if a bad actor takes over the repo, and rewrites tags to point to malicious commits, we will still be safe.
         with:
-          branch: ${{ github.head_ref }}
+          branch: ${{ github.head_ref || github.ref_name }}
 
