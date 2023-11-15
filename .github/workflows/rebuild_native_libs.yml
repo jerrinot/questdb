@@ -149,6 +149,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Print glibc version
+        run: |
+          ldd --version
       - name: Print file sizes before
         run: |
           find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \;
