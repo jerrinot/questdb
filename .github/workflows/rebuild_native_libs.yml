@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v3
       - name: Build in FreeBSD
         # @d44bf830e7d is the same as the tag v1, but it's guaranteed to be immutable.
-        uses: vmactions/freebsd-vm@d44bf830e7d
+        uses: vmactions/freebsd-vm@d44bf830e7d850111d27aa120d468c905e5980f4
         with:
           # FreeBSD 13.2
           release: 13.2
@@ -47,7 +47,7 @@ jobs:
   build-macos:
     strategy:
       matrix:
-        # macos-12-xlarge = ARM M1
+        # macos-13-xlarge = ARM M1
         # macos-latest = x64
         # if you change OS definitions then you need to change conditions in cache-save steps below
         os: [ macos-13-xlarge, macos-latest ]
@@ -78,11 +78,14 @@ jobs:
             core/src/main/resources/io/questdb/bin/osx/libquestdb.dylib
           key: nativelibs-osx-${{ github.sha }}
   build-others:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     env:
       generator: "CodeBlocks - Unix Makefiles"
     steps:
       - uses: actions/checkout@v3
+      - name: Print glibc version
+        run: |
+          ldd --version
       - name: Increase file count and install tooling
         run: |
           sudo sysctl -w fs.file-max=500000
@@ -119,8 +122,6 @@ jobs:
       - name: Check C++ runtime dependency
         run: |
           cd ./core
-          which x86_64-w64-mingw32-objdump
-          x86_64-w64-mingw32-objdump -p ./src/main/resources/io/questdb/bin/windows/libquestdb.dll
           if x86_64-w64-mingw32-objdump -p ./src/main/resources/io/questdb/bin/windows/libquestdb.dll | grep -q libstdc++; then
             echo "Failure: C++ runtime dependency detected"
             exit 1
@@ -190,12 +191,6 @@ jobs:
           path: |
             core/src/main/resources/io/questdb/bin/windows/libquestdb.dll
           key: nativelibs-windows-${{ github.sha }}
-      - name: Check git status
-        run: |
-          git status
-      - name: Print file sizes after
-        run: |
-          find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \;
       - name: Commit the files
         run: |
           git config --global user.name 'GitHub Actions - Rebuild Native Libraries'
@@ -206,13 +201,19 @@ jobs:
           git add core/src/main/resources/io/questdb/bin/linux/libquestdb.so
           git add core/src/main/resources/io/questdb/bin/armlinux/libquestdb.so
           git add core/src/main/resources/io/questdb/bin/windows/libquestdb.dll
-          git commit -m "Rebuild Native Libraries"
+          git commit -m "chore(build): Rebuild Native Libraries"
+      - name: Check git status
+        run: |
+          git status
+      - name: Print file sizes after
+        run: |
+          find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \;
       - name: Push the files to the current branch
-        uses: ad-m/github-push-action@d91a48109
+        uses: ad-m/github-push-action@d91a481090679876dfc4178fef17f286781251df
         # Why do we use a commit hash instead of a tag for the github-push-action?
         # ad-m/github-push-action is not as well-known repo as e.g. actions/checkout and therefore we trust it less.
         # d91a48109 is the same as the tag v0.8.0, but it's guaranteed to be immutable.
         # So even if a bad actor takes over the repo, and rewrites tags to point to malicious commits, we will still be safe.
         with:
-          branch: ${{ github.head_ref }}
+          branch: ${{ github.head_ref || github.ref_name }}
 
