@@ -2641,7 +2641,10 @@ public class SqlCompilerImpl implements SqlCompiler, Closeable, SqlParserCallbac
                     for (int i = 0; i < symCnt; i++) {
                         int symIdx = symIndexes[i];
                         String columnName = cursorMetadata.getColumnName(symIdx);
-                        sender.symbol(columnName, record.getSymA(symIdx));
+                        CharSequence sym = record.getSymA(symIdx);
+                        if (sym != null) {
+                            sender.symbol(columnName, sym);
+                        }
                     }
 
                     // then all other columns
@@ -2653,7 +2656,10 @@ public class SqlCompilerImpl implements SqlCompiler, Closeable, SqlParserCallbac
                         String columnName = cursorMetadata.getColumnName(i);
                         switch (columnType) {
                             case ColumnType.STRING:
-                                sender.stringColumn(columnName, record.getStrA(i));
+                                CharSequence str = record.getStrA(i);
+                                if (str != null) {
+                                    sender.stringColumn(columnName, str);
+                                }
                                 break;
                             case ColumnType.LONG:
                                 sender.longColumn(columnName, record.getLong(i));
