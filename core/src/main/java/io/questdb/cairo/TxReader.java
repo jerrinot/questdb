@@ -285,7 +285,7 @@ public class TxReader implements Closeable, Mutable {
      * @param ts timestamp
      * @return partition name txn or -1 if partition does not exist
      */
-    public long getPartitionNameTxnByPartitionTimestampConcurrent(long ts) {
+    public long getPartitionNameTxnByPartitionTimestampBlocking(long ts) {
         synchronized (attachedPartitions) {
             // we need to prevent other callers from modifying the snapshot while we are searching it
             SnapshottableLongList snapshot = attachedPartitions.snapshot();

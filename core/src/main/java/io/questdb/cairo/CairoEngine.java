@@ -900,7 +900,7 @@ public class CairoEngine implements Closeable, WriterSource {
                 if (tenant == null) {
                     continue;
                 }
-                if (tenant.isTxnVisibleConcurrent(partitionTimestamp, nameTxn)) {
+                if (tenant.isTxnVisibleBlocking(partitionTimestamp, nameTxn)) {
                     return false;
                 }
             }
