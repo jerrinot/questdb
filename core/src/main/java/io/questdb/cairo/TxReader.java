@@ -274,13 +274,27 @@ public class TxReader implements Closeable, Mutable {
         return defaultValue;
     }
 
+    /**
+     * Returns partition name txn for partition that contains timestamp as visible by this TxReader. If partition
+     * does not exist, returns -1.
+     * <p>
+     * This method is thread safe, it can be called from an arbitrary thread, even concurrently with the thread owning
+     * the TxReader. It returns txn as it was visible by TxReader at some time between start of this call and the time
+     * when the method returns.
+     *
+     * @param ts timestamp
+     * @return partition name txn or -1 if partition does not exist
+     */
     public long getPartitionNameTxnByPartitionTimestampConcurrent(long ts) {
-        SnapshottableLongList snapshot = attachedPartitions.snapshot();
-        int index = snapshot.binarySearchBlock(LONGS_PER_TX_ATTACHED_PARTITION_MSB, ts, BinarySearch.SCAN_UP);
-        if (index < 0) {
-            return -1;
+        synchronized (attachedPartitions) {
+            // we need to prevent other callers from modifying the snapshot while we are searching it
+            SnapshottableLongList snapshot = attachedPartitions.snapshot();
+            int index = snapshot.binarySearchBlock(LONGS_PER_TX_ATTACHED_PARTITION_MSB, ts, BinarySearch.SCAN_UP);
+            if (index < 0) {
+                return -1;
+            }
+            return snapshot.getQuick(index + PARTITION_NAME_TX_OFFSET);
         }
-        return snapshot.getQuick(index + PARTITION_NAME_TX_OFFSET);
     }
 
     public long getPartitionNameTxnByRawIndex(int index) {
