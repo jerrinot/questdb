@@ -24,8 +24,6 @@
 
 package io.questdb.cairo;
 
-import io.questdb.cairo.pool.AbstractMultiTenantPool;
-import io.questdb.cairo.pool.ReaderPool;
 import io.questdb.cairo.sql.TableReferenceOutOfDateException;
 import io.questdb.cairo.wal.WalUtils;
 import io.questdb.log.Log;
@@ -235,24 +233,6 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
         LOG.info().$("processed [table=").$(tableToken).I$();
     }
 
-    private boolean namedTxnInvisibleToReaders(TableToken tableToken, long partitionTimestamp, long nameTxn) {
-        // todo: consider moving this to CairoEngine
-        AbstractMultiTenantPool.Entry<ReaderPool.R> rEntry = engine.getReaderPoolEntries().get(tableToken.getDirName());
-        while (rEntry != null) {
-            for (int i = 0; i < ReaderPool.ENTRY_SIZE; i++) {
-                ReaderPool.R tenant = rEntry.getTenant(i);
-                if (tenant == null) {
-                    continue;
-                }
-                if (tenant.isTxnVisibleConcurrent(partitionTimestamp, nameTxn)) {
-                    return false;
-                }
-            }
-            rEntry = rEntry.getNext();
-        }
-        return true;
-    }
-
     private void processDetachedPartition(
             TableToken tableToken,
             FilesFacade ff,
@@ -365,7 +345,7 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
                         && txnScoreboard.isRangeAvailable(previousNameVersion, nextNameVersion);
 
                 long nameTxnDeleteCandidate = previousNameVersion - 1;
-                if (namedTxnInvisibleToReaders(tableToken, partitionTimestamp, nameTxnDeleteCandidate)) {
+                if (engine.namedTxnInvisibleToReaders(tableToken, partitionTimestamp, nameTxnDeleteCandidate)) {
                     path.trimTo(tableRootLen);
                     TableUtils.setPathForPartition(path, partitionBy, partitionTimestamp, nameTxnDeleteCandidate);
                     path.$();

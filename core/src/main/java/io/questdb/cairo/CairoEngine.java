@@ -891,6 +891,24 @@ public class CairoEngine implements Closeable, WriterSource {
         return tableNameRegistry.lockTableName(tableNameStr, dirName, tableId, isWal);
     }
 
+    public boolean namedTxnInvisibleToReaders(TableToken tableToken, long partitionTimestamp, long nameTxn) {
+        // todo: consider batching this, perhaps it could receive a list of txns and filter out all that are visible
+        AbstractMultiTenantPool.Entry<ReaderPool.R> rEntry = getReaderPoolEntries().get(tableToken.getDirName());
+        while (rEntry != null) {
+            for (int i = 0; i < ReaderPool.ENTRY_SIZE; i++) {
+                ReaderPool.R tenant = rEntry.getTenant(i);
+                if (tenant == null) {
+                    continue;
+                }
+                if (tenant.isTxnVisibleConcurrent(partitionTimestamp, nameTxn)) {
+                    return false;
+                }
+            }
+            rEntry = rEntry.getNext();
+        }
+        return true;
+    }
+
     public void notifyDropped(TableToken tableToken) {
         tableNameRegistry.dropTable(tableToken);
     }
