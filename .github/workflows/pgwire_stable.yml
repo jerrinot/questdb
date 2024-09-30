@@ -5,6 +5,7 @@ name: PGWire
 on:
   pull_request:
     types: [ synchronize, opened, reopened, edited ]
+  workflow_dispatch:
 
 jobs:
   build:
