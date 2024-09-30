@@ -1,4 +1,4 @@
-name: PGWire
+name: PGWire - Stable clients
 # Testing PGWire with fixed versions of clients
 # This is meant to be run on every PR to catch regressions introduced by QuestDB code changes
 

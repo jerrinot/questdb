@@ -1,4 +1,4 @@
-name: PGWire - Latest
+name: PGWire - Latest clients
 # Testing PGWire with the latest versions of clients
 # So we are notified of any issues with just released versions
 # It's intentionally not triggered on every PR since we do not want
@@ -30,7 +30,7 @@ jobs:
       - name: Setup Python version
         uses: actions/setup-python@v2
         with:
-          python-version: 3.8
+          python-version: 3
       - name: Create and start virtual environment for psycopg2
         run: |
           python3 -m venv venv_psycopg2
