@@ -2,7 +2,7 @@ name: Allocation Tracking Fuzzing
 
 on:
   schedule:
-    - cron: "1 */1 * * *"
+    - cron: "15 */1 * * *"
 
 jobs:
   build:
