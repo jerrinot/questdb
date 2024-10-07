@@ -533,6 +533,7 @@ abstract class AbstractLineHttpFuzzTest extends AbstractBootstrapTest {
                     Sender sender = Sender.builder(Sender.Transport.HTTP)
                             .address("localhost:" + port)
                             .httpUsernamePassword(username, password)
+                            .retryTimeoutMillis(0)
                             .build()
             ) {
                 LineHttpSender httpSender = (LineHttpSender) sender;
