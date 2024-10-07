@@ -194,7 +194,7 @@ public abstract class AbstractBootstrapTest extends AbstractTest {
 
             // configure worker pools
             writer.println(SHARED_WORKER_COUNT + "=2");
-            writer.println(HTTP_WORKER_COUNT + "=10");
+            writer.println(HTTP_WORKER_COUNT + "=1");
             writer.println(HTTP_MIN_WORKER_COUNT + "=1");
             writer.println(PG_WORKER_COUNT + "=1");
             writer.println(LINE_TCP_WRITER_WORKER_COUNT + "=1");

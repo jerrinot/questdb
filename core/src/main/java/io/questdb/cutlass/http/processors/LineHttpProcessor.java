@@ -140,7 +140,11 @@ public class LineHttpProcessor implements HttpRequestProcessor, HttpMultipartCon
     public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         state.onMessageComplete();
         if (state.isOk()) {
+            long startNanos = System.nanoTime();
             state.commit();
+            long elapsedNanos = System.nanoTime() - startNanos;
+            long elapsedMillis = elapsedNanos / 1_000_000;
+            LOG.infoW().$("line protocol commit [elapsed=").$(elapsedMillis).$("ms]").$();
         }
         // Check state again, commit may have failed
         if (state.isOk()) {
