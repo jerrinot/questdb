@@ -31,10 +31,10 @@ jobs:
       - name: Install toolchains (CXX/NASM)
         run: |
           brew install make cmake gcc nasm
-      - name: Build CXX Library     
+      - name: Build CXX Library
         run: |
           cd core
-          export MACOSX_DEPLOYMENT_TARGET=13
+          export MACOSX_DEPLOYMENT_TARGET=13.0
           cmake -B build/release -DCMAKE_BUILD_TYPE=Release
           cmake --build build/release --config Release
       - name: Copy darwin-aarch64 CXX Library to the final directory
