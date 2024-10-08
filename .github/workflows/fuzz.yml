@@ -1,8 +1,8 @@
 name: Allocation Tracking Fuzzing
 
 on:
-  schedule:
-    - cron: "15 */3 * * *"
+ # schedule:
+ #   - cron: "15 */3 * * *"
   workflow_dispatch:
 
 jobs:
