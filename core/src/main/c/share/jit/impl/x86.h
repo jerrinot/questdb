@@ -72,7 +72,7 @@ namespace questdb::x86 {
         }
         Label l_null = c.newLabel();
         Label l_exit = c.newLabel();
-        Mem NaN = c.newInt32Const(asmjit::ConstPool::kScopeLocal, 0x7fc00000); // float NaN
+        Mem NaN = c.newInt32Const(asmjit::ConstPoolScope::kLocal, 0x7fc00000); // float NaN
 
         c.cmp(rhs, INT_NULL);
         c.je(l_null);
@@ -94,7 +94,7 @@ namespace questdb::x86 {
         }
         Label l_null = c.newLabel();
         Label l_exit = c.newLabel();
-        Mem NaN = c.newInt64Const(asmjit::ConstPool::kScopeLocal, 0x7ff8000000000000LL); // double NaN
+        Mem NaN = c.newInt64Const(asmjit::ConstPoolScope::kLocal, 0x7ff8000000000000LL); // double NaN
 
         c.cmp(rhs, INT_NULL);
         c.je(l_null);
@@ -116,7 +116,7 @@ namespace questdb::x86 {
         }
         Label l_null = c.newLabel();
         Label l_exit = c.newLabel();
-        Mem NaN = c.newInt32Const(asmjit::ConstPool::kScopeLocal, 0x7fc00000); // float NaN
+        Mem NaN = c.newInt32Const(asmjit::ConstPoolScope::kLocal, 0x7fc00000); // float NaN
 
         Gp n = c.newGpq();
         c.movabs(n, LONG_NULL);
@@ -140,7 +140,7 @@ namespace questdb::x86 {
         }
         Label l_null = c.newLabel();
         Label l_exit = c.newLabel();
-        Mem NaN = c.newInt64Const(asmjit::ConstPool::kScopeLocal, 0x7ff8000000000000LL); // double NaN
+        Mem NaN = c.newInt64Const(asmjit::ConstPoolScope::kLocal, 0x7ff8000000000000LL); // double NaN
 
         Gp n = c.newGpq();
         c.movabs(n, LONG_NULL);
@@ -338,14 +338,14 @@ namespace questdb::x86 {
 
     inline Xmm float_neg(Compiler &c, const Xmm &rhs) {
         int32_t array[4] = {INT_NULL, 0, 0, 0};
-        Mem mem = c.newConst(ConstPool::kScopeLocal, &array, 32);
+        Mem mem = c.newConst(ConstPoolScope::kLocal, &array, 32);
         c.xorps(rhs, mem);
         return rhs;
     }
 
     inline Xmm double_neg(Compiler &c, const Xmm &rhs) {
         int32_t array[4] = {0, INT_NULL, 0, 0};
-        Mem mem = c.newConst(ConstPool::kScopeLocal, &array, 32);
+        Mem mem = c.newConst(ConstPoolScope::kLocal, &array, 32);
         c.xorpd(rhs, mem);
         return rhs;
     }
@@ -627,7 +627,7 @@ namespace questdb::x86 {
 
     inline Gpd double_lt(Compiler &c, const Xmm &lhs, const Xmm &rhs) {
         Gp r = c.newInt32();
-        c.cmpsd(lhs, rhs, Predicate::kCmpLT);
+        c.cmpsd(lhs, rhs, CmpImm::kLT);
         c.movd(r, lhs);
         c.neg(r);
         return r.as<Gpd>();
@@ -635,7 +635,7 @@ namespace questdb::x86 {
 
     inline Gpd double_le(Compiler &c, const Xmm &lhs, const Xmm &rhs) {
         Gp r = c.newInt32();
-        c.cmpsd(lhs, rhs, Predicate::kCmpLE);
+        c.cmpsd(lhs, rhs, CmpImm::kLE);
         c.movd(r, lhs);
         c.neg(r);
         return r.as<Gpd>();
@@ -643,7 +643,7 @@ namespace questdb::x86 {
 
     inline Gpd double_gt(Compiler &c, const Xmm &lhs, const Xmm &rhs) {
         Gp r = c.newInt32();
-        c.cmpsd(rhs, lhs, Predicate::kCmpLT);
+        c.cmpsd(rhs, lhs, CmpImm::kLT);
         c.movd(r, rhs);
         c.neg(r);
         return r.as<Gpd>();
@@ -651,7 +651,7 @@ namespace questdb::x86 {
 
     inline Gpd double_ge(Compiler &c, const Xmm &lhs, const Xmm &rhs) {
         Gp r = c.newInt32();
-        c.cmpsd(rhs, lhs, Predicate::kCmpLE);
+        c.cmpsd(rhs, lhs, CmpImm::kLE);
         c.movd(r, rhs);
         c.neg(r);
         return r.as<Gpd>();
@@ -676,7 +676,7 @@ namespace questdb::x86 {
 
     inline Gpd float_lt(Compiler &c, const Xmm &lhs, const Xmm &rhs) {
         Gp r = c.newInt32();
-        c.cmpss(lhs, rhs, Predicate::kCmpLT);
+        c.cmpss(lhs, rhs, CmpImm::kLT);
         c.movd(r, lhs);
         c.neg(r);
         return r.as<Gpd>();
@@ -684,7 +684,7 @@ namespace questdb::x86 {
 
     inline Gpd float_le(Compiler &c, const Xmm &lhs, const Xmm &rhs) {
         Gp r = c.newInt32();
-        c.cmpss(lhs, rhs, Predicate::kCmpLE);
+        c.cmpss(lhs, rhs, CmpImm::kLE);
         c.movd(r, lhs);
         c.neg(r);
         return r.as<Gpd>();
@@ -692,7 +692,7 @@ namespace questdb::x86 {
 
     inline Gpd float_gt(Compiler &c, const Xmm &lhs, const Xmm &rhs) {
         Gp r = c.newInt32();
-        c.cmpss(rhs, lhs, Predicate::kCmpLT);
+        c.cmpss(rhs, lhs, CmpImm::kLT);
         c.movd(r, rhs);
         c.neg(r);
         return r.as<Gpd>();
@@ -701,7 +701,7 @@ namespace questdb::x86 {
     inline Gpd float_ge(Compiler &c, const Xmm &lhs, const Xmm &rhs) {
         c.comment("float_ge_start");
         Gp r = c.newInt32();
-        c.cmpss(rhs, lhs, Predicate::kCmpLE);
+        c.cmpss(rhs, lhs, CmpImm::kLE);
         c.movd(r, rhs);
         c.neg(r);
         c.comment("float_ge_stop");
@@ -712,9 +712,9 @@ namespace questdb::x86 {
     inline Gpd double_cmp_epsilon(Compiler &c, const Xmm &xmm0, const Xmm &xmm1, double epsilon, bool eq) {
         c.comment("float_cmp_epsilon_start");
         int64_t nans[] = {0x7fffffffffffffff, 0x7fffffffffffffff}; // double NaN
-        Mem nans_memory = c.newConst(ConstPool::kScopeLocal, &nans, 32);
-        Mem d = c.newDoubleConst(ConstPool::kScopeLocal, epsilon);
-        Mem inf_memory = c.newInt64Const(ConstPool::kScopeLocal, 0x7FF0000000000000LL);
+        Mem nans_memory = c.newConst(ConstPoolScope::kLocal, &nans, 32);
+        Mem d = c.newDoubleConst(ConstPoolScope::kLocal, epsilon);
+        Mem inf_memory = c.newInt64Const(ConstPoolScope::kLocal, 0x7FF0000000000000LL);
         Label l_nan = c.newLabel();
         Label l_exit = c.newLabel();
         Gp r = c.newInt32();
@@ -758,9 +758,9 @@ namespace questdb::x86 {
 
     inline Gpd float_cmp_epsilon(Compiler &c, const Xmm &xmm0, const Xmm &xmm1, float epsilon, bool eq) {
         int32_t nans[] = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff}; // float NaN
-        Mem nans_memory = c.newConst(ConstPool::kScopeLocal, &nans, 16);
-        Mem inf_memory = c.newFloatConst(ConstPool::kScopeLocal, 0x7F800000);
-        Mem d = c.newFloatConst(ConstPool::kScopeLocal, epsilon);
+        Mem nans_memory = c.newConst(ConstPoolScope::kLocal, &nans, 16);
+        Mem inf_memory = c.newFloatConst(ConstPoolScope::kLocal, 0x7F800000);
+        Mem d = c.newFloatConst(ConstPoolScope::kLocal, epsilon);
         Label l_nan = c.newLabel();
         Label l_exit = c.newLabel();
         c.comment("float_cmp_epsilon_start");

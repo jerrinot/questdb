@@ -167,8 +167,8 @@ endif ()
 include(FetchContent)
 FetchContent_Declare(
         asmjit
-        GIT_REPOSITORY https://github.com/questdb/asmjit.git
-        GIT_TAG 4ec760a3d1f69e32ba460ecd2513f29b8428700b # Fixed typos in documentation
+        GIT_REPOSITORY https://github.com/asmjit/asmjit.git
+        GIT_TAG e1b20711cc40c29ec4918b54e328ace96470f6e5
 )
 
 FetchContent_MakeAvailable(asmjit)

@@ -102,7 +102,7 @@ namespace questdb::avx2 {
 
     inline Mem vec_broadcast_long(Compiler &c, uint32_t value) {
         uint64_t broadcast_value[4] = {value, value, value, value};
-        return c.newConst(ConstPool::kScopeLocal, &broadcast_value, 32);
+        return c.newConst(ConstPoolScope::kLocal, &broadcast_value, 32);
     }
 
     // Reads length of variable size column with header stored in data vector (string, binary).
@@ -297,7 +297,7 @@ namespace questdb::avx2 {
     }
 
     jit_value_t read_imm(Compiler &c, const instruction_t &instr) {
-        const auto scope = ConstPool::kScopeLocal;
+        const auto scope = ConstPoolScope::kLocal;
         Ymm val = c.newYmm("imm_value");
         auto type = static_cast<data_type_t>(instr.options);
         switch (type) {

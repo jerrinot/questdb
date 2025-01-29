@@ -198,7 +198,7 @@ namespace questdb::x86 {
             }
             case data_type_t::i128: {
                 return {
-                    c.newConst(ConstPool::kScopeLocal, &instr.ipayload, 16),
+                    c.newConst(ConstPoolScope::kLocal, &instr.ipayload, 16),
                     type,
                     data_kind_t::kMemory
                 };
@@ -222,18 +222,18 @@ namespace questdb::x86 {
 
     jit_value_t imm2reg(Compiler &c, data_type_t dst_type, const jit_value_t &v) {
         Imm k = v.op().as<Imm>();
-        if (k.isInteger()) {
+        if (k.isInt()) {
             auto value = k.valueAs<int64_t>();
             switch (dst_type) {
                 case data_type_t::f32: {
                     Xmm reg = c.newXmmSs("f32_imm %f", value);
-                    Mem mem = c.newFloatConst(ConstPool::kScopeLocal, static_cast<float>(value));
+                    Mem mem = c.newFloatConst(ConstPoolScope::kLocal, static_cast<float>(value));
                     c.movss(reg, mem);
                     return {reg, data_type_t::f32, data_kind_t::kConst};
                 }
                 case data_type_t::f64: {
                     Xmm reg = c.newXmmSd("f64_imm %f", (double) value);
-                    Mem mem = c.newDoubleConst(ConstPool::kScopeLocal, static_cast<double>(value));
+                    Mem mem = c.newDoubleConst(ConstPoolScope::kLocal, static_cast<double>(value));
                     c.movsd(reg, mem);
                     return {reg, data_type_t::f64, data_kind_t::kConst};
                 }
@@ -253,12 +253,12 @@ namespace questdb::x86 {
             auto value = k.valueAs<double>();
             if (dst_type == data_type_t::i64 || dst_type == data_type_t::f64 || !is_float(value)) {
                 Xmm reg = c.newXmmSd("f64_imm %f", value);
-                Mem mem = c.newDoubleConst(ConstPool::kScopeLocal, static_cast<double>(value));
+                Mem mem = c.newDoubleConst(ConstPoolScope::kLocal, static_cast<double>(value));
                 c.movsd(reg, mem);
                 return {reg, data_type_t::f64, data_kind_t::kConst};
             } else {
                 Xmm reg = c.newXmmSs("f32_imm %f", value);
-                Mem mem = c.newFloatConst(ConstPool::kScopeLocal, static_cast<float>(value));
+                Mem mem = c.newFloatConst(ConstPoolScope::kLocal, static_cast<float>(value));
                 c.movss(reg, mem);
                 return {reg, data_type_t::f32, data_kind_t::kConst};
             }

@@ -121,22 +121,22 @@ namespace questdb::avx2 {
 
     inline Mem vec_long_null(Compiler &c) {
         int64_t nulls[4] = {LONG_NULL, LONG_NULL, LONG_NULL, LONG_NULL};
-        return c.newConst(ConstPool::kScopeLocal, &nulls, 32);
+        return c.newConst(ConstPoolScope::kLocal, &nulls, 32);
     }
 
     inline Mem vec_int_null(Compiler &c) {
         int32_t nulls[8] = {INT_NULL, INT_NULL, INT_NULL, INT_NULL, INT_NULL, INT_NULL, INT_NULL, INT_NULL};
-        return c.newConst(ConstPool::kScopeLocal, &nulls, 32);
+        return c.newConst(ConstPoolScope::kLocal, &nulls, 32);
     }
 
     inline Mem vec_float_null(Compiler &c) {
         int32_t nulls[8] = {0x7fc00000, 0x7fc00000, 0x7fc00000, 0x7fc00000, 0x7fc00000, 0x7fc00000, 0x7fc00000, 0x7fc00000};
-        return c.newConst(ConstPool::kScopeLocal, &nulls, 32);
+        return c.newConst(ConstPoolScope::kLocal, &nulls, 32);
     }
 
     inline Mem vec_double_null(Compiler &c) {
         int64_t nulls[4] = {0x7ff8000000000000LL, 0x7ff8000000000000LL, 0x7ff8000000000000LL, 0x7ff8000000000000LL};
-        return c.newConst(ConstPool::kScopeLocal, &nulls, 32);
+        return c.newConst(ConstPoolScope::kLocal, &nulls, 32);
     }
 
     inline Mem vec_sign_mask(Compiler &c, data_type_t type) {
@@ -144,24 +144,24 @@ namespace questdb::avx2 {
             case data_type_t::i8: {
                 uint8_t mask[32] = {};
                 memset(mask, 0x7fu, 32);
-                return c.newConst(ConstPool::kScopeLocal, &mask, 32);
+                return c.newConst(ConstPoolScope::kLocal, &mask, 32);
             }
                 break;
             case data_type_t::i16: {
                 uint16_t mask[16] = {0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu };
-                return c.newConst(ConstPool::kScopeLocal, &mask, 32);
+                return c.newConst(ConstPoolScope::kLocal, &mask, 32);
             }
                 break;
             case data_type_t::i32:
             case data_type_t::f32: {
                 uint32_t mask[] = {0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu};
-                return c.newConst(ConstPool::kScopeLocal, &mask, 32);
+                return c.newConst(ConstPoolScope::kLocal, &mask, 32);
             }
                 break;
             case data_type_t::i64:
             case data_type_t::f64: {
                 uint64_t mask[] = {0x7fffffffffffffffu, 0x7fffffffffffffffu, 0x7fffffffffffffffu, 0x7fffffffffffffffu};
-                return c.newConst(ConstPool::kScopeLocal, &mask, 32);
+                return c.newConst(ConstPoolScope::kLocal, &mask, 32);
             }
                 break;
             default:
@@ -179,11 +179,11 @@ namespace questdb::avx2 {
         switch (type) {
             case data_type_t::f32:
                 c.vsubps(sub, x, x); // x - x = 0.0, NaN - NaN = NaN, Inf - Inf = NaN, -Inf - -Inf = NaN
-                c.vcmpps(dst, sub, sub, Predicate::kCmpUNORD);
+                c.vcmpps(dst, sub, sub, VCmpImm::kUNORD_Q);
                 break;
             default:
                 c.vsubpd(sub, x, x);
-                c.vcmppd(dst, sub, sub, Predicate::kCmpUNORD);
+                c.vcmppd(dst, sub, sub, VCmpImm::kUNORD_Q);
                 break;
         }
         return dst;
@@ -286,8 +286,8 @@ namespace questdb::avx2 {
         c.vsubps(lhs_copy, lhs_copy, rhs_copy); //(lhs - rhs)
         c.vpand(lhs_copy, lhs_copy, sign_mask); // abs(lhs - rhs)
         float eps[8] = {FLOAT_EPSILON,FLOAT_EPSILON,FLOAT_EPSILON,FLOAT_EPSILON,FLOAT_EPSILON,FLOAT_EPSILON,FLOAT_EPSILON,FLOAT_EPSILON};
-        Mem epsilon = c.newConst(ConstPool::kScopeLocal, &eps, 32);
-        c.vcmpps(dst, lhs_copy, epsilon, Predicate::kCmpLT);
+        Mem epsilon = c.newConst(ConstPoolScope::kLocal, &eps, 32);
+        c.vcmpps(dst, lhs_copy, epsilon, VCmpImm::kLT_OS);
         c.vpor(dst, dst, nans);
         return dst;
     }
@@ -303,8 +303,8 @@ namespace questdb::avx2 {
         c.vsubpd(lhs_copy, lhs_copy, rhs_copy); //(lhs - rhs)
         c.vpand(lhs_copy, lhs_copy, sign_mask); // abs(lhs - rhs)
         double eps[4] = {DOUBLE_EPSILON, DOUBLE_EPSILON, DOUBLE_EPSILON, DOUBLE_EPSILON};
-        Mem epsilon = c.newConst(ConstPool::kScopeLocal, &eps, 32);
-        c.vcmppd(dst, lhs_copy, epsilon, Predicate::kCmpLT);
+        Mem epsilon = c.newConst(ConstPoolScope::kLocal, &eps, 32);
+        c.vcmppd(dst, lhs_copy, epsilon, VCmpImm::kLT_OS);
         c.vpor(dst, dst, nans);
         return dst;
     }
@@ -365,12 +365,14 @@ namespace questdb::avx2 {
                 break;
             case data_type_t::f32: {
                 Ymm neq = mask_not(c, cmp_eq_float(c, type, lhs, rhs));
-                c.vcmpps(dst, lhs, rhs, Predicate::kCmpLT);
+                c.vcmpps(dst, lhs, rhs, VCmpImm::kLT_OS);
+                // c.vcmpps(dst, lhs, rhs, Predicate::kCmpLT);
                 return mask_and(c, dst, neq);
             }
             case data_type_t::f64: {
                 Ymm neq = mask_not(c, cmp_eq_double(c, type, lhs, rhs));
-                c.vcmppd(dst, lhs, rhs, Predicate::kCmpLT);
+                c.vcmppd(dst, lhs, rhs, VCmpImm::kLT_OS);
+                // c.vcmppd(dst, lhs, rhs, Predicate::kCmpLT);
                 return mask_and(c, dst, neq);
             }
             default:
@@ -423,13 +425,14 @@ namespace questdb::avx2 {
             case data_type_t::f32: {
                 Ymm eq = cmp_eq_float(c, type, lhs, rhs);
                 Ymm dst = c.newYmm();
-                c.vcmpps(dst.ymm(), lhs.ymm(), rhs.ymm(), Predicate::kCmpLE);
+                c.vcmpps(dst.ymm(), lhs.ymm(), rhs.ymm(), VCmpImm::kLE_OS);
+                // c.vcmpps(dst.ymm(), lhs.ymm(), rhs.ymm(), Predicate::kCmpLE);
                 return mask_or(c, dst, eq);
             }
             case data_type_t::f64: {
                 Ymm eq = cmp_eq_double(c, type, lhs, rhs);
                 Ymm dst = c.newYmm();
-                c.vcmppd(dst.ymm(), lhs.ymm(), rhs.ymm(), Predicate::kCmpLE);
+                c.vcmppd(dst.ymm(), lhs.ymm(), rhs.ymm(), VCmpImm::kLE_OS);
                 return mask_or(c, dst, eq);
             }
             default:
@@ -539,7 +542,7 @@ namespace questdb::avx2 {
                 uint8_t array[] = {255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255,
                                    0,
                                    255, 0, 255, 0, 255, 0, 255, 0, 255, 0};
-                Mem c0 = c.newConst(asmjit::ConstPool::kScopeLocal, &array, 32);
+                Mem c0 = c.newConst(asmjit::ConstPoolScope::kLocal, &array, 32);
                 Ymm mask = c.newYmm();
                 c.vmovdqa(mask, c0);
                 c.vpblendvb(dst, aodd, lhs, mask);

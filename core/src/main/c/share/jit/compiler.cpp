@@ -63,7 +63,7 @@ struct Function {
     };
 
     void compile(const instruction_t *istream, size_t size, uint32_t options) {
-        auto features = CpuInfo::host().features().as<x86::Features>();
+        auto features = CpuInfo::host().features().x86();
         enum type_size : uint32_t {
             scalar = 0,
             single_size = 1,
@@ -147,14 +147,14 @@ struct Function {
         //init row_ids_reg out of loop
         if (step == 4) {
             int64_t rows_id_mem[4] = {0, 1, 2, 3};
-            Mem mem = c.newConst(ConstPool::kScopeLocal, &rows_id_mem, 32);
+            Mem mem = c.newConst(ConstPoolScope::kLocal, &rows_id_mem, 32);
 
             c.vmovq(row_ids_reg.xmm(), rows_id_start_offset);
             c.vpbroadcastq(row_ids_reg, row_ids_reg.xmm());
             c.vpaddq(row_ids_reg, row_ids_reg, mem);
 
             int64_t step_data[4] = {step, step, step, step};
-            Mem stem_mem = c.newConst(ConstPool::kScopeLocal, &step_data, 32);
+            Mem stem_mem = c.newConst(ConstPoolScope::kLocal, &step_data, 32);
             c.vmovdqu(row_ids_step, stem_mem);
         }
 
@@ -192,7 +192,8 @@ struct Function {
 
     void begin_fn() {
         c.addFunc(FuncSignatureT<int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t>(
-            CallConv::kIdHost));
+            // CallConv::kIdHost));
+            CallConvId::kCDecl));
         data_ptr = c.newIntPtr("data_ptr");
         data_size = c.newInt64("data_size");
 
@@ -288,9 +289,11 @@ Java_io_questdb_jit_FiltersCompiler_compileFunction(JNIEnv *e,
     FileLogger logger(stdout);
     bool debug = options & 1;
     if (debug) {
-        logger.addFlags(FormatOptions::kFlagRegCasts |
-                        FormatOptions::kFlagExplainImms |
-                        FormatOptions::kFlagAnnotations);
+        logger.addFlags(FormatFlags::kRegCasts |
+                        FormatFlags::kExplainImms);
+        // logger.addFlags(FormatOptions::kFlagRegCasts |
+        //                 FormatOptions::kFlagExplainImms |
+        //                 FormatOptions::kFlagAnnotations);
         code.setLogger(&logger);
     }
 
@@ -298,6 +301,10 @@ Java_io_questdb_jit_FiltersCompiler_compileFunction(JNIEnv *e,
     code.setErrorHandler(&errorHandler);
 
     x86::Compiler c(&code);
+    if (debug) {
+        c.addDiagnosticOptions(DiagnosticOptions::kRAAnnotate);
+    }
+
     Function function(c);
 
     CompiledFn fn;
