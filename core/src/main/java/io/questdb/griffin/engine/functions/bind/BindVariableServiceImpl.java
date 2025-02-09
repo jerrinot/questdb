@@ -27,6 +27,8 @@ package io.questdb.griffin.engine.functions.bind;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GeoHashes;
+import io.questdb.cairo.arr.ArrayBuffers;
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.sql.BindVariableService;
 import io.questdb.cairo.sql.Function;
 import io.questdb.griffin.SqlException;
@@ -67,6 +69,7 @@ public class BindVariableServiceImpl implements BindVariableService {
     private final ObjectPool<TimestampBindVariable> timestampVarPool;
     private final ObjectPool<UuidBindVariable> uuidVarPool;
     private final ObjectPool<VarcharBindVariable> varcharVarPool;
+    private final ObjectPool<ArrayBindVariable> arrayVarPool;
 
     public BindVariableServiceImpl(CairoConfiguration configuration) {
         final int poolSize = configuration.getBindVariablePoolSize();
@@ -86,6 +89,7 @@ public class BindVariableServiceImpl implements BindVariableService {
         this.long256VarPool = new ObjectPool<>(Long256BindVariable::new, 8);
         this.uuidVarPool = new ObjectPool<>(UuidBindVariable::new, 8);
         this.varcharVarPool = new ObjectPool<>(VarcharBindVariable::new, poolSize);
+        this.arrayVarPool = new ObjectPool<>(ArrayBindVariable::new, poolSize); // todo: this might be excessive, smaller pool size might be enough
     }
 
     @Override
@@ -108,6 +112,7 @@ public class BindVariableServiceImpl implements BindVariableService {
         geoHashVarPool.clear();
         uuidVarPool.clear();
         varcharVarPool.clear();
+        arrayVarPool.clear();
     }
 
     @Override
@@ -176,8 +181,43 @@ public class BindVariableServiceImpl implements BindVariableService {
             case ColumnType.VARCHAR:
                 setVarchar(index);
                 return type;
+            case ColumnType.ARRAY:
+                setArray(index);
+                return type;
             default:
                 throw SqlException.$(position, "bind variable cannot be used [contextType=").put(ColumnType.nameOf(type)).put(", index=").put(index).put(']');
+        }
+    }
+
+    private void setArray(int index) throws SqlException {
+        setArray(index, null);
+    }
+
+    @Override
+    public void setArray(int index, ArrayView value) throws SqlException {
+        indexedVariables.extendPos(index + 1);
+        // variable exists
+        Function function = indexedVariables.getQuick(index);
+        if (function != null) {
+            setArray0(function, value, index, null);
+        } else {
+            indexedVariables.setQuick(index, function = arrayVarPool.next());
+            ((ArrayBindVariable) function).fromView(value);
+        }
+    }
+
+    private static void setArray0(Function function, ArrayView value, int index, @Nullable CharSequence name) throws SqlException {
+        final int functionType = ColumnType.tagOf(function.getType());
+        switch (functionType) {
+            case ColumnType.ARRAY:
+                ((ArrayBindVariable) function).fromView(value);
+                break;
+            case ColumnType.STRING:
+            case ColumnType.VARCHAR:
+                throw new UnsupportedOperationException("implement me");
+            default:
+                reportError(function, ColumnType.ARRAY, index, name);
+                break;
         }
     }
 
@@ -755,6 +795,7 @@ public class BindVariableServiceImpl implements BindVariableService {
         }
     }
 
+
     private static void reportError(Function function, int srcType, int index, @Nullable CharSequence name) throws SqlException {
         if (name == null) {
             throw SqlException.$(0, "bind variable at ").put(index).put(" is defined as ").put(ColumnType.nameOf(function.getType())).put(" and cannot accept ").put(ColumnType.nameOf(srcType));
@@ -1148,6 +1189,9 @@ public class BindVariableServiceImpl implements BindVariableService {
                 break;
             case ColumnType.UUID:
                 SqlUtil.implicitCastStrAsUuid(value, ((UuidBindVariable) function).value);
+                break;
+            case ColumnType.ARRAY:
+                ((ArrayBindVariable) function).parseArray(value);
                 break;
             default:
                 reportError(function, ColumnType.STRING, index, name);

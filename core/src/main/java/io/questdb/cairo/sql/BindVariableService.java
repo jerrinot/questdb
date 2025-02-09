@@ -24,6 +24,8 @@
 
 package io.questdb.cairo.sql;
 
+import io.questdb.cairo.arr.ArrayBuffers;
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.griffin.SqlException;
 import io.questdb.std.BinarySequence;
 import io.questdb.std.Long256;
@@ -564,4 +566,6 @@ public interface BindVariableService extends Mutable {
      *                      that is not compatible with UTF8 encoded String
      */
     void setVarchar(CharSequence name, Utf8Sequence value) throws SqlException;
+
+    void setArray(int i, ArrayView ab) throws SqlException;
 }

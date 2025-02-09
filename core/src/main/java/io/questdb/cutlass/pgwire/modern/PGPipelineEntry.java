@@ -32,8 +32,11 @@ import io.questdb.cairo.DataUnavailableException;
 import io.questdb.cairo.GeoHashes;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.TableWriterAPI;
+import io.questdb.cairo.arr.ArrayBuffers;
+import io.questdb.cairo.arr.ArrayMeta;
 import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.arr.ArrayTypeDriver;
+import io.questdb.cairo.arr.ArrayViewImpl;
 import io.questdb.cairo.pool.WriterSource;
 import io.questdb.cairo.sql.BindVariableService;
 import io.questdb.cairo.sql.Function;
@@ -205,6 +208,8 @@ public class PGPipelineEntry implements QuietCloseable, Mutable {
     private int stateSync = 0;
     private TypesAndInsertModern tai = null;
     private TypesAndSelectModern tas = null;
+    private ArrayBuffers arrayBuffers;
+    private final ArrayViewImpl arrayView = new ArrayViewImpl();
     // IMPORTANT: if you add a new state, make sure to add it to the close() method too!
     // PGPipelineEntry instances are pooled and reused, so we need to make sure
     // that all state is cleared before returning the instance to the pool
@@ -321,6 +326,7 @@ public class PGPipelineEntry implements QuietCloseable, Mutable {
         stateSync = SYNC_PARSE;
         tai = null;
         tas = null;
+        arrayBuffers = Misc.free(arrayBuffers);
     }
 
     public void commit(ObjObjHashMap<TableToken, TableWriterAPI> pendingWriters) throws BadProtocolException {
@@ -1201,6 +1207,9 @@ public class PGPipelineEntry implements QuietCloseable, Mutable {
                     case X_PG_UUID:
                         setUuidBindVariable(i, lo, valueSize, bindVariableService);
                         break;
+                    case X_PG_ARR_INT8:
+                        setBindVariableAsLongArray(i, lo, valueSize, bindVariableService);
+                        break;
                     default:
                         // before we bind a string, we need to define the type of the variable
                         // so the binding process can cast the string as required
@@ -1213,6 +1222,65 @@ public class PGPipelineEntry implements QuietCloseable, Mutable {
             }
             lo += valueSize;
         }
+    }
+
+    private void setBindVariableAsLongArray(int i, long lo, int valueSize, BindVariableService bindVariableService) {
+        // todo: do not use Unsafe here,
+        //       we should be able to read array data directly from the buffer
+        // todo: consider whether we need ArrayBuffers at all, perhaps we can create a view directly above the arena we received
+        //      from the client
+        if (arrayBuffers == null) {
+            arrayBuffers = new ArrayBuffers();
+        }
+
+        int dimensions = getIntUnsafe(lo);
+        lo += Integer.BYTES;
+
+        int hasNull = getIntUnsafe(lo);
+        lo += Integer.BYTES;
+
+        int componentOid = getIntUnsafe(lo);
+        lo += Integer.BYTES;
+
+        IntList dimensionSizes = new IntList();
+        int totalSize = 1;
+        for (int j = 0; j < dimensions; j++) {
+            int dimensionSize = getIntUnsafe(lo);
+            arrayBuffers.shape.add(dimensionSize);
+
+            totalSize *= dimensionSize;
+            dimensionSizes.add(dimensionSize);
+            lo += Integer.BYTES;
+
+            lo += Integer.BYTES; // skip lower bound, it's always 1
+        }
+
+        int nativeComponentType;
+        switch (componentOid) {
+            case PG_INT8:
+                nativeComponentType = ColumnType.LONG;
+                for (int j = 0; j < totalSize; j++) {
+                    int size = getIntUnsafe(lo);
+                    lo += Integer.BYTES;
+
+                    if (size == -1) {
+                        arrayBuffers.values.putLong(Numbers.LONG_NULL);
+                    } else {
+                        assert size == 8;
+                        long value = getLongUnsafe(lo);
+                        arrayBuffers.values.putLong(value);
+                        lo += 8;
+                    }
+                }
+                break;
+            default:
+                throw new UnsupportedOperationException("implement me");
+        }
+
+        arrayBuffers.type = ColumnType.encodeArrayType(nativeComponentType, dimensions);
+        ArrayMeta.determineDefaultStrides(arrayBuffers.shape.asSlice(), arrayBuffers.strides);
+        arrayBuffers.updateView(arrayView);
+        bindVariableService.setArray(i, arrayView);
     }
 
     private void copyPgResultSetColumnTypesAndNames() {
@@ -1277,6 +1345,9 @@ public class PGPipelineEntry implements QuietCloseable, Mutable {
                 break;
             case X_PG_UUID:
                 bindVariableService.define(j, ColumnType.UUID, 0);
+                break;
+            case X_PG_ARR_INT8:
+                bindVariableService.define(j, ColumnType.ARRAY, 0);
                 break;
             case PG_UNSPECIFIED:
                 // unknown types, we are not defining them for now - this gives
