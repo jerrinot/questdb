@@ -194,7 +194,7 @@ namespace questdb::x86 {
             case data_type_t::i16:
             case data_type_t::i32:
             case data_type_t::i64: {
-                return {imm(instr.ipayload.lo), type, data_kind_t::kConst};
+                return {asmjit::Imm(instr.ipayload.lo), type, data_kind_t::kConst};
             }
             case data_type_t::i128: {
                 return {
@@ -205,7 +205,7 @@ namespace questdb::x86 {
             }
             case data_type_t::f32:
             case data_type_t::f64: {
-                return {imm(instr.dpayload), type, data_kind_t::kConst};
+                return {asmjit::Imm(instr.dpayload), type, data_kind_t::kConst};
             }
             default:
                 __builtin_unreachable();

@@ -1,4 +1,5 @@
 #include "aarch64.h"
+#include "common.h"
 #include <utility>
 
 namespace questdb::aarch64 {
@@ -100,23 +101,23 @@ namespace questdb::aarch64 {
         }
     }
 
-    jit_value_t imm2reg(Compiler &c, data_type_t dst_type, const jit_value_t &v) {
-        Imm k = v.op().as<Imm>();
+    jit_value_t imm2reg(asmjit::aarch64::Compiler &c, data_type_t dst_type, const jit_value_t &v) {
+        asmjit::Imm k = v.op().as<asmjit::Imm>();
         if (k.isInt()) {
             auto value = k.valueAs<int64_t>();
             switch (dst_type) {
                 case data_type_t::f32: {
-                    Vec reg = c.newVecS("f32_imm");
+                    asmjit::aarch64::Vec reg = c.newVecS("f32_imm");
                     c.fmov(reg, static_cast<float>(value));
                     return {reg, data_type_t::f32, data_kind_t::kConst};
                 }
                 case data_type_t::f64: {
-                    Vec reg = c.newVecD("f64_imm");
+                    asmjit::aarch64::Vec reg = c.newVecD("f64_imm");
                     c.fmov(reg, static_cast<double>(value));
                     return {reg, data_type_t::f64, data_kind_t::kConst};
                 }
                 default: {
-                    Gp reg = c.newGpq("i64_imm");
+                    asmjit::aarch64::Gp reg = c.newGpq("i64_imm");
                     c.mov(reg, value);
                     return {reg, dst_type, data_kind_t::kConst};
                 }
@@ -124,11 +125,11 @@ namespace questdb::aarch64 {
         } else {
             auto value = k.valueAs<double>();
             if (dst_type == data_type_t::f64) {
-                Vec reg = c.newVecD("f64_imm");
+                asmjit::aarch64::Vec reg = c.newVecD("f64_imm");
                 c.fmov(reg, value);
                 return {reg, data_type_t::f64, data_kind_t::kConst};
             } else {
-                Vec reg = c.newVecS("f32_imm");
+                asmjit::aarch64::Vec reg = c.newVecS("f32_imm");
                 c.fmov(reg, static_cast<float>(value));
                 return {reg, data_type_t::f32, data_kind_t::kConst};
             }
@@ -369,7 +370,7 @@ namespace questdb::aarch64 {
         }
     }
 
-    void scalar_loop(Compiler &c, const instruction_t *istream, size_t size, bool null_check, int unroll_factor) {
+    void scalar_loop(asmjit::aarch64::Compiler &c, const instruction_t *istream, size_t size, bool null_check, int unroll_factor) {
         // Get the arguments from the function signature
         auto data_ptr = c.arg(0).as<Gp>();
         auto data_size = c.arg(1).as<Gp>();
