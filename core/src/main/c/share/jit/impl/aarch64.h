@@ -32,18 +32,18 @@ namespace questdb::aarch64 {
     using namespace asmjit::a64;
 
     inline Gp int32_not(Compiler &c, const Gp &b) {
-        c.mvn(b, b);
+        c.mvn(b.r32(), b.r32());
         return b;
     }
 
     inline Gp int32_and(Compiler &c, const Gp &b1, const Gp &b2) {
-        c.and_(b1, b1, b2);
+        c.and_(b1.r32(), b1.r32(), b2.r32());
         return b1;
     }
 
     inline Gp int32_or(Compiler &c, const Gp &b1, const Gp &b2) {
         c.comment("int32_or_start");
-        c.orr(b1, b1, b2);
+        c.orr(b1.r32(), b1.r32(), b2.r32());
         c.comment("int32_or_stop");
         return b1;
     }
@@ -52,23 +52,23 @@ namespace questdb::aarch64 {
         c.comment("check_int32_null");
         Gp null_val = c.newInt32();
         c.mov(null_val, INT_NULL);
-        c.cmp(lhs, null_val);
-        c.csel(dst, lhs, dst, arm::CondCode::kEQ);
-        c.cmp(rhs, null_val);
-        c.csel(dst, rhs, dst, arm::CondCode::kEQ);
+        c.cmp(lhs.r32(), null_val.r32());
+        c.csel(dst.r32(), lhs.r32(), dst.r32(), arm::CondCode::kEQ);
+        c.cmp(rhs.r32(), null_val.r32());
+        c.csel(dst.r32(), rhs.r32(), dst.r32(), arm::CondCode::kEQ);
     }
 
     inline Gp int32_neg(Compiler &c, const Gp &rhs, bool check_null) {
         c.comment("int32_neg");
         
         Gp r = c.newInt32();
-        c.mov(r, rhs);
-        c.neg(r, r);
+        c.mov(r.r32(), rhs.r32());
+        c.neg(r.r32(), r.r32());
         if (check_null) {
             Gp null_val = c.newInt32();
             c.mov(null_val, INT_NULL);
-            c.cmp(rhs, null_val);
-            c.csel(r, null_val, r, arm::CondCode::kEQ);
+            c.cmp(rhs.r32(), null_val.r32());
+            c.csel(r.r32(), null_val.r32(), r.r32(), arm::CondCode::kEQ);
         }
         return r;
     }
@@ -77,13 +77,13 @@ namespace questdb::aarch64 {
         c.comment("int64_neg");
         
         Gp r = c.newInt64();
-        c.mov(r, rhs);
-        c.neg(r, r);
+        c.mov(r.r64(), rhs.r64());
+        c.neg(r.r64(), r.r64());
         if (check_null) {
             Gp null_val = c.newInt64();
             c.mov(null_val, LONG_NULL);
-            c.cmp(rhs, null_val);
-            c.csel(r, rhs, r, arm::CondCode::kEQ);
+            c.cmp(rhs.r64(), null_val.r64());
+            c.csel(r.r64(), rhs.r64(), r.r64(), arm::CondCode::kEQ);
         }
         return r;
     }
@@ -92,7 +92,7 @@ namespace questdb::aarch64 {
         c.comment("int32_add");
         
         Gp r = c.newInt32();
-        c.add(r, lhs, rhs);
+        c.add(r.r32(), lhs.r32(), rhs.r32());
         if (check_null) check_int32_null(c, r, lhs, rhs);
         return r;
     }
@@ -101,7 +101,7 @@ namespace questdb::aarch64 {
         c.comment("int32_sub");
         
         Gp r = c.newInt32();
-        c.sub(r, lhs, rhs);
+        c.sub(r.r32(), lhs.r32(), rhs.r32());
         if (check_null) check_int32_null(c, r, lhs, rhs);
         return r;
     }
@@ -110,7 +110,7 @@ namespace questdb::aarch64 {
         c.comment("int32_mul");
         
         Gp r = c.newInt32();
-        c.mul(r, lhs, rhs);
+        c.mul(r.r32(), lhs.r32(), rhs.r32());
         if (check_null) check_int32_null(c, r, lhs, rhs);
         return r;
     }
@@ -124,8 +124,8 @@ namespace questdb::aarch64 {
         Gp r = c.newInt32();
         
         if (!check_null) {
-            c.cbz(rhs, l_null);
-            c.sdiv(r, lhs, rhs);
+            c.cbz(rhs.r32(), l_null);
+            c.sdiv(r.r32(), lhs.r32(), rhs.r32());
             c.b(l_exit);
             c.bind(l_null);
             c.mov(r, INT_NULL);
@@ -135,16 +135,16 @@ namespace questdb::aarch64 {
         
         Gp null_val = c.newInt32();
         c.mov(null_val, INT_NULL);
-        c.mov(r, null_val);
+        c.mov(r.r32(), null_val.r32());
         
         // Check for division by zero
-        c.cbz(rhs, l_null);
+        c.cbz(rhs.r32(), l_null);
         
         // Check for null inputs
-        c.cmp(lhs, null_val);
+        c.cmp(lhs.r32(), null_val.r32());
         c.b_eq(l_null);
         
-        c.sdiv(r, lhs, rhs);
+        c.sdiv(r.r32(), lhs.r32(), rhs.r32());
         c.bind(l_null);
         return r;
     }
@@ -153,17 +153,17 @@ namespace questdb::aarch64 {
         c.comment("check_int64_null");
         Gp null_val = c.newInt64();
         c.mov(null_val, LONG_NULL);
-        c.cmp(lhs, null_val);
-        c.csel(dst, lhs, dst, arm::CondCode::kEQ);
-        c.cmp(rhs, null_val);
-        c.csel(dst, rhs, dst, arm::CondCode::kEQ);
+        c.cmp(lhs.r64(), null_val.r64());
+        c.csel(dst.r64(), lhs.r64(), dst.r64(), arm::CondCode::kEQ);
+        c.cmp(rhs.r64(), null_val.r64());
+        c.csel(dst.r64(), rhs.r64(), dst.r64(), arm::CondCode::kEQ);
     }
 
     inline Gp int64_add(Compiler &c, const Gp &lhs, const Gp &rhs, bool check_null) {
         c.comment("int64_add");
         
         Gp r = c.newInt64();
-        c.add(r, lhs, rhs);
+        c.add(r.r64(), lhs.r64(), rhs.r64());
         if (check_null) check_int64_null(c, r, lhs, rhs);
         return r;
     }
@@ -172,7 +172,7 @@ namespace questdb::aarch64 {
         c.comment("int64_sub");
         
         Gp r = c.newInt64();
-        c.sub(r, lhs, rhs);
+        c.sub(r.r64(), lhs.r64(), rhs.r64());
         if (check_null) check_int64_null(c, r, lhs, rhs);
         return r;
     }
@@ -181,7 +181,7 @@ namespace questdb::aarch64 {
         c.comment("int64_mul");
         
         Gp r = c.newInt64();
-        c.mul(r, lhs, rhs);
+        c.mul(r.r64(), lhs.r64(), rhs.r64());
         if (check_null) check_int64_null(c, r, lhs, rhs);
         return r;
     }
@@ -195,8 +195,8 @@ namespace questdb::aarch64 {
         Gp r = c.newInt64();
         
         if (!check_null) {
-            c.cbz(rhs, l_null);
-            c.sdiv(r, lhs, rhs);
+            c.cbz(rhs.r64(), l_null);
+            c.sdiv(r.r64(), lhs.r64(), rhs.r64());
             c.b(l_exit);
             c.bind(l_null);
             c.mov(r, LONG_NULL);
@@ -206,16 +206,16 @@ namespace questdb::aarch64 {
         
         Gp null_val = c.newInt64();
         c.mov(null_val, LONG_NULL);
-        c.mov(r, null_val);
+        c.mov(r.r64(), null_val.r64());
         
         // Check for division by zero
-        c.cbz(rhs, l_null);
+        c.cbz(rhs.r64(), l_null);
         
         // Check for null inputs
-        c.cmp(lhs, null_val);
+        c.cmp(lhs.r64(), null_val.r64());
         c.b_eq(l_null);
         
-        c.sdiv(r, lhs, rhs);
+        c.sdiv(r.r64(), lhs.r64(), rhs.r64());
         c.bind(l_null);
         return r;
     }
@@ -272,26 +272,26 @@ namespace questdb::aarch64 {
 
     inline Gp int32_eq(Compiler &c, const Gp &lhs, const Gp &rhs) {
         Gp r = c.newInt32();
-        c.cmp(lhs, rhs);
-        c.cset(r, arm::CondCode::kEQ);
+        c.cmp(lhs.r32(), rhs.r32());
+        c.cset(r.r32(), arm::CondCode::kEQ);
         return r;
     }
 
     inline Gp int32_ne(Compiler &c, const Gp &lhs, const Gp &rhs) {
         Gp r = c.newInt32();
-        c.cmp(lhs, rhs);
-        c.cset(r, arm::CondCode::kNE);
+        c.cmp(lhs.r32(), rhs.r32());
+        c.cset(r.r32(), arm::CondCode::kNE);
         return r;
     }
 
     inline Gp int32_lt_gt(Compiler &c, const Gp &lhs, const Gp &rhs, bool gt, bool check_null) {
         if (!check_null) {
             Gp r = c.newInt32();
-            c.cmp(lhs, rhs);
+            c.cmp(lhs.r32(), rhs.r32());
             if (gt) {
-                c.cset(r, arm::CondCode::kGT);
+                c.cset(r.r32(), arm::CondCode::kGT);
             } else {
-                c.cset(r, arm::CondCode::kLT);
+                c.cset(r.r32(), arm::CondCode::kLT);
             }
             return r;
         } else {
@@ -303,22 +303,22 @@ namespace questdb::aarch64 {
             c.mov(null_val, INT_NULL);
             
             // Check if operands are not null
-            c.cmp(lhs, null_val);
-            c.cset(lhs_valid, arm::CondCode::kNE);
-            c.cmp(rhs, null_val);
-            c.cset(rhs_valid, arm::CondCode::kNE);
+            c.cmp(lhs.r32(), null_val.r32());
+            c.cset(lhs_valid.r32(), arm::CondCode::kNE);
+            c.cmp(rhs.r32(), null_val.r32());
+            c.cset(rhs_valid.r32(), arm::CondCode::kNE);
             
             // Both must be valid for comparison
-            c.and_(result, lhs_valid, rhs_valid);
+            c.and_(result.r32(), lhs_valid.r32(), rhs_valid.r32());
             
             // Perform comparison if both are valid
-            c.cmp(lhs, rhs);
+            c.cmp(lhs.r32(), rhs.r32());
             if (gt) {
-                c.cset(lhs_valid, arm::CondCode::kGT);
+                c.cset(lhs_valid.r32(), arm::CondCode::kGT);
             } else {
-                c.cset(lhs_valid, arm::CondCode::kLT);
+                c.cset(lhs_valid.r32(), arm::CondCode::kLT);
             }
-            c.and_(result, result, lhs_valid);
+            c.and_(result.r32(), result.r32(), lhs_valid.r32());
             
             return result;
         }
@@ -327,11 +327,11 @@ namespace questdb::aarch64 {
     inline Gp int32_le_ge(Compiler &c, const Gp &lhs, const Gp &rhs, bool ge, bool check_null) {
         if (!check_null) {
             Gp r = c.newInt32();
-            c.cmp(lhs, rhs);
+            c.cmp(lhs.r32(), rhs.r32());
             if (ge) {
-                c.cset(r, arm::CondCode::kGE);
+                c.cset(r.r32(), arm::CondCode::kGE);
             } else {
-                c.cset(r, arm::CondCode::kLE);
+                c.cset(r.r32(), arm::CondCode::kLE);
             }
             return r;
         } else {
@@ -343,22 +343,22 @@ namespace questdb::aarch64 {
             c.mov(null_val, INT_NULL);
             
             // Check null status
-            c.cmp(lhs, null_val);
-            c.cset(lhs_null, arm::CondCode::kEQ);
-            c.cmp(rhs, null_val);
-            c.cset(rhs_valid, arm::CondCode::kNE);
+            c.cmp(lhs.r32(), null_val.r32());
+            c.cset(lhs_null.r32(), arm::CondCode::kEQ);
+            c.cmp(rhs.r32(), null_val.r32());
+            c.cset(rhs_valid.r32(), arm::CondCode::kNE);
             
             // XOR for special null handling logic
-            c.eor(result, rhs_valid, lhs_null);
+            c.eor(result.r32(), rhs_valid.r32(), lhs_null.r32());
             
             // Perform comparison
-            c.cmp(lhs, rhs);
+            c.cmp(lhs.r32(), rhs.r32());
             if (ge) {
-                c.cset(lhs_null, arm::CondCode::kGE);
+                c.cset(lhs_null.r32(), arm::CondCode::kGE);
             } else {
-                c.cset(lhs_null, arm::CondCode::kLE);
+                c.cset(lhs_null.r32(), arm::CondCode::kLE);
             }
-            c.and_(result, result, lhs_null);
+            c.and_(result.r32(), result.r32(), lhs_null.r32());
             
             return result;
         }
@@ -382,26 +382,26 @@ namespace questdb::aarch64 {
 
     inline Gp int64_eq(Compiler &c, const Gp &lhs, const Gp &rhs) {
         Gp r = c.newInt64();
-        c.cmp(lhs, rhs);
-        c.cset(r, arm::CondCode::kEQ);
+        c.cmp(lhs.r64(), rhs.r64());
+        c.cset(r.r32(), arm::CondCode::kEQ);
         return r;
     }
 
     inline Gp int64_ne(Compiler &c, const Gp &lhs, const Gp &rhs) {
         Gp r = c.newInt64();
-        c.cmp(lhs, rhs);
-        c.cset(r, arm::CondCode::kNE);
+        c.cmp(lhs.r64(), rhs.r64());
+        c.cset(r.r32(), arm::CondCode::kNE);
         return r;
     }
 
     inline Gp int64_lt_gt(Compiler &c, const Gp &lhs, const Gp &rhs, bool gt, bool check_null) {
         if (!check_null) {
             Gp r = c.newInt64();
-            c.cmp(lhs, rhs);
+            c.cmp(lhs.r64(), rhs.r64());
             if (gt) {
-                c.cset(r, arm::CondCode::kGT);
+                c.cset(r.r32(), arm::CondCode::kGT);
             } else {
-                c.cset(r, arm::CondCode::kLT);
+                c.cset(r.r32(), arm::CondCode::kLT);
             }
             return r;
         } else {
@@ -413,22 +413,22 @@ namespace questdb::aarch64 {
             c.mov(null_val, LONG_NULL);
             
             // Check if operands are not null
-            c.cmp(lhs, null_val);
-            c.cset(lhs_valid, arm::CondCode::kNE);
-            c.cmp(rhs, null_val);
-            c.cset(rhs_valid, arm::CondCode::kNE);
+            c.cmp(lhs.r64(), null_val.r64());
+            c.cset(lhs_valid.r32(), arm::CondCode::kNE);
+            c.cmp(rhs.r64(), null_val.r64());
+            c.cset(rhs_valid.r32(), arm::CondCode::kNE);
             
             // Both must be valid for comparison
-            c.and_(result, lhs_valid, rhs_valid);
+            c.and_(result.r32(), lhs_valid.r32(), rhs_valid.r32());
             
             // Perform comparison if both are valid
-            c.cmp(lhs, rhs);
+            c.cmp(lhs.r64(), rhs.r64());
             if (gt) {
-                c.cset(lhs_valid, arm::CondCode::kGT);
+                c.cset(lhs_valid.r32(), arm::CondCode::kGT);
             } else {
-                c.cset(lhs_valid, arm::CondCode::kLT);
+                c.cset(lhs_valid.r32(), arm::CondCode::kLT);
             }
-            c.and_(result, result, lhs_valid);
+            c.and_(result.r32(), result.r32(), lhs_valid.r32());
             
             return result;
         }
@@ -437,11 +437,11 @@ namespace questdb::aarch64 {
     inline Gp int64_le_ge(Compiler &c, const Gp &lhs, const Gp &rhs, bool ge, bool check_null) {
         if (!check_null) {
             Gp r = c.newInt64();
-            c.cmp(lhs, rhs);
+            c.cmp(lhs.r64(), rhs.r64());
             if (ge) {
-                c.cset(r, arm::CondCode::kGE);
+                c.cset(r.r32(), arm::CondCode::kGE);
             } else {
-                c.cset(r, arm::CondCode::kLE);
+                c.cset(r.r32(), arm::CondCode::kLE);
             }
             return r;
         } else {
@@ -453,22 +453,22 @@ namespace questdb::aarch64 {
             c.mov(null_val, LONG_NULL);
             
             // Check null status
-            c.cmp(lhs, null_val);
-            c.cset(lhs_null, arm::CondCode::kEQ);
-            c.cmp(rhs, null_val);
-            c.cset(rhs_valid, arm::CondCode::kNE);
+            c.cmp(lhs.r64(), null_val.r64());
+            c.cset(lhs_null.r32(), arm::CondCode::kEQ);
+            c.cmp(rhs.r64(), null_val.r64());
+            c.cset(rhs_valid.r32(), arm::CondCode::kNE);
             
             // XOR for special null handling logic
-            c.eor(result, rhs_valid, lhs_null);
+            c.eor(result.r32(), rhs_valid.r32(), lhs_null.r32());
             
             // Perform comparison
-            c.cmp(lhs, rhs);
+            c.cmp(lhs.r64(), rhs.r64());
             if (ge) {
-                c.cset(lhs_null, arm::CondCode::kGE);
+                c.cset(lhs_null.r32(), arm::CondCode::kGE);
             } else {
-                c.cset(lhs_null, arm::CondCode::kLE);
+                c.cset(lhs_null.r32(), arm::CondCode::kLE);
             }
-            c.and_(result, result, lhs_null);
+            c.and_(result.r32(), result.r32(), lhs_null.r32());
             
             return result;
         }
