@@ -73,6 +73,7 @@ set(
         src/main/c/share/geohash.cpp
         src/main/c/share/jit/compiler.h
         src/main/c/share/jit/compiler.cpp
+        src/main/c/share/jit/aarch64.h
         src/main/c/share/cpprt_overrides.h
         src/main/c/share/cpprt_overrides.cpp
         src/main/c/share/dedup.cpp
@@ -246,6 +247,7 @@ if (ARCH_AARCH64)
             src/main/c/share/vec_agg_vanilla.cpp
             src/main/c/share/ooo_dispatch_vanilla.cpp
             src/main/c/share/geohash_dispatch_vanilla.cpp
+            src/main/c/share/jit/aarch64.cpp
     )
 
     add_library(questdb-aarch64 OBJECT ${AARCH64_FILES})

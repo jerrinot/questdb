@@ -23,8 +23,13 @@
  ******************************************************************************/
 
 #include "compiler.h"
+
+#ifdef __aarch64__
+#include "aarch64.h"
+#else
 #include "x86.h"
 #include "avx2.h"
+#endif
 
 using namespace asmjit;
 
@@ -46,9 +51,7 @@ struct JitGlobalContext {
     JitRuntime rt;
 };
 
-#ifndef __aarch64__
 static JitGlobalContext gGlobalContext;
-#endif
 
 using CompiledFn = int64_t (*)(int64_t *cols, int64_t cols_count,
                                int64_t *varsize_indexes,
@@ -56,6 +59,73 @@ using CompiledFn = int64_t (*)(int64_t *cols, int64_t cols_count,
                                int64_t *rows, int64_t rows_count,
                                int64_t rows_start_offset);
 
+#ifdef __aarch64__
+struct Function {
+    explicit Function(aarch64::Compiler &cc)
+            : c(cc), zone(4094 - Zone::kBlockOverhead), allocator(&zone) {
+        values.init(&allocator);
+    };
+
+    void compile(const instruction_t *istream, size_t size, uint32_t options) {
+        questdb::aarch64::scalar_loop(c, istream, size, false, 1);
+    };
+
+    void begin_fn() {
+        c.addFunc(FuncSignatureT<int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t>());
+        data_ptr = c.newIntPtr("data_ptr");
+        data_size = c.newInt64("data_size");
+
+        c.setArg(0, data_ptr);
+        c.setArg(1, data_size);
+
+        varsize_aux_ptr = c.newIntPtr("varsize_aux_ptr");
+
+        c.setArg(2, varsize_aux_ptr);
+
+        vars_ptr = c.newIntPtr("vars_ptr");
+        vars_size = c.newInt64("vars_size");
+
+        c.setArg(3, vars_ptr);
+        c.setArg(4, vars_size);
+
+        rows_ptr = c.newIntPtr("rows_ptr");
+        rows_size = c.newInt64("rows_size");
+
+        c.setArg(5, rows_ptr);
+        c.setArg(6, rows_size);
+
+        rows_id_start_offset = c.newInt64("rows_id_start_offset");
+        c.setArg(7, rows_id_start_offset);
+
+        input_index = c.newInt64("input_index");
+        c.mov(input_index, 0);
+
+        output_index = c.newInt64("output_index");
+        c.mov(output_index, 0);
+    }
+
+    void end_fn() {
+        c.endFunc();
+    }
+
+    aarch64::Compiler &c;
+
+    Zone zone;
+    ZoneAllocator allocator;
+    ZoneStack<jit_value_t> values;
+
+    aarch64::Gp data_ptr;
+    aarch64::Gp data_size;
+    aarch64::Gp varsize_aux_ptr;
+    aarch64::Gp vars_ptr;
+    aarch64::Gp vars_size;
+    aarch64::Gp rows_ptr;
+    aarch64::Gp rows_size;
+    aarch64::Gp input_index;
+    aarch64::Gp output_index;
+    aarch64::Gp rows_id_start_offset;
+};
+#else
 struct Function {
     explicit Function(x86::Compiler &cc)
             : c(cc), zone(4094 - Zone::kBlockOverhead), allocator(&zone) {
@@ -191,33 +261,32 @@ struct Function {
     }
 
     void begin_fn() {
-        c.addFunc(FuncSignatureT<int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t>(
-            // CallConv::kIdHost));
+        auto func = c.addFunc(FuncSignature::build<int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t>(
             CallConvId::kCDecl));
         data_ptr = c.newIntPtr("data_ptr");
         data_size = c.newInt64("data_size");
 
-        c.setArg(0, data_ptr);
-        c.setArg(1, data_size);
+        func->setArg(0, data_ptr);
+        func->setArg(1, data_size);
 
         varsize_aux_ptr = c.newIntPtr("varsize_aux_ptr");
 
-        c.setArg(2, varsize_aux_ptr);
+        func->setArg(2, varsize_aux_ptr);
 
         vars_ptr = c.newIntPtr("vars_ptr");
         vars_size = c.newInt64("vars_size");
 
-        c.setArg(3, vars_ptr);
-        c.setArg(4, vars_size);
+        func->setArg(3, vars_ptr);
+        func->setArg(4, vars_size);
 
         rows_ptr = c.newIntPtr("rows_ptr");
         rows_size = c.newInt64("rows_size");
 
-        c.setArg(5, rows_ptr);
-        c.setArg(6, rows_size);
+        func->setArg(5, rows_ptr);
+        func->setArg(6, rows_size);
 
         rows_id_start_offset = c.newInt64("rows_id_start_offset");
-        c.setArg(7, rows_id_start_offset);
+        func->setArg(7, rows_id_start_offset);
 
         input_index = c.newInt64("input_index");
         c.mov(input_index, 0);
@@ -247,6 +316,7 @@ struct Function {
     x86::Gp output_index;
     x86::Gp rows_id_start_offset;
 };
+#endif
 
 void fillJitErrorObject(JNIEnv *e, jobject error, uint32_t code, const char *msg) {
 
@@ -276,8 +346,6 @@ Java_io_questdb_jit_FiltersCompiler_compileFunction(JNIEnv *e,
                                                     jlong filterSize,
                                                     jint options,
                                                     jobject error) {
-#ifndef __aarch64__
-
     auto size = static_cast<size_t>(filterSize) / sizeof(instruction_t);
     if (filterAddress <= 0 || size <= 0) {
         fillJitErrorObject(e, error, ErrorCode::kErrorInvalidArgument, "Invalid argument passed");
@@ -291,16 +359,18 @@ Java_io_questdb_jit_FiltersCompiler_compileFunction(JNIEnv *e,
     if (debug) {
         logger.addFlags(FormatFlags::kRegCasts |
                         FormatFlags::kExplainImms);
-        // logger.addFlags(FormatOptions::kFlagRegCasts |
-        //                 FormatOptions::kFlagExplainImms |
-        //                 FormatOptions::kFlagAnnotations);
         code.setLogger(&logger);
     }
 
     JitErrorHandler errorHandler;
     code.setErrorHandler(&errorHandler);
 
+#ifdef __aarch64__
+    aarch64::Compiler c(&code);
+#else
     x86::Compiler c(&code);
+#endif
+
     if (debug) {
         c.addDiagnosticOptions(DiagnosticOptions::kRAAnnotate);
     }
@@ -331,18 +401,12 @@ Java_io_questdb_jit_FiltersCompiler_compileFunction(JNIEnv *e,
     }
 
     return reinterpret_cast<jlong>(fn);
-#else
-    return 0;
-#endif
-
 }
 
 JNIEXPORT void JNICALL
 Java_io_questdb_jit_FiltersCompiler_freeFunction(JNIEnv *e, jclass cl, jlong fnAddress) {
-#ifndef __aarch64__
     auto fn = reinterpret_cast<void *>(fnAddress);
     gGlobalContext.rt.release(fn);
-#endif
 }
 
 JNIEXPORT jlong JNICALL Java_io_questdb_jit_FiltersCompiler_callFunction(JNIEnv *e,
@@ -356,7 +420,6 @@ JNIEXPORT jlong JNICALL Java_io_questdb_jit_FiltersCompiler_callFunction(JNIEnv 
                                                                          jlong rowsAddress,
                                                                          jlong rowsSize,
                                                                          jlong rowsStartOffset) {
-#ifndef __aarch64__
     auto fn = reinterpret_cast<CompiledFn>(fnAddress);
     return fn(reinterpret_cast<int64_t *>(colsAddress),
               colsSize,
@@ -366,7 +429,5 @@ JNIEXPORT jlong JNICALL Java_io_questdb_jit_FiltersCompiler_callFunction(JNIEnv 
               reinterpret_cast<int64_t *>(rowsAddress),
               rowsSize,
               rowsStartOffset);
-#else
-    return 0;
-#endif
 }
+
