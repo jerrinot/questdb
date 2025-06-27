@@ -1,5 +1,6 @@
 #include "aarch64.h"
 #include "common.h"
+#include "impl/aarch64.h"
 #include <utility>
 #include <asmjit/core/archcommons.h>
 
@@ -163,14 +164,22 @@ namespace questdb::aarch64 {
         switch (dt) {
             case data_type_t::i8:
             case data_type_t::i16:
-            case data_type_t::i32:
-            case data_type_t::i64:
-                c.neg(lhs.gp(), lhs.gp());
-                return {lhs.gp(), dt, dk};
-            case data_type_t::f32:
-            case data_type_t::f64:
-                c.fneg(lhs.vec(), lhs.vec());
-                return {lhs.vec(), dt, dk};
+            case data_type_t::i32: {
+                auto result = questdb::aarch64::int32_neg(c, lhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::i64: {
+                auto result = questdb::aarch64::int64_neg(c, lhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::f32: {
+                auto result = questdb::aarch64::float_neg(c, lhs.vec());
+                return {result, dt, dk};
+            }
+            case data_type_t::f64: {
+                auto result = questdb::aarch64::double_neg(c, lhs.vec());
+                return {result, dt, dk};
+            }
             default:
                 __builtin_unreachable();
         }
@@ -179,8 +188,8 @@ namespace questdb::aarch64 {
     jit_value_t bin_not(asmjit::a64::Compiler &c, const jit_value_t &lhs) {
         auto dt = lhs.dtype();
         auto dk = lhs.dkind();
-        c.mvn(lhs.gp(), lhs.gp());
-        return {lhs.gp(), dt, dk};
+        auto result = questdb::aarch64::int32_not(c, lhs.gp());
+        return {result, dt, dk};
     }
 
     inline std::pair<jit_value_t, jit_value_t>
@@ -194,97 +203,195 @@ namespace questdb::aarch64 {
     jit_value_t bin_and(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        c.and_(lhs.gp(), lhs.gp(), rhs.gp());
-        return {lhs.gp(), dt, dk};
+        auto result = questdb::aarch64::int32_and(c, lhs.gp(), rhs.gp());
+        return {result, dt, dk};
     }
 
     jit_value_t bin_or(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        c.orr(lhs.gp(), lhs.gp(), rhs.gp());
-        return {lhs.gp(), dt, dk};
+        auto result = questdb::aarch64::int32_or(c, lhs.gp(), rhs.gp());
+        return {result, dt, dk};
     }
 
     jit_value_t cmp_eq(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        asmjit::a64::Gp result = c.newInt32("result");
-        c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, arm::CondCode::kEQ);
-        return {result, data_type_t::i32, dk};
+        if (dt == data_type_t::i64) {
+            auto result = questdb::aarch64::int64_eq(c, lhs.gp(), rhs.gp());
+            return {result, data_type_t::i32, dk};
+        } else {
+            auto result = questdb::aarch64::int32_eq(c, lhs.gp(), rhs.gp());
+            return {result, data_type_t::i32, dk};
+        }
     }
 
     jit_value_t cmp_ne(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        asmjit::a64::Gp result = c.newInt32("result");
-        c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, arm::CondCode::kNE);
-        return {result, data_type_t::i32, dk};
+        if (dt == data_type_t::i64) {
+            auto result = questdb::aarch64::int64_ne(c, lhs.gp(), rhs.gp());
+            return {result, data_type_t::i32, dk};
+        } else {
+            auto result = questdb::aarch64::int32_ne(c, lhs.gp(), rhs.gp());
+            return {result, data_type_t::i32, dk};
+        }
     }
 
     jit_value_t cmp_gt(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        asmjit::a64::Gp result = c.newInt32("result");
-        c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, arm::CondCode::kGT);
-        return {result, data_type_t::i32, dk};
+        if (dt == data_type_t::i64) {
+            auto result = questdb::aarch64::int64_gt(c, lhs.gp(), rhs.gp(), null_check);
+            return {result, data_type_t::i32, dk};
+        } else {
+            auto result = questdb::aarch64::int32_gt(c, lhs.gp(), rhs.gp(), null_check);
+            return {result, data_type_t::i32, dk};
+        }
     }
 
     jit_value_t cmp_ge(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        asmjit::a64::Gp result = c.newInt32("result");
-        c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, arm::CondCode::kGE);
-        return {result, data_type_t::i32, dk};
+        if (dt == data_type_t::i64) {
+            auto result = questdb::aarch64::int64_ge(c, lhs.gp(), rhs.gp(), null_check);
+            return {result, data_type_t::i32, dk};
+        } else {
+            auto result = questdb::aarch64::int32_ge(c, lhs.gp(), rhs.gp(), null_check);
+            return {result, data_type_t::i32, dk};
+        }
     }
 
     jit_value_t cmp_lt(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        asmjit::a64::Gp result = c.newInt32("result");
-        c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, arm::CondCode::kLT);
-        return {result, data_type_t::i32, dk};
+        if (dt == data_type_t::i64) {
+            auto result = questdb::aarch64::int64_lt(c, lhs.gp(), rhs.gp(), null_check);
+            return {result, data_type_t::i32, dk};
+        } else {
+            auto result = questdb::aarch64::int32_lt(c, lhs.gp(), rhs.gp(), null_check);
+            return {result, data_type_t::i32, dk};
+        }
     }
 
     jit_value_t cmp_le(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        asmjit::a64::Gp result = c.newInt32("result");
-        c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, arm::CondCode::kLE);
-        return {result, data_type_t::i32, dk};
+        if (dt == data_type_t::i64) {
+            auto result = questdb::aarch64::int64_le(c, lhs.gp(), rhs.gp(), null_check);
+            return {result, data_type_t::i32, dk};
+        } else {
+            auto result = questdb::aarch64::int32_le(c, lhs.gp(), rhs.gp(), null_check);
+            return {result, data_type_t::i32, dk};
+        }
     }
 
     jit_value_t add(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        c.add(lhs.gp(), lhs.gp(), rhs.gp());
-        return {lhs.gp(), dt, dk};
+        switch (dt) {
+            case data_type_t::i8:
+            case data_type_t::i16:
+            case data_type_t::i32: {
+                auto result = questdb::aarch64::int32_add(c, lhs.gp(), rhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::i64: {
+                auto result = questdb::aarch64::int64_add(c, lhs.gp(), rhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::f32: {
+                auto result = questdb::aarch64::float_add(c, lhs.vec(), rhs.vec());
+                return {result, dt, dk};
+            }
+            case data_type_t::f64: {
+                auto result = questdb::aarch64::double_add(c, lhs.vec(), rhs.vec());
+                return {result, dt, dk};
+            }
+            default:
+                __builtin_unreachable();
+        }
     }
 
     jit_value_t sub(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        c.sub(lhs.gp(), lhs.gp(), rhs.gp());
-        return {lhs.gp(), dt, dk};
+        switch (dt) {
+            case data_type_t::i8:
+            case data_type_t::i16:
+            case data_type_t::i32: {
+                auto result = questdb::aarch64::int32_sub(c, lhs.gp(), rhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::i64: {
+                auto result = questdb::aarch64::int64_sub(c, lhs.gp(), rhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::f32: {
+                auto result = questdb::aarch64::float_sub(c, lhs.vec(), rhs.vec());
+                return {result, dt, dk};
+            }
+            case data_type_t::f64: {
+                auto result = questdb::aarch64::double_sub(c, lhs.vec(), rhs.vec());
+                return {result, dt, dk};
+            }
+            default:
+                __builtin_unreachable();
+        }
     }
 
     jit_value_t mul(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        c.mul(lhs.gp(), lhs.gp(), rhs.gp());
-        return {lhs.gp(), dt, dk};
+        switch (dt) {
+            case data_type_t::i8:
+            case data_type_t::i16:
+            case data_type_t::i32: {
+                auto result = questdb::aarch64::int32_mul(c, lhs.gp(), rhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::i64: {
+                auto result = questdb::aarch64::int64_mul(c, lhs.gp(), rhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::f32: {
+                auto result = questdb::aarch64::float_mul(c, lhs.vec(), rhs.vec());
+                return {result, dt, dk};
+            }
+            case data_type_t::f64: {
+                auto result = questdb::aarch64::double_mul(c, lhs.vec(), rhs.vec());
+                return {result, dt, dk};
+            }
+            default:
+                __builtin_unreachable();
+        }
     }
 
     jit_value_t div(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        c.sdiv(lhs.gp(), lhs.gp(), rhs.gp());
-        return {lhs.gp(), dt, dk};
+        switch (dt) {
+            case data_type_t::i8:
+            case data_type_t::i16:
+            case data_type_t::i32: {
+                auto result = questdb::aarch64::int32_div(c, lhs.gp(), rhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::i64: {
+                auto result = questdb::aarch64::int64_div(c, lhs.gp(), rhs.gp(), null_check);
+                return {result, dt, dk};
+            }
+            case data_type_t::f32: {
+                auto result = questdb::aarch64::float_div(c, lhs.vec(), rhs.vec());
+                return {result, dt, dk};
+            }
+            case data_type_t::f64: {
+                auto result = questdb::aarch64::double_div(c, lhs.vec(), rhs.vec());
+                return {result, dt, dk};
+            }
+            default:
+                __builtin_unreachable();
+        }
     }
 
     void emit_bin_op(asmjit::a64::Compiler &c, const instruction_t &instr, asmjit::ZoneStack<jit_value_t> &values, bool null_check) {
