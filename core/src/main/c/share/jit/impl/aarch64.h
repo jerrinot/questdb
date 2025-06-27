@@ -48,6 +48,156 @@ namespace questdb::aarch64 {
         return b1;
     }
 
+    inline Gp int8_to_int32(Compiler &c, const Gp &rhs, bool check_null) {
+        c.comment("int8_to_int32");
+        Gp r = c.newInt32();
+        c.sxtb(r.r32(), rhs.r32());
+        return r;
+    }
+
+    inline Gp int16_to_int32(Compiler &c, const Gp &rhs, bool check_null) {
+        c.comment("int16_to_int32");
+        Gp r = c.newInt32();
+        c.sxth(r.r32(), rhs.r32());
+        return r;
+    }
+
+    inline Gp int32_to_int64(Compiler &c, const Gp &rhs, bool check_null) {
+        c.comment("int32_to_int64");
+        Gp r = c.newInt64();
+        if (!check_null) {
+            c.sxtw(r.r64(), rhs.r32());
+            return r;
+        }
+        Gp null_val = c.newInt32();
+        c.mov(null_val, INT_NULL);
+        c.cmp(rhs.r32(), null_val.r32());
+        c.sxtw(r.r64(), rhs.r32());
+        Gp long_null = c.newInt64();
+        c.mov(long_null, LONG_NULL);
+        c.csel(r.r64(), long_null.r64(), r.r64(), arm::CondCode::kEQ);
+        return r;
+    }
+
+    inline Vec int32_to_float(Compiler &c, const Gp &rhs, bool check_null) {
+        c.comment("int32_to_float");
+        Vec r = c.newVecS();
+        if (!check_null) {
+            c.scvtf(r.s(), rhs.r32());
+            return r;
+        }
+        Label l_null = c.newLabel();
+        Label l_exit = c.newLabel();
+        
+        Gp null_val = c.newInt32();
+        c.mov(null_val, INT_NULL);
+        c.cmp(rhs.r32(), null_val.r32());
+        c.b_eq(l_null);
+        
+        c.scvtf(r.s(), rhs.r32());
+        c.b(l_exit);
+        
+        c.bind(l_null);
+        // Load float NaN (0x7fc00000)
+        Gp nan_bits = c.newInt32();
+        c.mov(nan_bits, 0x7fc00000);
+        c.fmov(r.s(), nan_bits.r32());
+        
+        c.bind(l_exit);
+        return r;
+    }
+
+    inline Vec int32_to_double(Compiler &c, const Gp &rhs, bool check_null) {
+        c.comment("int32_to_double");
+        Vec r = c.newVecD();
+        if (!check_null) {
+            c.scvtf(r.d(), rhs.r32());
+            return r;
+        }
+        Label l_null = c.newLabel();
+        Label l_exit = c.newLabel();
+        
+        Gp null_val = c.newInt32();
+        c.mov(null_val, INT_NULL);
+        c.cmp(rhs.r32(), null_val.r32());
+        c.b_eq(l_null);
+        
+        c.scvtf(r.d(), rhs.r32());
+        c.b(l_exit);
+        
+        c.bind(l_null);
+        // Load double NaN (0x7ff8000000000000)
+        Gp nan_bits = c.newInt64();
+        c.mov(nan_bits, 0x7ff8000000000000LL);
+        c.fmov(r.d(), nan_bits.r64());
+        
+        c.bind(l_exit);
+        return r;
+    }
+
+    inline Vec int64_to_float(Compiler &c, const Gp &rhs, bool check_null) {
+        c.comment("int64_to_float");
+        Vec r = c.newVecS();
+        if (!check_null) {
+            c.scvtf(r.s(), rhs.r64());
+            return r;
+        }
+        Label l_null = c.newLabel();
+        Label l_exit = c.newLabel();
+        
+        Gp null_val = c.newInt64();
+        c.mov(null_val, LONG_NULL);
+        c.cmp(rhs.r64(), null_val.r64());
+        c.b_eq(l_null);
+        
+        c.scvtf(r.s(), rhs.r64());
+        c.b(l_exit);
+        
+        c.bind(l_null);
+        // Load float NaN (0x7fc00000)
+        Gp nan_bits = c.newInt32();
+        c.mov(nan_bits, 0x7fc00000);
+        c.fmov(r.s(), nan_bits.r32());
+        
+        c.bind(l_exit);
+        return r;
+    }
+
+    inline Vec int64_to_double(Compiler &c, const Gp &rhs, bool check_null) {
+        c.comment("int64_to_double");
+        Vec r = c.newVecD();
+        if (!check_null) {
+            c.scvtf(r.d(), rhs.r64());
+            return r;
+        }
+        Label l_null = c.newLabel();
+        Label l_exit = c.newLabel();
+        
+        Gp null_val = c.newInt64();
+        c.mov(null_val, LONG_NULL);
+        c.cmp(rhs.r64(), null_val.r64());
+        c.b_eq(l_null);
+        
+        c.scvtf(r.d(), rhs.r64());
+        c.b(l_exit);
+        
+        c.bind(l_null);
+        // Load double NaN (0x7ff8000000000000)
+        Gp nan_bits = c.newInt64();
+        c.mov(nan_bits, 0x7ff8000000000000LL);
+        c.fmov(r.d(), nan_bits.r64());
+        
+        c.bind(l_exit);
+        return r;
+    }
+
+    inline Vec float_to_double(Compiler &c, const Vec &rhs) {
+        c.comment("float_to_double");
+        Vec r = c.newVecD();
+        c.fcvt(r.d(), rhs.s());
+        return r;
+    }
+
     inline void check_int32_null(Compiler &c, const Gp &dst, const Gp &lhs, const Gp &rhs) {
         c.comment("check_int32_null");
         Gp null_val = c.newInt32();

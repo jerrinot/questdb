@@ -139,14 +139,130 @@ namespace questdb::aarch64 {
         }
     }
 
-    jit_value_t load_register(asmjit::a64::Compiler &c, data_type_t dst_type, const jit_value_t &v) {
-        if (v.op().isImm()) {
-            return imm2reg(c, dst_type, v);
-        } else if (v.op().isMem()) {
-            return mem2reg(c, v);
-        } else {
+    jit_value_t convert_type(asmjit::a64::Compiler &c, const jit_value_t &v, data_type_t dst_type, bool null_check) {
+        auto src_type = v.dtype();
+        auto src_kind = v.dkind();
+        
+        // No conversion needed
+        if (src_type == dst_type) {
             return v;
         }
+        
+        // Handle type conversions
+        switch (src_type) {
+            case data_type_t::i8:
+                switch (dst_type) {
+                    case data_type_t::i16:
+                    case data_type_t::i32: {
+                        auto result = questdb::aarch64::int8_to_int32(c, v.gp(), null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    case data_type_t::i64: {
+                        auto i32_result = questdb::aarch64::int8_to_int32(c, v.gp(), null_check);
+                        auto result = questdb::aarch64::int32_to_int64(c, i32_result, null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    case data_type_t::f32: {
+                        auto i32_result = questdb::aarch64::int8_to_int32(c, v.gp(), null_check);
+                        auto result = questdb::aarch64::int32_to_float(c, i32_result, null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    case data_type_t::f64: {
+                        auto i32_result = questdb::aarch64::int8_to_int32(c, v.gp(), null_check);
+                        auto result = questdb::aarch64::int32_to_double(c, i32_result, null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    default:
+                        break;
+                }
+                break;
+            case data_type_t::i16:
+                switch (dst_type) {
+                    case data_type_t::i32: {
+                        auto result = questdb::aarch64::int16_to_int32(c, v.gp(), null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    case data_type_t::i64: {
+                        auto i32_result = questdb::aarch64::int16_to_int32(c, v.gp(), null_check);
+                        auto result = questdb::aarch64::int32_to_int64(c, i32_result, null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    case data_type_t::f32: {
+                        auto i32_result = questdb::aarch64::int16_to_int32(c, v.gp(), null_check);
+                        auto result = questdb::aarch64::int32_to_float(c, i32_result, null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    case data_type_t::f64: {
+                        auto i32_result = questdb::aarch64::int16_to_int32(c, v.gp(), null_check);
+                        auto result = questdb::aarch64::int32_to_double(c, i32_result, null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    default:
+                        break;
+                }
+                break;
+            case data_type_t::i32:
+                switch (dst_type) {
+                    case data_type_t::i64: {
+                        auto result = questdb::aarch64::int32_to_int64(c, v.gp(), null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    case data_type_t::f32: {
+                        auto result = questdb::aarch64::int32_to_float(c, v.gp(), null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    case data_type_t::f64: {
+                        auto result = questdb::aarch64::int32_to_double(c, v.gp(), null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    default:
+                        break;
+                }
+                break;
+            case data_type_t::i64:
+                switch (dst_type) {
+                    case data_type_t::f32: {
+                        auto result = questdb::aarch64::int64_to_float(c, v.gp(), null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    case data_type_t::f64: {
+                        auto result = questdb::aarch64::int64_to_double(c, v.gp(), null_check);
+                        return {result, dst_type, src_kind};
+                    }
+                    default:
+                        break;
+                }
+                break;
+            case data_type_t::f32:
+                switch (dst_type) {
+                    case data_type_t::f64: {
+                        auto result = questdb::aarch64::float_to_double(c, v.vec());
+                        return {result, dst_type, src_kind};
+                    }
+                    default:
+                        break;
+                }
+                break;
+            default:
+                break;
+        }
+        
+        // No conversion available - return original value
+        return v;
+    }
+
+    jit_value_t load_register(asmjit::a64::Compiler &c, data_type_t dst_type, const jit_value_t &v) {
+        jit_value_t loaded;
+        if (v.op().isImm()) {
+            loaded = imm2reg(c, dst_type, v);
+        } else if (v.op().isMem()) {
+            loaded = mem2reg(c, v);
+        } else {
+            loaded = v;
+        }
+        
+        // Apply type conversion if needed
+        return convert_type(c, loaded, dst_type, true);
     }
 
     jit_value_t load_register(asmjit::a64::Compiler &c, const jit_value_t &v) {
@@ -192,12 +308,46 @@ namespace questdb::aarch64 {
         return {result, dt, dk};
     }
 
+    data_type_t promote_types(data_type_t lhs_type, data_type_t rhs_type) {
+        // Type promotion hierarchy: i8 < i16 < i32 < i64 < f32 < f64
+        // Return the "higher" type
+        
+        auto type_rank = [](data_type_t type) -> int {
+            switch (type) {
+                case data_type_t::i8: return 1;
+                case data_type_t::i16: return 2;
+                case data_type_t::i32: return 3;
+                case data_type_t::i64: return 4;
+                case data_type_t::f32: return 5;
+                case data_type_t::f64: return 6;
+                case data_type_t::i128: return 7; // Special case for 128-bit
+                default: return 0;
+            }
+        };
+        
+        int lhs_rank = type_rank(lhs_type);
+        int rhs_rank = type_rank(rhs_type);
+        
+        return (lhs_rank > rhs_rank) ? lhs_type : rhs_type;
+    }
+
     inline std::pair<jit_value_t, jit_value_t>
     get_arguments(asmjit::a64::Compiler &c, asmjit::ZoneStack<jit_value_t> &values, bool null_check) {
         auto lhs = values.pop();
         auto rhs = values.pop();
-        // We don't support type conversion for now
-        return {load_register(c, lhs), load_register(c, rhs)};
+        
+        // Load registers first
+        auto lhs_loaded = load_register(c, lhs);
+        auto rhs_loaded = load_register(c, rhs);
+        
+        // Determine target type for promotion
+        auto target_type = promote_types(lhs_loaded.dtype(), rhs_loaded.dtype());
+        
+        // Convert both operands to the target type
+        auto lhs_converted = convert_type(c, lhs_loaded, target_type, null_check);
+        auto rhs_converted = convert_type(c, rhs_loaded, target_type, null_check);
+        
+        return {lhs_converted, rhs_converted};
     }
 
     jit_value_t bin_and(asmjit::a64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
