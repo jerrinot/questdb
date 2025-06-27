@@ -61,41 +61,47 @@ using CompiledFn = int64_t (*)(int64_t *cols, int64_t cols_count,
 
 #ifdef __aarch64__
 struct Function {
-    explicit Function(aarch64::Compiler &cc)
+    explicit Function(asmjit::a64::Compiler &cc)
             : c(cc), zone(4094 - Zone::kBlockOverhead), allocator(&zone) {
         values.init(&allocator);
     };
 
     void compile(const instruction_t *istream, size_t size, uint32_t options) {
-        questdb::aarch64::scalar_loop(c, istream, size, false, 1);
+        questdb::aarch64::scalar_loop(c, istream, size, false, data_ptr, data_size, varsize_aux_ptr, 
+                                     vars_ptr, vars_size, rows_ptr, rows_size, rows_id_start_offset, 1);
     };
 
     void begin_fn() {
-        c.addFunc(FuncSignatureT<int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t *, int64_t, int64_t>());
+        FuncSignature signature;
+        signature.setRetT<int64_t>();
+        signature.addArgT<int64_t*>();  // data_ptr
+        signature.addArgT<int64_t>();   // data_size
+        signature.addArgT<int64_t*>();  // varsize_aux_ptr
+        signature.addArgT<int64_t*>();  // vars_ptr
+        signature.addArgT<int64_t>();   // vars_size
+        signature.addArgT<int64_t*>();  // rows_ptr
+        signature.addArgT<int64_t>();   // rows_size
+        signature.addArgT<int64_t>();   // rows_id_start_offset
+
+        FuncNode* funcNode = c.addFunc(signature);
+        
         data_ptr = c.newIntPtr("data_ptr");
         data_size = c.newInt64("data_size");
-
-        c.setArg(0, data_ptr);
-        c.setArg(1, data_size);
-
         varsize_aux_ptr = c.newIntPtr("varsize_aux_ptr");
-
-        c.setArg(2, varsize_aux_ptr);
-
         vars_ptr = c.newIntPtr("vars_ptr");
         vars_size = c.newInt64("vars_size");
-
-        c.setArg(3, vars_ptr);
-        c.setArg(4, vars_size);
-
         rows_ptr = c.newIntPtr("rows_ptr");
         rows_size = c.newInt64("rows_size");
-
-        c.setArg(5, rows_ptr);
-        c.setArg(6, rows_size);
-
         rows_id_start_offset = c.newInt64("rows_id_start_offset");
-        c.setArg(7, rows_id_start_offset);
+
+        funcNode->setArg(0, data_ptr);
+        funcNode->setArg(1, data_size);
+        funcNode->setArg(2, varsize_aux_ptr);
+        funcNode->setArg(3, vars_ptr);
+        funcNode->setArg(4, vars_size);
+        funcNode->setArg(5, rows_ptr);
+        funcNode->setArg(6, rows_size);
+        funcNode->setArg(7, rows_id_start_offset);
 
         input_index = c.newInt64("input_index");
         c.mov(input_index, 0);
@@ -108,22 +114,22 @@ struct Function {
         c.endFunc();
     }
 
-    aarch64::Compiler &c;
+    asmjit::a64::Compiler &c;
 
     Zone zone;
     ZoneAllocator allocator;
     ZoneStack<jit_value_t> values;
 
-    aarch64::Gp data_ptr;
-    aarch64::Gp data_size;
-    aarch64::Gp varsize_aux_ptr;
-    aarch64::Gp vars_ptr;
-    aarch64::Gp vars_size;
-    aarch64::Gp rows_ptr;
-    aarch64::Gp rows_size;
-    aarch64::Gp input_index;
-    aarch64::Gp output_index;
-    aarch64::Gp rows_id_start_offset;
+    asmjit::a64::Gp data_ptr;
+    asmjit::a64::Gp data_size;
+    asmjit::a64::Gp varsize_aux_ptr;
+    asmjit::a64::Gp vars_ptr;
+    asmjit::a64::Gp vars_size;
+    asmjit::a64::Gp rows_ptr;
+    asmjit::a64::Gp rows_size;
+    asmjit::a64::Gp input_index;
+    asmjit::a64::Gp output_index;
+    asmjit::a64::Gp rows_id_start_offset;
 };
 #else
 struct Function {
@@ -366,7 +372,7 @@ Java_io_questdb_jit_FiltersCompiler_compileFunction(JNIEnv *e,
     code.setErrorHandler(&errorHandler);
 
 #ifdef __aarch64__
-    aarch64::Compiler c(&code);
+    asmjit::a64::Compiler c(&code);
 #else
     x86::Compiler c(&code);
 #endif

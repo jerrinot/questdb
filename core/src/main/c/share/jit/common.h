@@ -26,6 +26,7 @@
 #define QUESTDB_JIT_COMMON_H
 
 #include <asmjit/asmjit.h>
+#include <asmjit/a64.h>
 
 enum class data_type_t : uint8_t {
     i8,
@@ -93,9 +94,9 @@ struct jit_value_t {
     inline jit_value_t &operator=(const jit_value_t &other) noexcept = default;
 
 #ifdef __aarch64__
-    inline const asmjit::aarch64::Vec &vec() const noexcept { return op_.as<asmjit::aarch64::Vec>(); }
+    inline const asmjit::a64::Vec &vec() const noexcept { return op_.as<asmjit::a64::Vec>(); }
 
-    inline const asmjit::aarch64::Gp &gp() const noexcept { return op_.as<asmjit::aarch64::Gp>(); }
+    inline const asmjit::a64::Gp &gp() const noexcept { return op_.as<asmjit::a64::Gp>(); }
 #else
     inline const asmjit::x86::Ymm &ymm() const noexcept { return op_.as<asmjit::x86::Ymm>(); }
 
