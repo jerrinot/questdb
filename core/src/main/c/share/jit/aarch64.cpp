@@ -3,27 +3,26 @@
 #include <utility>
 
 namespace questdb::aarch64 {
-    using namespace asmjit::aarch64;
 
-    jit_value_t read_imm(Compiler &c, const instruction_t &instr) {
+    jit_value_t read_imm(asmjit::aarch64::Compiler &c, const instruction_t &instr) {
         auto type = static_cast<data_type_t>(instr.options);
         switch (type) {
             case data_type_t::i8:
             case data_type_t::i16:
             case data_type_t::i32:
             case data_type_t::i64: {
-                return {imm(instr.ipayload.lo), type, data_kind_t::kConst};
+                return {asmjit::Imm(instr.ipayload.lo), type, data_kind_t::kConst};
             }
             case data_type_t::i128: {
                 return {
-                    c.newConst(ConstPoolScope::kLocal, &instr.ipayload, 16),
+                    c.newConst(asmjit::ConstPoolScope::kLocal, &instr.ipayload, 16),
                     type,
                     data_kind_t::kMemory
                 };
             }
             case data_type_t::f32:
             case data_type_t::f64: {
-                return {imm(instr.dpayload), type, data_kind_t::kConst};
+                return {asmjit::Imm(instr.dpayload), type, data_kind_t::kConst};
             }
             default:
                 __builtin_unreachable();
@@ -31,68 +30,68 @@ namespace questdb::aarch64 {
     }
 
     jit_value_t
-    read_vars_mem(Compiler &c, data_type_t type, int32_t idx, const Gp &vars_ptr) {
+    read_vars_mem(asmjit::aarch64::Compiler &c, data_type_t type, int32_t idx, const asmjit::aarch64::Gp &vars_ptr) {
         auto shift = type_shift(type);
         auto type_size = 1 << shift;
-        return {Mem(vars_ptr, 8 * idx, type_size), type, data_kind_t::kMemory};
+        return {asmjit::aarch64::Mem(vars_ptr, 8 * idx, type_size), type, data_kind_t::kMemory};
     }
 
     jit_value_t read_mem(
-            Compiler &c, data_type_t type, int32_t column_idx, const Gp &data_ptr,
-            const Gp &varsize_aux_ptr, const Gp &input_index
+            asmjit::aarch64::Compiler &c, data_type_t type, int32_t column_idx, const asmjit::aarch64::Gp &data_ptr,
+            const asmjit::aarch64::Gp &varsize_aux_ptr, const asmjit::aarch64::Gp &input_index
     ) {
         // For now, we don't support variable size columns on ARM
-        Gp column_address = c.newInt64("column_address");
-        c.mov(column_address, ptr(data_ptr, 8 * column_idx, 8));
+        asmjit::aarch64::Gp column_address = c.newInt64("column_address");
+        c.mov(column_address, asmjit::aarch64::ptr(data_ptr, 8 * column_idx, 8));
 
         auto shift = type_shift(type);
         auto type_size = 1 << shift;
         if (type_size <= 8) {
-            return {Mem(column_address, input_index, shift, 0, type_size), type, data_kind_t::kMemory};
+            return {asmjit::aarch64::Mem(column_address, input_index, shift, 0, type_size), type, data_kind_t::kMemory};
         } else {
-            Gp offset = c.newInt64("row_offset");
+            asmjit::aarch64::Gp offset = c.newInt64("row_offset");
             c.mov(offset, input_index);
             c.sal(offset, shift);
-            return {Mem(column_address, offset, 0, 0, type_size), type, data_kind_t::kMemory};
+            return {asmjit::aarch64::Mem(column_address, offset, 0, 0, type_size), type, data_kind_t::kMemory};
         }
     }
 
-    jit_value_t mem2reg(Compiler &c, const jit_value_t &v) {
+    jit_value_t mem2reg(asmjit::aarch64::Compiler &c, const jit_value_t &v) {
         auto type = v.dtype();
-        auto mem = v.op().as<Mem>();
+        auto mem = v.op().as<asmjit::Mem>();
         switch (type) {
             case data_type_t::i8: {
-                Gp row_data = c.newGpd("i8_mem");
+                asmjit::aarch64::Gp row_data = c.newGpd("i8_mem");
                 c.ldrsb(row_data, mem);
                 return {row_data, type, data_kind_t::kMemory};
             }
             case data_type_t::i16: {
-                Gp row_data = c.newGpd("i16_mem");
+                asmjit::aarch64::Gp row_data = c.newGpd("i16_mem");
                 c.ldrsh(row_data, mem);
                 return {row_data, type, data_kind_t::kMemory};
             }
             case data_type_t::i32: {
-                Gp row_data = c.newGpd("i32_mem");
+                asmjit::aarch64::Gp row_data = c.newGpd("i32_mem");
                 c.ldr(row_data, mem);
                 return {row_data, type, data_kind_t::kMemory};
             }
             case data_type_t::i64: {
-                Gp row_data = c.newGpq("i64_mem");
+                asmjit::aarch64::Gp row_data = c.newGpq("i64_mem");
                 c.ldr(row_data, mem);
                 return {row_data, type, data_kind_t::kMemory};
             }
             case data_type_t::i128: {
-                Vec row_data = c.newVecQ("i128_mem");
+                asmjit::aarch64::Vec row_data = c.newVecQ("i128_mem");
                 c.ldr(row_data, mem);
                 return {row_data, type, data_kind_t::kMemory};
             }
             case data_type_t::f32: {
-                Vec row_data = c.newVecS("f32_mem");
+                asmjit::aarch64::Vec row_data = c.newVecS("f32_mem");
                 c.ldr(row_data, mem);
                 return {row_data, type, data_kind_t::kMemory};
             }
             case data_type_t::f64: {
-                Vec row_data = c.newVecD("f64_mem");
+                asmjit::aarch64::Vec row_data = c.newVecD("f64_mem");
                 c.ldr(row_data, mem);
                 return {row_data, type, data_kind_t::kMemory};
             }
@@ -136,7 +135,7 @@ namespace questdb::aarch64 {
         }
     }
 
-    jit_value_t load_register(Compiler &c, data_type_t dst_type, const jit_value_t &v) {
+    jit_value_t load_register(asmjit::aarch64::Compiler &c, data_type_t dst_type, const jit_value_t &v) {
         if (v.op().isImm()) {
             return imm2reg(c, dst_type, v);
         } else if (v.op().isMem()) {
@@ -146,16 +145,16 @@ namespace questdb::aarch64 {
         }
     }
 
-    jit_value_t load_register(Compiler &c, const jit_value_t &v) {
+    jit_value_t load_register(asmjit::aarch64::Compiler &c, const jit_value_t &v) {
         return load_register(c, v.dtype(), v);
     }
 
-    inline jit_value_t get_argument(Compiler &c, ZoneStack<jit_value_t> &values) {
+    inline jit_value_t get_argument(asmjit::aarch64::Compiler &c, asmjit::ZoneStack<jit_value_t> &values) {
         auto arg = values.pop();
         return load_register(c, arg);
     }
 
-    jit_value_t neg(Compiler &c, const jit_value_t &lhs, bool null_check) {
+    jit_value_t neg(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = lhs.dkind();
         switch (dt) {
@@ -167,14 +166,14 @@ namespace questdb::aarch64 {
                 return {lhs.gp(), dt, dk};
             case data_type_t::f32:
             case data_type_t::f64:
-                c.fneg(lhs.dp(), lhs.dp());
-                return {lhs.dp(), dt, dk};
+                c.fneg(lhs.vec(), lhs.vec());
+                return {lhs.vec(), dt, dk};
             default:
                 __builtin_unreachable();
         }
     }
 
-    jit_value_t bin_not(Compiler &c, const jit_value_t &lhs) {
+    jit_value_t bin_not(asmjit::aarch64::Compiler &c, const jit_value_t &lhs) {
         auto dt = lhs.dtype();
         auto dk = lhs.dkind();
         c.mvn(lhs.gp(), lhs.gp());
@@ -182,110 +181,110 @@ namespace questdb::aarch64 {
     }
 
     inline std::pair<jit_value_t, jit_value_t>
-    get_arguments(Compiler &c, ZoneStack<jit_value_t> &values, bool null_check) {
+    get_arguments(asmjit::aarch64::Compiler &c, asmjit::ZoneStack<jit_value_t> &values, bool null_check) {
         auto lhs = values.pop();
         auto rhs = values.pop();
         // We don't support type conversion for now
         return {load_register(c, lhs), load_register(c, rhs)};
     }
 
-    jit_value_t bin_and(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
+    jit_value_t bin_and(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
         c.and_(lhs.gp(), lhs.gp(), rhs.gp());
         return {lhs.gp(), dt, dk};
     }
 
-    jit_value_t bin_or(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
+    jit_value_t bin_or(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
         c.orr(lhs.gp(), lhs.gp(), rhs.gp());
         return {lhs.gp(), dt, dk};
     }
 
-    jit_value_t cmp_eq(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
+    jit_value_t cmp_eq(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        Gp result = c.newGpd("result");
+        asmjit::aarch64::Gp result = c.newGpd("result");
         c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, Cond::kEQ);
+        c.cset(result, asmjit::aarch64::Cond::kEQ);
         return {result, data_type_t::i32, dk};
     }
 
-    jit_value_t cmp_ne(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
+    jit_value_t cmp_ne(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        Gp result = c.newGpd("result");
+        asmjit::aarch64::Gp result = c.newGpd("result");
         c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, Cond::kNE);
+        c.cset(result, asmjit::aarch64::Cond::kNE);
         return {result, data_type_t::i32, dk};
     }
 
-    jit_value_t cmp_gt(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
+    jit_value_t cmp_gt(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        Gp result = c.newGpd("result");
+        asmjit::aarch64::Gp result = c.newGpd("result");
         c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, Cond::kGT);
+        c.cset(result, asmjit::aarch64::Cond::kGT);
         return {result, data_type_t::i32, dk};
     }
 
-    jit_value_t cmp_ge(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
+    jit_value_t cmp_ge(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        Gp result = c.newGpd("result");
+        asmjit::aarch64::Gp result = c.newGpd("result");
         c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, Cond::kGE);
+        c.cset(result, asmjit::aarch64::Cond::kGE);
         return {result, data_type_t::i32, dk};
     }
 
-    jit_value_t cmp_lt(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
+    jit_value_t cmp_lt(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        Gp result = c.newGpd("result");
+        asmjit::aarch64::Gp result = c.newGpd("result");
         c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, Cond::kLT);
+        c.cset(result, asmjit::aarch64::Cond::kLT);
         return {result, data_type_t::i32, dk};
     }
 
-    jit_value_t cmp_le(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
+    jit_value_t cmp_le(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
-        Gp result = c.newGpd("result");
+        asmjit::aarch64::Gp result = c.newGpd("result");
         c.cmp(lhs.gp(), rhs.gp());
-        c.cset(result, Cond::kLE);
+        c.cset(result, asmjit::aarch64::Cond::kLE);
         return {result, data_type_t::i32, dk};
     }
 
-    jit_value_t add(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
+    jit_value_t add(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
         c.add(lhs.gp(), lhs.gp(), rhs.gp());
         return {lhs.gp(), dt, dk};
     }
 
-    jit_value_t sub(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
+    jit_value_t sub(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
         c.sub(lhs.gp(), lhs.gp(), rhs.gp());
         return {lhs.gp(), dt, dk};
     }
 
-    jit_value_t mul(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
+    jit_value_t mul(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
         c.mul(lhs.gp(), lhs.gp(), rhs.gp());
         return {lhs.gp(), dt, dk};
     }
 
-    jit_value_t div(Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
+    jit_value_t div(asmjit::aarch64::Compiler &c, const jit_value_t &lhs, const jit_value_t &rhs, bool null_check) {
         auto dt = lhs.dtype();
         auto dk = dst_kind(lhs, rhs);
         c.sdiv(lhs.gp(), lhs.gp(), rhs.gp());
         return {lhs.gp(), dt, dk};
     }
 
-    void emit_bin_op(Compiler &c, const instruction_t &instr, ZoneStack<jit_value_t> &values, bool null_check) {
+    void emit_bin_op(asmjit::aarch64::Compiler &c, const instruction_t &instr, asmjit::ZoneStack<jit_value_t> &values, bool null_check) {
         auto args = get_arguments(c, values, null_check);
         auto lhs = args.first;
         auto rhs = args.second;
@@ -331,12 +330,12 @@ namespace questdb::aarch64 {
         }
     }
 
-    void emit_code(Compiler &c, const instruction_t *istream, size_t size, ZoneStack<jit_value_t> &values,
+    void emit_code(asmjit::aarch64::Compiler &c, const instruction_t *istream, size_t size, asmjit::ZoneStack<jit_value_t> &values,
                    bool null_check,
-                   const Gp &data_ptr,
-                   const Gp &varsize_aux_ptr,
-                   const Gp &vars_ptr,
-                   const Gp &input_index) {
+                   const asmjit::aarch64::Gp &data_ptr,
+                   const asmjit::aarch64::Gp &varsize_aux_ptr,
+                   const asmjit::aarch64::Gp &vars_ptr,
+                   const asmjit::aarch64::Gp &input_index) {
         for (size_t i = 0; i < size; ++i) {
             auto &instr = istream[i];
             switch (instr.opcode) {
@@ -372,44 +371,44 @@ namespace questdb::aarch64 {
 
     void scalar_loop(asmjit::aarch64::Compiler &c, const instruction_t *istream, size_t size, bool null_check, int unroll_factor) {
         // Get the arguments from the function signature
-        auto data_ptr = c.arg(0).as<Gp>();
-        auto data_size = c.arg(1).as<Gp>();
-        auto varsize_aux_ptr = c.arg(2).as<Gp>();
-        auto vars_ptr = c.arg(3).as<Gp>();
-        auto vars_size = c.arg(4).as<Gp>();
-        auto rows_ptr = c.arg(5).as<Gp>();
-        auto rows_size = c.arg(6).as<Gp>();
-        auto rows_id_start_offset = c.arg(7).as<Gp>();
+        auto data_ptr = c.arg(0).as<asmjit::aarch64::Gp>();
+        auto data_size = c.arg(1).as<asmjit::aarch64::Gp>();
+        auto varsize_aux_ptr = c.arg(2).as<asmjit::aarch64::Gp>();
+        auto vars_ptr = c.arg(3).as<asmjit::aarch64::Gp>();
+        auto vars_size = c.arg(4).as<asmjit::aarch64::Gp>();
+        auto rows_ptr = c.arg(5).as<asmjit::aarch64::Gp>();
+        auto rows_size = c.arg(6).as<asmjit::aarch64::Gp>();
+        auto rows_id_start_offset = c.arg(7).as<asmjit::aarch64::Gp>();
 
-        Gp input_index = c.newGpq("input_index");
+        asmjit::aarch64::Gp input_index = c.newGpq("input_index");
         c.mov(input_index, 0);
 
-        Gp output_index = c.newGpq("output_index");
+        asmjit::aarch64::Gp output_index = c.newGpq("output_index");
         c.mov(output_index, 0);
 
-        Label l_loop = c.newLabel();
-        Label l_exit = c.newLabel();
+        asmjit::Label l_loop = c.newLabel();
+        asmjit::Label l_exit = c.newLabel();
 
         c.cmp(input_index, rows_size);
         c.b_ge(l_exit);
 
         c.bind(l_loop);
 
-        Zone zone(4096);
-        ZoneAllocator allocator(&zone);
-        ZoneStack<jit_value_t> values;
+        asmjit::Zone zone(4096);
+        asmjit::ZoneAllocator allocator(&zone);
+        asmjit::ZoneStack<jit_value_t> values;
         values.init(&allocator);
 
         emit_code(c, istream, size, values, null_check, data_ptr, varsize_aux_ptr, vars_ptr, input_index);
 
         auto mask = values.pop();
 
-        Gp adjusted_id = c.newGpq("adjusted_id");
+        asmjit::aarch64::Gp adjusted_id = c.newGpq("adjusted_id");
         c.add(adjusted_id, input_index, rows_id_start_offset);
-        c.str(adjusted_id, Mem(rows_ptr, output_index, 3));
+        c.str(adjusted_id, asmjit::aarch64::Mem(rows_ptr, output_index, 3));
 
         c.tst(mask.gp(), 1);
-        c.cinc(output_index, output_index, Cond::kNE);
+        c.cinc(output_index, output_index, asmjit::aarch64::Cond::kNE);
 
         c.add(input_index, input_index, 1);
 

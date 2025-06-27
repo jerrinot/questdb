@@ -1,14 +1,8 @@
 #pragma once
 
 #include <cstddef>
-
-// Forward declarations to keep the header light
-namespace asmjit {
-    namespace aarch64 {
-        class Compiler;
-    }
-}
-struct instruction_t;
+#include <asmjit/asmjit.h>
+#include "common.h"
 
 namespace questdb::aarch64 {
     void scalar_loop(
