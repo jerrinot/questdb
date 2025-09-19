@@ -1,0 +1,126 @@
+name: Build and Commit async-profiler Library
+on:
+  workflow_dispatch:
+# This workflow is triggered manually from the Actions tab.
+# It builds the async-profiler native library for Linux x86-64 from source
+# and commits it to the current branch, providing a full audit trail.
+#
+# The async-profiler submodule is located at: core/src/main/c/share/async-profiler
+# The built library will be placed at: core/src/main/bin/linux-x86-64/libasyncProfiler.so
+
+jobs:
+  build-async-profiler:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'corretto'
+          java-version: '11'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ make libstdc++-static
+
+          # Verify versions meet minimum requirements
+          gcc --version
+          g++ --version
+          make --version
+          java -version
+
+      - name: Get async-profiler version info
+        id: version
+        run: |
+          cd core/src/main/c/share/async-profiler
+          ASYNC_VERSION=$(git describe --tags --always)
+          ASYNC_SHA=$(git rev-parse --short=8 HEAD)
+          echo "version=$ASYNC_VERSION" >> $GITHUB_OUTPUT
+          echo "sha=$ASYNC_SHA" >> $GITHUB_OUTPUT
+          echo "Building async-profiler version: $ASYNC_VERSION (commit: $ASYNC_SHA)"
+
+      - name: Build async-profiler
+        run: |
+          cd core/src/main/c/share/async-profiler
+          # Clean any previous build artifacts
+          make clean || true
+          # Build the library
+          make
+          # Verify the library was built
+          ls -la build/lib/libasyncProfiler.so
+
+      - name: Copy library to target location
+        run: |
+          # Create target directory if it doesn't exist
+          mkdir -p core/src/main/bin/linux-x86-64/
+          # Copy the built library
+          cp core/src/main/c/share/async-profiler/build/lib/libasyncProfiler.so core/src/main/bin/linux-x86-64/
+          # Verify the copy
+          ls -la core/src/main/bin/linux-x86-64/libasyncProfiler.so
+          # Show library info
+          file core/src/main/bin/linux-x86-64/libasyncProfiler.so
+          ldd core/src/main/bin/linux-x86-64/libasyncProfiler.so || true
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --quiet core/src/main/bin/linux-x86-64/libasyncProfiler.so; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No changes detected in libasyncProfiler.so"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Changes detected in libasyncProfiler.so"
+            git diff --stat core/src/main/bin/linux-x86-64/libasyncProfiler.so
+          fi
+
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          # Configure git
+          git config --global user.name 'GitHub Actions - Build async-profiler'
+          git config --global user.email 'jaromir@questdb.com'
+
+          # Stage the file
+          git add core/src/main/bin/linux-x86-64/libasyncProfiler.so
+
+          # remove execute permission in Git index
+          git update-index --chmod=-x core/src/main/bin/linux-x86-64/libasyncProfiler.so
+
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          cat << EOF > commit_message.txt
+          chore: rebuild async-profiler library for Linux x86-64
+
+          Built from async-profiler ${{ steps.version.outputs.version }} (commit: ${{ steps.version.outputs.sha }})
+          Build timestamp: ${TIMESTAMP}
+          GitHub Action: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          [skip ci]
+          EOF
+
+          git commit -F commit_message.txt
+
+          # Push to current branch
+          git push origin HEAD
+
+          echo "Successfully committed and pushed async-profiler library update"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check_changes.outputs.changed }}" == "true" ]; then
+            echo "✅ **async-profiler library rebuilt and committed successfully**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Commit**: ${{ steps.version.outputs.sha }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **File**: \`core/src/main/bin/linux-x86-64/libasyncProfiler.so\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ **No changes detected** - library is already up to date" >> $GITHUB_STEP_SUMMARY
+          fi
