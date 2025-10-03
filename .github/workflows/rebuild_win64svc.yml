@@ -1,0 +1,99 @@
+name: Build and Commit win64svc Service Wrapper
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: win64svc-${{ github.ref }}
+  cancel-in-progress: false
+# This workflow is triggered manually from the Actions tab.
+# It builds the win64svc Windows service wrapper from source using MSVC
+# and commits it to the current branch, providing a full audit trail.
+#
+# The win64svc source is located at: win64svc/
+# The built binary will be placed at: core/src/main/bin/questdb.exe
+
+jobs:
+  build-win64svc:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get win64svc version info
+        id: version
+        shell: bash
+        run: |
+          set -eu
+          cd win64svc
+          # Get the git hash of the win64svc directory
+          WIN64SVC_SHA=$(git log -1 --format=%H --abbrev=8 -- .)
+          echo "sha=$WIN64SVC_SHA" >> "$GITHUB_OUTPUT"
+          echo "Building win64svc from commit: $WIN64SVC_SHA"
+
+      - name: Build win64svc with CMake and MSVC
+        shell: cmd
+        run: |
+          cd win64svc
+          mkdir build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --config Release
+
+      - name: Verify built binary
+        shell: bash
+        run: |
+          set -eu
+          ls -la core/src/main/bin/questdb.exe
+          file core/src/main/bin/questdb.exe || true
+          echo "Binary size: $(stat -c%s core/src/main/bin/questdb.exe 2>/dev/null || stat -f%z core/src/main/bin/questdb.exe) bytes"
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          set -eu
+          # Configure git
+          git config --global user.name "${GITHUB_ACTOR}"
+          git config --global user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+          git add core/src/main/bin/questdb.exe
+
+          # Remove execute permission (Windows binary doesn't need +x in git)
+          git update-index --chmod=-x core/src/main/bin/questdb.exe
+
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          cat << EOF > commit_message.txt
+          chore(build): rebuild win64svc service wrapper for Windows [skip ci]
+
+          Built from win64svc commit: ${{ steps.version.outputs.sha }}
+          Build timestamp: ${TIMESTAMP}
+          GitHub Action: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          EOF
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit --author="${GITHUB_ACTOR} <${GITHUB_ACTOR}@users.noreply.github.com>" -F commit_message.txt
+
+          # Push to current branch
+          git push origin HEAD
+
+          echo "Successfully committed and pushed win64svc binary update"
+
+      - name: Summary
+        shell: bash
+        run: |
+          set -eu
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **win64svc service wrapper rebuilt and committed successfully**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ steps.version.outputs.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **File**: \`core/src/main/bin/questdb.exe\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Toolchain**: MSVC on Windows Server 2022" >> $GITHUB_STEP_SUMMARY
