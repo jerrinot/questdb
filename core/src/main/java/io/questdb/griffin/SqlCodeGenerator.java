@@ -2744,6 +2744,10 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                             .$("JIT enabled for (sub)query [tableName=").$safe(model.getName())
                             .$(", fd=").$(executionContext.getRequestFd())
                             .I$();
+                    // Capture filter column indexes for prefetching
+                    final IntList filterTableColumnIndexes = new IntList(jitIRSerializer.getFilterTableColumnIndexes().size());
+                    filterTableColumnIndexes.addAll(jitIRSerializer.getFilterTableColumnIndexes());
+
                     return new AsyncJitFilteredRecordCursorFactory(
                             executionContext.getCairoEngine(),
                             configuration,
@@ -2763,7 +2767,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                             limitLoFunction,
                             limitLoPos,
                             executionContext.getSharedQueryWorkerCount(),
-                            enablePreTouch
+                            enablePreTouch,
+                            filterTableColumnIndexes
                     );
                 } catch (SqlException | LimitOverflowException ex) {
                     // for these errors we are intentionally **not** rethrowing the exception

@@ -27,6 +27,7 @@ package io.questdb.cairo.sql;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.ColumnType;
 import io.questdb.std.ByteList;
+import io.questdb.std.IntIntHashMap;
 import io.questdb.std.IntList;
 import io.questdb.std.LongList;
 import io.questdb.std.Mutable;
@@ -51,6 +52,8 @@ public class PageFrameAddressCache implements Mutable {
     private final ObjList<LongList> auxPageSizes = new ObjList<>();
     private final IntList columnIndexes = new IntList();
     private final IntList columnTypes = new IntList();
+    // Inverse map: table column index -> query column index (for prefetch)
+    private final IntIntHashMap tableToQueryColumnMap = new IntIntHashMap();
     private final ByteList frameFormats = new ByteList();
     private final LongList frameSizes = new LongList();
     private final ObjectPool<LongList> longListPool = new ObjectPool<>(LongList::new, 64);
@@ -136,6 +139,7 @@ public class PageFrameAddressCache implements Mutable {
         pageSizes.clear();
         auxPageSizes.clear();
         rowIdOffsets.clear();
+        tableToQueryColumnMap.clear();
         if (cacheSize < nativeCacheSizeThreshold) {
             longListPool.clear();
         } else {
@@ -226,6 +230,27 @@ public class PageFrameAddressCache implements Mutable {
         }
         this.columnIndexes.clear();
         this.columnIndexes.addAll(columnIndexes);
+        // Build inverse map: table column index -> query column index
+        // We store queryIdx + 1 to distinguish from the default value (0 means not found)
+        for (int queryIdx = 0, n = columnIndexes.size(); queryIdx < n; queryIdx++) {
+            int tableIdx = columnIndexes.getQuick(queryIdx);
+            tableToQueryColumnMap.put(tableIdx, queryIdx + 1);
+        }
         this.external = external;
+    }
+
+    /**
+     * Translates a table column index to the corresponding query column index.
+     * This is used for prefetching: the filter tracks table column indexes, but
+     * the address cache is indexed by query column indexes.
+     *
+     * @param tableColumnIndex the table column index (from filter column tracking)
+     * @return the query column index, or -1 if the column is not in the query
+     */
+    public int tableToQueryColumnIndex(int tableColumnIndex) {
+        int value = tableToQueryColumnMap.get(tableColumnIndex);
+        // get() returns noEntryValue (-1) when key is not found.
+        // We stored queryIdx + 1, so subtract 1 only if the key was found.
+        return value == -1 ? -1 : value - 1;
     }
 }

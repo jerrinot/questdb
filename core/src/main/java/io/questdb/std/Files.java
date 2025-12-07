@@ -62,6 +62,9 @@ public final class Files {
     // wasted disk read ops.
     public static final int POSIX_MADV_RANDOM;
     public static final int POSIX_MADV_SEQUENTIAL;
+    public static final int POSIX_MADV_WILLNEED;
+    // Minimum bytes to prefetch. Below this, syscall overhead exceeds benefit.
+    public static final int MIN_PREFETCH_BYTES = 4096;
     public static final char SEPARATOR;
     // https://github.com/torvalds/linux/blob/e2f48c48090dea172c0c571101041de64634dae5/include/uapi/linux/magic.h#L18
     public static final int TMPFS_MAGIC = 0x01021994;
@@ -333,7 +336,28 @@ public final class Files {
         }
     }
 
-    public static native void madvise0(long address, long len, int advise);
+    public static native int madvise0(long address, long len, int advise);
+
+    /**
+     * Issues madvise(MADV_WILLNEED) to prefetch memory pages.
+     * Safe to call on read-only memory regions like page frame data.
+     * Does not require the isSingleUse guard since prefetch is advisory and read-only.
+     *
+     * @param address the start address (kernel handles alignment)
+     * @param len the length in bytes
+     * @return 0 on success, -1 if not supported or on error
+     */
+    public static int prefetch(long address, long len) {
+        if (POSIX_MADV_WILLNEED < 0) {
+            return -1;  // Not supported on this platform
+        }
+        if (address == 0 || len < MIN_PREFETCH_BYTES) {
+            return 0;  // Nothing to prefetch or too small
+        }
+        // Cap at Integer.MAX_VALUE for JNI safety
+        int safeLen = (int) Math.min(len, Integer.MAX_VALUE);
+        return madvise0(address, safeLen, POSIX_MADV_WILLNEED);
+    }
 
     public static int mkdir(LPSZ path, int mode) {
         return mkdir(path.ptr(), mode);
@@ -631,6 +655,8 @@ public final class Files {
 
     private native static int getPosixMadvSequential();
 
+    private native static int getPosixMadvWillneed();
+
     private native static int getStdOutFd();
 
     private native static boolean isDir(long pUtf8PathZ);
@@ -795,11 +821,13 @@ public final class Files {
             POSIX_FADV_SEQUENTIAL = getPosixFadvSequential();
             POSIX_MADV_RANDOM = getPosixMadvRandom();
             POSIX_MADV_SEQUENTIAL = getPosixMadvSequential();
+            POSIX_MADV_WILLNEED = getPosixMadvWillneed();
         } else {
             POSIX_FADV_SEQUENTIAL = -1;
             POSIX_FADV_RANDOM = -1;
             POSIX_MADV_SEQUENTIAL = -1;
             POSIX_MADV_RANDOM = -1;
+            POSIX_MADV_WILLNEED = -1;
         }
     }
 }

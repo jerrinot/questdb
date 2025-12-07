@@ -1427,6 +1427,31 @@ public class DefaultCairoConfiguration implements CairoConfiguration {
     }
 
     @Override
+    public boolean isSqlJitPrefetchEnabled() {
+        return true;
+    }
+
+    @Override
+    public int getSqlJitPrefetchLookahead() {
+        return 2;
+    }
+
+    @Override
+    public boolean isSqlJitPrefetchAsync() {
+        return true;
+    }
+
+    @Override
+    public int getSqlJitPrefetchRingCapacity() {
+        return 64;
+    }
+
+    @Override
+    public long getSqlJitPrefetchMaxChunkBytes() {
+        return 64 * Numbers.SIZE_1MB;
+    }
+
+    @Override
     public boolean isSqlOrderBySortEnabled() {
         return true;
     }

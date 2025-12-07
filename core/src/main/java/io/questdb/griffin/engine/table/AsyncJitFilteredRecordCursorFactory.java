@@ -31,6 +31,7 @@ import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameAddressCache;
 import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.PartitionFormat;
@@ -38,10 +39,12 @@ import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.SymbolTableSource;
+import io.questdb.cairo.sql.async.AsyncPrefetchManager;
 import io.questdb.cairo.sql.async.PageFrameReduceTask;
 import io.questdb.cairo.sql.async.PageFrameReduceTaskFactory;
 import io.questdb.cairo.sql.async.PageFrameReducer;
 import io.questdb.cairo.sql.async.PageFrameSequence;
+import io.questdb.cairo.sql.async.PrefetchableAtom;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.PlanSink;
@@ -51,7 +54,9 @@ import io.questdb.griffin.engine.functions.bind.CompiledFilterSymbolBindVariable
 import io.questdb.jit.CompiledFilter;
 import io.questdb.mp.SCSequence;
 import io.questdb.std.DirectLongList;
+import io.questdb.std.Files;
 import io.questdb.std.IntList;
+import io.questdb.std.LongList;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
@@ -91,7 +96,8 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
             @Nullable Function limitLoFunction,
             int limitLoPos,
             int sharedQueryWorkerCount,
-            boolean enablePreTouch
+            boolean enablePreTouch,
+            @Nullable IntList filterTableColumnIndexes
     ) {
         super(base.getMetadata());
         assert !(base instanceof FilteredRecordCursorFactory);
@@ -121,7 +127,8 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
                 bindVarMemory,
                 bindVarFunctions,
                 columnTypes,
-                enablePreTouch
+                enablePreTouch,
+                filterTableColumnIndexes
         );
         this.frameSequence = new PageFrameSequence<>(
                 engine,
@@ -436,10 +443,15 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
         Misc.freeObjList(bindVarFunctions);
     }
 
-    public static class AsyncJitFilterAtom extends AsyncFilterAtom {
+    public static class AsyncJitFilterAtom extends AsyncFilterAtom implements PrefetchableAtom {
         final ObjList<Function> bindVarFunctions;
         final MemoryCARW bindVarMemory;
         final CompiledFilter compiledFilter;
+        private final IntList filterTableColumnIndexes;
+        private final boolean prefetchEnabled;
+        private final int prefetchLookahead;
+        private final boolean prefetchAsync;
+        private AsyncPrefetchManager asyncPrefetchManager;
 
         public AsyncJitFilterAtom(
                 CairoConfiguration configuration,
@@ -449,12 +461,20 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
                 MemoryCARW bindVarMemory,
                 ObjList<Function> bindVarFunctions,
                 IntList columnTypes,
-                boolean enablePreTouch
+                boolean enablePreTouch,
+                IntList filterTableColumnIndexes
         ) {
             super(configuration, filter, perWorkerFilters, columnTypes, enablePreTouch);
             this.compiledFilter = compiledFilter;
             this.bindVarMemory = bindVarMemory;
             this.bindVarFunctions = bindVarFunctions;
+            this.filterTableColumnIndexes = filterTableColumnIndexes;
+            this.prefetchEnabled = configuration.isSqlJitPrefetchEnabled() && filterTableColumnIndexes != null && filterTableColumnIndexes.size() > 0;
+            this.prefetchLookahead = configuration.getSqlJitPrefetchLookahead();
+            this.prefetchAsync = configuration.isSqlJitPrefetchAsync();
+            if (this.prefetchEnabled && this.prefetchAsync) {
+                this.asyncPrefetchManager = new AsyncPrefetchManager(configuration);
+            }
         }
 
         @Override
@@ -462,6 +482,65 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
             super.init(symbolTableSource, executionContext);
             Function.init(bindVarFunctions, symbolTableSource, executionContext, null);
             prepareBindVarMemory(executionContext, symbolTableSource, bindVarFunctions, bindVarMemory);
+        }
+
+        @Override
+        public void prefetchFrame(int frameIndex, PageFrameAddressCache cache) {
+            if (!prefetchEnabled || cache.getFrameFormat(frameIndex) != PartitionFormat.NATIVE) {
+                return;
+            }
+
+            // Use async prefetch manager if available
+            if (asyncPrefetchManager != null) {
+                asyncPrefetchManager.prefetch(frameIndex, cache, filterTableColumnIndexes);
+                return;
+            }
+
+            // Fallback to synchronous prefetch
+            final LongList pageAddresses = cache.getPageAddresses(frameIndex);
+            final LongList pageSizes = cache.getPageSizes(frameIndex);
+            final LongList auxPageAddresses = cache.getAuxPageAddresses(frameIndex);
+            final LongList auxPageSizes = cache.getAuxPageSizes(frameIndex);
+
+            if (pageAddresses == null) {
+                return;
+            }
+
+            for (int i = 0, n = filterTableColumnIndexes.size(); i < n; i++) {
+                int tableColumnIndex = filterTableColumnIndexes.getQuick(i);
+                int queryColumnIndex = cache.tableToQueryColumnIndex(tableColumnIndex);
+                if (queryColumnIndex < 0) {
+                    continue;
+                }
+
+                if (cache.isVarSizeColumn(queryColumnIndex)) {
+                    // For variable-size columns, prefetch the aux vector
+                    long auxAddr = auxPageAddresses.getQuick(queryColumnIndex);
+                    long auxSize = auxPageSizes.getQuick(queryColumnIndex);
+                    Files.prefetch(auxAddr, auxSize);
+                } else {
+                    // For fixed-size columns, prefetch the data vector
+                    long addr = pageAddresses.getQuick(queryColumnIndex);
+                    long size = pageSizes.getQuick(queryColumnIndex);
+                    Files.prefetch(addr, size);
+                }
+            }
+        }
+
+        @Override
+        public int getPrefetchLookahead() {
+            return prefetchLookahead;
+        }
+
+        @Override
+        public boolean isPrefetchEnabled() {
+            return prefetchEnabled;
+        }
+
+        @Override
+        public void close() {
+            super.close();
+            asyncPrefetchManager = Misc.free(asyncPrefetchManager);
         }
     }
 }

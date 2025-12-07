@@ -982,6 +982,78 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
         assertIR("(varchar_header avarchar)(i64 4L)(<>)(ret)");
     }
 
+    @Test
+    public void testFilterColumnTrackingSingleColumn() throws Exception {
+        // Single column filter should track exactly one column
+        serialize("along > 10");
+        Assert.assertEquals(1, serializer.getFilterTableColumnIndexes().size());
+        Assert.assertEquals(metadata.getColumnIndex("along"), serializer.getFilterTableColumnIndexes().get(0));
+    }
+
+    @Test
+    public void testFilterColumnTrackingMultipleColumns() throws Exception {
+        // Multiple different columns in filter should all be tracked
+        serialize("along > 10 and anint < 5");
+        Assert.assertEquals(2, serializer.getFilterTableColumnIndexes().size());
+        // Check both columns are tracked (order depends on parse order)
+        Assert.assertTrue(serializer.getFilterTableColumnIndexes().contains(metadata.getColumnIndex("along")));
+        Assert.assertTrue(serializer.getFilterTableColumnIndexes().contains(metadata.getColumnIndex("anint")));
+    }
+
+    @Test
+    public void testFilterColumnTrackingDuplicateColumn() throws Exception {
+        // Same column used multiple times should only be tracked once
+        serialize("along > 10 and along < 100");
+        Assert.assertEquals(1, serializer.getFilterTableColumnIndexes().size());
+        Assert.assertEquals(metadata.getColumnIndex("along"), serializer.getFilterTableColumnIndexes().get(0));
+    }
+
+    @Test
+    public void testFilterColumnTrackingClearedOnClear() throws Exception {
+        // Verify that clear() resets the filter column list
+        serialize("along > 10");
+        Assert.assertEquals(1, serializer.getFilterTableColumnIndexes().size());
+        serializer.clear();
+        Assert.assertEquals(0, serializer.getFilterTableColumnIndexes().size());
+    }
+
+    @Test
+    public void testFilterColumnTrackingVariousTypes() throws Exception {
+        // Test filter column tracking works with various column types
+        // Test INT column
+        serialize("anint > 10");
+        Assert.assertEquals(1, serializer.getFilterTableColumnIndexes().size());
+        Assert.assertEquals(metadata.getColumnIndex("anint"), serializer.getFilterTableColumnIndexes().get(0));
+
+        // Test DOUBLE column
+        serialize("adouble > 10.0");
+        Assert.assertEquals(1, serializer.getFilterTableColumnIndexes().size());
+        Assert.assertEquals(metadata.getColumnIndex("adouble"), serializer.getFilterTableColumnIndexes().get(0));
+
+        // Test FLOAT column
+        serialize("afloat > 10.0");
+        Assert.assertEquals(1, serializer.getFilterTableColumnIndexes().size());
+        Assert.assertEquals(metadata.getColumnIndex("afloat"), serializer.getFilterTableColumnIndexes().get(0));
+
+        // Test BOOLEAN column
+        serialize("aboolean = true");
+        Assert.assertEquals(1, serializer.getFilterTableColumnIndexes().size());
+        Assert.assertEquals(metadata.getColumnIndex("aboolean"), serializer.getFilterTableColumnIndexes().get(0));
+
+        // Test TIMESTAMP column
+        serialize("atimestamp > 0");
+        Assert.assertEquals(1, serializer.getFilterTableColumnIndexes().size());
+        Assert.assertEquals(metadata.getColumnIndex("atimestamp"), serializer.getFilterTableColumnIndexes().get(0));
+    }
+
+    @Test
+    public void testFilterColumnTrackingWithNegation() throws Exception {
+        // Test filter with NOT operator
+        serialize("not aboolean");
+        Assert.assertEquals(1, serializer.getFilterTableColumnIndexes().size());
+        Assert.assertEquals(metadata.getColumnIndex("aboolean"), serializer.getFilterTableColumnIndexes().get(0));
+    }
+
     private void assertIR(String message, String expectedIR) {
         TestIRSerializer ser = new TestIRSerializer(irMemory, metadata);
         String actualIR = ser.serialize();

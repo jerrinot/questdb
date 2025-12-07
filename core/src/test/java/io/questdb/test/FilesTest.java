@@ -73,6 +73,56 @@ public class FilesTest {
     public final TemporaryFolder temporaryFolder = new TemporaryFolder();
 
     @Test
+    public void testPosixMadvWillneedConstant() {
+        // On Linux, POSIX_MADV_WILLNEED should be 3 (from system headers)
+        // On other platforms, it should be -1 (not supported)
+        if (Os.isLinux()) {
+            Assert.assertEquals(3, Files.POSIX_MADV_WILLNEED);
+        } else {
+            Assert.assertEquals(-1, Files.POSIX_MADV_WILLNEED);
+        }
+    }
+
+    @Test
+    public void testPrefetch() throws Exception {
+        assertMemoryLeak(() -> {
+            File temp = temporaryFolder.newFile();
+            // Write enough data to exceed MIN_PREFETCH_BYTES (4096)
+            byte[] data = new byte[8192];
+            Arrays.fill(data, (byte) 'x');
+            try (FileOutputStream fos = new FileOutputStream(temp)) {
+                fos.write(data);
+            }
+
+            try (Path path = new Path().of(temp.getAbsolutePath())) {
+                long fd = Files.openRO(path.$());
+                Assert.assertTrue(fd > 0);
+                try {
+                    long addr = Files.mmap(fd, data.length, 0, Files.MAP_RO, MemoryTag.MMAP_DEFAULT);
+                    Assert.assertTrue(addr > 0);
+                    try {
+                        // Test prefetch on mapped memory
+                        int result = Files.prefetch(addr, data.length);
+                        if (Os.isLinux()) {
+                            Assert.assertEquals(0, result);  // Success on Linux
+                        } else {
+                            Assert.assertEquals(-1, result);  // Not supported
+                        }
+
+                        // Test edge cases
+                        Assert.assertEquals(0, Files.prefetch(0, data.length));  // Null address
+                        Assert.assertEquals(0, Files.prefetch(addr, 100));  // Below MIN_PREFETCH_BYTES
+                    } finally {
+                        Files.munmap(addr, data.length, MemoryTag.MMAP_DEFAULT);
+                    }
+                } finally {
+                    Files.close(fd);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testAllocate() throws Exception {
         assertMemoryLeak(() -> {
             File temp = temporaryFolder.newFile();

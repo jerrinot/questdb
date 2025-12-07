@@ -35,10 +35,12 @@ public class IOUringAccessor {
     static final short CQ_KTAIL_OFFSET;
     static final byte IORING_OP_NOP = 0;
     static final byte IORING_OP_READ = 22;
+    static final byte IORING_OP_MADVISE = 28;  // Requires kernel 5.6+
     static final short RING_FD_OFFSET;
     static final short SIZEOF_CQE;
     static final short SIZEOF_SQE;
     static final short SQE_ADDR_OFFSET;
+    static final short SQE_FADVISE_ADVICE_OFFSET;
     static final short SQE_FD_OFFSET;
     static final short SQE_LEN_OFFSET;
     static final short SQE_OFF_OFFSET;
@@ -94,6 +96,8 @@ public class IOUringAccessor {
 
     static native short getSqeAddrOffset();
 
+    static native short getSqeFadviseAdviceOffset();
+
     static native short getSqeFDOffset();
 
     static native short getSqeLenOffset();
@@ -131,6 +135,16 @@ public class IOUringAccessor {
         SQE_ADDR_OFFSET = getSqeAddrOffset();
         SQE_LEN_OFFSET = getSqeLenOffset();
         SQE_USER_DATA_OFFSET = getSqeUserDataOffset();
+        // SQE_FADVISE_ADVICE_OFFSET may not be available in older native libraries
+        short fadviseAdviceOffset;
+        try {
+            fadviseAdviceOffset = getSqeFadviseAdviceOffset();
+        } catch (UnsatisfiedLinkError e) {
+            // Fallback: fadvise_advice is in union at offset 28 in io_uring_sqe
+            // This is the standard offset in liburing
+            fadviseAdviceOffset = 28;
+        }
+        SQE_FADVISE_ADVICE_OFFSET = fadviseAdviceOffset;
 
         final short cqOffset = getCqOffset();
         CQ_KHEAD_OFFSET = (short) (cqOffset + getCqKheadOffset());

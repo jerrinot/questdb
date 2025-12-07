@@ -30,6 +30,63 @@ public class IOURingFacadeImpl implements IOURingFacade {
     private static final boolean available;
 
     /**
+     * Check if IORING_OP_MADVISE is supported (requires kernel 5.6+).
+     */
+    public boolean isMadviseSupported() {
+        if (!available) {
+            return false;
+        }
+        String version = IOUringAccessor.kernelVersion();
+        return isMadviseSupportedOn(version);
+    }
+
+    /**
+     * Check if kernel version supports IORING_OP_MADVISE (5.6+).
+     */
+    public static boolean isMadviseSupportedOn(String kernelVersion) {
+        if (kernelVersion == null) {
+            return false;
+        }
+        final String[] versionParts = kernelVersion.split("\\.");
+        if (versionParts.length < 2) {
+            return false;
+        }
+
+        int major;
+        try {
+            major = Numbers.parseInt(versionParts[0]);
+        } catch (NumericException e) {
+            return false;
+        }
+
+        if (major < 5) {
+            return false;
+        }
+        if (major > 5) {
+            return true;
+        }
+
+        // Parse minor version, handling non-numeric suffixes
+        String minorStr = versionParts[1];
+        int minorEnd = 0;
+        while (minorEnd < minorStr.length() && Character.isDigit(minorStr.charAt(minorEnd))) {
+            minorEnd++;
+        }
+        if (minorEnd == 0) {
+            return false;
+        }
+
+        int minor;
+        try {
+            minor = Numbers.parseInt(minorStr.substring(0, minorEnd));
+        } catch (NumericException e) {
+            return false;
+        }
+
+        return minor >= 6;
+    }
+
+    /**
      * io_uring is available since kernel 5.1, but we require 5.12 to avoid ulimit -l issues.
      */
     public static boolean isAvailableOn(String kernelVersion) {

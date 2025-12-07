@@ -175,6 +175,13 @@ JNIEXPORT jshort JNICALL Java_io_questdb_std_IOUringAccessor_getSqeAddrOffset
     return (jshort) offsetof(struct io_uring_sqe, addr);
 }
 
+JNIEXPORT jshort JNICALL Java_io_questdb_std_IOUringAccessor_getSqeFadviseAdviceOffset
+        (JNIEnv *e, jclass cl) {
+    // The fadvise_advice field is used for IORING_OP_MADVISE (opcode 28)
+    // It's in a union at the same offset as other fields
+    return (jshort) offsetof(struct io_uring_sqe, fadvise_advice);
+}
+
 JNIEXPORT jshort JNICALL Java_io_questdb_std_IOUringAccessor_getSqeLenOffset
         (JNIEnv *e, jclass cl) {
     return (jshort) offsetof(struct io_uring_sqe, len);

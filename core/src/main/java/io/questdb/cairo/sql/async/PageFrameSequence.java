@@ -530,6 +530,17 @@ public class PageFrameSequence<T extends StatefulAtom> implements Closeable {
                     reducePubSeq.done(cursor);
                     dispatchStartFrameIndex = i + 1;
                     dispatched = true;
+
+                    // Prefetch upcoming frames if the atom supports it
+                    if (atom instanceof PrefetchableAtom) {
+                        PrefetchableAtom prefetchable = (PrefetchableAtom) atom;
+                        if (prefetchable.isPrefetchEnabled()) {
+                            int prefetchIndex = i + prefetchable.getPrefetchLookahead();
+                            if (prefetchIndex < frameCount) {
+                                prefetchable.prefetchFrame(prefetchIndex, frameAddressCache);
+                            }
+                        }
+                    }
                     break;
                 } else if (cursor == -1) {
                     if (!workStealingStrategy.shouldSteal(collectedFrameCount)) {

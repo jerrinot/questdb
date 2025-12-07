@@ -1402,6 +1402,31 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public boolean isSqlJitPrefetchEnabled() {
+        return getDelegate().isSqlJitPrefetchEnabled();
+    }
+
+    @Override
+    public int getSqlJitPrefetchLookahead() {
+        return getDelegate().getSqlJitPrefetchLookahead();
+    }
+
+    @Override
+    public boolean isSqlJitPrefetchAsync() {
+        return getDelegate().isSqlJitPrefetchAsync();
+    }
+
+    @Override
+    public int getSqlJitPrefetchRingCapacity() {
+        return getDelegate().getSqlJitPrefetchRingCapacity();
+    }
+
+    @Override
+    public long getSqlJitPrefetchMaxChunkBytes() {
+        return getDelegate().getSqlJitPrefetchMaxChunkBytes();
+    }
+
+    @Override
     public boolean isSqlOrderBySortEnabled() {
         return getDelegate().isSqlOrderBySortEnabled();
     }

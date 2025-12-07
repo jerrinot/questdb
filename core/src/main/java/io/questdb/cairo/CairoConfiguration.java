@@ -774,6 +774,16 @@ public interface CairoConfiguration {
 
     boolean isSqlJitDebugEnabled();
 
+    boolean isSqlJitPrefetchEnabled();
+
+    int getSqlJitPrefetchLookahead();
+
+    boolean isSqlJitPrefetchAsync();
+
+    int getSqlJitPrefetchRingCapacity();
+
+    long getSqlJitPrefetchMaxChunkBytes();
+
     boolean isSqlOrderBySortEnabled();
 
     boolean isSqlParallelFilterEnabled();

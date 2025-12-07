@@ -49,6 +49,8 @@ import io.questdb.griffin.model.ExpressionNode;
 import io.questdb.griffin.model.IntervalUtils;
 import io.questdb.std.Chars;
 import io.questdb.std.GenericLexer;
+import io.questdb.std.IntHashSet;
+import io.questdb.std.IntList;
 import io.questdb.std.IntStack;
 import io.questdb.std.LongList;
 import io.questdb.std.LongObjHashMap;
@@ -113,6 +115,9 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
     private static final int INSTRUCTION_SIZE = Integer.BYTES + Integer.BYTES + Long.BYTES + Long.BYTES;
     // contains <memory_offset, constant_node> pairs for backfilling purposes
     private final LongObjHashMap<ExpressionNode> backfillNodes = new LongObjHashMap<>();
+    // Track table column indexes used in the filter for prefetch
+    private final IntHashSet filterTableColumnIndexSet = new IntHashSet();
+    private final IntList filterTableColumnIndexes = new IntList();
     private final PredicateContext predicateContext = new PredicateContext();
     private final StringSink sink = new StringSink();
     private final PostOrderTreeTraversalAlgo traverseAlgo = new PostOrderTreeTraversalAlgo();
@@ -134,6 +139,19 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         forceScalarMode = false;
         predicateContext.clear();
         backfillNodes.clear();
+        filterTableColumnIndexSet.clear();
+        filterTableColumnIndexes.clear();
+    }
+
+    /**
+     * Returns the list of table column indexes used in the filter expression.
+     * These are the columns that should be prefetched before executing the filter.
+     * The list is populated during serialization and cleared on {@link #clear()}.
+     *
+     * @return IntList of table column indexes (not query column indexes)
+     */
+    public IntList getFilterTableColumnIndexes() {
+        return filterTableColumnIndexes;
     }
 
     @Override
@@ -674,6 +692,11 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
             final int index = metadata.getColumnIndexQuiet(token);
             if (index == -1) {
                 throw SqlException.invalidColumn(position, token);
+            }
+
+            // Track this column as used in the filter (for prefetch)
+            if (filterTableColumnIndexSet.add(index)) {
+                filterTableColumnIndexes.add(index);
             }
 
             final int columnType = metadata.getColumnType(index);

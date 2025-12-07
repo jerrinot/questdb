@@ -70,6 +70,27 @@ public class IOURingImplTest extends AbstractTest {
     }
 
     @Test
+    public void testIsMadviseSupportedOn() {
+        // Kernel 5.6+ required for IORING_OP_MADVISE
+        Assert.assertFalse(IOURingFacadeImpl.isMadviseSupportedOn(null));
+        Assert.assertFalse(IOURingFacadeImpl.isMadviseSupportedOn(""));
+        Assert.assertFalse(IOURingFacadeImpl.isMadviseSupportedOn("invalid"));
+        Assert.assertFalse(IOURingFacadeImpl.isMadviseSupportedOn("4.0.0"));
+        Assert.assertFalse(IOURingFacadeImpl.isMadviseSupportedOn("5.0.0"));
+        Assert.assertFalse(IOURingFacadeImpl.isMadviseSupportedOn("5.5.0"));
+        Assert.assertFalse(IOURingFacadeImpl.isMadviseSupportedOn("5.5.99"));
+
+        Assert.assertTrue(IOURingFacadeImpl.isMadviseSupportedOn("5.6.0"));
+        Assert.assertTrue(IOURingFacadeImpl.isMadviseSupportedOn("5.6"));
+        Assert.assertTrue(IOURingFacadeImpl.isMadviseSupportedOn("5.7.0"));
+        Assert.assertTrue(IOURingFacadeImpl.isMadviseSupportedOn("5.12.0"));
+        Assert.assertTrue(IOURingFacadeImpl.isMadviseSupportedOn("5.14.0-1044-oem"));
+        Assert.assertTrue(IOURingFacadeImpl.isMadviseSupportedOn("6.0.0"));
+        Assert.assertTrue(IOURingFacadeImpl.isMadviseSupportedOn("6.2.2"));
+        Assert.assertTrue(IOURingFacadeImpl.isMadviseSupportedOn("7.1.1"));
+    }
+
+    @Test
     public void testRead() throws Exception {
         Assume.assumeTrue(rf.isAvailable());
 
@@ -197,6 +218,79 @@ public class IOURingImplTest extends AbstractTest {
                     Files.close(fd);
                     Unsafe.free(buf, txtLen, MemoryTag.NATIVE_DEFAULT);
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testEnqueueMadvise() throws Exception {
+        Assume.assumeTrue(rf.isAvailable());
+        // Skip this test if kernel doesn't support madvise
+        Assume.assumeTrue(IOURingFacadeImpl.INSTANCE.isMadviseSupported());
+
+        TestUtils.assertMemoryLeak(() -> {
+            final int memSize = 64 * 1024; // 64KB
+            final int MADV_WILLNEED = 3;
+
+            // Create a temp file and mmap it (madvise requires mmap'd memory)
+            File file = temp.newFile();
+            try (Path path = new Path()) {
+                long fd = Files.openRW(path.of(file.getAbsolutePath()).$());
+                Assert.assertTrue(fd > -1);
+
+                // Allocate the file
+                Assert.assertTrue(Files.allocate(fd, memSize));
+
+                // Map the file
+                long mem = Files.mmap(fd, memSize, 0, Files.MAP_RW, MemoryTag.NATIVE_DEFAULT);
+                Assert.assertNotEquals(-1, mem);
+
+                try (IOURing ring = rf.newInstance(4)) {
+                    // Test that enqueueMadvise returns a valid id
+                    long id = ring.enqueueMadvise(mem, memSize, MADV_WILLNEED);
+                    Assert.assertTrue("enqueueMadvise should return valid id", id >= 0);
+
+                    // Submit and wait for completion
+                    int submitted = ring.submitAndWait();
+                    Assert.assertEquals(1, submitted);
+
+                    // Check completion - we get a CQE regardless of result
+                    Assert.assertTrue(ring.nextCqe());
+                    Assert.assertEquals(id, ring.getCqeId());
+                    // Note: madvise may return 0 on success or negative errno on failure
+                    // depending on the system configuration. We just verify we get a response.
+                    int res = ring.getCqeRes();
+                    Assert.assertTrue("unexpected large positive result: " + res, res <= 0);
+                } finally {
+                    Files.munmap(mem, memSize, MemoryTag.NATIVE_DEFAULT);
+                    Files.close(fd);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testEnqueueMadviseQueueFull() throws Exception {
+        Assume.assumeTrue(rf.isAvailable());
+
+        TestUtils.assertMemoryLeak(() -> {
+            // Create a small ring (capacity 4)
+            try (IOURing ring = rf.newInstance(4)) {
+                // Fill the queue with madvise operations
+                int enqueued = 0;
+                while (true) {
+                    long id = ring.enqueueMadvise(0, 0, 0);
+                    if (id < 0) {
+                        // Queue is full
+                        break;
+                    }
+                    enqueued++;
+                    if (enqueued > 100) {
+                        Assert.fail("Queue should have filled up by now");
+                    }
+                }
+                Assert.assertTrue("Should have enqueued at least one operation", enqueued >= 1);
+                Assert.assertTrue("Queue should be full at capacity 4", enqueued <= 4);
             }
         });
     }

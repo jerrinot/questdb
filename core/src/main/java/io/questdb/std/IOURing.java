@@ -38,6 +38,16 @@ public interface IOURing extends Closeable {
 
     long enqueueRead(long fd, long offset, long bufPtr, int len);
 
+    /**
+     * Enqueue an async madvise operation.
+     *
+     * @param addr   the start address
+     * @param len    the length in bytes (32-bit limit)
+     * @param advice the advice value (e.g., MADV_WILLNEED = 3)
+     * @return the operation ID, or -1 if the queue is full
+     */
+    long enqueueMadvise(long addr, int len, int advice);
+
     long getCqeId();
 
     int getCqeRes();

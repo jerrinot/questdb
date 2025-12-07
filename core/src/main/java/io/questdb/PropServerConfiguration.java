@@ -438,6 +438,11 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final int sqlJitMaxInListSizeThreshold;
     private final int sqlJitMode;
     private final int sqlJitPageAddressCacheThreshold;
+    private final boolean sqlJitPrefetchEnabled;
+    private final int sqlJitPrefetchLookahead;
+    private final boolean sqlJitPrefetchAsync;
+    private final int sqlJitPrefetchRingCapacity;
+    private final long sqlJitPrefetchMaxChunkBytes;
     private final int sqlJoinContextPoolCapacity;
     private final int sqlJoinMetadataMaxResizes;
     private final int sqlJoinMetadataPageSize;
@@ -1515,6 +1520,11 @@ public class PropServerConfiguration implements ServerConfiguration {
             this.sqlJitPageAddressCacheThreshold = getIntSize(properties, env, PropertyKey.CAIRO_SQL_JIT_PAGE_ADDRESS_CACHE_THRESHOLD, 1024 * 1024);
             this.sqlJitDebugEnabled = getBoolean(properties, env, PropertyKey.CAIRO_SQL_JIT_DEBUG_ENABLED, false);
             this.sqlJitMaxInListSizeThreshold = getInt(properties, env, PropertyKey.CAIRO_SQL_JIT_MAX_IN_LIST_SIZE_THRESHOLD, 10);
+            this.sqlJitPrefetchEnabled = getBoolean(properties, env, PropertyKey.CAIRO_SQL_JIT_PREFETCH_ENABLED, true);
+            this.sqlJitPrefetchLookahead = getInt(properties, env, PropertyKey.CAIRO_SQL_JIT_PREFETCH_LOOKAHEAD, 2);
+            this.sqlJitPrefetchAsync = getBoolean(properties, env, PropertyKey.CAIRO_SQL_JIT_PREFETCH_ASYNC, true);
+            this.sqlJitPrefetchRingCapacity = getInt(properties, env, PropertyKey.CAIRO_SQL_JIT_PREFETCH_RING_CAPACITY, 64);
+            this.sqlJitPrefetchMaxChunkBytes = getLongSize(properties, env, PropertyKey.CAIRO_SQL_JIT_PREFETCH_MAX_CHUNK_BYTES, 64 * Numbers.SIZE_1MB);
 
             this.maxSqlRecompileAttempts = getInt(properties, env, PropertyKey.CAIRO_SQL_MAX_RECOMPILE_ATTEMPTS, 10);
 
@@ -4284,6 +4294,31 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public boolean isSqlJitDebugEnabled() {
             return sqlJitDebugEnabled;
+        }
+
+        @Override
+        public boolean isSqlJitPrefetchEnabled() {
+            return sqlJitPrefetchEnabled;
+        }
+
+        @Override
+        public int getSqlJitPrefetchLookahead() {
+            return sqlJitPrefetchLookahead;
+        }
+
+        @Override
+        public boolean isSqlJitPrefetchAsync() {
+            return sqlJitPrefetchAsync;
+        }
+
+        @Override
+        public int getSqlJitPrefetchRingCapacity() {
+            return sqlJitPrefetchRingCapacity;
+        }
+
+        @Override
+        public long getSqlJitPrefetchMaxChunkBytes() {
+            return sqlJitPrefetchMaxChunkBytes;
         }
 
         @Override

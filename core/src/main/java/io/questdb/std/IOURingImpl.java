@@ -104,6 +104,38 @@ public class IOURingImpl implements IOURing {
     }
 
     @Override
+    public long enqueueMadvise(long addr, int len, int advice) {
+        final long sqeAddr = nextSqe();
+        if (sqeAddr == 0) {
+            return -1;  // Queue full
+        }
+
+        // Clear the SQE (important for unused union fields)
+        Unsafe.getUnsafe().setMemory(sqeAddr, SIZEOF_SQE, (byte) 0);
+
+        // Set opcode
+        Unsafe.getUnsafe().putByte(sqeAddr + SQE_OPCODE_OFFSET, IORING_OP_MADVISE);
+
+        // fd is not used for madvise, but kernel expects -1
+        Unsafe.getUnsafe().putInt(sqeAddr + SQE_FD_OFFSET, -1);
+
+        // Address to madvise
+        Unsafe.getUnsafe().putLong(sqeAddr + SQE_ADDR_OFFSET, addr);
+
+        // Length (32-bit)
+        Unsafe.getUnsafe().putInt(sqeAddr + SQE_LEN_OFFSET, len);
+
+        // Advice value
+        Unsafe.getUnsafe().putInt(sqeAddr + SQE_FADVISE_ADVICE_OFFSET, advice);
+
+        // User data for correlation
+        final long id = idSeq++;
+        Unsafe.getUnsafe().putLong(sqeAddr + SQE_USER_DATA_OFFSET, id);
+
+        return id;
+    }
+
+    @Override
     public long getCqeId() {
         if (cachedIndex < cachedSize) {
             return cachedCqes[2 * cachedIndex];
