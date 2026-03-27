@@ -121,7 +121,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
     // Keep short-circuit IR disabled while the Java backend is the default JIT path.
     // This preserves native-backend coverage while allowing more existing tests to
     // exercise the vectorized Java execution path.
-    private static final boolean ENABLE_SHORT_CIRCUIT = false;
+    private static final boolean ENABLE_SHORT_CIRCUIT = true;
     private static final int INSTRUCTION_SIZE = Integer.BYTES + Integer.BYTES + Long.BYTES + Long.BYTES;
     // Maximum number of labels supported by the backend (must match LabelArray::MAX_LABELS in x86.h)
     private static final int MAX_LABELS = 8;

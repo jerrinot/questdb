@@ -1196,6 +1196,33 @@ public class CompiledFilterRegressionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testShortCircuitChainedInMixedSize() throws Exception {
+        // Tests multi-value IN() chained with AND on mixed-size columns.
+        // The serializer emits BEGIN_SC/OR_SC/AND_SC/END_SC for each IN group.
+        final String query = "x where " +
+                "i32 in (1, 2, 3) and i64 in (10, 20, 30)";
+        final String ddl = "create table x as " +
+                "(select timestamp_sequence(400000000000, 500000000) as k," +
+                " rnd_int(0, 10, 0) i32," +
+                " rnd_long(0, 50, 0) i64" +
+                " from long_sequence(" + N_SIMD_WITH_SCALAR_TAIL + ")) timestamp(k)";
+        assertQueryNotNull(query, ddl);
+    }
+
+    @Test
+    public void testShortCircuitChainedInMixedSizeNullable() throws Exception {
+        // Tests multi-value IN() with nullable columns on mixed sizes.
+        final String query = "x where " +
+                "i32 in (1, 2, 3) and i64 in (10, 20, 30)";
+        final String ddl = "create table x as " +
+                "(select timestamp_sequence(400000000000, 500000000) as k," +
+                " rnd_int(0, 10, 5) i32," +
+                " rnd_long(0, 50, 5) i64" +
+                " from long_sequence(" + N_SIMD_WITH_SCALAR_TAIL + ")) timestamp(k)";
+        assertQueryNullable(query, ddl);
+    }
+
+    @Test
     public void testShortCircuitMixedAndOr() throws Exception {
         // Tests mixed AND/OR chains with short-circuit evaluation
         final String query = "x where " +
