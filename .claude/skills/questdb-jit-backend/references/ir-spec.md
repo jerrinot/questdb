@@ -284,9 +284,17 @@ Two-vector layout:
 - **Data vector:** `[length_header][payload_bytes]` per row.
   Header: 4 bytes (STRING), 8 bytes (BINARY).
 
+Col-top detection: if `cols[col_idx] == 0`, the data column is absent.
+Return -1 (NULL sentinel). This check uses the data column address because
+string/binary NULL detection reads the actual data header.
+
 Access algorithm:
 
 ```
+data_base = cols[col_idx]
+if data_base == 0:
+    return -1                       // col-top: treat as NULL
+
 aux_base    = varsize_aux_ptr[col_idx]
 offset      = aux_base[row]         // 8-byte read
 next_offset = aux_base[row + 1]     // 8-byte read
@@ -296,7 +304,6 @@ if length != 0:
     return length       // non-empty, non-NULL
 
 // Ambiguous: empty string (header=0) or NULL (header=-1)
-data_base = data_ptr[col_idx]
 header    = read header_size bytes from (data_base + offset)
 return header           // 0 = empty, -1 = NULL
 ```
@@ -306,25 +313,56 @@ A subsequent EQ with the NULL sentinel (-1) determines NULL.
 
 ## 9. Variable-Size Column Access: Varchar
 
-Aux entries are 16 bytes each:
+Aux entries are 16 bytes each. The layout differs by encoding:
 
+**Fully inlined (size ≤ 9 bytes):**
 ```
 Offset  Size  Content
- 0       4    Header word (flags + length)
- 4       6    Inlined UTF-8 prefix
-10       6    48-bit data vector offset
+ 0       1    (size << 4) | flags
+ 1       9    Inline UTF-8 data (zero-padded)
+10       6    48-bit data vector offset (little-endian)
 ```
 
-Header word bits:
+**Non-inlined (size > 9 bytes):**
+```
+Offset  Size  Content
+ 0       4    (size << 4) | flags
+ 4       6    Inlined UTF-8 prefix
+10       6    48-bit data vector offset (little-endian)
+```
+
+**NULL:**
+```
+Offset  Size  Content
+ 0       4    VARCHAR_HEADER_FLAG_NULL (= 4)
+ 4       6    Zero padding
+10       6    48-bit data vector offset (little-endian)
+```
+
+Header flag bits (lowest 4 bits of first byte/int):
 - Bit 0: INLINED (value fully in aux entry)
 - Bit 1: ASCII-only
 - Bit 2: NULL flag
-- Bits [31:4]: length (28 bits)
+- Bits [31:4]: length (for non-inlined 4-byte header)
 
-JIT access: load 8 bytes from `aux_base + row * 16`. Push as i64.
+JIT access:
+```
+aux_base = varsize_aux_ptr[col_idx]
+if aux_base == 0:
+    return 4                        // col-top: treat as NULL
+header = load_i64(aux_base + row * 16)
+push header as i64
+```
+
+**IMPORTANT: Col-top detection for varchar must check `aux_base`, NOT
+`cols[col_idx]`.** The data column address (`cols[col_idx]`) can be 0 when
+all varchar values are fully inlined (≤ 9 bytes) — this is a normal
+condition, not a col-top. Unlike string/binary columns which read from the
+data column, varchar NULL detection reads only from the aux column.
 
 NULL detection: compare full 64-bit value against `4` (only NULL flag set,
-zero length, zero prefix). Non-NULL entries always have additional bits.
+zero length, zero prefix). Non-NULL entries always have additional bits
+(at minimum the INLINED flag or a non-zero length).
 
 ## 10. Short-Circuit Evaluation
 

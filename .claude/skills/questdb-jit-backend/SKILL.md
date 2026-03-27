@@ -148,10 +148,18 @@ the IR stream instead of a fixed stride.
 String/binary columns use a two-vector layout (aux offsets + data). The
 backend computes `length = aux[row+1] - aux[row] - header_size`. If length
 is zero, read the actual header from the data vector to distinguish empty
-string (header=0) from NULL (header=-1).
+string (header=0) from NULL (header=-1). Col-top: if `cols[col_idx] == 0`,
+the data column is absent — return -1 (NULL sentinel).
 
-Varchar columns use 16-byte aux entries. Load the first 8 bytes; compare
-the full 64-bit value against `4` (the NULL flag) for NULL detection.
+Varchar columns use 16-byte aux entries. Load the first 8 bytes from the
+**aux column** (not the data column); compare the full 64-bit value against
+`4` (the NULL flag) for NULL detection.
+
+**Critical:** Varchar col-top detection must check `varsize_aux_ptr[col_idx]
+== 0`, NOT `cols[col_idx] == 0`. The data column address can be 0 for
+fully-inlined varchars (values ≤ 9 bytes) without indicating a col-top.
+Using the data column address for this check causes all rows to be treated
+as non-NULL when all values are inlined.
 
 The JIT only uses variable-size columns for NULL checks; it does not read
 payload data.
