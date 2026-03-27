@@ -8,9 +8,32 @@ AArch64 scalar only. The proposal is to add a **pure-Java backend** that consume
 the same IR and uses the Java Vector API for SIMD, eliminating JNI overhead, the
 C++ build dependency for the SIMD path, and bringing SIMD to AArch64 for free.
 
-**Target: Java 24** (prototype). The Foreign Function & Memory API is final
-(since Java 22), and the Vector API is the 9th incubator with a stable API
-surface.
+**Vector API target: Java 24+** (future phase). The current Phase 1 backend is
+implemented in pure Java and remains compatible with the project's current Java
+17 source/target level. A Java 24+ toolchain is only required once the actual
+Vector API path is introduced.
+
+## Current Status
+
+### Done On This Branch
+
+- Backend-neutral JIT interfaces are in place (`JitFilter`,
+  `JitCountOnlyFilter`) and the existing native wrappers implement them.
+- `cairo.sql.jit.mode=vector` is parsed, logged, and exposed via
+  `SqlJitMode.JIT_MODE_FORCE_VECTOR`.
+- `IrDecoder` is implemented and tested against the real serialized IR format.
+- A pure-Java Phase 1 backend is implemented via `VectorCompiledFilter`,
+  `VectorCompiledCountOnlyFilter`, and `VectorFilterInterpreter`.
+- `SqlCodeGenerator` now selects the Java backend explicitly when
+  `cairo.sql.jit.mode=vector`.
+- Focused backend tests and end-to-end SQL integration tests are in place.
+
+### Still Pending
+
+- Actual Vector API SIMD execution.
+- Variable-size column support (`STRING`, `BINARY`, `VARCHAR`) in the Java backend.
+- Broader semantic parity work beyond the initial fixed-width subset.
+- Performance work, benchmarking, and ARM64 validation.
 
 ## Feasibility Assessment
 
@@ -63,22 +86,22 @@ short-circuits are present.
 ### New Classes
 
 ```
-io.questdb.jit.VectorCompiledFilter          -- Replaces CompiledFilter for vector path
-io.questdb.jit.VectorCompiledCountOnlyFilter -- Count-only variant
-io.questdb.jit.VectorFilterInterpreter       -- Core SIMD interpreter
-io.questdb.jit.IrDecoder                     -- Parses IR from native memory into Instruction[]
-io.questdb.jit.JitFilter                     -- Interface: call() + close()
-io.questdb.jit.JitCountOnlyFilter            -- Interface: call() + close()
+io.questdb.jit.VectorCompiledFilter          -- Done: Java backend wrapper for row-id filtering
+io.questdb.jit.VectorCompiledCountOnlyFilter -- Done: Java backend wrapper for count-only filtering
+io.questdb.jit.VectorFilterInterpreter       -- Done for Phase 1 as a scalar interpreter; SIMD work remains
+io.questdb.jit.IrDecoder                     -- Done: parses IR from native memory into Instruction[]
+io.questdb.jit.JitFilter                     -- Done: backend-neutral filter interface
+io.questdb.jit.JitCountOnlyFilter            -- Done: backend-neutral count-only filter interface
 ```
 
 ### Modified Classes
 
 ```
-io.questdb.jit.JitUtil                    -- Add isVectorApiAvailable()
-io.questdb.cairo.SqlJitMode               -- Add JIT_MODE_FORCE_VECTOR = 3
-io.questdb.griffin.SqlCodeGenerator        -- Backend selection logic
-io.questdb.jit.CompiledFilter             -- Extract JitFilter interface
-io.questdb.jit.CompiledCountOnlyFilter    -- Extract JitCountOnlyFilter interface
+io.questdb.jit.JitUtil                    -- Done: add isVectorApiAvailable()
+io.questdb.cairo.SqlJitMode               -- Done: add JIT_MODE_FORCE_VECTOR = 3
+io.questdb.griffin.SqlCodeGenerator       -- Done: backend selection logic
+io.questdb.jit.CompiledFilter             -- Done: implements JitFilter
+io.questdb.jit.CompiledCountOnlyFilter    -- Done: implements JitCountOnlyFilter
 ```
 
 ### Integration Point
@@ -93,7 +116,8 @@ if (useJit && canCompile) {
 }
 ```
 
-The change introduces a `JitFilter` interface and selects the backend:
+Done on this branch: `SqlCodeGenerator` now introduces a backend choice and
+selects the Java backend when `JIT_MODE_FORCE_VECTOR` is requested:
 
 ```java
 if (useJit && canCompile) {
@@ -112,6 +136,10 @@ instead of `CompiledFilter`. The `call()` signature is identical.
 
 ### Memory Access Strategy
 
+This section describes the planned Phase 2 Vector API path. The current Phase 1
+implementation uses the existing `Unsafe`-based memory access primitives and
+does not require `MemorySegment`.
+
 Java 24 has the Foreign Memory API finalized. Direct zero-copy access:
 
 ```java
@@ -129,6 +157,10 @@ No Unsafe needed for the Vector API path. The existing Unsafe-based code remains
 for the native JIT path.
 
 ### Interpreter Core Design
+
+Current implementation note: the existing `VectorFilterInterpreter` executes the
+decoded IR row-by-row as a scalar interpreter. The pseudocode below describes
+the intended Phase 2 vectorized execution model on top of the same decoded IR.
 
 The interpreter processes the decoded `Instruction[]` once per SIMD chunk:
 
@@ -201,11 +233,14 @@ available, falls back to vector, then to Java scalar.
 
 ## Limitations
 
-1. **SIMD mode only for single-type-size filters** (same as native AVX2)
-2. **No short-circuit in SIMD** (same as native AVX2; scalar fallback handles it)
-3. **Variable-size columns (string/binary/varchar):** Phase 1 delegates to scalar
-4. **i128:** Handled as paired longs (no native 128-bit Vector species)
-5. **Requires `--add-modules jdk.incubator.vector`** until the API finalizes
+1. **Current backend is scalar only.** The Vector API SIMD path is still pending.
+2. **Phase 1 supports fixed-width scalar types first.** Variable-size columns
+   (`STRING`, `BINARY`, `VARCHAR`) are not yet supported by the Java backend.
+3. **Short-circuit currently works in the scalar Java backend.** SIMD short-circuit
+   remains unsupported, same as native AVX2.
+4. **i128 is limited to equality/inequality** and is handled as paired longs.
+5. **`jdk.incubator.vector` is not needed yet.** It becomes a build/runtime
+   requirement only once the actual Vector API path lands.
 
 ---
 
@@ -222,50 +257,57 @@ available, falls back to vector, then to Java scalar.
 ## Phased Roadmap
 
 ### Phase 1: Scalar Interpreter + Wiring
-- `JitFilter`/`JitCountOnlyFilter` interfaces
-- `IrDecoder` parsing IR from native memory into Java `Instruction[]`
-- `VectorCompiledFilter`/`VectorCompiledCountOnlyFilter` with scalar interpreter
-- `SqlCodeGenerator` backend selection behind `cairo.sql.jit.mode=vector`
-- Existing `CompiledFilterRegressionTest` passing with vector backend
+- [x] `JitFilter`/`JitCountOnlyFilter` interfaces
+- [x] `IrDecoder` parsing IR from native memory into Java `Instruction[]`
+- [x] `VectorCompiledFilter`/`VectorCompiledCountOnlyFilter` with scalar interpreter
+- [x] `SqlCodeGenerator` backend selection behind `cairo.sql.jit.mode=vector`
+- [x] Focused backend tests for the Java interpreter
+- [x] End-to-end SQL integration test for `JIT_MODE_FORCE_VECTOR`
+- [x] Existing `CompiledFilterRegressionTest` still passing on the native path
 
 ### Phase 2: SIMD Vectorized Interpreter
-- `VectorFilterInterpreter` with Vector API for i32, i64, f32, f64
-- Species selection from compilation options
-- Vectorized comparison, arithmetic, boolean ops
-- NULL sentinel handling via VectorMask
-- Count-only mode with `trueCount()`
-- Scalar tail for remainder rows
-- `MemorySegment.ofAddress().reinterpret()` for zero-copy native memory access
+- [ ] `VectorFilterInterpreter` with Vector API for i32, i64, f32, f64
+- [ ] Species selection from compilation options
+- [ ] Vectorized comparison, arithmetic, boolean ops
+- [ ] NULL sentinel handling via `VectorMask`
+- [ ] Count-only mode with `trueCount()`
+- [ ] Scalar tail for remainder rows
+- [ ] `MemorySegment.ofAddress().reinterpret()` for zero-copy native memory access
 
 ### Phase 3: Complete Type Support
-- i128/UUID as paired long operations
-- Variable-size column header reads (string, binary, varchar)
-- Float epsilon comparisons
-- Division-by-zero handling
-- Short-circuit support in scalar fallback
+- [x] i128/UUID as paired long operations for equality/inequality
+- [x] Float epsilon comparisons
+- [x] Division-by-zero handling for integer arithmetic
+- [x] Short-circuit support in the scalar Java backend
+- [ ] Variable-size column header reads (string, binary, varchar)
+- [ ] Broader type/semantic parity beyond the initial fixed-width subset
 
 ### Phase 4: Performance Tuning
-- JMH benchmarks against native backend
-- C2 compilation verification (`-XX:+PrintCompilation`)
-- Optional specialized templates for top patterns
-- Full test suite validation
+- [ ] JMH benchmarks against native backend
+- [ ] C2 compilation verification (`-XX:+PrintCompilation`)
+- [ ] Optional specialized templates for top patterns
+- [ ] Full test suite validation
 
 ### Phase 5: AArch64 Validation
-- Test on ARM64 (Graviton, Apple Silicon)
-- Verify NEON intrinsic generation
-- Benchmark vs current scalar-only AArch64 native backend
+- [ ] Test on ARM64 (Graviton, Apple Silicon)
+- [ ] Verify NEON intrinsic generation
+- [ ] Benchmark vs current scalar-only AArch64 native backend
 
 ---
 
 ## Verification
 
-1. `mvn -Dtest=CompiledFilterRegressionTest test` -- end-to-end correctness
-   against Java interpreter baseline
-2. `mvn -Dtest=CompiledFilterIRSerializerTest test` -- IR serialization
-3. JMH micro-benchmarks comparing native vs vector backend throughput
-4. Manual: run QuestDB with `cairo.sql.jit.mode=vector`, execute filter queries,
-   verify correct results and no crashes
-5. ARM64 testing on CI or cloud instance
+Completed on this branch:
+
+1. [x] `mvn -pl core -DskipTests test-compile`
+2. [x] `mvn -pl core -DforkCount=0 -DreuseForks=false -Dtest=VectorCompiledFilterTest,VectorCompiledFilterIntegrationTest test`
+3. [x] `mvn -pl core -DforkCount=0 -DreuseForks=false -Dtest=CompiledFilterIRSerializerTest,CompiledFilterRegressionTest,PropServerConfigurationTest#testSqlJitMode test`
+
+Still pending:
+
+4. [ ] JMH micro-benchmarks comparing native vs vector backend throughput
+5. [ ] Manual QuestDB runs with `cairo.sql.jit.mode=vector` outside the test harness
+6. [ ] ARM64 testing on CI or cloud instance
 
 ---
 

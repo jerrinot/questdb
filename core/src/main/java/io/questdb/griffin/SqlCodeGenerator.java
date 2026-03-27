@@ -327,12 +327,11 @@ import io.questdb.griffin.model.RuntimeIntervalModel;
 import io.questdb.griffin.model.RuntimeIntrinsicIntervalModel;
 import io.questdb.griffin.model.WindowExpression;
 import io.questdb.griffin.model.WindowJoinContext;
-import io.questdb.jit.CompiledCountOnlyFilter;
-import io.questdb.jit.CompiledFilter;
 import io.questdb.jit.CompiledFilterIRSerializer;
 import io.questdb.jit.JitCountOnlyFilter;
 import io.questdb.jit.JitFilter;
-import io.questdb.jit.JitUtil;
+import io.questdb.jit.VectorCompiledCountOnlyFilter;
+import io.questdb.jit.VectorCompiledFilter;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.std.BitSet;
@@ -3228,9 +3227,10 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                 IntHashSet filterUsedColumnIndexes = new IntHashSet();
                 collectColumnIndexes(sqlNodeStack, factory.getMetadata(), filterExpr, filterUsedColumnIndexes);
 
-                final boolean useJit = executionContext.getJitMode() != SqlJitMode.JIT_MODE_DISABLED
+                final int jitMode = executionContext.getJitMode();
+                final boolean useJit = jitMode != SqlJitMode.JIT_MODE_DISABLED
                         && (!model.isUpdate() || executionContext.isWalApplication());
-                final boolean canCompile = factory.supportsPageFrameCursor() && JitUtil.isJitSupported();
+                final boolean canCompile = factory.supportsPageFrameCursor();
                 if (useJit && canCompile) {
                     JitFilter compiledFilter = null;
                     JitCountOnlyFilter compiledCountOnlyFilter = null;
@@ -3238,15 +3238,15 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                         int jitOptions;
                         final ObjList<Function> bindVarFunctions = new ObjList<>();
                         try (PageFrameCursor cursor = factory.getPageFrameCursor(executionContext, ORDER_ANY)) {
-                            final boolean forceScalar = executionContext.getJitMode() == SqlJitMode.JIT_MODE_FORCE_SCALAR;
+                            final boolean forceScalar = jitMode == SqlJitMode.JIT_MODE_FORCE_SCALAR;
                             jitIRSerializer.of(jitIRMem, executionContext, factory.getMetadata(), cursor, bindVarFunctions);
                             jitOptions = jitIRSerializer.serialize(filterExpr, forceScalar, enableJitDebug, enableJitNullChecks);
                         }
 
-                        compiledFilter = new CompiledFilter();
+                        compiledFilter = new VectorCompiledFilter();
                         compiledFilter.compile(jitIRMem, jitOptions);
 
-                        compiledCountOnlyFilter = new CompiledCountOnlyFilter();
+                        compiledCountOnlyFilter = new VectorCompiledCountOnlyFilter();
                         compiledCountOnlyFilter.compile(jitIRMem, jitOptions);
 
                         final Function limitLoFunction = getLimitLoFunctionOnly(model, executionContext);
@@ -3254,6 +3254,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
 
                         LOG.debug()
                                 .$("JIT enabled for (sub)query [tableName=").$safe(model.getName())
+                                .$(", backend=vector-java")
                                 .$(", fd=").$(executionContext.getRequestFd())
                                 .I$();
                         return new AsyncJitFilteredRecordCursorFactory(

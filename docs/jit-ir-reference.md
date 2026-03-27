@@ -14,20 +14,26 @@ fast row filtering. The pipeline is:
    memory buffer.
 2. The serializer returns a 32-bit **options** word encoding type-size, execution
    hint, and flags.
-3. **C++ backend** (`compiler.cpp`) reads the IR stream plus options, and uses
-   [asmjit](https://asmjit.com) to JIT-compile the instructions into native
-   machine code.
+3. A **backend** reads the IR stream plus options and executes/compiles the
+   filter.
 
-Three backends exist today: x86-64 scalar (`x86.h`), x86-64 AVX2 SIMD
-(`avx2.h`), and AArch64 scalar (`aarch64.h`).
+Four backends exist today: three native C++ backends that use
+[asmjit](https://asmjit.com) to JIT-compile the IR into machine code — x86-64
+scalar (`x86.h`), x86-64 AVX2 SIMD (`avx2.h`), and AArch64 scalar
+(`aarch64.h`) — and a pure-Java scalar interpreter (`VectorFilterInterpreter`)
+that evaluates the same IR without native code generation.
 
 ### Source Files
 
 | File | Role |
 |---|---|
 | `core/src/main/java/io/questdb/jit/CompiledFilterIRSerializer.java` | IR serializer (Java) |
-| `core/src/main/java/io/questdb/jit/CompiledFilter.java` | JIT-compiled filter wrapper (row-ID mode) |
-| `core/src/main/java/io/questdb/jit/CompiledCountOnlyFilter.java` | JIT-compiled filter wrapper (count-only mode) |
+| `core/src/main/java/io/questdb/jit/CompiledFilter.java` | Native JIT-compiled filter wrapper (row-ID mode) |
+| `core/src/main/java/io/questdb/jit/CompiledCountOnlyFilter.java` | Native JIT-compiled filter wrapper (count-only mode) |
+| `core/src/main/java/io/questdb/jit/VectorCompiledFilter.java` | Java interpreter filter wrapper (row-ID mode) |
+| `core/src/main/java/io/questdb/jit/VectorCompiledCountOnlyFilter.java` | Java interpreter filter wrapper (count-only mode) |
+| `core/src/main/java/io/questdb/jit/VectorFilterInterpreter.java` | Pure-Java scalar IR interpreter |
+| `core/src/main/java/io/questdb/jit/IrDecoder.java` | IR instruction decoder (Java records) |
 | `core/src/main/java/io/questdb/jit/FiltersCompiler.java` | JNI bridge to C++ |
 | `core/src/main/java/io/questdb/jit/JitUtil.java` | Architecture support check |
 | `core/src/main/c/share/jit/common.h` | Shared C++ types: `instruction_t`, `data_type_t`, `opcodes` |
@@ -340,6 +346,37 @@ Labels at index 2+ are user-defined via `BEGIN_SC`/`END_SC`, typically for
 
 Maximum labels: **8** (defined as `MAX_LABELS` in both Java and C++).
 
+#### Label Scoping for Chained IN() Expressions
+
+When multiple `IN()` expressions appear in the same AND chain, the serializer
+reuses the **same label index** (typically 2) for each one. For example,
+`a IN (1,2) AND b IN (3,4)` produces two `BEGIN_SC(2)`/`END_SC(2)` pairs in
+sequence:
+
+```
+BEGIN_SC(2)  ; first IN group
+...
+OR_SC(2)    ; on match, jump to END_SC(2) of THIS group
+...
+AND_SC(0)
+END_SC(2)   ; binds label 2 for the first group
+BEGIN_SC(2)  ; second IN group (reuses label index 2)
+...
+OR_SC(2)    ; must jump to END_SC(2) of THIS group, not the first
+...
+AND_SC(0)
+END_SC(2)   ; binds label 2 for the second group
+```
+
+In a native code generator (like asmjit), `BEGIN_SC` creates a new forward
+label object and `END_SC` binds it, so each pair naturally scopes correctly.
+
+In an interpreter, a naive approach of storing one target per label index fails
+because the second `END_SC(2)` overwrites the first. Each `AND_SC(2)`/`OR_SC(2)`
+must resolve to the nearest **following** `END_SC` with the same label index,
+not the globally last one. Pre-compute per-instruction jump targets during
+compilation rather than using a single per-label target array.
+
 #### Flag-Based Optimization
 
 When an `EQ` or `NE` instruction is immediately followed by `AND_SC` or `OR_SC`,
@@ -581,11 +618,18 @@ logic with `CBZ`, `AND`, and `CMP` instructions.
 
 **Floating-point division** (`float_div`, `double_div`):
 
-No explicit zero check. The backend emits `DIVSS`/`DIVSD` (x86) or
-`fdiv` (AArch64) directly, relying on IEEE 754 semantics:
-- `x / 0.0` produces `+Infinity` or `-Infinity`.
-- `0.0 / 0.0` produces `NaN`.
-- `NaN / x` or `x / NaN` produces `NaN`.
+The C++ native backends emit `DIVSS`/`DIVSD` (x86) or `fdiv` (AArch64) without
+an explicit zero check, relying on IEEE 754 semantics where `x / 0.0` produces
+`±Infinity`.
+
+**Semantic divergence:** QuestDB's non-JIT Function classes (`DivDoubleFunction`,
+etc.) return **NaN** for float/double division by zero, not `±Infinity`. A new
+backend should produce NaN on zero divisor to match the non-JIT path. The
+existing C++ backends produce `±Infinity`, which diverges from the non-JIT
+evaluator for queries like `col / 0 > 0` (JIT returns true via Infinity, non-JIT
+returns false via NaN). This divergence is tolerated because the regression tests
+only compare null-equality results for arithmetic expressions, but a backend
+aiming for exact parity should treat float division by zero as producing NaN.
 
 ---
 
@@ -641,7 +685,10 @@ inline bool cvt_null_check(data_type_t type) {
 - `i8` and `i16` columns: NULL check skipped during conversion (their NULL
   sentinels are specific GeoHash values, not the generic INT_NULL pattern).
 - `i32` to `i64`: if the 32-bit value equals `INT_NULL` (0x80000000), the result
-  is `LONG_NULL` (0x8000000000000000) instead of a sign-extended value.
+  is `LONG_NULL` (0x8000000000000000) instead of a sign-extended value. This is
+  critical for arithmetic null propagation: without it, `null_i32 + i64` widens
+  `INT_NULL` to `-2147483648L` (a valid long), bypassing the i64 null check in
+  the addition and producing a garbage result instead of `LONG_NULL`.
 - `i32` to `f32`/`f64`: if `INT_NULL`, the result is `NaN`.
 - `i64` to `f64`: if `LONG_NULL`, the result is `NaN`.
 
@@ -710,18 +757,66 @@ sentinel values:
 - **Integer arithmetic** (`add`, `sub`, `mul`, `div`): the x86 backend checks
   both operands for NULL and propagates the sentinel if either is NULL (using
   `cmove` conditional moves).
-- **Float/double arithmetic**: NaN propagation is handled automatically by IEEE
-  754 semantics.
+- **Float/double arithmetic**: NaN propagation for `+`, `-`, `*` is handled
+  automatically by IEEE 754 (any operation with NaN produces NaN). However,
+  float/double **division** requires an explicit zero check: QuestDB's non-JIT
+  evaluator returns NaN for `x / 0.0` (not `±Infinity`), so a backend must
+  check for zero divisor and produce NaN. See Section 4.10 for details.
 
 ### 6.3 NULL in Comparisons
 
-For ordered comparisons (`<`, `<=`, `>`, `>=`) on integer types with null checks
-enabled, the backend handles NULL by producing a false result when either operand
-is `INT_NULL` or `LONG_NULL`. This is implemented using conditional moves that
-set the result register to zero when a NULL sentinel is detected.
+When null checks are enabled, comparisons follow QuestDB's `Numbers.lessThan()`
+semantics, which differ between strict and non-strict operators.
 
-Float/double comparisons with NaN naturally return false for all ordered
-comparisons per IEEE 754.
+**Integer types** (`i32`, `i64`): when either operand is `INT_NULL` /
+`LONG_NULL`:
+
+| Operator | Both NULL | One NULL, one non-NULL |
+|---|---|---|
+| `EQ` (`=`) | true (raw sentinel comparison: `INT_NULL == INT_NULL`) | false |
+| `NE` (`<>`) | false (raw sentinel comparison) | true |
+| `LT` (`<`) | false | false |
+| `GT` (`>`) | false | false |
+| `LE` (`<=`) | true (`a == b`, both are the same sentinel) | false |
+| `GE` (`>=`) | true (`a == b`, both are the same sentinel) | false |
+
+The key distinction: strict operators (`<`, `>`) always return false when any
+NULL is involved. Non-strict operators (`<=`, `>=`) return true when **both**
+operands are NULL (because the sentinel values are equal). This matches the
+`Numbers.lessThan(a, b, negated)` function used by QuestDB's non-JIT evaluator:
+
+```java
+public static boolean lessThan(int a, int b, boolean negated) {
+    final boolean eq = a == b;
+    return (eq || (a != INT_NULL && b != INT_NULL))
+        && (negated ? (eq || a > b) : (!eq && a < b));
+}
+```
+
+This behavior means `column <= null` and `column >= null` act as IS NULL checks
+(returning true only for NULL rows), matching QuestDB's standard evaluation.
+
+**Float/double types**: NaN-based null handling follows an analogous pattern:
+
+| Operator | Both NaN | One NaN, one non-NaN |
+|---|---|---|
+| `EQ` | true | false |
+| `NE` | false | true |
+| `LT` | false | false |
+| `GT` | false | false |
+| `LE` | true | false |
+| `GE` | true | false |
+
+IEEE 754 naturally returns false for ordered comparisons involving NaN, but it
+also returns false for `NaN <= NaN`. A backend must override this: when **both**
+operands are NaN, `<=` and `>=` must return true to match QuestDB's IS NULL
+semantics.
+
+**Why this matters:** QuestDB's SQL evaluator treats `column op null` uniformly
+— the `null` keyword is serialized as the type's null sentinel, and comparisons
+against it follow the rules above. Without the both-NULL exception for `<=`/`>=`,
+queries like `f32 <= null` or `i32 >= null` produce zero rows instead of
+returning all NULL rows.
 
 ---
 
@@ -1177,18 +1272,27 @@ A new backend must implement the following:
 5. **Type conversions:** Implement the conversion matrix from Section 5.1.
    Handle NULL-aware conversions when `null_check` is set (Section 5.2).
 
-6. **Comparison operations:** Integer comparisons use standard signed compare.
-   Float/double comparisons use epsilon-based equality (Section 7). i128
-   comparisons use byte-level parallel compare (Section 4.9).
+6. **Comparison operations:** Integer comparisons use standard signed compare,
+   but with null checks enabled, must implement the strict/non-strict NULL
+   distinction: `<`/`>` return false when any operand is NULL, while `<=`/`>=`
+   return true when **both** are NULL (Section 6.3). Float/double comparisons
+   use epsilon-based equality (Section 7) and must handle both-NaN as true for
+   `<=`/`>=` (not false as IEEE 754 mandates). i128 comparisons use byte-level
+   parallel compare (Section 4.9).
 
 7. **Arithmetic operations:** With `null_check`, preserve NULL sentinels
-   (Section 6). Integer division must return NULL on zero divisor; float
-   division relies on IEEE 754 (Section 4.10).
+   (Section 6). Integer division must return NULL on zero divisor. Float
+   division should return NaN on zero divisor to match QuestDB's non-JIT
+   evaluator; relying on IEEE 754 `±Infinity` diverges from the expected
+   behavior (Section 4.10).
 
 8. **Short-circuit opcodes:** Implement label management (create, bind) and
    conditional jumps (AND_SC, OR_SC). Pre-create labels at indices 0 and 1.
    Handle `kFlagsEq`/`kFlagsNe` stack entries by using direct conditional
-   branches instead of materializing booleans (Section 4.8).
+   branches instead of materializing booleans (Section 4.8). When multiple
+   `IN()` expressions reuse the same label index, each `AND_SC`/`OR_SC` must
+   jump to the nearest following `END_SC` with the same label, not the last
+   one globally (Section 4.5).
 
 9. **Loop structure:** Iterate `input_index` from 0 to `rows_count - 1`. For
    each row, evaluate the IR. On match, store `input_index` in
@@ -1407,14 +1511,31 @@ These tests use `N_SIMD = 512` rows to exercise the AVX2 SIMD path, plus
 additional rows to cover the scalar tail. They test arithmetic operators,
 boolean combinations, NULL handling, mixed types, and multi-column filters.
 
-### 18.3 Verifying a New Backend
+### 18.3 Java Backend Unit Tests
+
+`VectorCompiledFilterTest` (in `core/src/test/java/.../jit/`) tests the
+`VectorFilterInterpreter` in isolation, verifying that the Java backend correctly
+decodes and evaluates IR instruction streams for basic comparisons, arithmetic,
+and count-only mode.
+
+`VectorCompiledFilterIntegrationTest` (in `core/src/test/java/.../griffin/`)
+tests the Java backend through the full SQL pipeline with actual table data.
+
+### 18.4 Verifying a New Backend
 
 To verify a new backend:
 
 1. Run `CompiledFilterRegressionTest` — this compares JIT output against the
-   Java interpreter for a wide range of filter expressions.
-2. Pay special attention to edge cases: NULL values, division by zero, mixed
-   type conversions, epsilon-based float equality, and short-circuit evaluation
-   with IN() lists.
+   non-JIT Java evaluator for a wide range of filter expressions.
+2. Pay special attention to edge cases:
+   - **NULL comparisons:** both strict (`<`, `>` → false) and non-strict
+     (`<=`, `>=` → true when both NULL) operators. See Section 6.3.
+   - **Division by zero:** integer division returns NULL sentinel; float
+     division should return NaN (not `±Infinity`). See Section 4.10.
+   - **Mixed-type NULL coercion:** `INT_NULL` widened to `LONG_NULL` for i32→i64
+     arithmetic, and to `NaN` for i32/i64→f32/f64 comparisons. See Section 5.2.
+   - **Short-circuit label scoping:** chained `IN()` lists reuse label indices;
+     each jump must resolve to its nearest `END_SC`. See Section 4.5.
+   - **Epsilon-based float equality** and **short-circuit evaluation**.
 3. Set the debug bit (bit 0) in options to log generated assembly for manual
    inspection.
