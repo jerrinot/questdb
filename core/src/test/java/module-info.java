@@ -24,6 +24,7 @@
 
 open module io.questdb.test {
     requires transitive io.questdb;
+    requires jdk.incubator.vector;
     requires static junit;
     requires transitive jdk.unsupported;
     requires static org.jetbrains.annotations;
