@@ -49,18 +49,27 @@ To reach full scalar parity with the native asmjit backends:
 2. Preserve the contract that any query the old native JIT could compile must
    still compile under the Java backend. If Java SIMD is ineligible, the Java
    backend must fall back to scalar instead of rejecting the query.
-3. Audit Java scalar semantics against native scalar for all fixed-width numeric
-   coercions across `i8`, `i16`, `i32`, `i64`, `f32`, and `f64`.
-4. Verify null semantics match native behavior for comparisons, boolean ops,
-   arithmetic, and mixed-type programs.
-5. Verify floating-point edge cases match the intended QuestDB semantics,
-   especially NaN handling, epsilon equality, and division-by-zero behavior.
-6. Close any remaining `i128` feature gap relative to native scalar. If native
-   only supports a limited subset, Java should match that exact subset.
-7. Verify variable-size header handling matches native scalar for
-   `STRING_HEADER`, `BINARY_HEADER`, and `VARCHAR_HEADER` cases.
-8. Keep bind-variable access compatible with the real producer layout in
-   `AsyncFilterUtils`, including mixed-width entries such as UUID.
+3. ~~Audit Java scalar semantics against native scalar for all fixed-width
+   numeric coercions across `i8`, `i16`, `i32`, `i64`, `f32`, and `f64`.~~
+   Done. Type coercion hierarchy matches: promotion rules for mixed int/float
+   comparisons and arithmetic are identical.
+4. ~~Verify null semantics match native behavior for comparisons, boolean ops,
+   arithmetic, and mixed-type programs.~~
+   Done. Null sentinel values, propagation rules, and comparison results match.
+   `null == null` → true, `null < x` → false, null arithmetic → null.
+5. ~~Verify floating-point edge cases match the intended QuestDB semantics,
+   especially NaN handling, epsilon equality, and division-by-zero behavior.~~
+   Done. Epsilon values (1e-10) match. NaN == NaN → true matches. Float
+   division by zero intentionally returns NaN (matching the non-JIT evaluator)
+   rather than ±Infinity (native hardware behavior).
+6. ~~Close any remaining `i128` feature gap relative to native scalar.~~ Done.
+   Both backends support only EQ/NE for i128, no arithmetic or ordering.
+7. ~~Verify variable-size header handling matches native scalar for
+   `STRING_HEADER`, `BINARY_HEADER`, and `VARCHAR_HEADER` cases.~~ Done. Both
+   backends read headers from aux tables and normalize to I4/I8 for comparison.
+8. ~~Keep bind-variable access compatible with the real producer layout in
+   `AsyncFilterUtils`, including mixed-width entries such as UUID.~~ Done. The
+   Java backend uses packed offsets that correctly match the producer layout.
 9. Add or keep A/B parity tests that compare Java scalar results to native
    scalar results while both implementations are still available for diffing.
 
@@ -68,14 +77,15 @@ To reach full scalar parity with the native asmjit backends:
 
 To reach parity with the native AVX2 backend:
 
-1. Match AVX2 eligibility rules exactly. Java SIMD should only run programs the
-   native AVX2 backend would also vectorize.
-2. Keep short-circuit programs scalar. Native AVX2 does not support
-   short-circuit execution in SIMD mode.
-3. Keep mixed-size programs scalar. Native AVX2 does not vectorize mixed-size
-   IR programs.
-4. Keep any small-int arithmetic cases scalar if native AVX2 also forces them
-   scalar for semantic reasons.
+1. ~~Match AVX2 eligibility rules exactly.~~ Done. Java SIMD is a strict subset
+   of native AVX2 eligibility. It rejects SC, mixed-size, and i8/i16 arithmetic
+   programs, and does not accept anything native would reject.
+2. ~~Keep short-circuit programs scalar.~~ Done. `VectorApiFilterExecutor.analyze()`
+   rejects any SC opcode, falling back to the scalar interpreter.
+3. ~~Keep mixed-size programs scalar.~~ Done. `tryCreate()` rejects programs
+   without `EXEC_HINT_SINGLE_SIZE`.
+4. ~~Keep any small-int arithmetic cases scalar.~~ Done. The serializer forces
+   `EXEC_HINT_SCALAR` for i8/i16 arithmetic programs.
 5. Finish the native-supported fixed-width SIMD matrix:
    - `i8`
    - `i16`
@@ -136,8 +146,24 @@ If the goal is to close parity methodically, the next sequence should be:
    existing suites pass. SC opcodes are only emitted when `scalarModeDetected`
    is true (mixed sizes or force-scalar), so SIMD-eligible programs are
    unaffected.
-2. Diff Java scalar against native scalar on the full pre-existing JIT corpus.
-3. Tighten Java SIMD eligibility to match native AVX2 exactly.
+2. ~~Diff Java scalar against native scalar on the full pre-existing JIT corpus.~~
+   Done. Systematic audit found the Java scalar backend semantically compatible
+   with native for all practical cases. Known intentional divergences:
+   - Float division by zero returns NaN (matching the non-JIT evaluator) instead
+     of ±Infinity (native hardware behavior).
+   - Bind variable layout uses packed offsets matching the actual producer
+     layout; native used uniform 8-byte stride (was broken for mixed
+     UUID+non-UUID binds).
+   - Regression tests added for float division by zero, integer division by zero
+     with null propagation, and nullable float arithmetic chains.
+3. ~~Tighten Java SIMD eligibility to match native AVX2 exactly.~~
+   Done. Java SIMD eligibility is already a strict subset of native AVX2:
+   - Rejects SC programs (correct: native AVX2 also scalar-only for SC).
+   - Rejects mixed-size programs (correct: native AVX2 also scalar-only).
+   - Rejects i8/i16 arithmetic (correct: serializer forces scalar for these).
+   - Does not handle i128 or variable-size headers (gap addressed in step 4).
+   No tightening needed; the Java SIMD path accepts nothing that native AVX2
+   would reject.
 4. Close the remaining AVX2-supported SIMD gaps, with variable-size header
    vectorization as the main likely missing area.
 5. Keep widening test coverage until every native-supported compiled shape is

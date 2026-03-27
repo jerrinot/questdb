@@ -312,6 +312,45 @@ public class CompiledFilterRegressionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testColumnFloatDivisionByZero() throws Exception {
+        // Tests that float/double division by zero produces NaN (treated as null),
+        // not ±Infinity as hardware would natively produce. The division-by-zero
+        // branch returns false (NaN > 1.0 is false), so the OR ensures rows match
+        // via the second predicate while the first exercises the edge case.
+        final String query = "x where f64 / 0.0 > 1.0 or f64 > 0.5";
+        final String ddl = "create table x as " +
+                "(select timestamp_sequence(400000000000, 500000000) as k," +
+                " rnd_double() f64" +
+                " from long_sequence(" + N_SIMD_WITH_SCALAR_TAIL + ")) timestamp(k)";
+        assertQueryNotNull(query, ddl);
+    }
+
+    @Test
+    public void testColumnIntDivisionByZeroNullable() throws Exception {
+        // Tests that integer division by zero with null checks produces null sentinel.
+        // Uses a column that contains zeros to trigger division by zero in some rows.
+        final String query = "x where i64 / i32_with_zeros > 0 or i64 > 50";
+        final String ddl = "create table x as " +
+                "(select timestamp_sequence(400000000000, 500000000) as k," +
+                " rnd_int(0, 10, 0) i32_with_zeros," +
+                " rnd_long(1, 100, 5) i64" +
+                " from long_sequence(" + N_SIMD_WITH_SCALAR_TAIL + ")) timestamp(k)";
+        assertQueryNullable(query, ddl);
+    }
+
+    @Test
+    public void testColumnFloatNullArithmetic() throws Exception {
+        // Tests null propagation in float/double arithmetic chains.
+        final String query = "x where f32 + 1.0 > 0.5 and f64 - 1.0 < 0.5";
+        final String ddl = "create table x as " +
+                "(select timestamp_sequence(400000000000, 500000000) as k," +
+                " rnd_float(5) f32," +
+                " rnd_double(5) f64" +
+                " from long_sequence(" + N_SIMD_WITH_SCALAR_TAIL + ")) timestamp(k)";
+        assertQueryNullable(query, ddl);
+    }
+
+    @Test
     public void testColumnIntConstantComparison() throws Exception {
         final String ddl = "create table x as " +
                 "(select timestamp_sequence(400000000000, 500000000) as k," +
