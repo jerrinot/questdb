@@ -118,9 +118,10 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
     private static final int EXEC_HINT_MIXED_SIZE_TYPE = 2;
     private static final int EXEC_HINT_SCALAR = 0;
     private static final int EXEC_HINT_SINGLE_SIZE_TYPE = 1;
-    // Keep short-circuit IR disabled while the Java backend is the default JIT path.
-    // This preserves native-backend coverage while allowing more existing tests to
-    // exercise the vectorized Java execution path.
+    // When true, the serializer emits short-circuit opcodes (AND_SC, OR_SC, BEGIN_SC,
+    // END_SC) for pure AND/OR chains when scalar mode is detected. SIMD-eligible
+    // programs are unaffected because the SC guard only fires when scalarModeDetected
+    // is true (mixed sizes or force-scalar).
     private static final boolean ENABLE_SHORT_CIRCUIT = true;
     private static final int INSTRUCTION_SIZE = Integer.BYTES + Integer.BYTES + Long.BYTES + Long.BYTES;
     // Maximum number of labels supported by the backend (must match LabelArray::MAX_LABELS in x86.h)
