@@ -257,16 +257,23 @@ another long (2 slots) is on the stack. The deepest point in the example
 is [MapValue(1), slot(1), longVal(2), 100000L(2)] = 6 slots. Declaring
 maxStack=4 causes a VerifyError — must be 6.
 
-**Available conversions:**
+**Available conversions** (all emit exactly 1 byte):
 | Method | Stack effect | Notes |
 |--------|-------------|-------|
 | i2l()  | int -> long | Widen: 1 slot becomes 2 |
 | i2f()  | int -> float | Same slot count |
 | i2d()  | int -> double | 1 slot becomes 2 |
+| i2b()  | int -> byte (as int) | Truncates |
+| i2s()  | int -> short (as int) | Truncates |
 | l2i()  | long -> int | Narrow: 2 slots become 1 |
 | l2d()  | long -> double | Same slot count (2) |
+| l2f()  | long -> float | 2 slots become 1 |
 | f2d()  | float -> double | 1 slot becomes 2 |
+| f2i()  | float -> int | Same slot count |
+| f2l()  | float -> long | 1 slot becomes 2 |
 | d2f()  | double -> float | 2 slots become 1 |
+| d2i()  | double -> int | 2 slots become 1 |
+| d2l()  | double -> long | Same slot count (2) |
 
 **Pool constant methods and their load instructions:**
 | Pool method | Pool slots | Load instruction |
@@ -425,3 +432,17 @@ missing. It follows the same convention as `iadd()` — single byte via
    endMethodCode(), every method needs: putShort(exceptionCount),
    putShort(attributeCount). For methods with a StackMapTable, the
    attribute count is 1, not 0.
+
+7. **Calling pool methods after finishPool().** All `pool*()` calls must
+   happen before `finishPool()`. Calling them after corrupts the class
+   file. If you need a constant that depends on runtime values, pool it
+   before finishPool and reference the index later.
+
+8. **if_icmp operand order.** Stack has `[..., val1, val2]`. The JVM
+   pops `val2` (top), then `val1`, and tests `val1 <cond> val2`. So
+   after pushing A then B, `if_icmpge` tests `A >= B`.
+
+9. **Long loop counters.** There is no `if_lcmpge`. For long comparison,
+   use `lcmp` (pushes -1/0/1 as int) followed by `ifle`/`ifge`/etc.
+   Example: `lload rowsCount; lload row; lcmp; ifle EXIT` exits when
+   `rowsCount <= row`.

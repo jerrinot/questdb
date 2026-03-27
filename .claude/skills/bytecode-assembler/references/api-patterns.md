@@ -66,16 +66,34 @@ spec requirement). `poolCount += 2` internally.
 | `aload(n)` | aload_0..3 or aload n | -> objectref | Optimized for 0-3 |
 | `iload(n)` | iload_0..3 or iload n | -> int | Optimized for 0-3 |
 | `lload(n)` | lload_0..3 or lload n | -> long (2 slots) | Optimized for 0-3 |
+| `fload(n)` | fload n | -> float | |
+| `dload(n)` | dload n | -> double (2 slots) | |
 | `istore(n)` | istore_0..3 or istore n | int -> | Optimized for 0-3 |
 | `lstore(n)` | lstore_0..3 or lstore n | long -> | Optimized for 0-3 |
+| `fstore(n)` | fstore n | float -> | |
+| `dstore(n)` | dstore n | double -> | |
 
 #### Constants
 | Method | Stack effect | Notes |
 |--------|-------------|-------|
 | `iconst(v)` | -> int | Optimized: iconst_m1..5, bipush, sipush. Range: Short.MIN_VALUE..Short.MAX_VALUE |
-| `lconst_0()` | -> long | Push 0L |
+| `lconst_0()` | -> long (2 slots) | Push 0L |
+| `lconst_1()` | -> long (2 slots) | Push 1L |
+| `fconst_0()` | -> float | Push 0.0f |
+| `fconst_1()` | -> float | Push 1.0f |
+| `fconst_2()` | -> float | Push 2.0f |
+| `dconst_0()` | -> double (2 slots) | Push 0.0d |
+| `dconst_1()` | -> double (2 slots) | Push 1.0d |
 | `ldc(index)` | -> value | Load from constant pool (int, float, string). Auto-selects ldc vs ldc_w. |
 | `ldc2_w(index)` | -> value (2 slots) | Load long or double from constant pool. |
+
+For int constants outside `Short.MIN_VALUE..Short.MAX_VALUE`, use
+`poolIntConst(v)` + `ldc(index)`. For long/double constants, use
+`poolLongConst(v)` / `poolDoubleConst(v)` + `ldc2_w(index)`.
+
+**Important:** All `pool*` methods must be called before `finishPool()`.
+No pool methods can be called after `finishPool()` closes the constant
+pool.
 
 #### Invocations
 | Method | Stack effect | Notes |
@@ -92,39 +110,58 @@ spec requirement). `poolCount += 2` internally.
 | `putfield(idx)` | objectref, value -> |
 | `getStatic(idx)` | -> value |
 
-#### Arithmetic and conversions
-| Method | Stack | Bytes | Notes |
-|--------|-------|-------|-------|
-| `iadd()` | int, int -> int | 1 | |
-| `isub()` | int, int -> int | 1 | |
-| `ladd()` | long, long -> long | 1 | |
-| `lmul()` | long, long -> long | 1 | |
-| `irem()` | int, int -> int | 1 | |
-| `ineg()` | int -> int | 1 | |
-| `i2l()` | int -> long | **2** | Uses putShort — emits nop + opcode |
-| `i2f()` | int -> float | **2** | Uses putShort |
-| `i2d()` | int -> double | **2** | Uses putShort |
-| `i2b()` | int -> byte (as int) | **2** | Uses putShort |
-| `i2s()` | int -> short (as int) | **2** | Uses putShort |
-| `l2i()` | long -> int | **2** | Uses putShort |
-| `l2d()` | long -> double | **2** | Uses putShort |
-| `l2f()` | long -> float | **2** | Uses putShort |
-| `f2d()` | float -> double | **2** | Uses putShort |
-| `f2i()` | float -> int | **2** | Uses putShort |
-| `f2l()` | float -> long | **2** | Uses putShort |
-| `d2f()` | double -> float | **2** | Uses putShort |
-| `d2i()` | double -> int | **2** | Uses putShort |
-| `d2l()` | double -> long | **2** | Uses putShort |
-| `lcmp()` | long, long -> int | 1 | -1, 0, or 1 |
-| `dcmpg()` | double, double -> int | 1 | NaN -> 1 |
+#### Arithmetic
+| Method | Stack | Notes |
+|--------|-------|-------|
+| `iadd()` | int, int -> int | |
+| `isub()` | int, int -> int | |
+| `imul()` | int, int -> int | |
+| `idiv()` | int, int -> int | |
+| `irem()` | int, int -> int | |
+| `ineg()` | int -> int | |
+| `ladd()` | long, long -> long | |
+| `lsub()` | long, long -> long | |
+| `lmul()` | long, long -> long | |
+| `ldiv()` | long, long -> long | |
+| `lneg()` | long -> long | |
+| `fadd()` | float, float -> float | |
+| `fsub()` | float, float -> float | |
+| `fmul()` | float, float -> float | |
+| `fdiv()` | float, float -> float | |
+| `fneg()` | float -> float | |
+| `dadd()` | double, double -> double | |
+| `dsub()` | double, double -> double | |
+| `dmul()` | double, double -> double | |
+| `ddiv()` | double, double -> double | |
+| `dneg()` | double -> double | |
 
-**WARNING: Conversion instructions emit 2 bytes, not 1.** All `i2l`,
-`f2d`, etc. methods use `putShort(opcode)` which writes a leading `0x00`
-(nop) byte followed by the actual opcode. Arithmetic and stack ops use
-`putByte(opcode)` and emit 1 byte. This distinction matters when computing
-byte offsets for stack map tables or branch targets. The existing factories
-account for this implicitly because they capture positions via
-`asm.position()` rather than counting bytes manually.
+#### Comparisons
+| Method | Stack | Notes |
+|--------|-------|-------|
+| `lcmp()` | long, long -> int | -1, 0, or 1 |
+| `fcmpg()` | float, float -> int | NaN -> 1 |
+| `dcmpg()` | double, double -> int | NaN -> 1 |
+
+#### Type conversions
+| Method | Stack | Notes |
+|--------|-------|-------|
+| `i2l()` | int -> long | 1 slot becomes 2 |
+| `i2f()` | int -> float | Same slot count |
+| `i2d()` | int -> double | 1 slot becomes 2 |
+| `i2b()` | int -> byte (as int) | Truncates |
+| `i2s()` | int -> short (as int) | Truncates |
+| `l2i()` | long -> int | 2 slots become 1 |
+| `l2d()` | long -> double | Same slot count (2) |
+| `l2f()` | long -> float | 2 slots become 1 |
+| `f2d()` | float -> double | 1 slot becomes 2 |
+| `f2i()` | float -> int | Same slot count |
+| `f2l()` | float -> long | 1 slot becomes 2 |
+| `d2f()` | double -> float | 2 slots become 1 |
+| `d2i()` | double -> int | 2 slots become 1 |
+| `d2l()` | double -> long | Same slot count (2) |
+
+All arithmetic, comparison, and conversion instructions emit exactly 1
+byte each.
 
 #### Stack manipulation
 | Method | Stack |
@@ -138,12 +175,23 @@ account for this implicitly because they capture positions via
 | Method | Returns | Notes |
 |--------|---------|-------|
 | `goto_()` | branch position | Unconditional jump (forward or backward). Patch with `setJmp`. |
+| `ifeq()` | branch position | Jump if top int == 0 |
 | `ifne()` | branch position | Jump if top int != 0 |
 | `iflt()` | branch position | Jump if top int < 0 |
 | `ifle()` | branch position | Jump if top int <= 0 |
-| `if_icmpne()` | branch position | Jump if top two ints not equal |
-| `if_icmpge()` | branch position | Jump if int1 >= int2 |
+| `ifge()` | branch position | Jump if top int >= 0 |
+| `ifgt()` | branch position | Jump if top int > 0 |
+| `if_icmpeq()` | branch position | Jump if int1 == int2 (pops both) |
+| `if_icmpne()` | branch position | Jump if int1 != int2 (pops both) |
+| `if_icmplt()` | branch position | Jump if int1 < int2 (pops both) |
+| `if_icmple()` | branch position | Jump if int1 <= int2 (pops both) |
+| `if_icmpge()` | branch position | Jump if int1 >= int2 (pops both) |
+| `if_icmpgt()` | branch position | Jump if int1 > int2 (pops both) |
 | `setJmp(branch, target)` | void | Patch any jump (forward or backward): writes `target - branch + 1` at branch position. Negative offset = backward jump. |
+
+**`if_icmp*` operand order:** Stack has `[..., val1, val2]`. The JVM pops
+`val2` (top), then `val1`, and evaluates `val1 <cond> val2`. So
+`if_icmpge` after pushing A then B tests `A >= B`.
 
 #### Returns
 | Method | Stack |
@@ -151,6 +199,8 @@ account for this implicitly because they capture positions via
 | `return_()` | (void return) |
 | `ireturn()` | int -> (returns int) |
 | `lreturn()` | long -> (returns long) |
+| `freturn()` | float -> (returns float) |
+| `dreturn()` | double -> (returns double) |
 
 #### Other
 | Method | Stack | Notes |

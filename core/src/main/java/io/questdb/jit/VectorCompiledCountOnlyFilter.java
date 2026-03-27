@@ -28,6 +28,7 @@ import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.SqlException;
 
 public class VectorCompiledCountOnlyFilter implements JitCountOnlyFilter {
+    private ScalarBytecodeFilterCompiler.ScalarFilterBody bytecodeFilter;
     private final VectorFilterInterpreter interpreter = new VectorFilterInterpreter();
 
     @Override
@@ -39,6 +40,16 @@ public class VectorCompiledCountOnlyFilter implements JitCountOnlyFilter {
             long varsSize,
             long rowsCount
     ) {
+        if (bytecodeFilter != null) {
+            return bytecodeFilter.countRows(
+                    dataAddress,
+                    dataSize,
+                    varSizeAuxAddress,
+                    varsAddress,
+                    varsSize,
+                    rowsCount
+            );
+        }
         return interpreter.filterCount(
                 dataAddress,
                 dataSize,
@@ -56,9 +67,24 @@ public class VectorCompiledCountOnlyFilter implements JitCountOnlyFilter {
     @Override
     public void compile(MemoryCARW filter, int options) throws SqlException {
         interpreter.compile(filter, options);
+        compileBytecode(filter, options);
+    }
+
+    public boolean usesBytecode() {
+        return bytecodeFilter != null;
     }
 
     public boolean usesVectorApi() {
         return interpreter.usesVectorApi();
+    }
+
+    private void compileBytecode(MemoryCARW filter, int options) throws SqlException {
+        if (interpreter.usesVectorApi()) {
+            return;
+        }
+        IrDecoder decoder = new IrDecoder();
+        IrDecoder.Instruction[] instructions = decoder.decode(filter);
+        LoweredProgram program = IrLowering.lower(instructions, options);
+        bytecodeFilter = ScalarBytecodeFilterCompiler.compile(program);
     }
 }

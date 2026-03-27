@@ -109,24 +109,74 @@ public class BytecodeAssembler {
         putByte(0xbf);
     }
 
-    @SuppressWarnings("unused")
     public void d2f() {
-        putShort(0x90);
+        putByte(0x90);
     }
 
-    @SuppressWarnings("unused")
     public void d2i() {
-        putShort(0x8E);
+        putByte(0x8e);
     }
 
-    @SuppressWarnings("unused")
     public void d2l() {
-        putShort(0x8F);
+        putByte(0x8f);
     }
 
-    @SuppressWarnings("unused")
+    public void dadd() {
+        putByte(0x63);
+    }
+
     public void dcmpg() {
         putByte(0x98);
+    }
+
+    public void dconst_0() {
+        putByte(0x0e);
+    }
+
+    public void dconst_1() {
+        putByte(0x0f);
+    }
+
+    public void ddiv() {
+        putByte(0x6f);
+    }
+
+    public void dmul() {
+        putByte(0x6b);
+    }
+
+    public void dneg() {
+        putByte(0x77);
+    }
+
+    public void dload(int value) {
+        if (value > 255) {
+            putByte(0xc4);
+            putByte(0x18);
+            putShort(value);
+        } else {
+            putByte(0x18);
+            putByte(value);
+        }
+    }
+
+    public void dreturn() {
+        putByte(0xaf);
+    }
+
+    public void dstore(int value) {
+        if (value > 255) {
+            putByte(0xc4);
+            putByte(0x39);
+            putShort(value);
+        } else {
+            putByte(0x39);
+            putByte(value);
+        }
+    }
+
+    public void dsub() {
+        putByte(0x67);
     }
 
     public void defineClass(int thisClassIndex) {
@@ -213,17 +263,77 @@ public class BytecodeAssembler {
     }
 
     public void f2d() {
-        putShort(0x8D);
+        putByte(0x8d);
     }
 
-    @SuppressWarnings("unused")
     public void f2i() {
-        putShort(0x8B);
+        putByte(0x8b);
     }
 
-    @SuppressWarnings("unused")
     public void f2l() {
-        putShort(0x8C);
+        putByte(0x8c);
+    }
+
+    public void fadd() {
+        putByte(0x62);
+    }
+
+    public void fcmpg() {
+        putByte(0x96);
+    }
+
+    public void fconst_0() {
+        putByte(0x0b);
+    }
+
+    public void fconst_1() {
+        putByte(0x0c);
+    }
+
+    public void fconst_2() {
+        putByte(0x0d);
+    }
+
+    public void fdiv() {
+        putByte(0x6e);
+    }
+
+    public void fload(int value) {
+        if (value > 255) {
+            putByte(0xc4);
+            putByte(0x17);
+            putShort(value);
+        } else {
+            putByte(0x17);
+            putByte(value);
+        }
+    }
+
+    public void fmul() {
+        putByte(0x6a);
+    }
+
+    public void fneg() {
+        putByte(0x76);
+    }
+
+    public void freturn() {
+        putByte(0xae);
+    }
+
+    public void fstore(int value) {
+        if (value > 255) {
+            putByte(0xc4);
+            putByte(0x38);
+            putShort(value);
+        } else {
+            putByte(0x38);
+            putByte(value);
+        }
+    }
+
+    public void fsub() {
+        putByte(0x66);
     }
 
     public void fieldCount(int count) {
@@ -286,28 +396,51 @@ public class BytecodeAssembler {
         return genericGoto(0xa7);
     }
 
+    /**
+     * Unconditional jump with 4-byte offset. Use for jumps that may
+     * exceed the signed 16-bit range of regular goto.
+     */
+    public int goto_w() {
+        putByte(0xc8);
+        int pos = position();
+        putInt(0); // 4-byte placeholder
+        return pos;
+    }
+
     public void i2b() {
-        putShort(0x91);
+        putByte(0x91);
     }
 
     public void i2d() {
-        putShort(0x87);
+        putByte(0x87);
     }
 
     public void i2f() {
-        putShort(0x86);
+        putByte(0x86);
     }
 
     public void i2l() {
-        putShort(0x85);
+        putByte(0x85);
     }
 
     public void i2s() {
-        putShort(0x93);
+        putByte(0x93);
+    }
+
+    public void idiv() {
+        putByte(0x6c);
+    }
+
+    public void imul() {
+        putByte(0x68);
     }
 
     public void iadd() {
         putByte(0x60);
+    }
+
+    public void iand() {
+        putByte(0x7e);
     }
 
     public void iconst(int v) {
@@ -328,12 +461,40 @@ public class BytecodeAssembler {
         }
     }
 
+    public int if_icmpeq() {
+        return genericGoto(0x9f);
+    }
+
     public int if_icmpge() {
         return genericGoto(0xa2);
     }
 
+    public int if_icmpgt() {
+        return genericGoto(0xa3);
+    }
+
+    public int if_icmple() {
+        return genericGoto(0xa4);
+    }
+
+    public int if_icmplt() {
+        return genericGoto(0xa1);
+    }
+
     public int if_icmpne() {
         return genericGoto(0xa0);
+    }
+
+    public int ifeq() {
+        return genericGoto(0x99);
+    }
+
+    public int ifge() {
+        return genericGoto(0x9c);
+    }
+
+    public int ifgt() {
+        return genericGoto(0x9d);
     }
 
     @SuppressWarnings("unused")
@@ -350,9 +511,16 @@ public class BytecodeAssembler {
     }
 
     public void iinc(int index, int inc) {
-        putByte(iinc);
-        putByte(index);
-        putByte(inc);
+        if (index > 255 || inc > 127 || inc < -128) {
+            putByte(0xc4); // wide
+            putByte(iinc);
+            putShort(index);
+            putShort(inc);
+        } else {
+            putByte(iinc);
+            putByte(index);
+            putByte(inc);
+        }
     }
 
     public void iload(int value) {
@@ -361,6 +529,10 @@ public class BytecodeAssembler {
 
     public void ineg() {
         putByte(0x74);
+    }
+
+    public void ior() {
+        putByte(0x80);
     }
 
     public void init(Class<?> host) {
@@ -423,15 +595,15 @@ public class BytecodeAssembler {
     }
 
     public void l2d() {
-        putShort(0x8A);
+        putByte(0x8a);
     }
 
     public void l2f() {
-        putShort(0x89);
+        putByte(0x89);
     }
 
     public void l2i() {
-        putShort(0x88);
+        putByte(0x88);
     }
 
     public void ladd() {
@@ -444,6 +616,14 @@ public class BytecodeAssembler {
 
     public void lconst_0() {
         putByte(0x09);
+    }
+
+    public void lconst_1() {
+        putByte(0x0a);
+    }
+
+    public void ldiv() {
+        putByte(0x6d);
     }
 
     public void ldc(int index) {
@@ -473,6 +653,10 @@ public class BytecodeAssembler {
         putByte(0x69);
     }
 
+    public void lneg() {
+        putByte(0x75);
+    }
+
     public <T> Class<T> loadClass() {
         Class<T> x = loadClass(host);
         assert x != null;
@@ -481,6 +665,10 @@ public class BytecodeAssembler {
 
     public void lreturn() {
         putByte(0xad);
+    }
+
+    public void lsub() {
+        putByte(0x65);
     }
 
     public void lstore(int value) {
@@ -543,14 +731,20 @@ public class BytecodeAssembler {
         return index;
     }
 
+    public int poolFloatConst(float value) {
+        putByte(0x04);
+        putInt(Float.floatToRawIntBits(value));
+        return poolCount++;
+    }
+
     public int poolField(int classIndex, int nameAndTypeIndex) {
         return poolRef(0x09, classIndex, nameAndTypeIndex);
     }
 
-    public void poolIntConst(int value) {
+    public int poolIntConst(int value) {
         putByte(0x03);
         putInt(value);
-        poolCount += 1;
+        return poolCount++;
     }
 
     public int poolInterfaceMethod(Class<?> clazz, String name, String sig) {
@@ -661,6 +855,14 @@ public class BytecodeAssembler {
         putByte(0x01);
     }
 
+    public void putITEM_Double() {
+        putByte(0x03);
+    }
+
+    public void putITEM_Float() {
+        putByte(0x02);
+    }
+
     public void putITEM_Long() {
         putByte(0x04);
     }
@@ -709,6 +911,13 @@ public class BytecodeAssembler {
 
     public void setJmp(int branch, int target) {
         putShort(branch, target - branch + 1);
+    }
+
+    /**
+     * Patch a 4-byte jump offset for goto_w.
+     */
+    public void setJmpW(int branch, int target) {
+        putInt(branch, target - branch + 1);
     }
 
     public void setupPool() {
@@ -851,8 +1060,14 @@ public class BytecodeAssembler {
                 putByte(code3);
                 break;
             default:
-                putByte(code);
-                putByte(value);
+                if (value > 255) {
+                    putByte(0xc4); // wide prefix
+                    putByte(code);
+                    putShort(value);
+                } else {
+                    putByte(code);
+                    putByte(value);
+                }
                 break;
         }
     }
