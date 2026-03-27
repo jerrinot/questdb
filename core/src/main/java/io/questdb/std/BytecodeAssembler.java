@@ -47,6 +47,11 @@ public class BytecodeAssembler {
     private static final int aload_1 = 0x2b;
     private static final int aload_2 = 0x2c;
     private static final int aload_3 = 0x2d;
+    private static final int astore = 0x3a;
+    private static final int astore_0 = 0x4b;
+    private static final int astore_1 = 0x4c;
+    private static final int astore_2 = 0x4d;
+    private static final int astore_3 = 0x4e;
     private static final int bipush = 0x10;
     private static final int iconst_0 = 3;
     private static final int iconst_m1 = 2;
@@ -99,14 +104,27 @@ public class BytecodeAssembler {
         optimisedIO(aload_0, aload_1, aload_2, aload_3, aload, value);
     }
 
+    public void aconst_null() {
+        putByte(0x01);
+    }
+
     public void append_frame(int itemCount, int offset) {
         putByte(0xfc + itemCount - 1);
         putShort(offset);
     }
 
+    public void astore(int value) {
+        optimisedIO(astore_0, astore_1, astore_2, astore_3, astore, value);
+    }
+
     @SuppressWarnings("unused")
     public void athrow() {
         putByte(0xbf);
+    }
+
+    public void checkcast(int classIndex) {
+        putByte(0xc0);
+        putShort(classIndex);
     }
 
     public void d2f() {
@@ -392,6 +410,11 @@ public class BytecodeAssembler {
         putShort(index);
     }
 
+    public void getstatic(int index) {
+        putByte(0xb2);
+        putShort(index);
+    }
+
     public int goto_() {
         return genericGoto(0xa7);
     }
@@ -663,6 +686,10 @@ public class BytecodeAssembler {
         return x;
     }
 
+    public void lastore() {
+        putByte(0x50);
+    }
+
     public void lreturn() {
         putByte(0xad);
     }
@@ -921,10 +948,14 @@ public class BytecodeAssembler {
     }
 
     public void setupPool() {
+        setupPool(0x33);
+    }
+
+    public void setupPool(int version) {
         // magic
         putInt(0xCAFEBABE);
         // version
-        putInt(0x33);
+        putInt(version);
         // skip pool count, write later when we know the value
         putShort(0);
 

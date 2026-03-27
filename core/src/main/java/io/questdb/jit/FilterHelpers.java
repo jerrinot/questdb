@@ -37,6 +37,62 @@ public final class FilterHelpers {
     private static final float FLOAT_EPSILON = 1e-10f;
     private static final sun.misc.Unsafe UNSAFE = Unsafe.getUnsafe();
 
+    /**
+     * Pre-computed iota array for vectorized row-ID generation.
+     * Used by VectorBytecodeFilterCompiler to create the iota vector
+     * without per-call allocation. Sized for the largest possible
+     * vector species (AVX-512 = 64 byte lanes = 8 long lanes).
+     */
+    public static final long[] IOTA_LONG = {
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+            32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+            48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+    };
+
+    // --- Vector API helpers (called by generated vectorized filter classes) ---
+
+    /**
+     * Creates a MemorySegment for a column's data, reading the column address
+     * from the data pointer array.
+     */
+    public static java.lang.foreign.MemorySegment columnSegment(long dataAddress, int columnIndex) {
+        long colAddr = UNSAFE.getLong(dataAddress + ((long) columnIndex << 3));
+        if (colAddr == 0) {
+            return java.lang.foreign.MemorySegment.NULL;
+        }
+        return java.lang.foreign.MemorySegment.ofAddress(colAddr).reinterpret(Long.MAX_VALUE);
+    }
+
+    /**
+     * Creates a MemorySegment wrapping a raw address with maximum size.
+     */
+    public static java.lang.foreign.MemorySegment segment(long address) {
+        return java.lang.foreign.MemorySegment.ofAddress(address).reinterpret(Long.MAX_VALUE);
+    }
+
+    /**
+     * Returns the native byte order. Called once at method entry, stored in a local.
+     */
+    public static java.nio.ByteOrder nativeByteOrder() {
+        return java.nio.ByteOrder.nativeOrder();
+    }
+
+    /**
+     * Returns the preferred LongVector species. Called once at method entry.
+     */
+    public static jdk.incubator.vector.VectorSpecies<Long> longSpecies() {
+        return jdk.incubator.vector.LongVector.SPECIES_PREFERRED;
+    }
+
+    /**
+     * Creates the iota LongVector [0, 1, 2, ..., species.length()-1].
+     * Called once at method entry for row-ID mode.
+     */
+    public static jdk.incubator.vector.LongVector iotaVector(jdk.incubator.vector.VectorSpecies<Long> species) {
+        return jdk.incubator.vector.LongVector.fromArray(species, IOTA_LONG, 0);
+    }
+
     // --- Column reads ---
 
     public static byte readByte(long dataAddress, int columnIndex, long row) {

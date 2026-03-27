@@ -66,7 +66,7 @@ import java.util.concurrent.TimeUnit;
  * </ul>
  */
 @State(Scope.Benchmark)
-@BenchmarkMode(Mode.SingleShotTime)
+@BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 public class JitBackendBenchmark {
     private static final int NUM_ROWS = 128 * 1024 * 1024;
