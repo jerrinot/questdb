@@ -434,6 +434,10 @@ public class BytecodeAssembler {
         putShort(0x88);
     }
 
+    public void ladd() {
+        putByte(0x61);
+    }
+
     public void lcmp() {
         putByte(0x94);
     }
