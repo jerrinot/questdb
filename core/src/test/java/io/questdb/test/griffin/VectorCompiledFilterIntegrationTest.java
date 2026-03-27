@@ -30,6 +30,7 @@ import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory;
 import io.questdb.jit.VectorCompiledFilter;
+import io.questdb.jit.VectorFilterInterpreter;
 import io.questdb.std.str.StringSink;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
@@ -47,11 +48,16 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
                             ") timestamp(ts)"
             );
 
-            final String query = "select i64, i32 from x where i64 + 1 > 3 and i32 in (2, 5, 7)";
+            final String query = "select i64, i32 from x where i32 + 1 > 3 and i32 in (2, 5, 7)";
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_ENABLED);
             try (RecordCursorFactory factory = select(query)) {
                 Assert.assertTrue(factory.usesCompiledFilter());
                 assertVectorCompiledFilter(factory);
+                final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    CursorPrinter.println(cursor, factory.getMetadata(), sink);
+                }
+                assertVectorApiExecutedIfSelected(query, factory, vectorApiExecutionCount);
             }
         });
     }
@@ -66,8 +72,8 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
                             ") timestamp(ts)"
             );
 
-            final String query = "select i64, i32 from x where i64 + 1 > 3 and i32 in (2, 5, 7)";
-            final String countQuery = "select count() from x where i64 + 1 > 3 and i32 in (2, 5, 7)";
+            final String query = "select i64, i32 from x where i32 + 1 > 3 and i32 in (2, 5, 7)";
+            final String countQuery = "select count() from x where i32 + 1 > 3 and i32 in (2, 5, 7)";
             final StringSink actualSink = new StringSink();
 
             sink.clear();
@@ -80,13 +86,16 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
             }
 
             actualSink.clear();
+            VectorFilterInterpreter.resetVectorApiExecutionCount();
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_FORCE_VECTOR);
             try (RecordCursorFactory factory = select(query)) {
                 Assert.assertTrue(factory.usesCompiledFilter());
                 assertVectorCompiledFilter(factory);
+                final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
                 try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
                     CursorPrinter.println(cursor, factory.getMetadata(), actualSink);
                 }
+                assertVectorApiExecutedIfSelected(query, factory, vectorApiExecutionCount);
             }
             TestUtils.assertEquals("vector backend result mismatch", sink, actualSink);
 
@@ -103,10 +112,12 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_FORCE_VECTOR);
             try (RecordCursorFactory factory = select(countQuery)) {
                 Assert.assertTrue(factory.usesCompiledFilter());
+                final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
                 try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
                     Assert.assertTrue(cursor.hasNext());
                     Assert.assertEquals(expectedCount, cursor.getRecord().getLong(0));
                 }
+                assertVectorApiExecutedIfSelected(countQuery, factory, vectorApiExecutionCount);
             }
         });
     }

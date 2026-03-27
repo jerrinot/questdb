@@ -75,7 +75,10 @@ import io.questdb.griffin.engine.functions.rnd.SharedRandom;
 import io.questdb.griffin.engine.ops.AlterOperation;
 import io.questdb.griffin.engine.ops.AlterOperationBuilder;
 import io.questdb.griffin.model.ExplainModel;
+import io.questdb.jit.JitFilter;
 import io.questdb.jit.JitUtil;
+import io.questdb.jit.VectorCompiledFilter;
+import io.questdb.jit.VectorFilterInterpreter;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.mp.SCSequence;
@@ -2169,7 +2172,47 @@ public abstract class AbstractCairoTest extends AbstractTest {
     protected void assertSqlRunWithJit(CharSequence selectSql) throws Exception {
         try (RecordCursorFactory factory = select(selectSql)) {
             Assert.assertTrue("JIT was not enabled for selectSql: " + selectSql, factory.usesCompiledFilter());
+            final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
+            try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                while (cursor.hasNext()) {
+                    // Iterate to force compiled filter execution.
+                }
+            }
+            assertVectorApiExecutedIfSelected(selectSql, factory, vectorApiExecutionCount);
         }
+    }
+
+    protected final void assertVectorApiExecutedIfSelected(
+            CharSequence sql,
+            RecordCursorFactory factory,
+            long beforeExecutionCount
+    ) {
+        if (beforeExecutionCount >= 0) {
+            Assert.assertTrue(
+                    "Vector API path was not executed for query: " + sql,
+                    VectorFilterInterpreter.getVectorApiExecutionCount() > beforeExecutionCount
+            );
+        }
+    }
+
+    protected final long getVectorApiExecutionCountIfSelected(RecordCursorFactory factory) {
+        final JitFilter compiledFilter = findCompiledFilter(factory);
+        if (compiledFilter instanceof VectorCompiledFilter && ((VectorCompiledFilter) compiledFilter).usesVectorApi()) {
+            return VectorFilterInterpreter.getVectorApiExecutionCount();
+        }
+        return -1;
+    }
+
+    protected final JitFilter findCompiledFilter(RecordCursorFactory factory) {
+        RecordCursorFactory current = factory;
+        while (current != null) {
+            final JitFilter compiledFilter = current.getCompiledFilter();
+            if (compiledFilter != null) {
+                return compiledFilter;
+            }
+            current = current.getBaseFactory();
+        }
+        return null;
     }
 
     protected void assertSqlWithTypes(CharSequence expected, CharSequence sql) throws SqlException {

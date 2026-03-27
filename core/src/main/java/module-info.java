@@ -24,6 +24,7 @@
 
 open module io.questdb {
     requires transitive jdk.unsupported;
+    requires jdk.incubator.vector;
     requires static org.jetbrains.annotations;
     requires static java.management;
     requires jdk.management;

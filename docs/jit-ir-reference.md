@@ -1,13 +1,13 @@
 # QuestDB JIT IR Reference
 
 This document describes the Intermediate Representation (IR) used by QuestDB's
-JIT filter compiler. It is intended to be sufficient for implementing a new
-backend that consumes the IR and generates native code.
+JIT filter compiler. It is intended to be sufficient for implementing a backend
+that consumes the IR and either generates native code or executes it directly.
 
 ## Overview
 
-The JIT system compiles SQL WHERE clause predicates into native machine code for
-fast row filtering. The pipeline is:
+The JIT system compiles SQL WHERE clause predicates into a compact IR for fast
+row filtering. The pipeline is:
 
 1. **Java frontend** (`CompiledFilterIRSerializer`) traverses the SQL expression
    tree in post-order and emits a flat IR instruction stream into a contiguous
@@ -17,11 +17,13 @@ fast row filtering. The pipeline is:
 3. A **backend** reads the IR stream plus options and executes/compiles the
    filter.
 
-Four backends exist today: three native C++ backends that use
+Four backend families exist today: three native C++ backends that use
 [asmjit](https://asmjit.com) to JIT-compile the IR into machine code — x86-64
 scalar (`x86.h`), x86-64 AVX2 SIMD (`avx2.h`), and AArch64 scalar
-(`aarch64.h`) — and a pure-Java scalar interpreter (`VectorFilterInterpreter`)
-that evaluates the same IR without native code generation.
+(`aarch64.h`) — and one Java backend (`VectorFilterInterpreter`). The Java
+backend evaluates the same IR without native code generation and can either
+interpret it scalarly or delegate eligible fixed-width programs to
+`VectorApiFilterExecutor` for Vector API execution.
 
 ### Source Files
 
@@ -30,12 +32,13 @@ that evaluates the same IR without native code generation.
 | `core/src/main/java/io/questdb/jit/CompiledFilterIRSerializer.java` | IR serializer (Java) |
 | `core/src/main/java/io/questdb/jit/CompiledFilter.java` | Native JIT-compiled filter wrapper (row-ID mode) |
 | `core/src/main/java/io/questdb/jit/CompiledCountOnlyFilter.java` | Native JIT-compiled filter wrapper (count-only mode) |
-| `core/src/main/java/io/questdb/jit/VectorCompiledFilter.java` | Java interpreter filter wrapper (row-ID mode) |
-| `core/src/main/java/io/questdb/jit/VectorCompiledCountOnlyFilter.java` | Java interpreter filter wrapper (count-only mode) |
-| `core/src/main/java/io/questdb/jit/VectorFilterInterpreter.java` | Pure-Java scalar IR interpreter |
+| `core/src/main/java/io/questdb/jit/VectorCompiledFilter.java` | Java backend filter wrapper (row-ID mode) |
+| `core/src/main/java/io/questdb/jit/VectorCompiledCountOnlyFilter.java` | Java backend filter wrapper (count-only mode) |
+| `core/src/main/java/io/questdb/jit/VectorFilterInterpreter.java` | Java backend driver: scalar interpreter plus optional Vector API dispatch |
+| `core/src/main/java/io/questdb/jit/VectorApiFilterExecutor.java` | Java Vector API executor for eligible fixed-width programs |
 | `core/src/main/java/io/questdb/jit/IrDecoder.java` | IR instruction decoder (Java records) |
 | `core/src/main/java/io/questdb/jit/FiltersCompiler.java` | JNI bridge to C++ |
-| `core/src/main/java/io/questdb/jit/JitUtil.java` | Architecture support check |
+| `core/src/main/java/io/questdb/jit/JitUtil.java` | Native JIT / Vector API support checks |
 | `core/src/main/c/share/jit/common.h` | Shared C++ types: `instruction_t`, `data_type_t`, `opcodes` |
 | `core/src/main/c/share/jit/compiler.h` | JNI function declarations |
 | `core/src/main/c/share/jit/compiler.cpp` | `Function`/`CountOnlyFunction` structs, JNI implementations |
@@ -268,8 +271,10 @@ Pushes a bind variable value.
 | `ipayload.lo` | Bind variable index (0-based position in the vars array) |
 | `ipayload.hi` | 0 (unused) |
 
-The backend reads the value from `vars_ptr + 8 * index` with a type-appropriate
-load size. See Section 10.4 for the full bind variable memory layout.
+The native backends read the value from `vars_ptr + 8 * index` with a
+type-appropriate load size. The Java backend precomputes byte offsets per bind
+variable from the IR stream and reads from those offsets instead. See
+Section 10.4 for the full bind variable memory layout.
 
 ### 4.4 Operator Instructions
 
@@ -898,6 +903,15 @@ On x86-64:
 
 On AArch64: always use `scalar_loop()` (no SIMD backend implemented).
 
+In the Java backend, `VectorFilterInterpreter.compile()` uses the same options
+word to decide whether `VectorApiFilterExecutor` can be used. The current
+Vector API path is intentionally more conservative than native AVX2:
+
+- It requires `exec_hint == 1` (single-size).
+- It currently supports only fixed-width `I4`, `I8`, `F4`, and `F8` programs.
+- It falls back to the scalar interpreter for short-circuit opcodes, variable-
+  size header checks, `I16`, and mixed-type programs.
+
 ---
 
 ## 9. Short-Circuit Evaluation
@@ -905,6 +919,13 @@ On AArch64: always use `scalar_loop()` (no SIMD backend implemented).
 Short-circuit evaluation is used only in **scalar mode** for top-level AND or OR
 chains. It allows early termination of predicate evaluation when the result is
 already determined.
+
+**Current branch status:** the IR format and opcode semantics below are still
+valid, but the serializer currently has short-circuit emission hard-disabled
+(`ENABLE_SHORT_CIRCUIT = false` in `CompiledFilterIRSerializer`). So the current
+branch emits regular boolean `AND`/`OR` chains instead of `AND_SC` / `OR_SC`
+forms. This section documents the short-circuit IR shape for when emission is
+re-enabled and for any backend that needs to support pre-existing streams.
 
 ### 9.1 AND Chains
 
@@ -990,7 +1011,7 @@ typedef int64_t (*CompiledFn)(
     int64_t *cols,             // Array of column data pointers
     int64_t  cols_count,       // Number of columns
     int64_t *varsize_indexes,  // Array of variable-size column auxiliary data pointers
-    int64_t *vars,             // Array of bind variable values (8 bytes each)
+    int64_t *vars,             // Bind-variable memory blob (see Section 10.4)
     int64_t  vars_count,       // Number of bind variables
     int64_t *filtered_rows,    // Output: array of matching row indices
     int64_t  rows_count        // Total number of rows to filter
@@ -1005,7 +1026,7 @@ typedef int64_t (*CompiledCountOnlyFn)(
     int64_t *cols,             // Array of column data pointers
     int64_t  cols_count,       // Number of columns
     int64_t *varsize_indexes,  // Array of variable-size column auxiliary data pointers
-    int64_t *vars,             // Array of bind variable values (8 bytes each)
+    int64_t *vars,             // Bind-variable memory blob (see Section 10.4)
     int64_t  vars_count,       // Number of bind variables
     int64_t  rows_count        // Total number of rows to filter
 );
@@ -1037,8 +1058,12 @@ integers) are written sequentially by the filter function.
 
 The bind variable memory is populated by `AsyncFilterUtils.writeBindVarFunction()`
 which writes each bind variable value sequentially with **type-dependent sizes**.
-The backend reads bind variables using `vars_ptr + 8 * index` as the byte offset
-(`read_vars_mem()` in `x86.h:112`).
+This creates a backend ABI distinction:
+
+- The native backends still address bind variables using `vars_ptr + 8 * index`
+  as the byte offset (`read_vars_mem()` in `x86.h:112` and `aarch64.h:130`).
+- The Java backend computes a byte offset table from the decoded IR and reads
+  bind variables at those exact offsets.
 
 Per-type sizes written by the producer:
 
@@ -1052,9 +1077,8 @@ Per-type sizes written by the producer:
 | DOUBLE | 8 | `putDouble(value)` |
 | UUID | 16 | `putLong128(lo, hi)` — two consecutive 64-bit values |
 
-The backend addresses each bind variable at `vars_ptr + 8 * index` regardless
-of type (`read_vars_mem()` in `x86.h:112` and `aarch64.h:130`). For most types,
-each entry is exactly 8 bytes and the `8 * index` stride is correct.
+For most types, each entry is exactly 8 bytes and the native `8 * index` stride
+is correct.
 
 **UUID breaks this contract.** The current producer writes 16 bytes for UUID
 (`putLong128` at `AsyncFilterUtils.java:213`). LONG128 is not a separate case
@@ -1062,15 +1086,18 @@ in the producer — unsupported bind-variable types (including bare LONG128) fal
 through to an exception at `AsyncFilterUtils.java:216`. So this issue is
 specific to UUID bind variables.
 
-The backend still uses `8 * index` addressing for UUID. Concretely: if a UUID
-bind variable is at index `i`, it occupies bytes `[8*i, 8*i+16)`. Any bind
+The native backends still use `8 * index` addressing for UUID. Concretely: if a
+UUID bind variable is at index `i`, it occupies bytes `[8*i, 8*i+16)`. Any bind
 variable at index `i+1` will be read from `8*(i+1) = 8*i+8`, which lands in the
 middle of the UUID value.
 
 This means **a UUID bind variable followed by any other bind variable produces
-incorrect results.** A new backend must either:
-- Replicate this limitation (UUID bind variables must be the last or only entry).
-- Or adopt a different addressing scheme and coordinate with the producer.
+incorrect results in the native backends.** The Java backend does not share this
+limitation because it uses computed byte offsets instead of a uniform stride.
+
+A new backend must decide explicitly whether to:
+- Replicate the native limitation (`8 * index` addressing).
+- Or adopt offset-based addressing and coordinate with the producer ABI.
 
 The serializer does not enforce this ordering, but the type-compatibility rules
 (Section 13.2) constrain UUID to its own predicate, which limits how often UUID
@@ -1266,8 +1293,10 @@ A new backend must implement the following:
    - Binary headers: same algorithm, 8-byte header (Section 4.6).
    - Varchar headers: load 8 bytes from aux vector at `row * 16` (Section 4.7).
 
-4. **Bind variable reads (`Var`):** Load from `vars_ptr + 8 * index` with
-   type-appropriate size (Section 10.4). Note the UUID caveat.
+4. **Bind variable reads (`Var`):** Use the bind-variable addressing scheme
+   described in Section 10.4. Native backends currently use `vars_ptr + 8 *
+   index`; offset-based backends should read from computed byte offsets. Note
+   the UUID caveat.
 
 5. **Type conversions:** Implement the conversion matrix from Section 5.1.
    Handle NULL-aware conversions when `null_check` is set (Section 5.2).
@@ -1504,22 +1533,26 @@ resolution, and IN() list serialization. They do not execute the generated IR.
 
 `CompiledFilterRegressionTest` (in `core/src/test/java/.../griffin/`) tests the
 full pipeline: SQL parsing, IR serialization, JIT compilation, and execution.
-Each test runs a SQL query with the JIT-compiled filter and compares the result
-against the Java-interpreted filter to ensure correctness.
+Each test runs a SQL query with the compiled filter and compares the result
+against the non-JIT evaluator to ensure correctness.
 
-These tests use `N_SIMD = 512` rows to exercise the AVX2 SIMD path, plus
-additional rows to cover the scalar tail. They test arithmetic operators,
-boolean combinations, NULL handling, mixed types, and multi-column filters.
+These tests use `N_SIMD = 512` rows to exercise vectorized execution paths plus
+additional rows to cover scalar tails. The current harness executes the compiled
+cursor rather than only checking that JIT was selected, and it asserts real
+Vector API execution whenever a query was compiled onto the Java Vector API
+path. The suite tests arithmetic operators, boolean combinations, NULL
+handling, mixed types, and multi-column filters.
 
 ### 18.3 Java Backend Unit Tests
 
 `VectorCompiledFilterTest` (in `core/src/test/java/.../jit/`) tests the
 `VectorFilterInterpreter` in isolation, verifying that the Java backend correctly
 decodes and evaluates IR instruction streams for basic comparisons, arithmetic,
-and count-only mode.
+count-only mode, scalar fallback, and selected Vector API paths.
 
 `VectorCompiledFilterIntegrationTest` (in `core/src/test/java/.../griffin/`)
-tests the Java backend through the full SQL pipeline with actual table data.
+tests the Java backend through the full SQL pipeline with actual table data and
+asserts Vector API execution for vectorizable queries.
 
 ### 18.4 Verifying a New Backend
 

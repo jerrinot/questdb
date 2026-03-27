@@ -30,6 +30,7 @@ import io.questdb.std.Numbers;
 import io.questdb.std.Unsafe;
 
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static io.questdb.jit.CompiledFilterIRSerializer.ADD;
 import static io.questdb.jit.CompiledFilterIRSerializer.AND;
@@ -69,6 +70,7 @@ public class VectorFilterInterpreter {
     private static final float FLOAT_EPSILON = 1e-10f;
     private static final int NULL_CHECKS_FLAG = 1 << 6;
     private static final sun.misc.Unsafe UNSAFE = Unsafe.getUnsafe();
+    private static final AtomicLong VECTOR_API_EXECUTION_COUNT = new AtomicLong();
 
     private final IrDecoder decoder = new IrDecoder();
     private final java.lang.ThreadLocal<ExecutionState> tlState = new java.lang.ThreadLocal<>();
@@ -76,6 +78,7 @@ public class VectorFilterInterpreter {
     private int[] jumpTargets = new int[0];
     private boolean nullChecks;
     private int[] varOffsets = new int[0];
+    private VectorApiFilterExecutor vectorExecutor;
 
     public void compile(MemoryCARW filter, int options) throws SqlException {
         final IrDecoder.Instruction[] decoded = decoder.decode(filter);
@@ -86,6 +89,7 @@ public class VectorFilterInterpreter {
         varOffsets = offsets;
         jumpTargets = targets;
         nullChecks = (options & NULL_CHECKS_FLAG) != 0;
+        vectorExecutor = VectorApiFilterExecutor.tryCreate(decoded, offsets, options, nullChecks);
         tlState.remove();
     }
 
@@ -98,6 +102,16 @@ public class VectorFilterInterpreter {
             long filteredRowsAddress,
             long rowsCount
     ) {
+        if (vectorExecutor != null) {
+            VECTOR_API_EXECUTION_COUNT.incrementAndGet();
+            return vectorExecutor.filter(
+                    dataAddress,
+                    dataSize,
+                    varsAddress,
+                    filteredRowsAddress,
+                    rowsCount
+            );
+        }
         long filteredCount = 0;
         for (long row = 0; row < rowsCount; row++) {
             if (evaluateRow(dataAddress, dataSize, varSizeAuxAddress, varsAddress, varsSize, row)) {
@@ -116,6 +130,15 @@ public class VectorFilterInterpreter {
             long varsSize,
             long rowsCount
     ) {
+        if (vectorExecutor != null) {
+            VECTOR_API_EXECUTION_COUNT.incrementAndGet();
+            return vectorExecutor.filterCount(
+                    dataAddress,
+                    dataSize,
+                    varsAddress,
+                    rowsCount
+            );
+        }
         long filteredCount = 0;
         for (long row = 0; row < rowsCount; row++) {
             if (evaluateRow(dataAddress, dataSize, varSizeAuxAddress, varsAddress, varsSize, row)) {
@@ -123,6 +146,18 @@ public class VectorFilterInterpreter {
             }
         }
         return filteredCount;
+    }
+
+    public static long getVectorApiExecutionCount() {
+        return VECTOR_API_EXECUTION_COUNT.get();
+    }
+
+    public static void resetVectorApiExecutionCount() {
+        VECTOR_API_EXECUTION_COUNT.set(0);
+    }
+
+    public boolean usesVectorApi() {
+        return vectorExecutor != null;
     }
 
     private static boolean asBoolean(ScalarValue value) {

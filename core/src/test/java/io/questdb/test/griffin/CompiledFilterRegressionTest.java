@@ -1506,9 +1506,12 @@ public class CompiledFilterRegressionTest extends AbstractCairoTest {
     private long runJitCountQuery(CharSequence countQuery) throws SqlException {
         try (RecordCursorFactory factory = select(countQuery)) {
             Assert.assertTrue("JIT was not enabled for query: " + countQuery, factory.usesCompiledFilter());
+            final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
             try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
                 Assert.assertTrue(cursor.hasNext());
-                return cursor.getRecord().getLong(0);
+                final long count = cursor.getRecord().getLong(0);
+                assertVectorApiExecutedIfSelected(countQuery, factory, vectorApiExecutionCount);
+                return count;
             }
         }
     }
@@ -1516,10 +1519,12 @@ public class CompiledFilterRegressionTest extends AbstractCairoTest {
     private void runJitQuery(CharSequence query) throws SqlException {
         try (RecordCursorFactory factory = select(query)) {
             Assert.assertTrue("JIT was not enabled for query: " + query, factory.usesCompiledFilter());
+            final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
             try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
                 RecordMetadata metadata = factory.getMetadata();
                 CursorPrinter.println(cursor, metadata, jitSink);
             }
+            assertVectorApiExecutedIfSelected(query, factory, vectorApiExecutionCount);
         }
     }
 

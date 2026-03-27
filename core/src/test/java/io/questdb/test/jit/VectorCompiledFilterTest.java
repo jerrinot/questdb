@@ -39,10 +39,13 @@ import static io.questdb.jit.CompiledFilterIRSerializer.AND_SC;
 import static io.questdb.jit.CompiledFilterIRSerializer.BEGIN_SC;
 import static io.questdb.jit.CompiledFilterIRSerializer.END_SC;
 import static io.questdb.jit.CompiledFilterIRSerializer.EQ;
+import static io.questdb.jit.CompiledFilterIRSerializer.F4_TYPE;
+import static io.questdb.jit.CompiledFilterIRSerializer.F8_TYPE;
 import static io.questdb.jit.CompiledFilterIRSerializer.GT;
 import static io.questdb.jit.CompiledFilterIRSerializer.I16_TYPE;
 import static io.questdb.jit.CompiledFilterIRSerializer.I4_TYPE;
 import static io.questdb.jit.CompiledFilterIRSerializer.IMM;
+import static io.questdb.jit.CompiledFilterIRSerializer.LE;
 import static io.questdb.jit.CompiledFilterIRSerializer.LT;
 import static io.questdb.jit.CompiledFilterIRSerializer.MEM;
 import static io.questdb.jit.CompiledFilterIRSerializer.OR;
@@ -51,6 +54,9 @@ import static io.questdb.jit.CompiledFilterIRSerializer.RET;
 import static io.questdb.jit.CompiledFilterIRSerializer.VAR;
 
 public class VectorCompiledFilterTest {
+    private static final int I4_SINGLE_SIZE_OPTIONS = (2 << 1) | (1 << 4);
+    private static final int F8_SINGLE_SIZE_OPTIONS = (3 << 1) | (1 << 4);
+
     @Test
     public void testInterpretsArithmeticAndCountOnly() throws Exception {
         try (
@@ -81,8 +87,10 @@ public class VectorCompiledFilterTest {
             putOperator(ir, AND);
             putOperator(ir, RET);
 
-            filter.compile(ir, 0);
-            countOnlyFilter.compile(ir, 0);
+            filter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
+            countOnlyFilter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
+            Assert.assertTrue(filter.usesVectorApi());
+            Assert.assertTrue(countOnlyFilter.usesVectorApi());
 
             long count = filter.call(
                     dataAddresses.getAddress(),
@@ -135,7 +143,8 @@ public class VectorCompiledFilterTest {
             putLabel(ir, END_SC, 2);
             putOperator(ir, RET);
 
-            filter.compile(ir, 0);
+            filter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
+            Assert.assertFalse(filter.usesVectorApi());
 
             long count = filter.call(
                     dataAddresses.getAddress(),
@@ -205,6 +214,98 @@ public class VectorCompiledFilterTest {
         }
     }
 
+    @Test
+    public void testInterpretsFloatArithmeticWithVectorApi() throws Exception {
+        try (
+                MemoryCARW ir = Vm.getCARWInstance(1024, 1, MemoryTag.NATIVE_JIT);
+                MemoryCARW col0 = Vm.getCARWInstance(64, 1, MemoryTag.NATIVE_JIT);
+                MemoryCARW col1 = Vm.getCARWInstance(64, 1, MemoryTag.NATIVE_JIT);
+                DirectLongList dataAddresses = new DirectLongList(2, MemoryTag.NATIVE_OFFLOAD);
+                DirectLongList filteredRows = new DirectLongList(8, MemoryTag.NATIVE_OFFLOAD);
+                VectorCompiledFilter filter = new VectorCompiledFilter();
+                VectorCompiledCountOnlyFilter countOnlyFilter = new VectorCompiledCountOnlyFilter()
+        ) {
+            putFloats(col0, 1.5f, 0.5f, Float.NaN, 4.0f);
+            putFloats(col1, 0.5f, 1.0f, 2.0f, -1.0f);
+
+            dataAddresses.add(col0.getAddress());
+            dataAddresses.add(col1.getAddress());
+
+            putFloatingImmediate(ir, F4_TYPE, 2.0);
+            putInstruction(ir, MEM, F4_TYPE, 1, 0);
+            putInstruction(ir, MEM, F4_TYPE, 0, 0);
+            putOperator(ir, ADD);
+            putOperator(ir, GT);
+            putOperator(ir, RET);
+
+            filter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
+            countOnlyFilter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
+            Assert.assertTrue(filter.usesVectorApi());
+            Assert.assertTrue(countOnlyFilter.usesVectorApi());
+
+            long count = filter.call(
+                    dataAddresses.getAddress(),
+                    dataAddresses.size(),
+                    0,
+                    0,
+                    0,
+                    filteredRows.getAddress(),
+                    4
+            );
+            filteredRows.setPos(count);
+
+            Assert.assertEquals(1, count);
+            Assert.assertEquals(3, filteredRows.get(0));
+
+            long countOnly = countOnlyFilter.call(
+                    dataAddresses.getAddress(),
+                    dataAddresses.size(),
+                    0,
+                    0,
+                    0,
+                    4
+            );
+            Assert.assertEquals(1, countOnly);
+        }
+    }
+
+    @Test
+    public void testInterpretsDoubleNaNNullComparisonsWithVectorApi() throws Exception {
+        try (
+                MemoryCARW ir = Vm.getCARWInstance(1024, 1, MemoryTag.NATIVE_JIT);
+                MemoryCARW column = Vm.getCARWInstance(64, 1, MemoryTag.NATIVE_JIT);
+                DirectLongList dataAddresses = new DirectLongList(1, MemoryTag.NATIVE_OFFLOAD);
+                DirectLongList filteredRows = new DirectLongList(8, MemoryTag.NATIVE_OFFLOAD);
+                VectorCompiledFilter filter = new VectorCompiledFilter()
+        ) {
+            putDoubles(column, 1.0, Double.NaN, 2.0, Double.NaN);
+            dataAddresses.add(column.getAddress());
+
+            putFloatingImmediate(ir, F8_TYPE, Double.NaN);
+            putInstruction(ir, MEM, F8_TYPE, 0, 0);
+            putOperator(ir, LE);
+            putOperator(ir, RET);
+
+            filter.compile(ir, F8_SINGLE_SIZE_OPTIONS);
+            Assert.assertTrue(filter.usesVectorApi());
+
+            long count = filter.call(
+                    dataAddresses.getAddress(),
+                    dataAddresses.size(),
+                    0,
+                    0,
+                    0,
+                    filteredRows.getAddress(),
+                    4
+            );
+            filteredRows.setPos(count);
+
+            Assert.assertEquals(2, count);
+            Assert.assertEquals(1, filteredRows.get(0));
+            Assert.assertEquals(3, filteredRows.get(1));
+        }
+    }
+
     private static void putInstruction(MemoryCARW memory, int opcode, int type, long payloadLo, long payloadHi) {
         memory.putInt(opcode);
         memory.putInt(type);
@@ -212,9 +313,28 @@ public class VectorCompiledFilterTest {
         memory.putLong(payloadHi);
     }
 
+    private static void putFloatingImmediate(MemoryCARW memory, int type, double value) {
+        memory.putInt(IMM);
+        memory.putInt(type);
+        memory.putDouble(value);
+        memory.putLong(0);
+    }
+
     private static void putInts(MemoryCARW memory, int... values) {
         for (int value : values) {
             memory.putInt(value);
+        }
+    }
+
+    private static void putFloats(MemoryCARW memory, float... values) {
+        for (float value : values) {
+            memory.putFloat(value);
+        }
+    }
+
+    private static void putDoubles(MemoryCARW memory, double... values) {
+        for (double value : values) {
+            memory.putDouble(value);
         }
     }
 

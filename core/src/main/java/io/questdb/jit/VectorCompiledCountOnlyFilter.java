@@ -57,4 +57,8 @@ public class VectorCompiledCountOnlyFilter implements JitCountOnlyFilter {
     public void compile(MemoryCARW filter, int options) throws SqlException {
         interpreter.compile(filter, options);
     }
+
+    public boolean usesVectorApi() {
+        return interpreter.usesVectorApi();
+    }
 }
