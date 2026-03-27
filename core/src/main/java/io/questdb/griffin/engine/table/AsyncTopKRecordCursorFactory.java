@@ -51,7 +51,7 @@ import io.questdb.griffin.engine.orderby.LimitedSizeLongTreeChain;
 import io.questdb.griffin.engine.orderby.RecordComparatorCompiler;
 import io.questdb.griffin.engine.orderby.SortedLightRecordCursorFactory;
 import io.questdb.griffin.engine.orderby.SortedRecordCursorFactory;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.IntHashSet;
 import io.questdb.std.Misc;
@@ -85,7 +85,7 @@ public class AsyncTopKRecordCursorFactory extends AbstractRecordCursorFactory {
             @Nullable Function filter,
             @Nullable IntHashSet filterUsedColumnIndexes,
             @Nullable ObjList<Function> perWorkerFilters,
-            @Nullable CompiledFilter compiledFilter,
+            @Nullable JitFilter compiledFilter,
             @Nullable MemoryCARW bindVarMemory,
             @Nullable ObjList<Function> bindVarFunctions,
             @NotNull @Transient RecordComparatorCompiler recordComparatorCompiler,
@@ -214,7 +214,7 @@ public class AsyncTopKRecordCursorFactory extends AbstractRecordCursorFactory {
         rows.clear();
         final LimitedSizeLongTreeChain chain = atom.getTreeChain(slotId);
         final RecordComparator comparator = atom.getComparator(slotId);
-        final CompiledFilter compiledFilter = filterCtx.getCompiledFilter();
+        final JitFilter compiledFilter = filterCtx.getCompiledFilter();
         final Function filter = filterCtx.getFilter(slotId);
         try {
             if (compiledFilter == null || frameMemory.hasColumnTops()) {

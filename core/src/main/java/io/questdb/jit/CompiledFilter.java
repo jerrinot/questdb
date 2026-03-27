@@ -30,8 +30,6 @@ import io.questdb.std.MemoryTag;
 import io.questdb.std.ThreadLocal;
 import io.questdb.std.Unsafe;
 
-import java.io.Closeable;
-
 /**
  * A wrapper for a JIT-compiled filter function that evaluates SQL WHERE clause predicates
  * and collects matching row IDs.
@@ -48,7 +46,7 @@ import java.io.Closeable;
  * @see CompiledCountOnlyFilter
  * @see CompiledFilterIRSerializer
  */
-public class CompiledFilter implements Closeable {
+public class CompiledFilter implements JitFilter {
     private static final ThreadLocal<FiltersCompiler.JitError> tlJitError = new ThreadLocal<>(FiltersCompiler.JitError::new);
     private long fnAddress;
 

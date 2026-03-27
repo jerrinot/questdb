@@ -35,7 +35,7 @@ import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.bind.CompiledFilterSymbolBindVariable;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.ObjList;
 import org.jetbrains.annotations.NotNull;
@@ -52,7 +52,7 @@ public class AsyncFilterUtils {
     }
 
     public static void applyCompiledFilter(
-            @NotNull CompiledFilter compiledFilter,
+            @NotNull JitFilter compiledFilter,
             @NotNull MemoryCARW bindVarMemory,
             @NotNull ObjList<Function> bindVarFunctions,
             @NotNull PageFrameReduceTask task
@@ -62,7 +62,7 @@ public class AsyncFilterUtils {
 
     public static void applyCompiledFilter(
             @Nullable PageFrameMemory frameMemory,
-            @NotNull CompiledFilter compiledFilter,
+            @NotNull JitFilter compiledFilter,
             @NotNull MemoryCARW bindVarMemory,
             @NotNull ObjList<Function> bindVarFunctions,
             @NotNull PageFrameReduceTask task
@@ -88,7 +88,7 @@ public class AsyncFilterUtils {
     }
 
     public static void applyCompiledFilter(
-            @NotNull CompiledFilter compiledFilter,
+            @NotNull JitFilter compiledFilter,
             @NotNull MemoryCARW bindVarMemory,
             @NotNull ObjList<Function> bindVarFunctions,
             @NotNull PageFrameMemory frameMemory,

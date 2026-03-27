@@ -34,7 +34,7 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.table.ConcurrentTimeFrameCursor;
 import io.questdb.griffin.engine.table.PushdownFilterExtractor;
 import io.questdb.griffin.model.ExpressionNode;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.mp.SCSequence;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
@@ -154,7 +154,7 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
     }
 
     @Nullable
-    default CompiledFilter getCompiledFilter() {
+    default JitFilter getCompiledFilter() {
         return null;
     }
 
@@ -364,7 +364,7 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
     }
 
     /**
-     * @return true if the factory uses a {@link io.questdb.jit.CompiledFilter}.
+     * @return true if the factory uses a {@link io.questdb.jit.JitFilter}.
      */
     default boolean usesCompiledFilter() {
         return false;

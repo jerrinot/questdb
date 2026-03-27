@@ -47,7 +47,7 @@ import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.table.parquet.PartitionDecoder;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.std.DirectIntList;
 import io.questdb.std.IntList;
 import io.questdb.std.LongList;
@@ -90,7 +90,7 @@ public final class ExtraNullColumnCursorFactory extends AbstractRecordCursorFact
     }
 
     @Override
-    public CompiledFilter getCompiledFilter() {
+    public JitFilter getCompiledFilter() {
         return base.getCompiledFilter();
     }
 

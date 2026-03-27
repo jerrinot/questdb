@@ -576,7 +576,7 @@ public class Bootstrap {
                 verifyFileOpts(path, cairoConfig);
                 cairoConfig.getVolumeDefinitions().forEach((alias, volumePath) -> verifyFileSystem(path, volumePath, "create table allowed volume [" + alias + ']', true, false));
             }
-            if (JitUtil.isJitSupported()) {
+            if (JitUtil.isJitSupported() || JitUtil.isVectorApiAvailable()) {
                 final int jitMode = cairoConfig.getSqlJitMode();
                 switch (jitMode) {
                     case SqlJitMode.JIT_MODE_ENABLED:
@@ -587,6 +587,9 @@ public class Bootstrap {
                         break;
                     case SqlJitMode.JIT_MODE_DISABLED:
                         log.advisoryW().$(" - SQL JIT compiler mode: off").$();
+                        break;
+                    case SqlJitMode.JIT_MODE_FORCE_VECTOR:
+                        log.advisoryW().$(" - SQL JIT compiler mode: vector").$();
                         break;
                     default:
                         log.errorW().$(" - Unknown SQL JIT compiler mode: ").$(jitMode).$();

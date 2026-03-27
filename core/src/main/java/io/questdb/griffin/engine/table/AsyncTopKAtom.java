@@ -43,7 +43,7 @@ import io.questdb.griffin.engine.RecordComparator;
 import io.questdb.griffin.engine.orderby.LimitedSizeLongTreeChain;
 import io.questdb.griffin.engine.orderby.RecordComparatorCompiler;
 import io.questdb.griffin.engine.orderby.SortKeyEncoder;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.std.DirectIntList;
 import io.questdb.std.IntHashSet;
 import io.questdb.std.Misc;
@@ -71,7 +71,7 @@ public class AsyncTopKAtom implements StatefulAtom, Reopenable, Plannable {
             @Nullable Function ownerFilter,
             @Nullable IntHashSet filterUsedColumnIndexes,
             @Nullable ObjList<Function> perWorkerFilters,
-            @Nullable CompiledFilter compiledFilter,
+            @Nullable JitFilter compiledFilter,
             @Nullable MemoryCARW bindVarMemory,
             @Nullable ObjList<Function> bindVarFunctions,
             @NotNull @Transient RecordComparatorCompiler recordComparatorCompiler,

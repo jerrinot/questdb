@@ -43,7 +43,7 @@ import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdaterFactory;
 import io.questdb.griffin.engine.groupby.GroupByUtils;
 import io.questdb.griffin.engine.groupby.SimpleMapValue;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.IntHashSet;
 import io.questdb.std.Misc;
@@ -80,7 +80,7 @@ public class AsyncGroupByNotKeyedAtom implements StatefulAtom, Closeable, Reopen
             @Nullable ObjList<ObjList<GroupByFunction>> perWorkerGroupByFunctions,
             int @NotNull [] batchColumnIndexes,
             int valueCount,
-            @Nullable CompiledFilter compiledFilter,
+            @Nullable JitFilter compiledFilter,
             @Nullable MemoryCARW bindVarMemory,
             @Nullable ObjList<Function> bindVarFunctions,
             @Nullable Function ownerFilter,

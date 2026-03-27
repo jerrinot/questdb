@@ -1642,6 +1642,12 @@ public class PropServerConfigurationTest {
         properties.setProperty("cairo.sql.jit.mode", "scalar");
         configuration = newPropServerConfiguration(properties);
         Assert.assertEquals(SqlJitMode.JIT_MODE_FORCE_SCALAR, configuration.getCairoConfiguration().getSqlJitMode());
+        Assert.assertEquals("scalar", SqlJitMode.toString(SqlJitMode.JIT_MODE_FORCE_SCALAR));
+
+        properties.setProperty("cairo.sql.jit.mode", "vector");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(SqlJitMode.JIT_MODE_FORCE_VECTOR, configuration.getCairoConfiguration().getSqlJitMode());
+        Assert.assertEquals("vector", SqlJitMode.toString(SqlJitMode.JIT_MODE_FORCE_VECTOR));
 
         properties.setProperty("cairo.sql.jit.mode", "off");
         configuration = newPropServerConfiguration(properties);

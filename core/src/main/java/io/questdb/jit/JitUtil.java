@@ -27,11 +27,16 @@ package io.questdb.jit;
 import io.questdb.std.Os;
 
 public final class JitUtil {
+    private static final boolean VECTOR_API_AVAILABLE = ModuleLayer.boot().findModule("jdk.incubator.vector").isPresent();
 
     private JitUtil() {
     }
 
     public static boolean isJitSupported() {
         return Os.arch == Os.ARCH_X86_64 || Os.arch == Os.ARCH_AARCH64;
+    }
+
+    public static boolean isVectorApiAvailable() {
+        return VECTOR_API_AVAILABLE;
     }
 }

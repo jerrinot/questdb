@@ -330,6 +330,8 @@ import io.questdb.griffin.model.WindowJoinContext;
 import io.questdb.jit.CompiledCountOnlyFilter;
 import io.questdb.jit.CompiledFilter;
 import io.questdb.jit.CompiledFilterIRSerializer;
+import io.questdb.jit.JitCountOnlyFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.jit.JitUtil;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
@@ -3230,8 +3232,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                         && (!model.isUpdate() || executionContext.isWalApplication());
                 final boolean canCompile = factory.supportsPageFrameCursor() && JitUtil.isJitSupported();
                 if (useJit && canCompile) {
-                    CompiledFilter compiledFilter = null;
-                    CompiledCountOnlyFilter compiledCountOnlyFilter = null;
+                    JitFilter compiledFilter = null;
+                    JitCountOnlyFilter compiledCountOnlyFilter = null;
                     try {
                         int jitOptions;
                         final ObjList<Function> bindVarFunctions = new ObjList<>();
@@ -3379,7 +3381,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
         final LongList offsets = computeHorizonOffsets(horizonContext, masterMetadata);
 
         // Check if master factory supports page frames - required for parallel execution
-        CompiledFilter compiledFilter = null;
+        JitFilter compiledFilter = null;
         MemoryCARW bindVarMemory = null;
         ObjList<Function> bindVarFunctions = null;
         Function filter = null;
@@ -3767,7 +3769,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
             final JoinRecordMetadata innerMetadata0 = innerMetadata;
             final ObjList<GroupByFunction> groupByFunctions0 = groupByFunctions;
             final ObjList<ObjList<GroupByFunction>> perWorkerGroupByFunctions0 = perWorkerGroupByFunctions;
-            final CompiledFilter compiledFilter0 = compiledFilter;
+            final JitFilter compiledFilter0 = compiledFilter;
             final MemoryCARW bindVarMemory0 = bindVarMemory;
             final ObjList<Function> bindVarFunctions0 = bindVarFunctions;
             final Function filter0 = filter;
@@ -4824,7 +4826,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                         || (master.supportsFilterStealing() && master.getBaseFactory().supportsPageFrameCursor());
                                 if (parallelWindowJoinEnabled && masterSupportsPageFrames && slave.supportsTimeFrameCursor()) {
                                     // try to steal master filter
-                                    CompiledFilter compiledFilter = null;
+                                    JitFilter compiledFilter = null;
                                     MemoryCARW bindVarMemory = null;
                                     ObjList<Function> bindVarFunctions = null;
                                     Function masterFilter = null;
@@ -5743,7 +5745,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                     QueryModel.restoreWhereClause(expressionNodePool, model);
 
                                     RecordCursorFactory baseFactory = recordCursorFactory;
-                                    CompiledFilter compiledFilter = null;
+                                    JitFilter compiledFilter = null;
                                     MemoryCARW bindVarMemory = null;
                                     ObjList<Function> bindVarFunctions = null;
                                     Function filter = null;
@@ -6915,7 +6917,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                             && GroupByUtils.isParallelismSupported(groupByFunctions)
             ) {
                 boolean supportsParallelism = factory.supportsPageFrameCursor();
-                CompiledFilter compiledFilter = null;
+                JitFilter compiledFilter = null;
                 MemoryCARW bindVarMemory = null;
                 ObjList<Function> bindVarFunctions = null;
                 Function filter = null;

@@ -22,25 +22,22 @@
  *
  ******************************************************************************/
 
-package io.questdb.cairo;
+package io.questdb.jit;
 
-public final class SqlJitMode {
-    public static final int JIT_MODE_DISABLED = 2;
-    public static final int JIT_MODE_ENABLED = 0;
-    public static final int JIT_MODE_FORCE_SCALAR = 1;
-    public static final int JIT_MODE_FORCE_VECTOR = 3;
+import io.questdb.cairo.vm.api.MemoryCARW;
+import io.questdb.griffin.SqlException;
 
-    public static String toString(int mode) {
-        switch (mode) {
-            case JIT_MODE_ENABLED:
-                return "on";
-            case JIT_MODE_FORCE_SCALAR:
-                return "scalar";
-            case JIT_MODE_DISABLED:
-                return "off";
-            case JIT_MODE_FORCE_VECTOR:
-                return "vector";
-        }
-        return "unknown";
-    }
+import java.io.Closeable;
+
+public interface JitCountOnlyFilter extends Closeable {
+    long call(
+            long dataAddress,
+            long dataSize,
+            long varSizeAuxAddress,
+            long varsAddress,
+            long varsSize,
+            long rowsCount
+    );
+
+    void compile(MemoryCARW filter, int options) throws SqlException;
 }

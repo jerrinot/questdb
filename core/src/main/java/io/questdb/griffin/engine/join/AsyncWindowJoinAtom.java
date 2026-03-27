@@ -54,7 +54,7 @@ import io.questdb.griffin.engine.groupby.GroupByUtils;
 import io.questdb.griffin.engine.table.ConcurrentTimeFrameCursor;
 import io.questdb.griffin.engine.table.SelectivityStats;
 import io.questdb.griffin.engine.table.TablePageFrameCursor;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.DirectIntList;
 import io.questdb.std.IntHashSet;
@@ -77,7 +77,7 @@ public class AsyncWindowJoinAtom implements StatefulAtom, Reopenable, Plannable 
     protected final WindowJoinTimeFrameHelper ownerSlaveTimeFrameHelper;
     private final ObjList<Function> bindVarFunctions;
     private final MemoryCARW bindVarMemory;
-    private final CompiledFilter compiledMasterFilter;
+    private final JitFilter compiledMasterFilter;
     private final IntHashSet filterUsedColumnIndexes;
     private final IntList groupByFunctionToColumnIndex;
     private final IntList groupByFunctionTypes;
@@ -157,7 +157,7 @@ public class AsyncWindowJoinAtom implements StatefulAtom, Reopenable, Plannable 
             @Transient @NotNull ArrayColumnTypes valueTypes,
             @NotNull ObjList<GroupByFunction> ownerGroupByFunctions,
             @Nullable ObjList<ObjList<GroupByFunction>> perWorkerGroupByFunctions,
-            @Nullable CompiledFilter compiledMasterFilter,
+            @Nullable JitFilter compiledMasterFilter,
             @Nullable MemoryCARW bindVarMemory,
             @Nullable ObjList<Function> bindVarFunctions,
             @Nullable Function ownerMasterFilter,
@@ -411,7 +411,7 @@ public class AsyncWindowJoinAtom implements StatefulAtom, Reopenable, Plannable 
         return perWorkerColumnSinks.getQuick(slotId);
     }
 
-    public CompiledFilter getCompiledMasterFilter() {
+    public JitFilter getCompiledMasterFilter() {
         return compiledMasterFilter;
     }
 

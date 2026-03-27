@@ -34,7 +34,7 @@ import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.IntHashSet;
 import io.questdb.std.MemoryTag;
@@ -51,7 +51,7 @@ import java.io.Closeable;
 public class AsyncFilterContext implements Closeable {
     private final ObjList<Function> bindVarFunctions;
     private final MemoryCARW bindVarMemory;
-    private final CompiledFilter compiledFilter;
+    private final JitFilter compiledFilter;
     private final IntHashSet filterUsedColumnIndexes;
     private final ObjList<PageFrameFilteredMemoryRecord> frameFilteredMemoryRecords;
     private final DirectLongList ownerAuxAddresses;
@@ -70,7 +70,7 @@ public class AsyncFilterContext implements Closeable {
 
     public AsyncFilterContext(
             CairoConfiguration configuration,
-            @Nullable CompiledFilter compiledFilter,
+            @Nullable JitFilter compiledFilter,
             @Nullable MemoryCARW bindVarMemory,
             @Nullable ObjList<Function> bindVarFunctions,
             @Nullable Function ownerFilter,
@@ -173,7 +173,7 @@ public class AsyncFilterContext implements Closeable {
         return bindVarMemory;
     }
 
-    public CompiledFilter getCompiledFilter() {
+    public JitFilter getCompiledFilter() {
         return compiledFilter;
     }
 

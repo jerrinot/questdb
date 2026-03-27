@@ -2279,6 +2279,10 @@ public class PropServerConfiguration implements ServerConfiguration {
             return SqlJitMode.JIT_MODE_FORCE_SCALAR;
         }
 
+        if (Chars.equalsLowerCaseAscii(jitMode, "vector")) {
+            return SqlJitMode.JIT_MODE_FORCE_VECTOR;
+        }
+
         return SqlJitMode.JIT_MODE_ENABLED;
     }
 

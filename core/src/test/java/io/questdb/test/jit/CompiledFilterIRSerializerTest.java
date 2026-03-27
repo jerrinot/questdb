@@ -37,9 +37,11 @@ import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.model.ExpressionNode;
 import io.questdb.jit.CompiledFilterIRSerializer;
+import io.questdb.jit.IrDecoder;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
+import io.questdb.std.Uuid;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.cairo.TableModel;
 import io.questdb.test.griffin.BaseFunctionFactoryTest;
@@ -1261,6 +1263,51 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
         assertIR("(varchar_header avarchar)(i64 4L)(<>)(ret)");
     }
 
+    @Test
+    public void testIrDecoderDecodesFloatingImmediate() throws Exception {
+        serialize("afloat = 42.5");
+
+        final IrDecoder.Instruction[] instructions = new IrDecoder().decode(irMemory);
+        Assert.assertEquals(4, instructions.length);
+
+        assertInstruction(instructions[0], IMM, F4_TYPE, Double.doubleToLongBits(42.5), 0);
+        Assert.assertEquals(42.5, instructions[0].doublePayload(), 0.0);
+        assertInstruction(instructions[1], MEM, F4_TYPE, metadata.getColumnIndexQuiet("afloat"), 0);
+        assertInstruction(instructions[2], EQ, 0, 0, 0);
+        assertInstruction(instructions[3], RET, 0, 0, 0);
+    }
+
+    @Test
+    public void testIrDecoderDecodesI128Immediate() throws Exception {
+        final String uuid = "11111111-1111-1111-1111-111111111111";
+        serialize("auuid = '" + uuid + '\'');
+
+        final IrDecoder.Instruction[] instructions = new IrDecoder().decode(irMemory);
+        Assert.assertEquals(4, instructions.length);
+
+        assertInstruction(instructions[0], IMM, I16_TYPE, Uuid.parseLo(uuid, 0), Uuid.parseHi(uuid, 0));
+        assertInstruction(instructions[1], MEM, I16_TYPE, metadata.getColumnIndexQuiet("auuid"), 0);
+        assertInstruction(instructions[2], EQ, 0, 0, 0);
+        assertInstruction(instructions[3], RET, 0, 0, 0);
+    }
+
+    @Test
+    public void testIrDecoderDecodesShortCircuitProgram() throws Exception {
+        serialize("along = 1 and anint = 2");
+
+        final IrDecoder.Instruction[] instructions = new IrDecoder().decode(irMemory);
+        Assert.assertEquals(8, instructions.length);
+
+        assertInstruction(instructions[0], IMM, I8_TYPE, 1, 0);
+        assertInstruction(instructions[1], MEM, I8_TYPE, metadata.getColumnIndexQuiet("along"), 0);
+        assertInstruction(instructions[2], EQ, 0, 0, 0);
+        assertInstruction(instructions[3], AND_SC, 0, 0, 0);
+        assertInstruction(instructions[4], IMM, I4_TYPE, 2, 0);
+        assertInstruction(instructions[5], MEM, I4_TYPE, metadata.getColumnIndexQuiet("anint"), 0);
+        assertInstruction(instructions[6], EQ, 0, 0, 0);
+        assertInstruction(instructions[7], RET, 0, 0, 0);
+    }
+
     private void assertIR(String message, String expectedIR) {
         TestIRSerializer ser = new TestIRSerializer(irMemory, metadata);
         String actualIR = ser.serialize();
@@ -1269,6 +1316,13 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
 
     private void assertIR(String expectedIR) {
         assertIR(null, expectedIR);
+    }
+
+    private void assertInstruction(IrDecoder.Instruction instruction, int opcode, int type, long payloadLo, long payloadHi) {
+        Assert.assertEquals(opcode, instruction.opcode());
+        Assert.assertEquals(type, instruction.type());
+        Assert.assertEquals(payloadLo, instruction.payloadLo());
+        Assert.assertEquals(payloadHi, instruction.payloadHi());
     }
 
     private void assertOptionsDebug(int options, boolean expectedFlag) {

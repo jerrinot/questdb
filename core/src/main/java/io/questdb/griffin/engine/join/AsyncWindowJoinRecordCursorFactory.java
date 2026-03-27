@@ -55,7 +55,7 @@ import io.questdb.griffin.engine.groupby.GroupByColumnSink;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.GroupByLongList;
 import io.questdb.griffin.engine.table.TablePageFrameCursor;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.mp.SCSequence;
 import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.DirectLongList;
@@ -139,7 +139,7 @@ public class AsyncWindowJoinRecordCursorFactory extends AbstractRecordCursorFact
             @Transient @NotNull ArrayColumnTypes valueTypes,
             @NotNull ObjList<GroupByFunction> groupByFunctions,
             @Nullable ObjList<ObjList<GroupByFunction>> perWorkerGroupByFunctions,
-            @Nullable CompiledFilter compiledMasterFilter,
+            @Nullable JitFilter compiledMasterFilter,
             @Nullable MemoryCARW bindVarMemory,
             @Nullable ObjList<Function> bindVarFunctions,
             @Nullable Function masterFilter,
@@ -1549,7 +1549,7 @@ public class AsyncWindowJoinRecordCursorFactory extends AbstractRecordCursorFact
         rows.clear();
 
         final Function filter = atom.getMasterFilter(slotId);
-        final CompiledFilter compiledFilter = atom.getCompiledMasterFilter();
+        final JitFilter compiledFilter = atom.getCompiledMasterFilter();
 
         try {
             if (compiledFilter == null || frameMemory.hasColumnTops()) {
@@ -1699,7 +1699,7 @@ public class AsyncWindowJoinRecordCursorFactory extends AbstractRecordCursorFact
         rows.clear();
 
         final Function filter = atom.getMasterFilter(slotId);
-        final CompiledFilter compiledFilter = atom.getCompiledMasterFilter();
+        final JitFilter compiledFilter = atom.getCompiledMasterFilter();
 
         try {
             if (compiledFilter == null || frameMemory.hasColumnTops()) {
@@ -1879,7 +1879,7 @@ public class AsyncWindowJoinRecordCursorFactory extends AbstractRecordCursorFact
         rows.clear();
 
         final Function filter = atom.getMasterFilter(slotId);
-        final CompiledFilter compiledFilter = atom.getCompiledMasterFilter();
+        final JitFilter compiledFilter = atom.getCompiledMasterFilter();
 
         try {
             if (compiledFilter == null || frameMemory.hasColumnTops()) {
@@ -2056,7 +2056,7 @@ public class AsyncWindowJoinRecordCursorFactory extends AbstractRecordCursorFact
         rows.clear();
 
         final Function filter = atom.getMasterFilter(slotId);
-        final CompiledFilter compiledFilter = atom.getCompiledMasterFilter();
+        final JitFilter compiledFilter = atom.getCompiledMasterFilter();
 
         try {
             if (compiledFilter == null || frameMemory.hasColumnTops()) {
@@ -2320,7 +2320,7 @@ public class AsyncWindowJoinRecordCursorFactory extends AbstractRecordCursorFact
         rows.clear();
 
         final Function filter = atom.getMasterFilter(slotId);
-        final CompiledFilter compiledFilter = atom.getCompiledMasterFilter();
+        final JitFilter compiledFilter = atom.getCompiledMasterFilter();
 
         try {
             if (compiledFilter == null || frameMemory.hasColumnTops()) {
@@ -2478,7 +2478,7 @@ public class AsyncWindowJoinRecordCursorFactory extends AbstractRecordCursorFact
         rows.clear();
 
         final Function filter = atom.getMasterFilter(slotId);
-        final CompiledFilter compiledFilter = atom.getCompiledMasterFilter();
+        final JitFilter compiledFilter = atom.getCompiledMasterFilter();
 
         try {
             if (compiledFilter == null || frameMemory.hasColumnTops()) {
@@ -2635,7 +2635,7 @@ public class AsyncWindowJoinRecordCursorFactory extends AbstractRecordCursorFact
         rows.clear();
 
         final Function filter = atom.getMasterFilter(slotId);
-        final CompiledFilter compiledFilter = atom.getCompiledMasterFilter();
+        final JitFilter compiledFilter = atom.getCompiledMasterFilter();
 
         try {
             if (compiledFilter == null || frameMemory.hasColumnTops()) {
@@ -2781,7 +2781,7 @@ public class AsyncWindowJoinRecordCursorFactory extends AbstractRecordCursorFact
         rows.clear();
 
         final Function filter = atom.getMasterFilter(slotId);
-        final CompiledFilter compiledFilter = atom.getCompiledMasterFilter();
+        final JitFilter compiledFilter = atom.getCompiledMasterFilter();
 
         try {
             if (compiledFilter == null || frameMemory.hasColumnTops()) {

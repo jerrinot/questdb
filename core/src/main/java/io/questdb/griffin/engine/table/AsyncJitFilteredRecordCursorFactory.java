@@ -47,8 +47,8 @@ import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.model.ExpressionNode;
-import io.questdb.jit.CompiledCountOnlyFilter;
-import io.questdb.jit.CompiledFilter;
+import io.questdb.jit.JitCountOnlyFilter;
+import io.questdb.jit.JitFilter;
 import io.questdb.mp.SCSequence;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.IntHashSet;
@@ -68,8 +68,8 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
     private final ObjList<Function> bindVarFunctions;
     private final MemoryCARW bindVarMemory;
     private final SCSequence collectSubSeq = new SCSequence();
-    private final CompiledCountOnlyFilter compiledCountOnlyFilter;
-    private final CompiledFilter compiledFilter;
+    private final JitCountOnlyFilter compiledCountOnlyFilter;
+    private final JitFilter compiledFilter;
     private final AsyncFilteredRecordCursor cursor;
     private final Function filter;
     private final ExpressionNode filterExpr;
@@ -87,8 +87,8 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
             @NotNull MessageBus messageBus,
             @NotNull RecordCursorFactory base,
             @NotNull ObjList<Function> bindVarFunctions,
-            @NotNull CompiledFilter compiledFilter,
-            @NotNull CompiledCountOnlyFilter compiledCountOnlyFilter,
+            @NotNull JitFilter compiledFilter,
+            @NotNull JitCountOnlyFilter compiledCountOnlyFilter,
             @NotNull Function filter,
             @NotNull IntHashSet filterUsedColumnIndexes,
             @NotNull PageFrameReduceTaskFactory reduceTaskFactory,
@@ -175,7 +175,7 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
     }
 
     @Override
-    public CompiledFilter getCompiledFilter() {
+    public JitFilter getCompiledFilter() {
         return compiledFilter;
     }
 
@@ -419,16 +419,16 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
     public static class AsyncJitFilterAtom extends AsyncFilterAtom {
         final ObjList<Function> bindVarFunctions;
         final MemoryCARW bindVarMemory;
-        final CompiledCountOnlyFilter compiledCountOnlyFilter;
-        final CompiledFilter compiledFilter;
+        final JitCountOnlyFilter compiledCountOnlyFilter;
+        final JitFilter compiledFilter;
 
         public AsyncJitFilterAtom(
                 CairoConfiguration configuration,
                 Function filter,
                 IntHashSet filterUsedColumnIndexes,
                 ObjList<Function> perWorkerFilters,
-                CompiledFilter compiledFilter,
-                CompiledCountOnlyFilter compiledCountOnlyFilter,
+                JitFilter compiledFilter,
+                JitCountOnlyFilter compiledCountOnlyFilter,
                 MemoryCARW bindVarMemory,
                 ObjList<Function> bindVarFunctions,
                 IntList columnTypes,
