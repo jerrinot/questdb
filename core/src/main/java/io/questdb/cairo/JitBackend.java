@@ -45,10 +45,14 @@ public final class JitBackend {
      */
     public static final int JAVA_INTERPRETED = 2;
     /**
-     * Java bytecode compiler ({@link io.questdb.jit.ScalarBytecodeFilterCompiler}).
-     * Always scalar.
+     * Java scalar bytecode compiler ({@link io.questdb.jit.ScalarBytecodeFilterCompiler}).
      */
     public static final int JAVA_COMPILED = 3;
+    /**
+     * Java vectorized bytecode compiler ({@link io.questdb.jit.VectorBytecodeFilterCompiler}).
+     * Generates bytecode that invokes Vector API for SIMD execution.
+     */
+    public static final int JAVA_VECTOR_COMPILED = 4;
 
     private JitBackend() {
     }
@@ -59,6 +63,7 @@ public final class JitBackend {
             case CPP -> "cpp";
             case JAVA_INTERPRETED -> "java_interpreted";
             case JAVA_COMPILED -> "java_compiled";
+            case JAVA_VECTOR_COMPILED -> "java_vector_compiled";
             default -> "unknown";
         };
     }

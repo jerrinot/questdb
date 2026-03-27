@@ -31,6 +31,7 @@ import io.questdb.griffin.SqlException;
 public class VectorCompiledFilter implements JitFilter {
     private ScalarBytecodeFilterCompiler.ScalarFilterBody bytecodeFilter;
     private final VectorFilterInterpreter interpreter = new VectorFilterInterpreter();
+    private VectorFilterBody vectorBytecodeFilter;
 
     @Override
     public long call(
@@ -42,6 +43,17 @@ public class VectorCompiledFilter implements JitFilter {
             long filteredRowsAddress,
             long rowsCount
     ) {
+        if (vectorBytecodeFilter != null) {
+            return vectorBytecodeFilter.filterRows(
+                    dataAddress,
+                    dataSize,
+                    varSizeAuxAddress,
+                    varsAddress,
+                    varsSize,
+                    filteredRowsAddress,
+                    rowsCount
+            );
+        }
         if (bytecodeFilter != null) {
             return bytecodeFilter.filterRows(
                     dataAddress,
@@ -74,29 +86,45 @@ public class VectorCompiledFilter implements JitFilter {
     }
 
     public void compile(MemoryCARW filter, int options, int backend) throws SqlException {
-        if (backend != JitBackend.JAVA_COMPILED) {
+        if (backend != JitBackend.JAVA_COMPILED && backend != JitBackend.JAVA_VECTOR_COMPILED) {
             interpreter.compile(filter, options);
         }
         if (backend != JitBackend.JAVA_INTERPRETED) {
-            compileBytecode(filter, options);
+            compileBytecode(filter, options, backend);
         }
     }
 
     public boolean usesBytecode() {
-        return bytecodeFilter != null;
+        return bytecodeFilter != null || vectorBytecodeFilter != null;
     }
 
     public boolean usesVectorApi() {
         return interpreter.usesVectorApi();
     }
 
-    private void compileBytecode(MemoryCARW filter, int options) throws SqlException {
-        if (interpreter.usesVectorApi()) {
+    public boolean usesVectorBytecode() {
+        return vectorBytecodeFilter != null;
+    }
+
+    private void compileBytecode(MemoryCARW filter, int options, int backend) throws SqlException {
+        if (backend != JitBackend.JAVA_VECTOR_COMPILED && interpreter.usesVectorApi()) {
             return;
         }
         IrDecoder decoder = new IrDecoder();
         IrDecoder.Instruction[] instructions = decoder.decode(filter);
         LoweredProgram program = IrLowering.lower(instructions, options);
-        bytecodeFilter = ScalarBytecodeFilterCompiler.compile(program);
+
+        // Try vectorized bytecode first (unless forced to scalar)
+        if (backend != JitBackend.JAVA_COMPILED) {
+            vectorBytecodeFilter = VectorBytecodeFilterCompiler.compile(program);
+            if (vectorBytecodeFilter != null) {
+                return;
+            }
+        }
+
+        // Fall back to scalar bytecode
+        if (backend != JitBackend.JAVA_VECTOR_COMPILED) {
+            bytecodeFilter = ScalarBytecodeFilterCompiler.compile(program);
+        }
     }
 }

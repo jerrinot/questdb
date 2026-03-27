@@ -72,7 +72,7 @@ public class JitBackendBenchmark {
     private static final int NUM_ROWS = 128 * 1024 * 1024;
     private static final CairoConfiguration configuration = new DefaultCairoConfiguration(System.getProperty("java.io.tmpdir"));
 
-    @Param({"DISABLED", "NATIVE_SIMD", "NATIVE_SCALAR", "JAVA_VECTOR_API", "JAVA_INTERPRETER", "JAVA_BYTECODE"})
+    @Param({"DISABLED", "NATIVE_SIMD", "NATIVE_SCALAR", "JAVA_VECTOR_API", "JAVA_INTERPRETER", "JAVA_BYTECODE", "JAVA_VECTOR_BYTECODE"})
     public Backend backend;
 
     @Param({"l > 42", "l > 42 AND d < 100.0", "l IN (1, 2, 3, 4, 5)", "l > 0 AND i != 0 AND d < 0.5 AND l < 1000000"})
@@ -215,7 +215,8 @@ public class JitBackendBenchmark {
         NATIVE_SCALAR(SqlJitMode.JIT_MODE_FORCE_SCALAR, JitBackend.CPP),
         JAVA_VECTOR_API(SqlJitMode.JIT_MODE_ENABLED, JitBackend.JAVA_INTERPRETED),
         JAVA_INTERPRETER(SqlJitMode.JIT_MODE_FORCE_SCALAR, JitBackend.JAVA_INTERPRETED),
-        JAVA_BYTECODE(SqlJitMode.JIT_MODE_FORCE_SCALAR, JitBackend.JAVA_COMPILED);
+        JAVA_BYTECODE(SqlJitMode.JIT_MODE_FORCE_SCALAR, JitBackend.JAVA_COMPILED),
+        JAVA_VECTOR_BYTECODE(SqlJitMode.JIT_MODE_ENABLED, JitBackend.JAVA_VECTOR_COMPILED);
 
         final int jitBackend;
         final int jitMode;
