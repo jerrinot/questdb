@@ -75,7 +75,7 @@ public class JitBackendBenchmark {
     @Param({"DISABLED", "NATIVE_SIMD", "NATIVE_SCALAR", "JAVA_VECTOR_API", "JAVA_INTERPRETER", "JAVA_BYTECODE"})
     public Backend backend;
 
-    @Param({"l > 42", "l > 42 AND d < 100.0", "l IN (1, 2, 3, 4, 5)"})
+    @Param({"l > 42", "l > 42 AND d < 100.0", "l IN (1, 2, 3, 4, 5)", "l > 0 AND i != 0 AND d < 0.5 AND l < 1000000"})
     public String filter;
 
     private SqlCompilerImpl compiler;
