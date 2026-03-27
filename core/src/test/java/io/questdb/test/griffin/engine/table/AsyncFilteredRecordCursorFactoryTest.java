@@ -1223,6 +1223,11 @@ public class AsyncFilteredRecordCursorFactoryTest extends AbstractCairoTest {
         }
 
         @Override
+        public int getJitBackend() {
+            return sqlExecutionContext.getJitBackend();
+        }
+
+        @Override
         public int getJitMode() {
             return sqlExecutionContext.getJitMode();
         }
@@ -1416,6 +1421,11 @@ public class AsyncFilteredRecordCursorFactoryTest extends AbstractCairoTest {
         @Override
         public void setIntervalFunctionType(int intervalType) {
             sqlExecutionContext.setIntervalFunctionType(intervalType);
+        }
+
+        @Override
+        public void setJitBackend(int jitBackend) {
+            sqlExecutionContext.setJitBackend(jitBackend);
         }
 
         @Override

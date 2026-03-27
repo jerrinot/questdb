@@ -42,6 +42,7 @@ import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.ProjectableRecordCursorFactory;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.RecordSinkFactory;
+import io.questdb.cairo.JitBackend;
 import io.questdb.cairo.SqlJitMode;
 import io.questdb.cairo.SymbolMapReader;
 import io.questdb.cairo.TableColumnMetadata;
@@ -327,6 +328,8 @@ import io.questdb.griffin.model.RuntimeIntervalModel;
 import io.questdb.griffin.model.RuntimeIntrinsicIntervalModel;
 import io.questdb.griffin.model.WindowExpression;
 import io.questdb.griffin.model.WindowJoinContext;
+import io.questdb.jit.CompiledCountOnlyFilter;
+import io.questdb.jit.CompiledFilter;
 import io.questdb.jit.CompiledFilterIRSerializer;
 import io.questdb.jit.JitCountOnlyFilter;
 import io.questdb.jit.JitFilter;
@@ -3243,18 +3246,32 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                             jitOptions = jitIRSerializer.serialize(filterExpr, forceScalar, enableJitDebug, enableJitNullChecks);
                         }
 
-                        compiledFilter = new VectorCompiledFilter();
-                        compiledFilter.compile(jitIRMem, jitOptions);
+                        final int jitBackend = executionContext.getJitBackend();
+                        if (jitBackend == JitBackend.CPP) {
+                            CompiledFilter nativeFilter = new CompiledFilter();
+                            nativeFilter.compile(jitIRMem, jitOptions);
+                            compiledFilter = nativeFilter;
 
-                        compiledCountOnlyFilter = new VectorCompiledCountOnlyFilter();
-                        compiledCountOnlyFilter.compile(jitIRMem, jitOptions);
+                            CompiledCountOnlyFilter nativeCountOnly = new CompiledCountOnlyFilter();
+                            nativeCountOnly.compile(jitIRMem, jitOptions);
+                            compiledCountOnlyFilter = nativeCountOnly;
+                        } else {
+                            VectorCompiledFilter javaFilter = new VectorCompiledFilter();
+                            javaFilter.compile(jitIRMem, jitOptions, jitBackend);
+                            compiledFilter = javaFilter;
 
+                            VectorCompiledCountOnlyFilter javaCountOnly = new VectorCompiledCountOnlyFilter();
+                            javaCountOnly.compile(jitIRMem, jitOptions, jitBackend);
+                            compiledCountOnlyFilter = javaCountOnly;
+                        }
+
+                        final String backendName = JitBackend.toString(jitBackend);
                         final Function limitLoFunction = getLimitLoFunctionOnly(model, executionContext);
                         final int limitLoPos = model.getLimitAdviceLo() != null ? model.getLimitAdviceLo().position : 0;
 
                         LOG.debug()
                                 .$("JIT enabled for (sub)query [tableName=").$safe(model.getName())
-                                .$(", backend=vector-java")
+                                .$(", backend=").$(backendName)
                                 .$(", fd=").$(executionContext.getRequestFd())
                                 .I$();
                         return new AsyncJitFilteredRecordCursorFactory(

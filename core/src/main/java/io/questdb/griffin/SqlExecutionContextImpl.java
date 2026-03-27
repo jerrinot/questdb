@@ -88,6 +88,7 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
     private boolean cloneSymbolTables;
     private boolean containsSecret;
     private int intervalFunctionType;
+    private int jitBackend;
     private int jitMode;
     private long nowMicros;
     private long nowNanos;
@@ -250,6 +251,11 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
     @Override
     public int getIntervalFunctionType() {
         return intervalFunctionType;
+    }
+
+    @Override
+    public int getJitBackend() {
+        return jitBackend;
     }
 
     @Override
@@ -470,6 +476,11 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
     @Override
     public void setIntervalFunctionType(int intervalType) {
         this.intervalFunctionType = intervalType;
+    }
+
+    @Override
+    public void setJitBackend(int jitBackend) {
+        this.jitBackend = jitBackend;
     }
 
     @Override

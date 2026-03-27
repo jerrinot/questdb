@@ -120,6 +120,8 @@ public interface SqlExecutionContext extends Sinkable, Closeable {
 
     int getIntervalFunctionType();
 
+    int getJitBackend();
+
     int getJitMode();
 
     default @NotNull MessageBus getMessageBus() {
@@ -267,6 +269,8 @@ public interface SqlExecutionContext extends Sinkable, Closeable {
     void setCloneSymbolTables(boolean cloneSymbolTables);
 
     void setIntervalFunctionType(int intervalType);
+
+    void setJitBackend(int jitBackend);
 
     void setJitMode(int jitMode);
 

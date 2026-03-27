@@ -24,6 +24,7 @@
 
 package io.questdb.jit;
 
+import io.questdb.cairo.JitBackend;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.SqlException;
 
@@ -69,8 +70,16 @@ public class VectorCompiledFilter implements JitFilter {
 
     @Override
     public void compile(MemoryCARW filter, int options) throws SqlException {
-        interpreter.compile(filter, options);
-        compileBytecode(filter, options);
+        compile(filter, options, JitBackend.AUTO);
+    }
+
+    public void compile(MemoryCARW filter, int options, int backend) throws SqlException {
+        if (backend != JitBackend.JAVA_COMPILED) {
+            interpreter.compile(filter, options);
+        }
+        if (backend != JitBackend.JAVA_INTERPRETED) {
+            compileBytecode(filter, options);
+        }
     }
 
     public boolean usesBytecode() {

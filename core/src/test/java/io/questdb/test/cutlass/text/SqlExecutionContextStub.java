@@ -126,6 +126,11 @@ public record SqlExecutionContextStub(CairoEngine engine) implements SqlExecutio
     }
 
     @Override
+    public int getJitBackend() {
+        return 0;
+    }
+
+    @Override
     public int getJitMode() {
         return 0;
     }
@@ -314,6 +319,10 @@ public record SqlExecutionContextStub(CairoEngine engine) implements SqlExecutio
 
     @Override
     public void setIntervalFunctionType(int intervalFunctionType) {
+    }
+
+    @Override
+    public void setJitBackend(int jitBackend) {
     }
 
     @Override
