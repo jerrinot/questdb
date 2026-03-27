@@ -1440,6 +1440,17 @@ public class CompiledFilterRegressionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testVarcharCaseWhenNullCheck() throws Exception {
+        // Reproducer for varchar IS NOT NULL bug with CASE WHEN nulls.
+        final String query = "x where varchar_value <> null";
+        final String ddl = "create table x as " +
+                "(select timestamp_sequence(400000000000, 500000000) as k," +
+                " CASE WHEN x % 2 = 0 THEN rnd_varchar('yes', 'no') ELSE NULL END varchar_value" +
+                " from long_sequence(" + N_SIMD_WITH_SCALAR_TAIL + ")) timestamp(k)";
+        assertQueryNullable(query, ddl);
+    }
+
+    @Test
     public void testVarSizeNullComparison() throws Exception {
         final String ddl = "create table x as (select" +
                 " x," +

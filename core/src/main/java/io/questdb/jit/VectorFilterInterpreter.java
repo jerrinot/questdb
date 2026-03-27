@@ -24,6 +24,7 @@
 
 package io.questdb.jit;
 
+import io.questdb.cairo.VarcharTypeDriver;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.SqlException;
 import io.questdb.std.Numbers;
@@ -874,11 +875,14 @@ public class VectorFilterInterpreter {
                 return;
             }
             case VARCHAR_HEADER_TYPE: {
-                if (columnAddress == 0) {
-                    out.set(I8_TYPE, 0, 0);
+                // Varchar headers live in the aux column, not the data column.
+                // columnAddress (data column) can be 0 for fully-inlined varchars
+                // without indicating a col-top, so we check auxAddress instead.
+                final long auxAddress = UNSAFE.getLong(varSizeAuxAddress + ((long) columnIndex << 3));
+                if (auxAddress == 0) {
+                    out.set(I8_TYPE, VarcharTypeDriver.VARCHAR_HEADER_FLAG_NULL, 0);
                     return;
                 }
-                final long auxAddress = UNSAFE.getLong(varSizeAuxAddress + ((long) columnIndex << 3));
                 out.set(I8_TYPE, UNSAFE.getLong(auxAddress + (row << 4)), 0);
                 return;
             }
