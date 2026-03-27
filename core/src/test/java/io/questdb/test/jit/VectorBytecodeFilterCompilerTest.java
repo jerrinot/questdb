@@ -334,4 +334,184 @@ public class VectorBytecodeFilterCompilerTest {
     private static IrDecoder.Instruction insn(int opcode, int type, long lo, long hi) {
         return new IrDecoder.Instruction(opcode, type, lo, hi);
     }
+
+    // ========================
+    // Int (I4) type tests
+    // ========================
+
+    private static final int INT_OPTIONS = (2 << 1) | (1 << 4); // log2(4), single-size
+
+    @Test
+    public void testIntNotSupportedYet() throws Exception {
+        // I4 programs are not vectorized yet (lane count mismatch with LongVector)
+        IrDecoder.Instruction[] instructions = ir(
+                insn(IMM, I4_TYPE, 5, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        );
+        LoweredProgram prog = IrLowering.lower(instructions, INT_OPTIONS);
+        VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+        Assert.assertNull("I4 programs should fall back to scalar", vector);
+    }
+
+    // ========================
+    // Double (F8) type tests
+    // ========================
+
+    private static final int DOUBLE_OPTIONS = (3 << 1) | (1 << 4); // log2(8), single-size
+
+    @Test
+    public void testDoubleGt() throws Exception {
+        // col0 > 3.14
+        double[] data = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) data[i] = i * 0.5;
+        assertParityDoubleCol(data, ir(
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(3.14), 0),
+                insn(MEM, F8_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
+    public void testDoubleCountOnly() throws Exception {
+        // col0 < 2.0
+        double[] data = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) data[i] = i * 0.3;
+        assertCountParityDoubleCol(data, ir(
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(2.0), 0),
+                insn(MEM, F8_TYPE, 0, 0),
+                insn(LT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    // ========================
+    // Int helpers
+    // ========================
+
+    private void assertParityIntCol(int[] data, IrDecoder.Instruction[] instructions) throws Exception {
+        int len = data.length;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long colData = Unsafe.malloc(Math.max(1, (long) len * Integer.BYTES), MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putInt(colData + (long) i * Integer.BYTES, data[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, INT_OPTIONS);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 1, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support int program", vector);
+            long actual = vector.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(colData, Math.max(1, (long) len * Integer.BYTES), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private void assertCountParityIntCol(int[] data, IrDecoder.Instruction[] instructions) throws Exception {
+        int len = data.length;
+        long colData = Unsafe.malloc(Math.max(1, (long) len * Integer.BYTES), MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putInt(colData + (long) i * Integer.BYTES, data[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, INT_OPTIONS);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.countRows(colPtrArray, 1, 0, 0, 0, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull(vector);
+            long actual = vector.countRows(colPtrArray, 1, 0, 0, 0, len);
+
+            Assert.assertEquals("count mismatch", expected, actual);
+        } finally {
+            Unsafe.free(colData, Math.max(1, (long) len * Integer.BYTES), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    // ========================
+    // Double helpers
+    // ========================
+
+    private void assertParityDoubleCol(double[] data, IrDecoder.Instruction[] instructions) throws Exception {
+        int len = data.length;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long colData = Unsafe.malloc(Math.max(1, (long) len * Double.BYTES), MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putDouble(colData + (long) i * Double.BYTES, data[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, DOUBLE_OPTIONS);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 1, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support double program", vector);
+            long actual = vector.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(colData, Math.max(1, (long) len * Double.BYTES), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private void assertCountParityDoubleCol(double[] data, IrDecoder.Instruction[] instructions) throws Exception {
+        int len = data.length;
+        long colData = Unsafe.malloc(Math.max(1, (long) len * Double.BYTES), MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putDouble(colData + (long) i * Double.BYTES, data[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, DOUBLE_OPTIONS);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.countRows(colPtrArray, 1, 0, 0, 0, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull(vector);
+            long actual = vector.countRows(colPtrArray, 1, 0, 0, 0, len);
+
+            Assert.assertEquals("count mismatch", expected, actual);
+        } finally {
+            Unsafe.free(colData, Math.max(1, (long) len * Double.BYTES), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
 }

@@ -35,15 +35,13 @@ import static io.questdb.jit.CompiledFilterIRSerializer.*;
  * {@link VectorFilterBody}. The generated class evaluates the filter
  * in vector-width chunks using the Java Vector API.
  * <p>
- * Phase 1: I8_TYPE (long) only, no null checks, straight-line only.
- * <p>
- * Setup (MemorySegment creation, species, ByteOrder) uses FilterHelpers
- * to keep the constant pool small. The hot loop emits direct Vector API
- * calls (invokestatic/invokevirtual) so C2 can intrinsify them to SIMD.
+ * Supports straight-line programs (no control flow) with single-element-size
+ * types: I4, I8, F4, F8, and same-width mixed pairs (I4+F4, I8+F8).
+ * Setup delegates to {@link FilterHelpers}; the hot loop emits direct
+ * Vector API calls for C2 intrinsification.
  */
 public final class VectorBytecodeFilterCompiler {
 
-    // --- Method parameter slot layout (same as scalar compiler) ---
     private static final int SLOT_DATA_ADDR = 1;
     private static final int SLOT_VARS_ADDR = 7;
     private static final int FR_SLOT_FILTERED_ROWS = 11;
@@ -73,7 +71,6 @@ public final class VectorBytecodeFilterCompiler {
 
         asm.finishPool();
 
-        // --- Class structure ---
         asm.defineClass(thisClass);
         asm.interfaceCount(1);
         asm.putShort(ifaceClass);
@@ -83,15 +80,13 @@ public final class VectorBytecodeFilterCompiler {
 
         int tempCount = program.getNextTempId();
 
-        // filterRows
+        int primary = primaryType(program);
         emitMethod(asm, program, pool, tempCount, filterRowsName, filterRowsSig,
-                stackMapAttr, FR_SLOT_ROWS_COUNT, FR_SLOT_FILTERED_ROWS, FR_FIRST_FREE, false);
-
-        // countRows
+                stackMapAttr, FR_SLOT_ROWS_COUNT, FR_SLOT_FILTERED_ROWS, FR_FIRST_FREE, false, primary);
         emitMethod(asm, program, pool, tempCount, countRowsName, countRowsSig,
-                stackMapAttr, CR_SLOT_ROWS_COUNT, -1, CR_FIRST_FREE, true);
+                stackMapAttr, CR_SLOT_ROWS_COUNT, -1, CR_FIRST_FREE, true, primary);
 
-        asm.putShort(0); // class attributes
+        asm.putShort(0);
         return asm.newInstance();
     }
 
@@ -107,28 +102,68 @@ public final class VectorBytecodeFilterCompiler {
             LoweredOp op = block.getOp(i);
             if (op instanceof LoweredOp.LoadVarSizeHeader) return false;
             if (op instanceof LoweredOp.CompareI128) return false;
-            if (op instanceof LoweredOp.LoadColumn lc && lc.type() != I8_TYPE) return false;
-            if (op instanceof LoweredOp.LoadVar lv && lv.type() != I8_TYPE) return false;
-            if (op instanceof LoweredOp.LoadImm li && li.type() != I8_TYPE) return false;
-            if (op instanceof LoweredOp.Cast) return false;
-            if (op instanceof LoweredOp.Arithmetic a && a.resultType() != I8_TYPE) return false;
-            if (op instanceof LoweredOp.Compare c && c.operandType() != I8_TYPE) return false;
-            if (op instanceof LoweredOp.Negate n && n.type() != I8_TYPE) return false;
+            // Reject types we don't vectorize yet (I1, I2, I16)
+            if (op instanceof LoweredOp.LoadColumn lc && !isSupportedVectorType(lc.type())) return false;
+            if (op instanceof LoweredOp.LoadVar lv && !isSupportedVectorType(lv.type())) return false;
+            if (op instanceof LoweredOp.LoadImm li && !isSupportedVectorType(li.type())) return false;
+            if (op instanceof LoweredOp.Cast c && !isSupportedCast(c)) return false;
+            if (op instanceof LoweredOp.Arithmetic a && !isSupportedVectorType(a.resultType())) return false;
+            if (op instanceof LoweredOp.Compare c && !isSupportedVectorType(c.operandType())) return false;
+            if (op instanceof LoweredOp.Negate n && !isSupportedVectorType(n.type())) return false;
         }
         return true;
     }
 
+    private static boolean isSupportedVectorType(int type) {
+        // 8-byte types: same lane count as LongVector, so loop stride works
+        return type == I8_TYPE || type == F8_TYPE;
+    }
+
+    private static boolean isSupportedCast(LoweredOp.Cast c) {
+        // Same-width casts: I8<->F8
+        return (c.fromType() == I8_TYPE && c.toType() == F8_TYPE)
+                || (c.fromType() == F8_TYPE && c.toType() == I8_TYPE);
+    }
+
+    /**
+     * Determines the primary vector element type of the program.
+     * For single-element-size programs, this is the type of the data columns.
+     * Mixed I8+F8 programs use I8 as primary (LongVector species for the loop).
+     */
+    private static int primaryType(LoweredProgram program) {
+        LoweredBlock block = program.getBlock(program.getEntryBlockId());
+        for (int i = 0; i < block.getOpCount(); i++) {
+            LoweredOp op = block.getOp(i);
+            if (op instanceof LoweredOp.LoadColumn lc) {
+                return lc.type();
+            }
+        }
+        return I8_TYPE; // default
+    }
+
+    private static int elementBytes(int type) {
+        return switch (type) {
+            case I1_TYPE -> 1;
+            case I2_TYPE -> 2;
+            case I4_TYPE, F4_TYPE -> 4;
+            case I8_TYPE, F8_TYPE -> 8;
+            default -> throw new UnsupportedOperationException("element size for type: " + type);
+        };
+    }
+
+    // === Method emission ===
+
     private static void emitMethod(
             BytecodeAssembler asm, LoweredProgram program, Pool pool,
             int tempCount, int methodName, int methodSig, int stackMapAttr,
-            int rowsCountSlot, int filteredRowsSlot, int firstFree, boolean isCountOnly
+            int rowsCountSlot, int filteredRowsSlot, int firstFree, boolean isCountOnly,
+            int primaryType
     ) {
-        // Work area layout (all Object locals are 1 slot, longs are 2):
-        int filteredCountSlot = firstFree;       // long (2 slots)
-        int rowSlot = firstFree + 2;             // long (2 slots)
-        int speciesSlot = firstFree + 4;         // Object
-        int nativeOrderSlot = firstFree + 5;     // Object
-        int activeMaskSlot = firstFree + 6;      // Object
+        int filteredCountSlot = firstFree;
+        int rowSlot = firstFree + 2;
+        int speciesSlot = firstFree + 4;
+        int nativeOrderSlot = firstFree + 5;
+        int activeMaskSlot = firstFree + 6;
 
         int nextSlot = firstFree + 7;
         int outputSegSlot = -1;
@@ -145,35 +180,29 @@ public final class VectorBytecodeFilterCompiler {
         }
         int varsSegSlot = nextSlot++;
 
-        // All IR temporaries → Object locals (1 slot each)
         int[] tempSlots = new int[tempCount];
         for (int i = 0; i < tempCount; i++) {
             tempSlots[i] = nextSlot++;
         }
         int maxLocals = nextSlot;
-        int objectLocalCount = maxLocals - (firstFree + 4); // everything after row
+        int objectLocalCount = maxLocals - (firstFree + 4);
 
-        // maxStack: upper bound for Vector API calls
         asm.startMethod(methodName, methodSig, 12, maxLocals);
 
         // === SETUP ===
-
-        // filteredCount = 0
         asm.lconst_0();
         asm.lstore(filteredCountSlot);
-        // row = 0
         asm.lconst_0();
         asm.lstore(rowSlot);
 
-        // species = FilterHelpers.longSpecies()
-        asm.invokeStatic(pool.helpersLongSpecies);
+        // Load the species matching the primary data type.
+        // For I8: LongVector.SPECIES_PREFERRED
+        // For F8: DoubleVector.SPECIES_PREFERRED (same lane count as Long)
+        asm.invokeStatic(primaryType == F8_TYPE ? pool.helpersDoubleSpecies : pool.helpersLongSpecies);
         asm.astore(speciesSlot);
-
-        // nativeOrder = FilterHelpers.nativeByteOrder()
         asm.invokeStatic(pool.helpersNativeByteOrder);
         asm.astore(nativeOrderSlot);
 
-        // Column segments: colSeg[i] = FilterHelpers.columnSegment(dataAddr, i)
         for (int i = 0; i <= maxColIndex; i++) {
             asm.lload(SLOT_DATA_ADDR);
             asm.iconst(i);
@@ -181,24 +210,20 @@ public final class VectorBytecodeFilterCompiler {
             asm.astore(colSegSlots[i]);
         }
 
-        // varsSeg = FilterHelpers.segment(varsAddress)
         asm.lload(SLOT_VARS_ADDR);
         asm.invokeStatic(pool.helpersSegment);
         asm.astore(varsSegSlot);
 
         if (!isCountOnly) {
-            // outputSeg = FilterHelpers.segment(filteredRowsAddress)
             asm.lload(filteredRowsSlot);
             asm.invokeStatic(pool.helpersSegment);
             asm.astore(outputSegSlot);
-
-            // iota = FilterHelpers.iotaVector(species)
-            asm.aload(speciesSlot);
+            // iota always uses Long species (row IDs are longs)
+            asm.invokeStatic(pool.helpersLongSpecies);
             asm.invokeStatic(pool.helpersIotaVector);
             asm.astore(iotaSlot);
         }
 
-        // Initialize activeMask + all temp slots to null
         asm.aconst_null();
         asm.astore(activeMaskSlot);
         for (int i = 0; i < tempCount; i++) {
@@ -208,19 +233,16 @@ public final class VectorBytecodeFilterCompiler {
 
         // === LOOP ===
         int loopStart = asm.position();
-
-        // if (row >= rowsCount) goto EXIT
         asm.lload(rowSlot);
         asm.lload(rowsCountSlot);
         asm.lcmp();
         int exitBranch = asm.ifge();
 
-        // activeMask = species.indexInRange(row, rowsCount)
         asm.aload(speciesSlot);
         asm.checkcast(pool.vecSpeciesClass);
         asm.lload(rowSlot);
         asm.lload(rowsCountSlot);
-        asm.invokeInterface(pool.speciesIndexInRange, 4); // 2 longs = 4 slots
+        asm.invokeInterface(pool.speciesIndexInRange, 4);
         asm.astore(activeMaskSlot);
 
         // === Emit ops ===
@@ -232,7 +254,6 @@ public final class VectorBytecodeFilterCompiler {
 
         // === Terminator ===
         Terminator.Return ret = (Terminator.Return) block.getTerminator();
-
         if (ret.src() == Terminator.Return.ACCEPT) {
             asm.aload(activeMaskSlot);
         } else {
@@ -242,10 +263,8 @@ public final class VectorBytecodeFilterCompiler {
             asm.checkcast(pool.vectorMaskClass);
             asm.invokeVirtual(pool.maskAnd);
         }
-        // Stack: resultMask (as Object or VectorMask)
 
         if (isCountOnly) {
-            // filteredCount += resultMask.trueCount()
             asm.checkcast(pool.vectorMaskClass);
             asm.invokeVirtual(pool.maskTrueCount);
             asm.i2l();
@@ -253,29 +272,27 @@ public final class VectorBytecodeFilterCompiler {
             asm.ladd();
             asm.lstore(filteredCountSlot);
         } else {
-            // Save resultMask (reuse activeMaskSlot since we're past the ops)
             asm.checkcast(pool.vectorMaskClass);
             asm.astore(activeMaskSlot);
-
-            // matchCount = resultMask.trueCount()
             asm.aload(activeMaskSlot);
             asm.checkcast(pool.vectorMaskClass);
             asm.invokeVirtual(pool.maskTrueCount);
-            // Stack: int matchCount
-            int skipBranch = asm.ifeq(); // if 0, skip to NEXT
+            int skipBranch = asm.ifeq();
 
-            // rowIds = iota.add(row)
+            // Row-ID output always uses LongVector (row IDs are longs).
+            // If primary type is F8, cast the result mask to Long.
             asm.aload(iotaSlot);
             asm.checkcast(pool.longVectorClass);
             asm.lload(rowSlot);
             asm.invokeVirtual(pool.longVecAddScalar);
-
-            // compressed = rowIds.compress(resultMask)
             asm.aload(activeMaskSlot);
             asm.checkcast(pool.vectorMaskClass);
+            if (primaryType == F8_TYPE) {
+                // Cast VectorMask<Double> → VectorMask<Long> (same lane count)
+                asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+                asm.invokeVirtual(pool.maskCast);
+            }
             asm.invokeVirtual(pool.longVecCompress);
-
-            // compressed.intoMemorySegment(outputSeg, filteredCount * 8, nativeOrder)
             asm.aload(outputSegSlot);
             asm.checkcast(pool.memSegClass);
             asm.lload(filteredCountSlot);
@@ -285,7 +302,6 @@ public final class VectorBytecodeFilterCompiler {
             asm.checkcast(pool.byteOrderClass);
             asm.invokeVirtual(pool.longVecIntoMemSeg);
 
-            // filteredCount += resultMask.trueCount()
             asm.aload(activeMaskSlot);
             asm.checkcast(pool.vectorMaskClass);
             asm.invokeVirtual(pool.maskTrueCount);
@@ -299,8 +315,6 @@ public final class VectorBytecodeFilterCompiler {
 
         // === NEXT ===
         int nextStart = asm.position();
-
-        // row += species.length()
         asm.lload(rowSlot);
         asm.aload(speciesSlot);
         asm.checkcast(pool.vecSpeciesClass);
@@ -319,21 +333,18 @@ public final class VectorBytecodeFilterCompiler {
         asm.lreturn();
 
         // === StackMapTable ===
-        asm.endMethodCode();
-        asm.putShort(0); // exception table
-
-        // StackMapTable offsets are relative to code start, not buffer start
         int codeStart = asm.getCodeStart();
         int loopBci = loopStart - codeStart;
         int nextBci = nextStart - codeStart;
         int exitBci = exitStart - codeStart;
 
-        // 3 frames: LOOP, NEXT, EXIT
-        asm.putShort(1); // 1 attribute: StackMapTable
+        asm.endMethodCode();
+        asm.putShort(0);
+
+        asm.putShort(1);
         asm.startStackMapTables(stackMapAttr, 3);
 
-        // Frame 1: full_frame at LOOP
-        asm.putByte(0xff); // full_frame tag
+        asm.putByte(0xff);
         asm.putShort(loopBci);
         int longParamCount = isCountOnly ? 6 : 7;
         int totalLocals = 1 + longParamCount + 2 + objectLocalCount;
@@ -342,16 +353,14 @@ public final class VectorBytecodeFilterCompiler {
         for (int i = 0; i < longParamCount; i++) {
             asm.putITEM_Long();
         }
-        asm.putITEM_Long(); // filteredCount
-        asm.putITEM_Long(); // row
+        asm.putITEM_Long();
+        asm.putITEM_Long();
         for (int i = 0; i < objectLocalCount; i++) {
             asm.putITEM_Object(pool.objectClassIndex);
         }
-        asm.putShort(0); // empty stack
+        asm.putShort(0);
 
-        // Frame 2: same_frame at NEXT (offset relative to previous frame + 1)
         emitSameFrame(asm, nextBci, loopBci);
-        // Frame 3: same_frame at EXIT
         emitSameFrame(asm, exitBci, nextBci);
 
         asm.endStackMapTables();
@@ -363,7 +372,7 @@ public final class VectorBytecodeFilterCompiler {
         if (offset <= 63) {
             asm.putByte(offset);
         } else {
-            asm.putByte(251); // same_frame_extended
+            asm.putByte(251);
             asm.putShort(offset);
         }
     }
@@ -376,93 +385,160 @@ public final class VectorBytecodeFilterCompiler {
             int[] colSegSlots, int varsSegSlot, Pool pool
     ) {
         switch (op) {
-            case LoweredOp.LoadColumn lc -> {
-                // LongVector.fromMemorySegment(species, colSeg, row * 8, nativeOrder, activeMask)
-                asm.aload(speciesSlot);
-                asm.checkcast(pool.vecSpeciesClass);
-                asm.aload(colSegSlots[lc.columnIndex()]);
-                asm.checkcast(pool.memSegClass);
-                asm.lload(rowSlot);
-                asm.ldc2_w(pool.longEight);
-                asm.lmul();
-                asm.aload(nativeOrderSlot);
-                asm.checkcast(pool.byteOrderClass);
-                asm.aload(activeMaskSlot);
-                asm.checkcast(pool.vectorMaskClass);
-                asm.invokeStatic(pool.longVecFromMemSegMasked);
-                asm.astore(tempSlots[lc.dst()]);
-            }
-            case LoweredOp.LoadImm li -> {
-                // LongVector.broadcast(species, value)
-                asm.aload(speciesSlot);
-                asm.checkcast(pool.vecSpeciesClass);
-                asm.ldc2_w(pool.getLong(li.lo()));
-                asm.invokeStatic(pool.longVecBroadcast);
-                asm.astore(tempSlots[li.dst()]);
-            }
-            case LoweredOp.LoadVar lv -> {
-                // Load scalar from vars, broadcast
-                asm.aload(speciesSlot);
-                asm.checkcast(pool.vecSpeciesClass);
-                asm.aload(varsSegSlot);
-                asm.checkcast(pool.memSegClass);
-                asm.getstatic(pool.javaLongUnaligned);
-                asm.ldc2_w(pool.getLong(lv.byteOffset()));
-                asm.invokeInterface(pool.memSegGetLong, 3); // ValueLayout(1) + long(2) = 3
-                asm.invokeStatic(pool.longVecBroadcast);
-                asm.astore(tempSlots[lv.dst()]);
-            }
-            case LoweredOp.Compare c -> {
-                // lhs.compare(VectorOperators.XX, rhs)
-                asm.aload(tempSlots[c.lhs()]);
-                asm.checkcast(pool.longVectorClass);
-                asm.getstatic(pool.comparisonOp(c.opcode()));
-                asm.aload(tempSlots[c.rhs()]);
-                asm.checkcast(pool.longVectorClass);
-                asm.invokeVirtual(pool.longVecCompare);
-                asm.astore(tempSlots[c.dst()]);
-            }
-            case LoweredOp.BooleanOp bo -> {
-                asm.aload(tempSlots[bo.lhs()]);
-                asm.checkcast(pool.vectorMaskClass);
-                asm.aload(tempSlots[bo.rhs()]);
-                asm.checkcast(pool.vectorMaskClass);
-                asm.invokeVirtual(bo.opcode() == AND ? pool.maskAnd : pool.maskOr);
-                asm.astore(tempSlots[bo.dst()]);
-            }
-            case LoweredOp.Not n -> {
-                asm.aload(tempSlots[n.src()]);
-                asm.checkcast(pool.vectorMaskClass);
-                asm.invokeVirtual(pool.maskNot);
-                asm.astore(tempSlots[n.dst()]);
-            }
-            case LoweredOp.Arithmetic a -> {
-                asm.aload(tempSlots[a.lhs()]);
-                asm.checkcast(pool.longVectorClass);
-                asm.aload(tempSlots[a.rhs()]);
-                asm.checkcast(pool.longVectorClass);
-                int method = switch (a.opcode()) {
-                    case ADD -> pool.longVecAdd;
-                    case SUB -> pool.longVecSub;
-                    case MUL -> pool.longVecMul;
-                    case DIV -> pool.longVecDiv;
-                    default -> throw new UnsupportedOperationException("arith op: " + a.opcode());
-                };
-                asm.invokeVirtual(method);
-                asm.astore(tempSlots[a.dst()]);
-            }
-            case LoweredOp.Negate neg -> {
-                asm.aload(tempSlots[neg.src()]);
-                asm.checkcast(pool.longVectorClass);
-                asm.invokeVirtual(pool.longVecNeg);
-                asm.astore(tempSlots[neg.dst()]);
-            }
+            case LoweredOp.LoadColumn lc -> emitLoadColumn(asm, lc, tempSlots, rowSlot,
+                    activeMaskSlot, speciesSlot, nativeOrderSlot, colSegSlots, pool);
+            case LoweredOp.LoadImm li -> emitLoadImm(asm, li, tempSlots, speciesSlot, pool);
+            case LoweredOp.LoadVar lv -> emitLoadVar(asm, lv, tempSlots, speciesSlot, varsSegSlot, pool);
+            case LoweredOp.Compare c -> emitCompare(asm, c, tempSlots, pool);
+            case LoweredOp.BooleanOp bo -> emitBooleanOp(asm, bo, tempSlots, pool);
+            case LoweredOp.Not n -> emitNot(asm, n, tempSlots, pool);
+            case LoweredOp.Arithmetic a -> emitArithmetic(asm, a, tempSlots, pool);
+            case LoweredOp.Negate neg -> emitNegate(asm, neg, tempSlots, pool);
             case LoweredOp.Move m -> {
                 asm.aload(tempSlots[m.src()]);
                 asm.astore(tempSlots[m.dst()]);
             }
+            case LoweredOp.Cast c -> emitCast(asm, c, tempSlots, speciesSlot, pool);
             default -> throw new UnsupportedOperationException("Vector op: " + op);
         }
+    }
+
+    private static void emitLoadColumn(
+            BytecodeAssembler asm, LoweredOp.LoadColumn lc, int[] tempSlots,
+            int rowSlot, int activeMaskSlot, int speciesSlot, int nativeOrderSlot,
+            int[] colSegSlots, Pool pool
+    ) {
+        Pool.VecType vt = pool.vecType(lc.type());
+        asm.aload(speciesSlot);
+        asm.checkcast(pool.vecSpeciesClass);
+        asm.aload(colSegSlots[lc.columnIndex()]);
+        asm.checkcast(pool.memSegClass);
+        asm.lload(rowSlot);
+        asm.ldc2_w(pool.ensureLongPooled(elementBytes(lc.type())));
+        asm.lmul();
+        asm.aload(nativeOrderSlot);
+        asm.checkcast(pool.byteOrderClass);
+        asm.aload(activeMaskSlot);
+        asm.checkcast(pool.vectorMaskClass);
+        asm.invokeStatic(vt.fromMemSegMasked);
+        asm.astore(tempSlots[lc.dst()]);
+    }
+
+    private static void emitLoadImm(BytecodeAssembler asm, LoweredOp.LoadImm li, int[] tempSlots,
+                                     int speciesSlot, Pool pool) {
+        Pool.VecType vt = pool.vecType(li.type());
+        asm.aload(speciesSlot);
+        asm.checkcast(pool.vecSpeciesClass);
+        switch (li.type()) {
+            case I4_TYPE -> asm.iconst((int) li.lo());
+            case I8_TYPE -> asm.ldc2_w(pool.ensureLongPooled(li.lo()));
+            case F4_TYPE -> asm.ldc(pool.ensureFloatPooled(Float.intBitsToFloat((int) li.lo())));
+            case F8_TYPE -> asm.ldc2_w(pool.ensureDoublePooled(Double.longBitsToDouble(li.lo())));
+            default -> throw new UnsupportedOperationException("LoadImm type: " + li.type());
+        }
+        asm.invokeStatic(vt.broadcast);
+        asm.astore(tempSlots[li.dst()]);
+    }
+
+    private static void emitLoadVar(BytecodeAssembler asm, LoweredOp.LoadVar lv, int[] tempSlots,
+                                     int speciesSlot, int varsSegSlot, Pool pool) {
+        Pool.VecType vt = pool.vecType(lv.type());
+        asm.aload(speciesSlot);
+        asm.checkcast(pool.vecSpeciesClass);
+        // Load scalar from vars segment and broadcast
+        asm.aload(varsSegSlot);
+        asm.checkcast(pool.memSegClass);
+        asm.getstatic(pool.varLayout(lv.type()));
+        asm.ldc2_w(pool.ensureLongPooled(lv.byteOffset()));
+        switch (lv.type()) {
+            case I4_TYPE -> {
+                asm.invokeInterface(pool.memSegGetInt, 3);
+                asm.invokeStatic(vt.broadcast);
+            }
+            case I8_TYPE -> {
+                asm.invokeInterface(pool.memSegGetLong, 3);
+                asm.invokeStatic(vt.broadcast);
+            }
+            case F4_TYPE -> {
+                asm.invokeInterface(pool.memSegGetFloat, 3);
+                asm.invokeStatic(vt.broadcast);
+            }
+            case F8_TYPE -> {
+                asm.invokeInterface(pool.memSegGetDouble, 3);
+                asm.invokeStatic(vt.broadcast);
+            }
+            default -> throw new UnsupportedOperationException("LoadVar type: " + lv.type());
+        }
+        asm.astore(tempSlots[lv.dst()]);
+    }
+
+    private static void emitCompare(BytecodeAssembler asm, LoweredOp.Compare c, int[] tempSlots, Pool pool) {
+        Pool.VecType vt = pool.vecType(c.operandType());
+        asm.aload(tempSlots[c.lhs()]);
+        asm.checkcast(vt.vecClass);
+        asm.getstatic(pool.comparisonOp(c.opcode()));
+        asm.aload(tempSlots[c.rhs()]);
+        asm.checkcast(vt.vecClass);
+        asm.invokeVirtual(vt.compare);
+        asm.astore(tempSlots[c.dst()]);
+    }
+
+    private static void emitBooleanOp(BytecodeAssembler asm, LoweredOp.BooleanOp bo, int[] tempSlots, Pool pool) {
+        asm.aload(tempSlots[bo.lhs()]);
+        asm.checkcast(pool.vectorMaskClass);
+        asm.aload(tempSlots[bo.rhs()]);
+        asm.checkcast(pool.vectorMaskClass);
+        asm.invokeVirtual(bo.opcode() == AND ? pool.maskAnd : pool.maskOr);
+        asm.astore(tempSlots[bo.dst()]);
+    }
+
+    private static void emitNot(BytecodeAssembler asm, LoweredOp.Not n, int[] tempSlots, Pool pool) {
+        asm.aload(tempSlots[n.src()]);
+        asm.checkcast(pool.vectorMaskClass);
+        asm.invokeVirtual(pool.maskNot);
+        asm.astore(tempSlots[n.dst()]);
+    }
+
+    private static void emitArithmetic(BytecodeAssembler asm, LoweredOp.Arithmetic a, int[] tempSlots, Pool pool) {
+        Pool.VecType vt = pool.vecType(a.resultType());
+        asm.aload(tempSlots[a.lhs()]);
+        asm.checkcast(vt.vecClass);
+        asm.aload(tempSlots[a.rhs()]);
+        asm.checkcast(vt.vecClass);
+        int method = switch (a.opcode()) {
+            case ADD -> vt.add;
+            case SUB -> vt.sub;
+            case MUL -> vt.mul;
+            case DIV -> vt.div;
+            default -> throw new UnsupportedOperationException("arith op: " + a.opcode());
+        };
+        asm.invokeVirtual(method);
+        asm.astore(tempSlots[a.dst()]);
+    }
+
+    private static void emitNegate(BytecodeAssembler asm, LoweredOp.Negate neg, int[] tempSlots, Pool pool) {
+        Pool.VecType vt = pool.vecType(neg.type());
+        asm.aload(tempSlots[neg.src()]);
+        asm.checkcast(vt.vecClass);
+        asm.invokeVirtual(vt.neg);
+        asm.astore(tempSlots[neg.dst()]);
+    }
+
+    private static void emitCast(BytecodeAssembler asm, LoweredOp.Cast c, int[] tempSlots,
+                                  int speciesSlot, Pool pool) {
+        // Same-width cast: I4<->F4 via convertShape(I2F/F2I), I8<->F8 via L2D/D2L
+        // Same-width types have identical lane counts, so part 0 covers all lanes.
+        Pool.VecType srcVt = pool.vecType(c.fromType());
+        asm.aload(tempSlots[c.src()]);
+        asm.checkcast(srcVt.vecClass);
+        asm.getstatic(pool.conversionOp(c.fromType(), c.toType()));
+        // Load target species: for same-width, we can use the speciesSlot (all same lanes)
+        // but convertShape needs the target VectorSpecies. Use getstatic on target's SPECIES_PREFERRED.
+        asm.getstatic(pool.vecType(c.toType()).speciesPreferred);
+        asm.iconst(0); // part 0 (same width → single part)
+        asm.invokeVirtual(srcVt.convertShape);
+        asm.checkcast(pool.vecType(c.toType()).vecClass);
+        asm.astore(tempSlots[c.dst()]);
     }
 
     private static int findMaxColumnIndex(LoweredProgram program) {
@@ -481,7 +557,6 @@ public final class VectorBytecodeFilterCompiler {
     // === Constant pool ===
 
     static final class Pool {
-        final int thisClassIndex;
         final int objectClassIndex;
         final int longVectorClass;
         final int vectorMaskClass;
@@ -491,6 +566,7 @@ public final class VectorBytecodeFilterCompiler {
 
         // FilterHelpers setup methods
         final int helpersLongSpecies;
+        final int helpersDoubleSpecies;
         final int helpersNativeByteOrder;
         final int helpersColumnSegment;
         final int helpersSegment;
@@ -502,20 +578,23 @@ public final class VectorBytecodeFilterCompiler {
 
         // MemorySegment interface methods
         final int memSegGetLong;
+        final int memSegGetInt;
+        final int memSegGetFloat;
+        final int memSegGetDouble;
 
-        // Static fields
+        // ValueLayout fields
         final int javaLongUnaligned;
+        final int javaIntUnaligned;
+        final int javaFloatUnaligned;
+        final int javaDoubleUnaligned;
+
+        // VectorOperators comparison fields
         private final int opEQ, opNE, opLT, opLE, opGT, opGE;
 
-        // LongVector methods
-        final int longVecFromMemSegMasked;
-        final int longVecBroadcast;
-        final int longVecCompare;
-        final int longVecAdd;
-        final int longVecSub;
-        final int longVecMul;
-        final int longVecDiv;
-        final int longVecNeg;
+        // VectorOperators conversion fields
+        private int convI2F, convF2I, convL2D, convD2L;
+
+        // LongVector-specific (always needed for row-ID output)
         final int longVecAddScalar;
         final int longVecCompress;
         final int longVecIntoMemSeg;
@@ -525,101 +604,132 @@ public final class VectorBytecodeFilterCompiler {
         final int maskOr;
         final int maskNot;
         final int maskTrueCount;
+        final int maskCast;
 
         // Pre-pooled constants
         final int longEight;
         private final HashMap<Long, Integer> pooledLongs = new HashMap<>();
+        private final HashMap<Integer, Integer> pooledInts = new HashMap<>();
+        private final HashMap<Float, Integer> pooledFloats = new HashMap<>();
+        private final HashMap<Double, Integer> pooledDoubles = new HashMap<>();
+
+        // Per-type vector method pools
+        private final VecType[] vecTypes = new VecType[7]; // indexed by IR type constant
 
         Pool(BytecodeAssembler asm, LoweredProgram program) {
             // --- Classes ---
             int longVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/LongVector"));
             longVectorClass = longVecCls;
+            int intVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/IntVector"));
+            int floatVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/FloatVector"));
+            int doubleVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/DoubleVector"));
             int vecMaskCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/VectorMask"));
             vectorMaskClass = vecMaskCls;
             int vecSpeciesCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/VectorSpecies"));
+            vecSpeciesClass = vecSpeciesCls;
             int vecOpsCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/VectorOperators"));
             int memSegCls = asm.poolClass(asm.poolUtf8("java/lang/foreign/MemorySegment"));
             memSegClass = memSegCls;
             int byteOrderCls = asm.poolClass(asm.poolUtf8("java/nio/ByteOrder"));
             byteOrderClass = byteOrderCls;
-            vecSpeciesClass = vecSpeciesCls;
             int valueLayoutCls = asm.poolClass(asm.poolUtf8("java/lang/foreign/ValueLayout"));
             int helpersCls = asm.poolClass(asm.poolUtf8("io/questdb/jit/FilterHelpers"));
             objectClassIndex = asm.poolClass(asm.poolUtf8("java/lang/Object"));
-            thisClassIndex = asm.poolClass(asm.poolUtf8("io/questdb/jit/vgen"));
 
-            // --- Reusable signature fragments ---
+            // Signature fragments
             String sMask = "Ljdk/incubator/vector/VectorMask;";
-            String sLVec = "Ljdk/incubator/vector/LongVector;";
-            String sVec = "Ljdk/incubator/vector/Vector;";
             String sSpec = "Ljdk/incubator/vector/VectorSpecies;";
             String sMSeg = "Ljava/lang/foreign/MemorySegment;";
             String sBO = "Ljava/nio/ByteOrder;";
             String sComp = "Ljdk/incubator/vector/VectorOperators$Comparison;";
+            String sVec = "Ljdk/incubator/vector/Vector;";
+            String sConv = "Ljdk/incubator/vector/VectorOperators$Conversion;";
 
-            // --- FilterHelpers setup methods (all invokestatic on a class) ---
+            // --- FilterHelpers ---
             helpersLongSpecies = asm.poolMethod(helpersCls, "longSpecies", "()" + sSpec);
+            helpersDoubleSpecies = asm.poolMethod(helpersCls, "doubleSpecies", "()" + sSpec);
             helpersNativeByteOrder = asm.poolMethod(helpersCls, "nativeByteOrder", "()Ljava/nio/ByteOrder;");
             helpersColumnSegment = asm.poolMethod(helpersCls, "columnSegment", "(JI)" + sMSeg);
             helpersSegment = asm.poolMethod(helpersCls, "segment", "(J)" + sMSeg);
-            helpersIotaVector = asm.poolMethod(helpersCls, "iotaVector", "(" + sSpec + ")" + sLVec);
+            helpersIotaVector = asm.poolMethod(helpersCls, "iotaVector",
+                    "(" + sSpec + ")Ljdk/incubator/vector/LongVector;");
 
-            // --- VectorSpecies (interface) methods ---
+            // --- VectorSpecies (interface) ---
             speciesIndexInRange = asm.poolInterfaceMethod(vecSpeciesCls, "indexInRange", "(JJ)" + sMask);
             speciesLength = asm.poolInterfaceMethod(vecSpeciesCls, "length", "()I");
 
-            // --- MemorySegment (interface) methods ---
+            // --- MemorySegment (interface) ---
             memSegGetLong = asm.poolInterfaceMethod(memSegCls, "get",
                     "(Ljava/lang/foreign/ValueLayout$OfLong;J)J");
+            memSegGetInt = asm.poolInterfaceMethod(memSegCls, "get",
+                    "(Ljava/lang/foreign/ValueLayout$OfInt;J)I");
+            memSegGetFloat = asm.poolInterfaceMethod(memSegCls, "get",
+                    "(Ljava/lang/foreign/ValueLayout$OfFloat;J)F");
+            memSegGetDouble = asm.poolInterfaceMethod(memSegCls, "get",
+                    "(Ljava/lang/foreign/ValueLayout$OfDouble;J)D");
 
-            // --- ValueLayout static field ---
-            javaLongUnaligned = asm.poolField(valueLayoutCls,
-                    asm.poolNameAndType(asm.poolUtf8("JAVA_LONG_UNALIGNED"),
-                            asm.poolUtf8("Ljava/lang/foreign/ValueLayout$OfLong;")));
+            // --- ValueLayout fields ---
+            javaLongUnaligned = poolStaticField(asm, valueLayoutCls, "JAVA_LONG_UNALIGNED",
+                    "Ljava/lang/foreign/ValueLayout$OfLong;");
+            javaIntUnaligned = poolStaticField(asm, valueLayoutCls, "JAVA_INT_UNALIGNED",
+                    "Ljava/lang/foreign/ValueLayout$OfInt;");
+            javaFloatUnaligned = poolStaticField(asm, valueLayoutCls, "JAVA_FLOAT_UNALIGNED",
+                    "Ljava/lang/foreign/ValueLayout$OfFloat;");
+            javaDoubleUnaligned = poolStaticField(asm, valueLayoutCls, "JAVA_DOUBLE_UNALIGNED",
+                    "Ljava/lang/foreign/ValueLayout$OfDouble;");
 
-            // --- VectorOperators comparison fields ---
+            // --- Comparison ops ---
             String compType = "Ljdk/incubator/vector/VectorOperators$Comparison;";
-            opEQ = poolCompField(asm, vecOpsCls, "EQ", compType);
-            opNE = poolCompField(asm, vecOpsCls, "NE", compType);
-            opLT = poolCompField(asm, vecOpsCls, "LT", compType);
-            opLE = poolCompField(asm, vecOpsCls, "LE", compType);
-            opGT = poolCompField(asm, vecOpsCls, "GT", compType);
-            opGE = poolCompField(asm, vecOpsCls, "GE", compType);
+            opEQ = poolStaticField(asm, vecOpsCls, "EQ", compType);
+            opNE = poolStaticField(asm, vecOpsCls, "NE", compType);
+            opLT = poolStaticField(asm, vecOpsCls, "LT", compType);
+            opLE = poolStaticField(asm, vecOpsCls, "LE", compType);
+            opGT = poolStaticField(asm, vecOpsCls, "GT", compType);
+            opGE = poolStaticField(asm, vecOpsCls, "GE", compType);
 
-            // --- LongVector methods (class, so poolMethod + invokevirtual/invokestatic) ---
-            // static: fromMemorySegment(species, seg, offset, order, mask) -> LongVector
-            longVecFromMemSegMasked = asm.poolMethod(longVecCls, "fromMemorySegment",
-                    "(" + sSpec + sMSeg + "J" + sBO + sMask + ")" + sLVec);
-            // static: broadcast(species, long) -> LongVector
-            longVecBroadcast = asm.poolMethod(longVecCls, "broadcast",
-                    "(" + sSpec + "J)" + sLVec);
-            // instance: compare(Comparison, Vector) -> VectorMask (generic erased to Vector)
-            longVecCompare = asm.poolMethod(longVecCls, "compare",
-                    "(" + sComp + sVec + ")" + sMask);
-            // instance: add/sub/mul/div(Vector) -> LongVector
-            longVecAdd = asm.poolMethod(longVecCls, "add", "(" + sVec + ")" + sLVec);
-            longVecSub = asm.poolMethod(longVecCls, "sub", "(" + sVec + ")" + sLVec);
-            longVecMul = asm.poolMethod(longVecCls, "mul", "(" + sVec + ")" + sLVec);
-            longVecDiv = asm.poolMethod(longVecCls, "div", "(" + sVec + ")" + sLVec);
-            // instance: neg() -> LongVector
-            longVecNeg = asm.poolMethod(longVecCls, "neg", "()" + sLVec);
-            // instance: add(long) -> LongVector
+            // --- Conversion ops (for Cast) ---
+            String convType = "Ljdk/incubator/vector/VectorOperators$Conversion;";
+            convI2F = poolStaticField(asm, vecOpsCls, "I2F", convType);
+            convF2I = poolStaticField(asm, vecOpsCls, "F2I", convType);
+            convL2D = poolStaticField(asm, vecOpsCls, "L2D", convType);
+            convD2L = poolStaticField(asm, vecOpsCls, "D2L", convType);
+
+            // --- Per-type VecType pools ---
+            String sLVec = "Ljdk/incubator/vector/LongVector;";
+            String sIVec = "Ljdk/incubator/vector/IntVector;";
+            String sFVec = "Ljdk/incubator/vector/FloatVector;";
+            String sDVec = "Ljdk/incubator/vector/DoubleVector;";
+
+            vecTypes[I8_TYPE] = poolVecType(asm, longVecCls, sLVec, sSpec, sMSeg, sBO, sMask, sVec, sConv, "J");
+            vecTypes[I4_TYPE] = poolVecType(asm, intVecCls, sIVec, sSpec, sMSeg, sBO, sMask, sVec, sConv, "I");
+            vecTypes[F4_TYPE] = poolVecType(asm, floatVecCls, sFVec, sSpec, sMSeg, sBO, sMask, sVec, sConv, "F");
+            vecTypes[F8_TYPE] = poolVecType(asm, doubleVecCls, sDVec, sSpec, sMSeg, sBO, sMask, sVec, sConv, "D");
+
+            // --- LongVector-specific (for row-ID output) ---
             longVecAddScalar = asm.poolMethod(longVecCls, "add", "(J)" + sLVec);
-            // instance: compress(VectorMask) -> LongVector
             longVecCompress = asm.poolMethod(longVecCls, "compress", "(" + sMask + ")" + sLVec);
-            // instance: intoMemorySegment(MemorySegment, long, ByteOrder) -> void
             longVecIntoMemSeg = asm.poolMethod(longVecCls, "intoMemorySegment",
                     "(" + sMSeg + "J" + sBO + ")V");
 
-            // --- VectorMask methods (abstract class, so poolMethod) ---
+            // --- VectorMask methods ---
             maskAnd = asm.poolMethod(vecMaskCls, "and", "(" + sMask + ")" + sMask);
             maskOr = asm.poolMethod(vecMaskCls, "or", "(" + sMask + ")" + sMask);
             maskNot = asm.poolMethod(vecMaskCls, "not", "()" + sMask);
             maskTrueCount = asm.poolMethod(vecMaskCls, "trueCount", "()I");
+            maskCast = asm.poolMethod(vecMaskCls, "cast", "(" + sSpec + ")" + sMask);
 
-            // --- Pre-pool long constants ---
-            longEight = ensureLong(asm, 8L);
+            // --- Constants ---
+            doPoolLong(asm, 8L);
             prePoolConstants(asm, program);
+            longEight = ensureLongPooled(8L);
+        }
+
+        VecType vecType(int type) {
+            VecType vt = vecTypes[type];
+            if (vt == null) {
+                throw new UnsupportedOperationException("No VecType for type: " + type);
+            }
+            return vt;
         }
 
         int comparisonOp(int opcode) {
@@ -630,20 +740,58 @@ public final class VectorBytecodeFilterCompiler {
                 case LE -> opLE;
                 case GT -> opGT;
                 case GE -> opGE;
-                default -> throw new UnsupportedOperationException("cmp op: " + opcode);
+                default -> throw new UnsupportedOperationException("cmp: " + opcode);
             };
         }
 
-        int getLong(long value) {
+        int conversionOp(int fromType, int toType) {
+            if (fromType == I4_TYPE && toType == F4_TYPE) return convI2F;
+            if (fromType == F4_TYPE && toType == I4_TYPE) return convF2I;
+            if (fromType == I8_TYPE && toType == F8_TYPE) return convL2D;
+            if (fromType == F8_TYPE && toType == I8_TYPE) return convD2L;
+            throw new UnsupportedOperationException("conversion: " + fromType + " -> " + toType);
+        }
+
+        int varLayout(int type) {
+            return switch (type) {
+                case I4_TYPE -> javaIntUnaligned;
+                case I8_TYPE -> javaLongUnaligned;
+                case F4_TYPE -> javaFloatUnaligned;
+                case F8_TYPE -> javaDoubleUnaligned;
+                default -> throw new UnsupportedOperationException("var layout: " + type);
+            };
+        }
+
+        int ensureLongPooled(long value) {
             Integer idx = pooledLongs.get(value);
-            if (idx == null) {
-                throw new IllegalStateException("Long constant " + value + " was not pre-pooled");
-            }
+            if (idx == null) throw new IllegalStateException("Long " + value + " not pre-pooled");
             return idx;
         }
 
-        private int ensureLong(BytecodeAssembler asm, long value) {
-            return pooledLongs.computeIfAbsent(value, v -> asm.poolLongConst(v));
+        int ensureFloatPooled(float value) {
+            Integer idx = pooledFloats.get(value);
+            if (idx == null) throw new IllegalStateException("Float " + value + " not pre-pooled");
+            return idx;
+        }
+
+        int ensureDoublePooled(double value) {
+            Integer idx = pooledDoubles.get(value);
+            if (idx == null) throw new IllegalStateException("Double " + value + " not pre-pooled");
+            return idx;
+        }
+
+        // Pool-time methods (called during constructor, before finishPool)
+
+        private void doPoolLong(BytecodeAssembler asm, long value) {
+            pooledLongs.computeIfAbsent(value, v -> asm.poolLongConst(v));
+        }
+
+        private void doPoolFloat(BytecodeAssembler asm, float value) {
+            pooledFloats.computeIfAbsent(value, v -> asm.poolFloatConst(v));
+        }
+
+        private void doPoolDouble(BytecodeAssembler asm, double value) {
+            pooledDoubles.computeIfAbsent(value, v -> asm.poolDoubleConst(v));
         }
 
         private void prePoolConstants(BytecodeAssembler asm, LoweredProgram program) {
@@ -652,17 +800,74 @@ public final class VectorBytecodeFilterCompiler {
                 for (int i = 0; i < block.getOpCount(); i++) {
                     LoweredOp op = block.getOp(i);
                     if (op instanceof LoweredOp.LoadImm li) {
-                        ensureLong(asm, li.lo());
+                        switch (li.type()) {
+                            case I8_TYPE -> doPoolLong(asm, li.lo());
+                            case F8_TYPE -> doPoolDouble(asm, Double.longBitsToDouble(li.lo()));
+                            case F4_TYPE -> doPoolFloat(asm, Float.intBitsToFloat((int) li.lo()));
+                            case I4_TYPE -> {} // iconst handles small ints inline
+                        }
                     }
                     if (op instanceof LoweredOp.LoadVar lv) {
-                        ensureLong(asm, (long) lv.byteOffset());
+                        doPoolLong(asm, lv.byteOffset());
+                    }
+                    if (op instanceof LoweredOp.LoadColumn lc) {
+                        doPoolLong(asm, elementBytes(lc.type()));
                     }
                 }
             }
+            // Ensure element-byte constants are pooled for all types used
+            doPoolLong(asm, 4L);
+            doPoolLong(asm, 8L);
         }
 
-        private static int poolCompField(BytecodeAssembler asm, int classCp, String name, String type) {
+        private static int poolStaticField(BytecodeAssembler asm, int classCp, String name, String type) {
             return asm.poolField(classCp, asm.poolNameAndType(asm.poolUtf8(name), asm.poolUtf8(type)));
         }
+
+        private static VecType poolVecType(BytecodeAssembler asm, int vecCls, String sVecType,
+                                            String sSpec, String sMSeg, String sBO, String sMask,
+                                            String sVec, String sConv, String scalarDesc) {
+            // fromMemorySegment(species, seg, offset, order, mask) -> XxxVector
+            int fromMemSegMasked = asm.poolMethod(vecCls, "fromMemorySegment",
+                    "(" + sSpec + sMSeg + "J" + sBO + sMask + ")" + sVecType);
+
+            // broadcast(species, scalar) -> XxxVector
+            int broadcast = asm.poolMethod(vecCls, "broadcast",
+                    "(" + sSpec + scalarDesc + ")" + sVecType);
+
+            // compare(Comparison, Vector) -> VectorMask (generic erased to Vector)
+            int compare = asm.poolMethod(vecCls, "compare",
+                    "(" + "Ljdk/incubator/vector/VectorOperators$Comparison;" + sVec + ")" + sMask);
+
+            // add/sub/mul/div(Vector) -> XxxVector
+            int add = asm.poolMethod(vecCls, "add", "(" + sVec + ")" + sVecType);
+            int sub = asm.poolMethod(vecCls, "sub", "(" + sVec + ")" + sVecType);
+            int mul = asm.poolMethod(vecCls, "mul", "(" + sVec + ")" + sVecType);
+            int div = asm.poolMethod(vecCls, "div", "(" + sVec + ")" + sVecType);
+
+            // neg() -> XxxVector
+            int neg = asm.poolMethod(vecCls, "neg", "()" + sVecType);
+
+            // convertShape(Conversion, VectorSpecies, int) -> Vector
+            int convertShape = asm.poolMethod(vecCls, "convertShape",
+                    "(" + sConv + sSpec + "I)" + sVec);
+
+            // SPECIES_PREFERRED field
+            int speciesPreferred = asm.poolField(vecCls,
+                    asm.poolNameAndType(asm.poolUtf8("SPECIES_PREFERRED"), asm.poolUtf8(sSpec)));
+
+            return new VecType(vecCls, fromMemSegMasked, broadcast, compare,
+                    add, sub, mul, div, neg, convertShape, speciesPreferred);
+        }
+
+        record VecType(
+                int vecClass,
+                int fromMemSegMasked,
+                int broadcast,
+                int compare,
+                int add, int sub, int mul, int div, int neg,
+                int convertShape,
+                int speciesPreferred
+        ) {}
     }
 }

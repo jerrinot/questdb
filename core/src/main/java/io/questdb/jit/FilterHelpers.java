@@ -86,6 +86,13 @@ public final class FilterHelpers {
     }
 
     /**
+     * Returns the preferred DoubleVector species. Called once at method entry.
+     */
+    public static jdk.incubator.vector.VectorSpecies<Double> doubleSpecies() {
+        return jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED;
+    }
+
+    /**
      * Creates the iota LongVector [0, 1, 2, ..., species.length()-1].
      * Called once at method entry for row-ID mode.
      */
