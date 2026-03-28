@@ -109,13 +109,15 @@ so `bytecodeFilter` is always set. The interpreter fallback in `call()` is
 dead code for AUTO. The interpreter is only used when `JitBackend.JAVA_INTERPRETED`
 is explicitly forced (benchmark-only mode).
 
-### 2. Test oracle — NOT YET RESOLVED
+### ~~2. Test oracle~~ RESOLVED
 
-`ScalarBytecodeFilterCompilerTest` uses `interpreterFilter()` /
-`interpreterCount()` as the semantic oracle in 6 tests. Removing the
-interpreter requires migrating these to use non-JIT SQL execution as the
-oracle (like `CompiledFilterRegressionTest` does). This is a separate task
-that does not block the current review.
+All `ScalarBytecodeFilterCompilerTest` tests now use hardcoded expected
+row indices computed from the input data. The `interpreterFilter()`,
+`interpreterCount()`, and `writeIr()` helper methods and their imports
+(`Vm`, `MemoryCARW`, `VectorFilterInterpreter`) have been removed.
+
+The interpreter is no longer a test dependency for the scalar bytecode
+compiler tests.
 
 ### ~~3. Default integration path~~ RESOLVED
 
