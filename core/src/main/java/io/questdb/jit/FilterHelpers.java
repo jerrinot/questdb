@@ -653,6 +653,43 @@ public final class FilterHelpers {
         return UNSAFE.getLong(auxAddr + (row << 4));
     }
 
+    // --- Vectorized var-size header gathers ---
+    // These gather scalar headers into a vector for subsequent NULL check comparison.
+    // The int[]/long[] allocations are scalar-replaced by C2 escape analysis.
+
+    public static jdk.incubator.vector.IntVector gatherStringHeaders(
+            long dataAddress, long varSizeAuxAddress, int columnIndex, long startRow,
+            jdk.incubator.vector.VectorSpecies<Integer> species
+    ) {
+        int[] buf = new int[species.length()];
+        for (int i = 0; i < buf.length; i++) {
+            buf[i] = readStringHeader(dataAddress, varSizeAuxAddress, columnIndex, startRow + i);
+        }
+        return jdk.incubator.vector.IntVector.fromArray(species, buf, 0);
+    }
+
+    public static jdk.incubator.vector.LongVector gatherBinaryHeaders(
+            long dataAddress, long varSizeAuxAddress, int columnIndex, long startRow,
+            jdk.incubator.vector.VectorSpecies<Long> species
+    ) {
+        long[] buf = new long[species.length()];
+        for (int i = 0; i < buf.length; i++) {
+            buf[i] = readBinaryHeader(dataAddress, varSizeAuxAddress, columnIndex, startRow + i);
+        }
+        return jdk.incubator.vector.LongVector.fromArray(species, buf, 0);
+    }
+
+    public static jdk.incubator.vector.LongVector gatherVarcharHeaders(
+            long varSizeAuxAddress, int columnIndex, long startRow,
+            jdk.incubator.vector.VectorSpecies<Long> species
+    ) {
+        long[] buf = new long[species.length()];
+        for (int i = 0; i < buf.length; i++) {
+            buf[i] = readVarcharHeader(varSizeAuxAddress, columnIndex, startRow + i);
+        }
+        return jdk.incubator.vector.LongVector.fromArray(species, buf, 0);
+    }
+
     // --- Bind variable reads ---
 
     public static byte readVarByte(long varsAddress, int byteOffset) {

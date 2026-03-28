@@ -52,6 +52,7 @@ import static io.questdb.jit.CompiledFilterIRSerializer.*;
 public final class VectorBytecodeFilterCompiler {
 
     private static final int SLOT_DATA_ADDR = 1;
+    private static final int SLOT_VAR_SIZE_AUX = 5;
     private static final int SLOT_VARS_ADDR = 7;
     private static final int FR_SLOT_FILTERED_ROWS = 11;
     private static final int FR_SLOT_ROWS_COUNT = 13;
@@ -120,7 +121,6 @@ public final class VectorBytecodeFilterCompiler {
         }
         for (int i = 0; i < block.getOpCount(); i++) {
             LoweredOp op = block.getOp(i);
-            if (op instanceof LoweredOp.LoadVarSizeHeader) return false;
             if (op instanceof LoweredOp.CompareI128) return false;
             if (op instanceof LoweredOp.LoadColumn lc && !isSupportedLoadType(lc.type())) return false;
             if (op instanceof LoweredOp.LoadVar lv && !isSupportedLoadType(lv.type())) return false;
@@ -224,6 +224,10 @@ public final class VectorBytecodeFilterCompiler {
                     } else if (op instanceof LoweredOp.Negate n) {
                         if (n.type() == I4_TYPE) usesI4 = true;
                         if (n.type() == F4_TYPE) usesF4 = true;
+                    } else if (op instanceof LoweredOp.LoadVarSizeHeader vh) {
+                        int normalized = IrLowering.normalizeVarSizeType(vh.headerType());
+                        if (normalized == I4_TYPE) usesI4 = true;
+                        maxColIdx = Math.max(maxColIdx, vh.columnIndex());
                     } else if (op instanceof LoweredOp.Cast) {
                         hasCast = true;
                     }
@@ -1069,6 +1073,7 @@ public final class VectorBytecodeFilterCompiler {
         int[] tempSlots = ctx.s().tempSlots();
         switch (op) {
             case LoweredOp.LoadColumn lc -> emitLoadColumn(ctx, lc, maskedLoads);
+            case LoweredOp.LoadVarSizeHeader vh -> emitLoadVarSizeHeader(ctx, vh);
             case LoweredOp.LoadImm li -> emitLoadImm(ctx, li);
             case LoweredOp.LoadVar lv -> emitLoadVar(ctx, lv);
             case LoweredOp.Compare c -> emitCompare(ctx, c);
@@ -1107,6 +1112,31 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeStatic(vt.fromMemSeg);
         }
         asm.astore(s.tempSlots()[lc.dst()]);
+    }
+
+    private static void emitLoadVarSizeHeader(EmitContext ctx, LoweredOp.LoadVarSizeHeader vh) {
+        BytecodeAssembler asm = ctx.asm();
+        Pool pool = ctx.pool();
+        SlotLayout s = ctx.s();
+        int normalizedType = IrLowering.normalizeVarSizeType(vh.headerType());
+        // Gather header values via scalar helper → vector
+        // STRING_HEADER → gatherStringHeaders(dataAddr, auxAddr, col, row, intSpecies) → IntVector
+        // BINARY_HEADER → gatherBinaryHeaders(dataAddr, auxAddr, col, row, longSpecies) → LongVector
+        // VARCHAR_HEADER → gatherVarcharHeaders(auxAddr, col, row, longSpecies) → LongVector
+        int gatherMethod = pool.headerGatherMethod(vh.headerType());
+        if (vh.headerType() != VARCHAR_HEADER_TYPE) {
+            asm.lload(SLOT_DATA_ADDR);
+        }
+        asm.lload(SLOT_VAR_SIZE_AUX);
+        asm.iconst(vh.columnIndex());
+        asm.lload(s.rowSlot());
+        if (normalizedType == I4_TYPE) {
+            asm.aload(s.intSpeciesSlot());
+        } else {
+            asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+        }
+        asm.invokeStatic(gatherMethod);
+        asm.astore(s.tempSlots()[vh.dst()]);
     }
 
     private static void emitLoadImm(EmitContext ctx, LoweredOp.LoadImm li) {
@@ -1435,6 +1465,10 @@ public final class VectorBytecodeFilterCompiler {
         final int longToDoubleNullAware;
         final int intToLongNullAware;
         final int intToFloatNullAware;
+        // Var-size header gather helpers
+        final int gatherStringHeaders;
+        final int gatherBinaryHeaders;
+        final int gatherVarcharHeaders;
 
         // LongVector-specific (always needed for row-ID output)
         final int longVecAddScalar;
@@ -1555,6 +1589,14 @@ public final class VectorBytecodeFilterCompiler {
                     "(Ljdk/incubator/vector/IntVector;Ljdk/incubator/vector/LongVector;)Ljdk/incubator/vector/LongVector;");
             intToFloatNullAware = asm.poolMethod(helpersCls, "intToFloatNullAware",
                     "(Ljdk/incubator/vector/IntVector;" + sSpec + ")Ljdk/incubator/vector/FloatVector;");
+
+            // --- FilterHelpers: var-size header gathers ---
+            gatherStringHeaders = asm.poolMethod(helpersCls, "gatherStringHeaders",
+                    "(JJI" + "J" + sSpec + ")Ljdk/incubator/vector/IntVector;");
+            gatherBinaryHeaders = asm.poolMethod(helpersCls, "gatherBinaryHeaders",
+                    "(JJI" + "J" + sSpec + ")Ljdk/incubator/vector/LongVector;");
+            gatherVarcharHeaders = asm.poolMethod(helpersCls, "gatherVarcharHeaders",
+                    "(JI" + "J" + sSpec + ")Ljdk/incubator/vector/LongVector;");
 
             // --- VectorSpecies (interface) ---
             speciesIndexInRange = asm.poolInterfaceMethod(vecSpeciesCls, "indexInRange", "(JJ)" + sMask);
@@ -1729,6 +1771,15 @@ public final class VectorBytecodeFilterCompiler {
             if (fromType == I1_TYPE && toType == I4_TYPE) return convB2I;
             if (fromType == I2_TYPE && toType == I4_TYPE) return convS2I;
             throw new UnsupportedOperationException("conversion: " + fromType + " -> " + toType);
+        }
+
+        int headerGatherMethod(int headerType) {
+            return switch (headerType) {
+                case STRING_HEADER_TYPE -> gatherStringHeaders;
+                case BINARY_HEADER_TYPE -> gatherBinaryHeaders;
+                case VARCHAR_HEADER_TYPE -> gatherVarcharHeaders;
+                default -> throw new UnsupportedOperationException("header gather: " + headerType);
+            };
         }
 
         int varLayout(int type) {
