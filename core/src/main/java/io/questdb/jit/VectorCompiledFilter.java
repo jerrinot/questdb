@@ -86,6 +86,8 @@ public class VectorCompiledFilter implements JitFilter {
     }
 
     public void compile(MemoryCARW filter, int options, int backend) throws SqlException {
+        // The interpreter is always compiled as the ultimate fallback,
+        // unless a specific compiled backend is forced.
         if (backend != JitBackend.JAVA_COMPILED && backend != JitBackend.JAVA_VECTOR_COMPILED) {
             interpreter.compile(filter, options);
         }
@@ -107,14 +109,13 @@ public class VectorCompiledFilter implements JitFilter {
     }
 
     private void compileBytecode(MemoryCARW filter, int options, int backend) throws SqlException {
-        if (backend != JitBackend.JAVA_VECTOR_COMPILED && interpreter.usesVectorApi()) {
-            return;
-        }
         IrDecoder decoder = new IrDecoder();
         IrDecoder.Instruction[] instructions = decoder.decode(filter);
         LoweredProgram program = IrLowering.lower(instructions, options);
 
-        // Try vectorized bytecode first (unless forced to scalar)
+        // Try vectorized bytecode first (unless forced to scalar-only).
+        // This generates SIMD code via Vector API — best performance for
+        // supported programs (I8/F8, straight-line, no var-size/UUID).
         if (backend != JitBackend.JAVA_COMPILED) {
             vectorBytecodeFilter = VectorBytecodeFilterCompiler.compile(program);
             if (vectorBytecodeFilter != null) {
@@ -122,7 +123,8 @@ public class VectorCompiledFilter implements JitFilter {
             }
         }
 
-        // Fall back to scalar bytecode
+        // Fall back to scalar bytecode — handles all programs including
+        // control flow, all types, var-size columns, UUID.
         if (backend != JitBackend.JAVA_VECTOR_COMPILED) {
             bytecodeFilter = ScalarBytecodeFilterCompiler.compile(program);
         }

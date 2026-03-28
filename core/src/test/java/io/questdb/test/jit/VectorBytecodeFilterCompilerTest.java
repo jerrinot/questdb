@@ -24,6 +24,9 @@
 
 package io.questdb.test.jit;
 
+import io.questdb.cairo.JitBackend;
+import io.questdb.cairo.vm.Vm;
+import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.jit.*;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
@@ -277,6 +280,72 @@ public class VectorBytecodeFilterCompilerTest {
             Unsafe.free(colPtrArray, 16, MemoryTag.NATIVE_DEFAULT);
             Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
             Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    // ========================
+    // AUTO backend selection
+    // ========================
+
+    @Test
+    public void testAutoSelectsVectorBytecodeForEligibleProgram() throws Exception {
+        // An I8 straight-line program with single-size hint should be compiled
+        // by the vectorized bytecode compiler when using AUTO backend.
+        IrDecoder.Instruction[] instructions = ir(
+                insn(IMM, I8_TYPE, 42, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        );
+
+        try (MemoryCARW irMem = Vm.getCARWInstance(1024, 1, MemoryTag.NATIVE_JIT)) {
+            for (IrDecoder.Instruction insn : instructions) {
+                irMem.putInt(insn.opcode());
+                irMem.putInt(insn.type());
+                irMem.putLong(insn.payloadLo());
+                irMem.putLong(insn.payloadHi());
+            }
+
+            VectorCompiledFilter filter = new VectorCompiledFilter();
+            filter.compile(irMem, LONG_OPTIONS, JitBackend.AUTO);
+
+            Assert.assertTrue("AUTO should select vectorized bytecode for eligible I8 program",
+                    filter.usesVectorBytecode());
+        }
+    }
+
+    @Test
+    public void testAutoFallsBackToScalarForControlFlow() throws Exception {
+        // A program with short-circuit (IN) should fall back to scalar bytecode.
+        // Use BEGIN_SC/AND_SC/END_SC to create control flow.
+        IrDecoder.Instruction[] instructions = ir(
+                insn(CompiledFilterIRSerializer.BEGIN_SC, 0, 2, 0),
+                insn(IMM, I8_TYPE, 1, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(CompiledFilterIRSerializer.OR_SC, 0, 2, 0),
+                insn(IMM, I8_TYPE, 2, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(CompiledFilterIRSerializer.END_SC, 0, 2, 0),
+                insn(RET, 0, 0, 0)
+        );
+
+        try (MemoryCARW irMem = Vm.getCARWInstance(1024, 1, MemoryTag.NATIVE_JIT)) {
+            for (IrDecoder.Instruction insn : instructions) {
+                irMem.putInt(insn.opcode());
+                irMem.putInt(insn.type());
+                irMem.putLong(insn.payloadLo());
+                irMem.putLong(insn.payloadHi());
+            }
+
+            VectorCompiledFilter filter = new VectorCompiledFilter();
+            filter.compile(irMem, LONG_OPTIONS, JitBackend.AUTO);
+
+            Assert.assertFalse("Control-flow program should NOT use vectorized bytecode",
+                    filter.usesVectorBytecode());
+            Assert.assertTrue("Control-flow program should fall back to scalar bytecode",
+                    filter.usesBytecode());
         }
     }
 

@@ -2197,7 +2197,11 @@ public abstract class AbstractCairoTest extends AbstractTest {
 
     protected final long getVectorApiExecutionCountIfSelected(RecordCursorFactory factory) {
         final JitFilter compiledFilter = findCompiledFilter(factory);
-        if (compiledFilter instanceof VectorCompiledFilter && ((VectorCompiledFilter) compiledFilter).usesVectorApi()) {
+        // Only track the counter when the interpreter is the active execution path.
+        // When bytecode compilation succeeds, the interpreter is not called at runtime.
+        if (compiledFilter instanceof VectorCompiledFilter vcf
+                && !vcf.usesBytecode()
+                && vcf.usesVectorApi()) {
             return VectorFilterInterpreter.getVectorApiExecutionCount();
         }
         return -1;

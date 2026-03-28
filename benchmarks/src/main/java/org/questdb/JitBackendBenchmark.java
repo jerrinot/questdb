@@ -72,7 +72,7 @@ public class JitBackendBenchmark {
     private static final int NUM_ROWS = 128 * 1024 * 1024;
     private static final CairoConfiguration configuration = new DefaultCairoConfiguration(System.getProperty("java.io.tmpdir"));
 
-    @Param({"DISABLED", "NATIVE_SIMD", "NATIVE_SCALAR", "JAVA_VECTOR_API", "JAVA_INTERPRETER", "JAVA_BYTECODE", "JAVA_VECTOR_BYTECODE"})
+    @Param({"DISABLED", "NATIVE_SIMD", "NATIVE_SCALAR", /*"JAVA_VECTOR_API", "JAVA_INTERPRETER", */"JAVA_BYTECODE", "JAVA_VECTOR_BYTECODE"})
     public Backend backend;
 
     @Param({"l > 42", "l > 42 AND d < 100.0", "l IN (1, 2, 3, 4, 5)", "l > 0 AND i != 0 AND d < 0.5 AND l < 1000000"})
@@ -112,8 +112,8 @@ public class JitBackendBenchmark {
 
         Options opt = new OptionsBuilder()
                 .include(JitBackendBenchmark.class.getSimpleName())
-                .warmupIterations(3)
-                .measurementIterations(5)
+                .warmupIterations(1)
+                .measurementIterations(2)
                 .forks(1)
                 .build();
         new Runner(opt).run();
@@ -180,7 +180,7 @@ public class JitBackendBenchmark {
         }
     }
 
-    @Benchmark
+//    @Benchmark
     public long testCountOnlyFilter() throws SqlException {
         if (isSkipped) {
             return -1;

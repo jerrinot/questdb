@@ -31,7 +31,9 @@ package io.questdb.cairo;
  */
 public final class JitBackend {
     /**
-     * Default: Java bytecode compiler when available, interpreter as fallback.
+     * Default: vectorized bytecode compiler for eligible programs (I8/F8,
+     * straight-line), scalar bytecode compiler as fallback for all others,
+     * interpreter as ultimate fallback.
      */
     public static final int AUTO = 0;
     /**

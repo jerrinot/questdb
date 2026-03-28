@@ -103,9 +103,6 @@ public class VectorCompiledCountOnlyFilter implements JitCountOnlyFilter {
     }
 
     private void compileBytecode(MemoryCARW filter, int options, int backend) throws SqlException {
-        if (backend != JitBackend.JAVA_VECTOR_COMPILED && interpreter.usesVectorApi()) {
-            return;
-        }
         IrDecoder decoder = new IrDecoder();
         IrDecoder.Instruction[] instructions = decoder.decode(filter);
         LoweredProgram program = IrLowering.lower(instructions, options);

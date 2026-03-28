@@ -97,8 +97,12 @@ public final class VectorBytecodeFilterCompiler {
         if (program.getOptions().isScalarOnly()) {
             return false;
         }
-        // Null-aware comparisons are implemented for I8 and F8 types.
         LoweredBlock block = program.getBlock(program.getEntryBlockId());
+        // Each vector op emits ~30-40 bytes of bytecode. JVM methods are
+        // limited to 65535 bytes. Reject programs that would exceed this.
+        if (block.getOpCount() > 1500) {
+            return false;
+        }
         for (int i = 0; i < block.getOpCount(); i++) {
             LoweredOp op = block.getOp(i);
             if (op instanceof LoweredOp.LoadVarSizeHeader) return false;
@@ -233,16 +237,10 @@ public final class VectorBytecodeFilterCompiler {
         }
 
         if (nullChecks) {
-            // Load null sentinel vector once per method.
-            // For I8: broadcast LONG_NULL using Long species
-            // For F8: broadcast NaN using Double species
-            if (primaryType == F8_TYPE) {
-                asm.invokeStatic(pool.helpersDoubleSpecies);
-                asm.invokeStatic(pool.helpersDoubleNanVector);
-            } else {
-                asm.aload(speciesSlot); // Long species
-                asm.invokeStatic(pool.helpersLongNullVector);
-            }
+            // Load LONG_NULL sentinel vector for I8 null-aware comparisons
+            // and arithmetic. F8 comparisons detect NaN internally via IS_NAN.
+            asm.aload(speciesSlot); // always Long species
+            asm.invokeStatic(pool.helpersLongNullVector);
             asm.astore(nullVecSlot);
         }
 
@@ -379,8 +377,7 @@ public final class VectorBytecodeFilterCompiler {
         asm.putITEM_Object(pool.byteOrderClass);  // nativeOrderSlot
         asm.putITEM_Object(pool.vectorMaskClass);  // activeMaskSlot
         if (nullChecks) {
-            Pool.VecType nvt = pool.vecType(primaryType);
-            asm.putITEM_Object(nvt.vecClass); // nullVecSlot
+            asm.putITEM_Object(pool.longVectorClass); // nullVecSlot — always LongVector
         }
         if (!isCountOnly) {
             asm.putITEM_Object(pool.memSegClass);      // outputSegSlot
