@@ -328,6 +328,18 @@ This investigation should leave behind:
 These can live as follow-up docs under `docs/` or as review notes linked from
 this plan.
 
+## Produced Artifacts
+
+Investigation completed 2026-03-28. All artifacts are under `docs/`:
+
+1. [Stage 1: Bytecode Review](jit-investigation-stage1-bytecode-review.md)
+2. [Stage 2: C2 Inlining Review](jit-investigation-stage2-c2-inlining.md)
+3. [Stage 3: Machine Code Review](jit-investigation-stage3-machine-code.md)
+4. [Stage 4: Native Comparison](jit-investigation-stage4-native-comparison.md)
+5. [Stage 5: Optimization Backlog](jit-investigation-stage5-optimization-backlog.md)
+
+Driver: `core/src/test/java/io/questdb/test/jit/VectorBytecodeC2Driver.java`
+
 ## Exit Criteria
 
 This plan is complete when we can answer, with evidence:
@@ -342,6 +354,28 @@ This plan is complete when we can answer, with evidence:
    - row-id compaction
    - mixed-type path
    - HotSpot-specific tuning
+
+## Exit Criteria Answers
+
+1. **Why slower:** Per-call MemorySegment construction overhead, IN() not
+   vectorized (scalar fallback), safepoint poll. The hot loop itself is
+   near-optimal AVX-512 — C2 inlines everything and generates clean x86.
+
+2. **QuestDB-controlled:** IN() vectorization (100%), MemorySegment caching
+   or avoidance (100%), redundant mask.cast (100%, but C2 handles it).
+
+3. **HotSpot/Vector API:** Safepoint poll (~5%), reinterpretInternal too
+   big to inline (per-call overhead), AVX-512 throttling (unconfirmed).
+
+4. **Top 3 optimizations:**
+   - Vectorize IN() predicates (5.6x gap → ~1.5-2x)
+   - Cache/eliminate MemorySegment construction (~20-30% of simple filter gap)
+   - Vectorize simple AND short-circuit chains (expand vectorizable programs)
+
+5. **Focus areas:** IN() vectorization (highest impact single item) and
+   MemorySegment optimization (broadest impact). NOT bytecode shape,
+   helper boundaries, row-id compaction, or HotSpot tuning — these are
+   already well-handled.
 
 ## Suggested First Pass
 
