@@ -379,11 +379,12 @@ public final class IrLowering {
             int srcType = typeStack.pop();
             int srcTmp = tempIdStack.pop();
 
-            // NEG promotes I1/I2 -> I4
+            // NEG promotes I1/I2 -> I4: insert a widening cast first
             int resultType = switch (srcType) {
                 case I1_TYPE, I2_TYPE -> I4_TYPE;
                 default -> srcType;
             };
+            srcTmp = coerceIfNeeded(srcTmp, srcType, resultType);
 
             int dst = allocTemp();
             currentBlock.addOp(new LoweredOp.Negate(dst, srcTmp, resultType));

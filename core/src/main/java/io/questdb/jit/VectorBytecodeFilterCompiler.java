@@ -142,7 +142,8 @@ public final class VectorBytecodeFilterCompiler {
     }
 
     private static boolean isSupportedLoadType(int type) {
-        return type == I8_TYPE || type == F8_TYPE || type == I4_TYPE || type == F4_TYPE;
+        return type == I8_TYPE || type == F8_TYPE || type == I4_TYPE || type == F4_TYPE
+                || type == I1_TYPE || type == I2_TYPE;
     }
 
     private static boolean isSupportedCast(LoweredOp.Cast c) {
@@ -154,6 +155,8 @@ public final class VectorBytecodeFilterCompiler {
         // Cross-width casts: F4<->F8, I4<->I8
         if ((from == F4_TYPE && to == F8_TYPE) || (from == F8_TYPE && to == F4_TYPE)) return true;
         if ((from == I4_TYPE && to == I8_TYPE) || (from == I8_TYPE && to == I4_TYPE)) return true;
+        // Widening from narrow types: I1/I2 → I4
+        if ((from == I1_TYPE || from == I2_TYPE) && to == I4_TYPE) return true;
         return false;
     }
 
@@ -170,13 +173,16 @@ public final class VectorBytecodeFilterCompiler {
      *                       IntVector species slot
      * @param maxColumnIndex highest column index seen across all LoadColumn ops
      */
-    record ProgramShape(boolean pureF8, boolean usesI4, boolean usesF4, int maxColumnIndex) {
+    record ProgramShape(boolean pureF8, boolean usesI4, boolean usesF4,
+                        boolean usesI1, boolean usesI2, int maxColumnIndex) {
 
         static ProgramShape analyze(LoweredProgram program) {
             boolean hasI8 = false;
             boolean hasCast = false;
             boolean usesI4 = false;
             boolean usesF4 = false;
+            boolean usesI1 = false;
+            boolean usesI2 = false;
             int primaryType = I8_TYPE;
             boolean primarySet = false;
             int maxColIdx = 0;
@@ -193,15 +199,21 @@ public final class VectorBytecodeFilterCompiler {
                         if (lc.type() == I8_TYPE) hasI8 = true;
                         if (lc.type() == I4_TYPE) usesI4 = true;
                         if (lc.type() == F4_TYPE) usesF4 = true;
+                        if (lc.type() == I1_TYPE) usesI1 = true;
+                        if (lc.type() == I2_TYPE) usesI2 = true;
                         maxColIdx = Math.max(maxColIdx, lc.columnIndex());
                     } else if (op instanceof LoweredOp.LoadVar lv) {
                         if (lv.type() == I8_TYPE) hasI8 = true;
                         if (lv.type() == I4_TYPE) usesI4 = true;
                         if (lv.type() == F4_TYPE) usesF4 = true;
+                        if (lv.type() == I1_TYPE) usesI1 = true;
+                        if (lv.type() == I2_TYPE) usesI2 = true;
                     } else if (op instanceof LoweredOp.LoadImm li) {
                         if (li.type() == I8_TYPE) hasI8 = true;
                         if (li.type() == I4_TYPE) usesI4 = true;
                         if (li.type() == F4_TYPE) usesF4 = true;
+                        if (li.type() == I1_TYPE) usesI1 = true;
+                        if (li.type() == I2_TYPE) usesI2 = true;
                     } else if (op instanceof LoweredOp.Compare c) {
                         if (c.operandType() == I4_TYPE) usesI4 = true;
                         if (c.operandType() == F4_TYPE) usesF4 = true;
@@ -218,8 +230,9 @@ public final class VectorBytecodeFilterCompiler {
                 }
             }
 
-            boolean pureF8 = !hasI8 && !hasCast && !usesI4 && !usesF4 && primaryType == F8_TYPE;
-            return new ProgramShape(pureF8, usesI4, usesF4, maxColIdx);
+            boolean pureF8 = !hasI8 && !hasCast && !usesI4 && !usesF4
+                    && !usesI1 && !usesI2 && primaryType == F8_TYPE;
+            return new ProgramShape(pureF8, usesI4, usesF4, usesI1, usesI2, maxColIdx);
         }
     }
 
@@ -244,6 +257,8 @@ public final class VectorBytecodeFilterCompiler {
             int activeMaskSlot,
             int intSpeciesSlot,
             int floatSpeciesSlot,
+            int byteSpeciesSlot,
+            int shortSpeciesSlot,
             int nullVecSlot,
             int outputSegSlot,
             int iotaSlot,
@@ -277,6 +292,14 @@ public final class VectorBytecodeFilterCompiler {
             int floatSpeciesSlot = -1;
             if (usesF4) {
                 floatSpeciesSlot = nextSlot++;
+            }
+            int byteSpeciesSlot = -1;
+            if (shape.usesI1()) {
+                byteSpeciesSlot = nextSlot++;
+            }
+            int shortSpeciesSlot = -1;
+            if (shape.usesI2()) {
+                shortSpeciesSlot = nextSlot++;
             }
             int nullVecSlot = -1;
             if (nullChecks && !pureF8) {
@@ -315,7 +338,8 @@ public final class VectorBytecodeFilterCompiler {
             return new SlotLayout(
                     filteredCountSlot, rowSlot, strideSlot,
                     speciesSlot, nativeOrderSlot, activeMaskSlot,
-                    intSpeciesSlot, floatSpeciesSlot, nullVecSlot,
+                    intSpeciesSlot, floatSpeciesSlot, byteSpeciesSlot, shortSpeciesSlot,
+                    nullVecSlot,
                     outputSegSlot, iotaSlot, matchCountSlot, countAccSlot, fullMaskSlot,
                     colSegSlots, varsSegSlot, tempSlots,
                     maxLocals, objectLocalCount
@@ -362,7 +386,7 @@ public final class VectorBytecodeFilterCompiler {
 
         asm.startMethod(methodName, methodSig, 12, s.maxLocals());
 
-        emitSetup(ctx, block, filteredRowsSlot, isCountOnly, usesI4, shape.usesF4(), needsNullVec);
+        emitSetup(ctx, block, filteredRowsSlot, isCountOnly, shape, needsNullVec);
 
         // Count-only and row-ID paths are kept separate because they differ in:
         //   - reduction strategy: count-only accumulates a LongVector via masked
@@ -389,9 +413,11 @@ public final class VectorBytecodeFilterCompiler {
 
     private static void emitSetup(
             EmitContext ctx, LoweredBlock block,
-            int filteredRowsSlot, boolean isCountOnly, boolean usesI4, boolean usesF4,
+            int filteredRowsSlot, boolean isCountOnly, ProgramShape shape,
             boolean needsNullVec
     ) {
+        boolean usesI4 = shape.usesI4();
+        boolean usesF4 = shape.usesF4();
         BytecodeAssembler asm = ctx.asm();
         Pool pool = ctx.pool();
         SlotLayout s = ctx.s();
@@ -418,6 +444,14 @@ public final class VectorBytecodeFilterCompiler {
         if (usesF4) {
             asm.invokeStatic(pool.helpersFloatSpeciesForLongRows);
             asm.astore(s.floatSpeciesSlot());
+        }
+        if (shape.usesI1()) {
+            asm.invokeStatic(pool.helpersByteSpeciesForLongRows);
+            asm.astore(s.byteSpeciesSlot());
+        }
+        if (shape.usesI2()) {
+            asm.invokeStatic(pool.helpersShortSpeciesForLongRows);
+            asm.astore(s.shortSpeciesSlot());
         }
         // Hoist species.length() as a long to avoid per-iteration invokeInterface + i2l.
         asm.aload(s.speciesSlot());
@@ -724,6 +758,12 @@ public final class VectorBytecodeFilterCompiler {
         if (shape.usesF4()) {
             asm.putITEM_Object(pool.vecSpeciesClass); // floatSpeciesSlot
         }
+        if (shape.usesI1()) {
+            asm.putITEM_Object(pool.vecSpeciesClass); // byteSpeciesSlot
+        }
+        if (shape.usesI2()) {
+            asm.putITEM_Object(pool.vecSpeciesClass); // shortSpeciesSlot
+        }
         if (needsNullVec) {
             asm.putITEM_Object(pool.longVectorClass); // nullVecSlot — always LongVector
         }
@@ -1011,12 +1051,15 @@ public final class VectorBytecodeFilterCompiler {
             }
             case I4_TYPE -> asm.aload(s.intSpeciesSlot());
             case F4_TYPE -> asm.aload(s.floatSpeciesSlot());
+            case I1_TYPE -> asm.aload(s.byteSpeciesSlot());
+            case I2_TYPE -> asm.aload(s.shortSpeciesSlot());
             default -> throw new UnsupportedOperationException("vector species for type: " + type);
         }
     }
 
     private static boolean needsLoadMaskCast(int type, boolean pureF8) {
-        return type == I4_TYPE || type == F4_TYPE || (!pureF8 && type == F8_TYPE);
+        return type == I4_TYPE || type == F4_TYPE || type == I1_TYPE || type == I2_TYPE
+                || (!pureF8 && type == F8_TYPE);
     }
 
     // === Op emission ===
@@ -1072,6 +1115,8 @@ public final class VectorBytecodeFilterCompiler {
         Pool.VecType vt = pool.vecType(li.type());
         emitTypeSpecies(ctx, li.type());
         switch (li.type()) {
+            case I1_TYPE -> asm.iconst((int) (byte) li.lo());
+            case I2_TYPE -> asm.iconst((int) (short) li.lo());
             case I4_TYPE -> emitIntConst(asm, (int) li.lo(), pool);
             case I8_TYPE -> asm.ldc2_w(pool.ensureLongPooled(li.lo()));
             case F4_TYPE -> asm.ldc(pool.ensureFloatPooled(Float.intBitsToFloat((int) li.lo())));
@@ -1101,6 +1146,8 @@ public final class VectorBytecodeFilterCompiler {
         asm.getstatic(pool.varLayout(lv.type()));
         asm.ldc2_w(pool.ensureLongPooled(lv.byteOffset()));
         int getter = switch (lv.type()) {
+            case I1_TYPE -> pool.memSegGetByte;
+            case I2_TYPE -> pool.memSegGetShort;
             case I4_TYPE -> pool.memSegGetInt;
             case I8_TYPE -> pool.memSegGetLong;
             case F4_TYPE -> pool.memSegGetFloat;
@@ -1336,6 +1383,8 @@ public final class VectorBytecodeFilterCompiler {
         final int helpersDoubleSpecies;
         final int helpersIntSpeciesForLongRows;
         final int helpersFloatSpeciesForLongRows;
+        final int helpersByteSpeciesForLongRows;
+        final int helpersShortSpeciesForLongRows;
         final int helpersNativeByteOrder;
         final int helpersLongNullVector;
         final int helpersDoubleNanVector;
@@ -1348,12 +1397,16 @@ public final class VectorBytecodeFilterCompiler {
         final int speciesLength;
 
         // MemorySegment interface methods
+        final int memSegGetByte;
+        final int memSegGetShort;
         final int memSegGetLong;
         final int memSegGetInt;
         final int memSegGetFloat;
         final int memSegGetDouble;
 
         // ValueLayout fields
+        final int javaByteUnaligned;
+        final int javaShortUnaligned;
         final int javaLongUnaligned;
         final int javaIntUnaligned;
         final int javaFloatUnaligned;
@@ -1363,7 +1416,8 @@ public final class VectorBytecodeFilterCompiler {
         private final int opEQ, opNE, opLT, opLE, opGT, opGE;
 
         // VectorOperators conversion fields
-        private final int convI2F, convF2I, convL2D, convD2L, convF2D, convD2F, convI2L, convL2I;
+        private final int convI2F, convF2I, convL2D, convD2L, convF2D, convD2F, convI2L, convL2I,
+                convB2I, convS2I;
 
         // Null-aware comparison helpers (I8 and I4)
         private final int longNullLt, longNullLe, longNullGt, longNullGe;
@@ -1411,6 +1465,8 @@ public final class VectorBytecodeFilterCompiler {
             // --- Classes ---
             int longVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/LongVector"));
             longVectorClass = longVecCls;
+            int byteVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/ByteVector"));
+            int shortVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/ShortVector"));
             int intVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/IntVector"));
             int floatVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/FloatVector"));
             int doubleVecCls = asm.poolClass(asm.poolUtf8("jdk/incubator/vector/DoubleVector"));
@@ -1440,6 +1496,8 @@ public final class VectorBytecodeFilterCompiler {
             helpersDoubleSpecies = asm.poolMethod(helpersCls, "doubleSpecies", "()" + sSpec);
             helpersIntSpeciesForLongRows = asm.poolMethod(helpersCls, "intSpeciesForLongRows", "()" + sSpec);
             helpersFloatSpeciesForLongRows = asm.poolMethod(helpersCls, "floatSpeciesForLongRows", "()" + sSpec);
+            helpersByteSpeciesForLongRows = asm.poolMethod(helpersCls, "byteSpeciesForLongRows", "()" + sSpec);
+            helpersShortSpeciesForLongRows = asm.poolMethod(helpersCls, "shortSpeciesForLongRows", "()" + sSpec);
             helpersNativeByteOrder = asm.poolMethod(helpersCls, "nativeByteOrder", "()Ljava/nio/ByteOrder;");
             helpersColumnSegment = asm.poolMethod(helpersCls, "columnSegment", "(JI)" + sMSeg);
             helpersSegment = asm.poolMethod(helpersCls, "segment", "(J)" + sMSeg);
@@ -1503,6 +1561,10 @@ public final class VectorBytecodeFilterCompiler {
             speciesLength = asm.poolInterfaceMethod(vecSpeciesCls, "length", "()I");
 
             // --- MemorySegment (interface) ---
+            memSegGetByte = asm.poolInterfaceMethod(memSegCls, "get",
+                    "(Ljava/lang/foreign/ValueLayout$OfByte;J)B");
+            memSegGetShort = asm.poolInterfaceMethod(memSegCls, "get",
+                    "(Ljava/lang/foreign/ValueLayout$OfShort;J)S");
             memSegGetLong = asm.poolInterfaceMethod(memSegCls, "get",
                     "(Ljava/lang/foreign/ValueLayout$OfLong;J)J");
             memSegGetInt = asm.poolInterfaceMethod(memSegCls, "get",
@@ -1513,6 +1575,10 @@ public final class VectorBytecodeFilterCompiler {
                     "(Ljava/lang/foreign/ValueLayout$OfDouble;J)D");
 
             // --- ValueLayout fields ---
+            javaByteUnaligned = poolStaticField(asm, valueLayoutCls, "JAVA_BYTE",
+                    "Ljava/lang/foreign/ValueLayout$OfByte;");
+            javaShortUnaligned = poolStaticField(asm, valueLayoutCls, "JAVA_SHORT_UNALIGNED",
+                    "Ljava/lang/foreign/ValueLayout$OfShort;");
             javaLongUnaligned = poolStaticField(asm, valueLayoutCls, "JAVA_LONG_UNALIGNED",
                     "Ljava/lang/foreign/ValueLayout$OfLong;");
             javaIntUnaligned = poolStaticField(asm, valueLayoutCls, "JAVA_INT_UNALIGNED",
@@ -1542,6 +1608,8 @@ public final class VectorBytecodeFilterCompiler {
             convD2F = poolStaticField(asm, vecOpsCls, "D2F", convType);
             convI2L = poolStaticField(asm, vecOpsCls, "I2L", convType);
             convL2I = poolStaticField(asm, vecOpsCls, "L2I", convType);
+            convB2I = poolStaticField(asm, vecOpsCls, "B2I", convType);
+            convS2I = poolStaticField(asm, vecOpsCls, "S2I", convType);
 
             // --- Per-type VecType pools ---
             String sLVec = "Ljdk/incubator/vector/LongVector;";
@@ -1549,6 +1617,11 @@ public final class VectorBytecodeFilterCompiler {
             String sFVec = "Ljdk/incubator/vector/FloatVector;";
             String sDVec = "Ljdk/incubator/vector/DoubleVector;";
 
+            String sBVec = "Ljdk/incubator/vector/ByteVector;";
+            String sSVec = "Ljdk/incubator/vector/ShortVector;";
+
+            vecTypes[I1_TYPE] = poolVecType(asm, byteVecCls, sBVec, sSpec, sMSeg, sBO, sMask, sVec, sConv, "B");
+            vecTypes[I2_TYPE] = poolVecType(asm, shortVecCls, sSVec, sSpec, sMSeg, sBO, sMask, sVec, sConv, "S");
             vecTypes[I8_TYPE] = poolVecType(asm, longVecCls, sLVec, sSpec, sMSeg, sBO, sMask, sVec, sConv, "J");
             vecTypes[I4_TYPE] = poolVecType(asm, intVecCls, sIVec, sSpec, sMSeg, sBO, sMask, sVec, sConv, "I");
             vecTypes[F4_TYPE] = poolVecType(asm, floatVecCls, sFVec, sSpec, sMSeg, sBO, sMask, sVec, sConv, "F");
@@ -1653,11 +1726,15 @@ public final class VectorBytecodeFilterCompiler {
             if (fromType == F8_TYPE && toType == F4_TYPE) return convD2F;
             if (fromType == I4_TYPE && toType == I8_TYPE) return convI2L;
             if (fromType == I8_TYPE && toType == I4_TYPE) return convL2I;
+            if (fromType == I1_TYPE && toType == I4_TYPE) return convB2I;
+            if (fromType == I2_TYPE && toType == I4_TYPE) return convS2I;
             throw new UnsupportedOperationException("conversion: " + fromType + " -> " + toType);
         }
 
         int varLayout(int type) {
             return switch (type) {
+                case I1_TYPE -> javaByteUnaligned;
+                case I2_TYPE -> javaShortUnaligned;
                 case I4_TYPE -> javaIntUnaligned;
                 case I8_TYPE -> javaLongUnaligned;
                 case F4_TYPE -> javaFloatUnaligned;

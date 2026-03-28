@@ -123,6 +123,34 @@ public final class FilterHelpers {
     }
 
     /**
+     * Returns a ByteVector species whose lane count matches the preferred
+     * LongVector lane count. Used transiently for loading byte columns
+     * before widening to IntVector.
+     */
+    public static jdk.incubator.vector.VectorSpecies<Byte> byteSpeciesForLongRows() {
+        return jdk.incubator.vector.VectorSpecies.of(
+                byte.class,
+                jdk.incubator.vector.VectorShape.forBitSize(
+                        jdk.incubator.vector.LongVector.SPECIES_PREFERRED.length() * Byte.SIZE
+                )
+        );
+    }
+
+    /**
+     * Returns a ShortVector species whose lane count matches the preferred
+     * LongVector lane count. Used transiently for loading short columns
+     * before widening to IntVector.
+     */
+    public static jdk.incubator.vector.VectorSpecies<Short> shortSpeciesForLongRows() {
+        return jdk.incubator.vector.VectorSpecies.of(
+                short.class,
+                jdk.incubator.vector.VectorShape.forBitSize(
+                        jdk.incubator.vector.LongVector.SPECIES_PREFERRED.length() * Short.SIZE
+                )
+        );
+    }
+
+    /**
      * Creates the iota LongVector [0, 1, 2, ..., species.length()-1].
      * Called once at method entry for row-ID mode.
      */

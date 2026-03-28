@@ -858,6 +858,98 @@ public class VectorBytecodeFilterCompilerTest {
         ));
     }
 
+    // ========================
+    // Byte (I1) and Short (I2) via widening to I4
+    // ========================
+
+    @Test
+    public void testByteCompareViaWidening() throws Exception {
+        // Byte column: col0(I1) > 3 — lowering widens I1→I4
+        int options = (0 << 1) | (2 << 4); // log2(1), mixed-size
+        IrDecoder.Instruction[] instructions = ir(
+                insn(IMM, I1_TYPE, 3, 0),
+                insn(MEM, I1_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        );
+        int len = ROW_COUNT;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long colData = Unsafe.malloc(Math.max(1, (long) len), MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putByte(colData + i, (byte) (i % 10 - 5));
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, options);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 1, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support I1 via widening", vector);
+            long actual = vector.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(colData, Math.max(1, (long) len), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testShortCompareViaWidening() throws Exception {
+        // Short column: col0(I2) < 100 — lowering widens I2→I4
+        int options = (1 << 1) | (2 << 4); // log2(2), mixed-size
+        IrDecoder.Instruction[] instructions = ir(
+                insn(IMM, I2_TYPE, 100, 0),
+                insn(MEM, I2_TYPE, 0, 0),
+                insn(LT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        );
+        int len = ROW_COUNT;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long colData = Unsafe.malloc(Math.max(1, (long) len * Short.BYTES), MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putShort(colData + (long) i * Short.BYTES, (short) (i * 10 - 50));
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, options);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 1, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support I2 via widening", vector);
+            long actual = vector.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(colData, Math.max(1, (long) len * Short.BYTES), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     @Test
     public void testMixedLongIntDoubleBenchmarkShape() throws Exception {
         long[] longData = new long[ROW_COUNT];
