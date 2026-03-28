@@ -152,6 +152,10 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
     private SqlExecutionContext executionContext;
     // internal flag used to forcefully enable scalar mode based on filter's contents
     private boolean forceScalarMode;
+    // true when serializing for a backend that can vectorize byte/short arithmetic
+    // via I1/I2 → I4 widening (Java vector backends). When true, byte/short
+    // arithmetic does not force scalar mode.
+    private boolean isJavaVectorCapable;
     private MemoryCARW memory;
     private RecordMetadata metadata;
     private PageFrameCursor pageFrameCursor;
@@ -162,6 +166,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         metadata = null;
         pageFrameCursor = null;
         forceScalarMode = false;
+        isJavaVectorCapable = false;
         predicateContext.clear();
         backfillNodes.clear();
         collectedPredicates.clear();
@@ -243,6 +248,11 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
             boolean nullChecks,
             boolean enableShortCircuit
     ) throws SqlException {
+        // Java vector-capable backends (AUTO, JAVA_VECTOR_COMPILED) pass
+        // enableShortCircuit=false. They handle byte/short arithmetic via
+        // I1/I2 → I4 widening and don't need forceScalarMode for narrow types.
+        isJavaVectorCapable = !enableShortCircuit;
+
         // Detect if scalar mode is guaranteed by checking for mixed column sizes.
         // Short-circuit optimizations (including IN() short-circuit) only work correctly
         // in scalar mode, so we only enable them when scalar mode is certain.
@@ -309,11 +319,15 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         if (predicateLeft) {
             // We're out of a predicate
 
-            // Force scalar mode if the predicate had byte or short arithmetic operations.
-            // That's because SIMD mode uses byte/short-sized overflows for arithmetic
-            // calculations instead of implicit upcast to int done by *.sql.Function classes.
+            // Force scalar mode if the predicate had byte or short arithmetic operations,
+            // but only for non-Java-vector backends. The native C++ SIMD backend uses
+            // byte/short-sized overflows that differ from the JVM's implicit upcast to int.
+            // Java vector backends widen I1/I2 to I4 via IrLowering, preserving correct
+            // JVM overflow semantics, so they don't need this restriction.
             forceScalarMode |=
-                    predicateContext.hasArithmeticOperations && predicateContext.localTypesObserver.maxSize() <= 2;
+                    !isJavaVectorCapable
+                    && predicateContext.hasArithmeticOperations
+                    && predicateContext.localTypesObserver.maxSize() <= 2;
 
             // Then backfill constants and symbol bind variables and clean up
             try {

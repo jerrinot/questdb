@@ -508,7 +508,7 @@ This gap-closure effort is complete when:
 6. Phase 5 var-size null headers — done
 7. Phase 6 `I128` — done
 8. Phase 7 mixed-width broadening — done
-9. Phase 8 large-method support — done (validated, helper splitting deferred)
+9. Phase 8 large-method support — guard validated; 1500-op limit retained (helper splitting not implemented)
 
 This order maximizes real SQL coverage while minimizing risk to the currently
 fast and already-correct vectorized cases.

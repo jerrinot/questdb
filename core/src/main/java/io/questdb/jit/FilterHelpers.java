@@ -706,8 +706,8 @@ public final class FilterHelpers {
         for (int i = 0; i < count; i++) {
             long lo, hi;
             if (colAddr == 0) {
-                lo = 0;
-                hi = 0;
+                lo = Numbers.LONG_NULL;
+                hi = Numbers.LONG_NULL;
             } else {
                 long offset = (startRow + i) << 4;
                 lo = UNSAFE.getLong(colAddr + offset);
@@ -747,12 +747,12 @@ public final class FilterHelpers {
         long colAddr2 = UNSAFE.getLong(dataAddress + ((long) colIdx2 << 3));
         for (int i = 0; i < count; i++) {
             long lo1, hi1, lo2, hi2;
-            if (colAddr1 == 0) { lo1 = 0; hi1 = 0; } else {
+            if (colAddr1 == 0) { lo1 = Numbers.LONG_NULL; hi1 = Numbers.LONG_NULL; } else {
                 long off = (startRow + i) << 4;
                 lo1 = UNSAFE.getLong(colAddr1 + off);
                 hi1 = UNSAFE.getLong(colAddr1 + off + 8);
             }
-            if (colAddr2 == 0) { lo2 = 0; hi2 = 0; } else {
+            if (colAddr2 == 0) { lo2 = Numbers.LONG_NULL; hi2 = Numbers.LONG_NULL; } else {
                 long off = (startRow + i) << 4;
                 lo2 = UNSAFE.getLong(colAddr2 + off);
                 hi2 = UNSAFE.getLong(colAddr2 + off + 8);
