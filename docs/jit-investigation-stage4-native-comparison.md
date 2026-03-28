@@ -131,22 +131,32 @@ register space with integer masks).
 | Mask conversions | 0 (uniform 256-bit) | 2 per chunk (Long↔Double) |
 | Null handling | Inlined per-element check | longNullGt helper (C2-inlined) |
 
-## Filter 3: `l IN (1, 2, 3, 4, 5)` (short-circuit)
+## Filter 3: `l IN (1, 2, 3, 4, 5)` (straight-line OR)
 
 ### Native SIMD path
 
 Uses AVX2 SIMD with 4-element chunks. Each value in the IN list is
-compared vectorized, and results are OR'd together. Short-circuit
-optimization jumps to the store label on the first match.
+compared vectorized, and results are OR'd together.
 
 ### Java Vector Bytecode path
 
-**Not vectorized.** `IN()` generates short-circuit IR
-(`hasControlFlow() == true`), so `VectorBytecodeFilterCompiler.isSupported()`
-rejects it. Falls back to scalar bytecode (`ScalarBytecodeFilterCompiler`).
+**Vectorized.** For single-size columns (all LONG), the IR serializer
+emits plain `EQ` + `OR` ops (no short-circuit). The vector compiler
+accepts the straight-line program and generates AVX-512 code that:
+1. Loads the column once per IN value (5 loads for 5 values)
+2. Broadcasts each constant and compares
+3. ORs all masks together
 
-This is the **largest contributor to the IN() benchmark gap**: the Java
-path runs scalar per-row code while native runs 4-wide SIMD.
+The IN() path is vectorized but loads the column 5 times per chunk
+(once per IN value) instead of once. The native backend similarly
+loads the column per value but at 256-bit width. The Java path
+processes 8 elements per load vs native's 4, but does 5 loads per
+chunk vs potentially fewer in native with register reuse.
+
+The 5.6x gap for IN() may come from:
+- Column re-loading overhead (5 vector loads vs 1 needed)
+- MemorySegment construction per call (same as other filters)
+- Possibly lower data cache efficiency with 5x 512-bit loads
 
 ## Summary
 
@@ -154,4 +164,4 @@ path runs scalar per-row code while native runs 4-wide SIMD.
 |--------|--------|------|------------|
 | `l > 42` | AVX2 (4 wide) | AVX-512 (8 wide) | Per-call setup, safepoint |
 | `l > 42 AND d < 100.0` | AVX2 (4 wide) | AVX-512 (8 wide) + mask cast | Setup + 2 mask casts/chunk |
-| `l IN (1,2,3,4,5)` | AVX2 (4 wide) | **Scalar fallback** | No vectorization at all |
+| `l IN (1,2,3,4,5)` | AVX2 (4 wide) | AVX-512 (8 wide), 5 loads/chunk | Column re-loads, setup |

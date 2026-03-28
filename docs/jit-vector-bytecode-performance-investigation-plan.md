@@ -361,19 +361,20 @@ This plan is complete when we can answer, with evidence:
    vectorized (scalar fallback), safepoint poll. The hot loop itself is
    near-optimal AVX-512 — C2 inlines everything and generates clean x86.
 
-2. **QuestDB-controlled:** IN() vectorization (100%), MemorySegment caching
-   or avoidance (100%), redundant mask.cast (100%, but C2 handles it).
+2. **QuestDB-controlled:** IN() column-load deduplication (100%),
+   MemorySegment caching or avoidance (100%), I4 column support (100%),
+   redundant mask.cast (100%, but C2 handles it).
 
 3. **HotSpot/Vector API:** Safepoint poll (~5%), reinterpretInternal too
    big to inline (per-call overhead), AVX-512 throttling (unconfirmed).
 
 4. **Top 3 optimizations:**
-   - Vectorize IN() predicates (5.6x gap → ~1.5-2x)
+   - IN() column-load deduplication (load column once per chunk, not N times)
    - Cache/eliminate MemorySegment construction (~20-30% of simple filter gap)
-   - Vectorize simple AND short-circuit chains (expand vectorizable programs)
+   - I4 (INT) column support (expand vectorizable programs)
 
-5. **Focus areas:** IN() vectorization (highest impact single item) and
-   MemorySegment optimization (broadest impact). NOT bytecode shape,
+5. **Focus areas:** IN() column-load dedup (highest impact single item)
+   and MemorySegment optimization (broadest impact). NOT bytecode shape,
    helper boundaries, row-id compaction, or HotSpot tuning — these are
    already well-handled.
 
