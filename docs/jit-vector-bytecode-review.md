@@ -31,36 +31,17 @@ Changes:
 - Tests: `testAutoSelectsVectorBytecodeForEligibleProgram`,
   `testAutoFallsBackToScalarForControlFlow`
 
-### High: vector arithmetic does not preserve current JIT semantics
+### ~~High: vector arithmetic does not preserve current JIT semantics~~ RESOLVED
 
-The vector arithmetic path emits raw Vector API arithmetic for all supported
-types:
+`emitArithmetic` now dispatches to vectorized helper methods that match
+QuestDB JIT semantics:
+- F8: `FilterHelpers.doubleVecArithmetic` handles div-by-zero → NaN and
+  NaN propagation via `IS_NAN` + masked `div` + `blend`.
+- I8 with null checks: `FilterHelpers.longVecArithmeticNull` preserves
+  LONG_NULL via sentinel detection + masked division + blend.
+- I8 without null checks: raw vector arithmetic (correct for non-null data).
 
-- `core/src/main/java/io/questdb/jit/VectorBytecodeFilterCompiler.java`
-  `emitArithmetic()`
-
-The scalar compiler does not do that. It explicitly routes:
-
-- `I8` null-aware arithmetic through `FilterHelpers.longArithmeticNull`
-- `F4` arithmetic requiring NaN-on-zero or NaN propagation through
-  `FilterHelpers.floatArithmeticNull`
-- `F8` arithmetic requiring NaN-on-zero or NaN propagation through
-  `FilterHelpers.doubleArithmeticNull`
-
-References:
-- `core/src/main/java/io/questdb/jit/ScalarBytecodeFilterCompiler.java`
-  `emitArithmetic()`
-- `core/src/main/java/io/questdb/jit/FilterHelpers.java`
-- `core/src/main/java/io/questdb/jit/VectorFilterInterpreter.java`
-  `binaryArithmetic()`
-
-Consequences:
-- `F8 DIV` in the vector compiler will produce IEEE results rather than the
-  current QuestDB JIT behavior of returning `NaN` on division by zero.
-- `I8` arithmetic with null checks will not preserve `LONG_NULL`.
-- `F8` arithmetic with null checks will not preserve `NaN`-as-null semantics.
-
-This is a backend-visible semantic mismatch, not just a performance issue.
+Tests: `testLongArithmeticNullAware`, `testDoubleArithmeticDivByZero`.
 
 ### ~~High: mixed `F8` + `I8` ordered null-aware comparisons can use the wrong null vector type~~ RESOLVED
 

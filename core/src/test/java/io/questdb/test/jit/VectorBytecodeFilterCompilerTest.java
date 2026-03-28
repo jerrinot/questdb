@@ -347,6 +347,82 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     // ========================
+    // Arithmetic semantics
+    // ========================
+
+    @Test
+    public void testLongArithmeticNullAware() throws Exception {
+        // (col0 + col0) > 100 with null checks — LONG_NULL should propagate
+        long[] data = longCol(ROW_COUNT, i -> i == 4 ? io.questdb.std.Numbers.LONG_NULL : i * 10L);
+        assertParityWithOptions(data, ir(
+                insn(IMM, I8_TYPE, 100, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(ADD, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), LONG_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testDoubleArithmeticDivByZero() throws Exception {
+        // col0 / col1 > 0.5 — division by zero should produce NaN (not infinity)
+        double[] col0Data = new double[ROW_COUNT];
+        double[] col1Data = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            col0Data[i] = i * 1.0;
+            col1Data[i] = (i % 3 == 0) ? 0.0 : 2.0; // every 3rd row is div-by-zero
+        }
+
+        IrDecoder.Instruction[] instructions = ir(
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(0.5), 0),
+                insn(MEM, F8_TYPE, 0, 0),
+                insn(MEM, F8_TYPE, 1, 0),
+                insn(DIV, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        );
+
+        int options = (3 << 1) | (1 << 4); // double, single-size, no null checks
+        int len = ROW_COUNT;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long col0 = Unsafe.malloc((long) len * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long col1 = Unsafe.malloc((long) len * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putDouble(col0 + (long) i * Double.BYTES, col0Data[i]);
+            Unsafe.getUnsafe().putDouble(col1 + (long) i * Double.BYTES, col1Data[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, col0);
+        Unsafe.getUnsafe().putLong(colPtrArray + 8, col1);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, options);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 2, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull(vector);
+            long actual = vector.filterRows(colPtrArray, 2, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(col0, (long) len * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(col1, (long) len * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 16, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    // ========================
     // AUTO backend selection
     // ========================
 

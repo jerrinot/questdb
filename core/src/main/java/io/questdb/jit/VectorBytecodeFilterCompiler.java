@@ -426,7 +426,7 @@ public final class VectorBytecodeFilterCompiler {
             case LoweredOp.Compare c -> emitCompare(asm, c, tempSlots, pool, nullChecks, nullVecSlot);
             case LoweredOp.BooleanOp bo -> emitBooleanOp(asm, bo, tempSlots, pool);
             case LoweredOp.Not n -> emitNot(asm, n, tempSlots, pool);
-            case LoweredOp.Arithmetic a -> emitArithmetic(asm, a, tempSlots, pool);
+            case LoweredOp.Arithmetic a -> emitArithmetic(asm, a, tempSlots, pool, nullChecks, nullVecSlot);
             case LoweredOp.Negate neg -> emitNegate(asm, neg, tempSlots, pool);
             case LoweredOp.Move m -> {
                 asm.aload(tempSlots[m.src()]);
@@ -566,21 +566,45 @@ public final class VectorBytecodeFilterCompiler {
         asm.astore(tempSlots[n.dst()]);
     }
 
-    private static void emitArithmetic(BytecodeAssembler asm, LoweredOp.Arithmetic a, int[] tempSlots, Pool pool) {
+    private static void emitArithmetic(BytecodeAssembler asm, LoweredOp.Arithmetic a, int[] tempSlots,
+                                       Pool pool, boolean nullChecks, int nullVecSlot) {
         Pool.VecType vt = pool.vecType(a.resultType());
-        asm.aload(tempSlots[a.lhs()]);
-        asm.checkcast(vt.vecClass);
-        asm.aload(tempSlots[a.rhs()]);
-        asm.checkcast(vt.vecClass);
-        int method = switch (a.opcode()) {
-            case ADD -> vt.add;
-            case SUB -> vt.sub;
-            case MUL -> vt.mul;
-            case DIV -> vt.div;
-            default -> throw new UnsupportedOperationException("arith op: " + a.opcode());
-        };
-        asm.invokeVirtual(method);
-        asm.astore(tempSlots[a.dst()]);
+
+        if (a.resultType() == F8_TYPE) {
+            // F8: always use helper for NaN propagation and div-by-zero → NaN
+            asm.aload(tempSlots[a.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(tempSlots[a.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.iconst(a.opcode());
+            asm.invokeStatic(pool.doubleVecArithmetic);
+            asm.astore(tempSlots[a.dst()]);
+        } else if (nullChecks && a.resultType() == I8_TYPE) {
+            // I8 with null checks: use helper for LONG_NULL preservation
+            asm.aload(tempSlots[a.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(tempSlots[a.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(nullVecSlot);
+            asm.iconst(a.opcode());
+            asm.invokeStatic(pool.longVecArithmeticNull);
+            asm.astore(tempSlots[a.dst()]);
+        } else {
+            // I8 without null checks: raw vector arithmetic
+            asm.aload(tempSlots[a.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(tempSlots[a.rhs()]);
+            asm.checkcast(vt.vecClass);
+            int method = switch (a.opcode()) {
+                case ADD -> vt.add;
+                case SUB -> vt.sub;
+                case MUL -> vt.mul;
+                case DIV -> vt.div;
+                default -> throw new UnsupportedOperationException("arith op: " + a.opcode());
+            };
+            asm.invokeVirtual(method);
+            asm.astore(tempSlots[a.dst()]);
+        }
     }
 
     private static void emitNegate(BytecodeAssembler asm, LoweredOp.Negate neg, int[] tempSlots, Pool pool) {
@@ -667,6 +691,9 @@ public final class VectorBytecodeFilterCompiler {
         private int longNullLt, longNullLe, longNullGt, longNullGe;
         // Double comparison helpers (epsilon + NaN)
         private int doubleVecEq, doubleVecNe, doubleVecLt, doubleVecLe, doubleVecGt, doubleVecGe;
+        // Arithmetic helpers
+        final int longVecArithmeticNull;
+        final int doubleVecArithmetic;
 
         // LongVector-specific (always needed for row-ID output)
         final int longVecAddScalar;
@@ -747,6 +774,12 @@ public final class VectorBytecodeFilterCompiler {
             doubleVecLe = asm.poolMethod(helpersCls, "doubleVecLe", dblCmpSig);
             doubleVecGt = asm.poolMethod(helpersCls, "doubleVecGt", dblCmpSig);
             doubleVecGe = asm.poolMethod(helpersCls, "doubleVecGe", dblCmpSig);
+
+            // Arithmetic helpers
+            longVecArithmeticNull = asm.poolMethod(helpersCls, "longVecArithmeticNull",
+                    "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;I)Ljdk/incubator/vector/LongVector;");
+            doubleVecArithmetic = asm.poolMethod(helpersCls, "doubleVecArithmetic",
+                    "(Ljdk/incubator/vector/DoubleVector;Ljdk/incubator/vector/DoubleVector;I)Ljdk/incubator/vector/DoubleVector;");
 
             // --- VectorSpecies (interface) ---
             speciesIndexInRange = asm.poolInterfaceMethod(vecSpeciesCls, "indexInRange", "(JJ)" + sMask);
