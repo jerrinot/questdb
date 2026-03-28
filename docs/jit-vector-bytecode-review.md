@@ -53,32 +53,10 @@ StackMapTable declares `nullVecSlot` as LongVector.
 Test: `testMixedDoubleFirstThenLongNullOrdered` — F8 column loaded first,
 then I8 ordered null comparison with LONG_NULL values.
 
-### Medium: the implementation advertises a broader support surface than the gate actually allows
+### ~~Medium: the implementation advertises a broader support surface than the gate actually allows~~ RESOLVED
 
-The class-level comment says the compiler supports:
-
-- `I4`, `I8`, `F4`, `F8`
-- same-width mixed pairs (`I4+F4`, `I8+F8`)
-
-Reference:
-- `core/src/main/java/io/questdb/jit/VectorBytecodeFilterCompiler.java`
-
-But the current gate only admits:
-
-- `I8`
-- `F8`
-
-Reference:
-- `core/src/main/java/io/questdb/jit/VectorBytecodeFilterCompiler.java`
-  `isSupportedVectorType()`
-
-This mismatch is already visible in the tests:
-
-- `testIntNotSupportedYet()` correctly expects `I4` fallback
-- the rest of the file is effectively an `I8`/`F8` test suite
-
-The implementation itself is fine being narrow, but the advertised support
-surface should match the actual gate.
+Class-level Javadoc now says "I8, F8, and mixed I8+F8" and explicitly
+notes that I4/F4 are not yet supported due to lane count mismatch.
 
 ## Coverage Notes
 

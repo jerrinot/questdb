@@ -35,8 +35,9 @@ import static io.questdb.jit.CompiledFilterIRSerializer.*;
  * {@link VectorFilterBody}. The generated class evaluates the filter
  * in vector-width chunks using the Java Vector API.
  * <p>
- * Supports straight-line programs (no control flow) with single-element-size
- * types: I4, I8, F4, F8, and same-width mixed pairs (I4+F4, I8+F8).
+ * Supports straight-line programs (no control flow) with 8-byte element
+ * types: I8, F8, and mixed I8+F8. 4-byte types (I4, F4) are not yet
+ * supported due to lane count mismatch with the LongVector loop stride.
  * Setup delegates to {@link FilterHelpers}; the hot loop emits direct
  * Vector API calls for C2 intrinsification.
  */
