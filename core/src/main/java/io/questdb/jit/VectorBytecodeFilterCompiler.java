@@ -155,6 +155,8 @@ public final class VectorBytecodeFilterCompiler {
         // Cross-width casts: F4<->F8, I4<->I8
         if ((from == F4_TYPE && to == F8_TYPE) || (from == F8_TYPE && to == F4_TYPE)) return true;
         if ((from == I4_TYPE && to == I8_TYPE) || (from == I8_TYPE && to == I4_TYPE)) return true;
+        // Cross-width int→float: I4→F8 (for mixed int+double predicates)
+        if (from == I4_TYPE && to == F8_TYPE) return true;
         // Widening from narrow types: I1/I2 → I4
         if ((from == I1_TYPE || from == I2_TYPE) && to == I4_TYPE) return true;
         return false;
@@ -1451,6 +1453,10 @@ public final class VectorBytecodeFilterCompiler {
             asm.aload(ctx.s().nullVecSlot());
             asm.checkcast(pool.vecType(I8_TYPE).vecClass);
             asm.invokeStatic(pool.longToDoubleNullAware);
+        } else if (ctx.nullChecks() && c.fromType() == I4_TYPE && c.toType() == F8_TYPE) {
+            // Null-aware I4→F8: INT_NULL must become NaN, not -2.14e9.
+            emitTypeSpecies(ctx, F8_TYPE);
+            asm.invokeStatic(pool.intToDoubleNullAware);
         } else if (ctx.nullChecks() && c.fromType() == I4_TYPE && c.toType() == F4_TYPE) {
             // Null-aware I4→F4: INT_NULL must become NaN, not -2.14e9.
             emitTypeSpecies(ctx, F4_TYPE);
@@ -1521,7 +1527,7 @@ public final class VectorBytecodeFilterCompiler {
 
         // VectorOperators conversion fields
         private final int convI2F, convF2I, convL2D, convD2L, convF2D, convD2F, convI2L, convL2I,
-                convB2I, convS2I;
+                convB2I, convS2I, convI2D;
 
         // Null-aware comparison helpers (I8 and I4)
         private final int longNullLt, longNullLe, longNullGt, longNullGe;
@@ -1537,6 +1543,7 @@ public final class VectorBytecodeFilterCompiler {
         final int floatVecArithmetic;
         // Null-aware cast helpers
         final int longToDoubleNullAware;
+        final int intToDoubleNullAware;
         final int intToLongNullAware;
         final int intToFloatNullAware;
         // Var-size header gather helpers
@@ -1665,6 +1672,8 @@ public final class VectorBytecodeFilterCompiler {
                     "(Ljdk/incubator/vector/FloatVector;Ljdk/incubator/vector/FloatVector;I)Ljdk/incubator/vector/FloatVector;");
             longToDoubleNullAware = asm.poolMethod(helpersCls, "longToDoubleNullAware",
                     "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;)Ljdk/incubator/vector/DoubleVector;");
+            intToDoubleNullAware = asm.poolMethod(helpersCls, "intToDoubleNullAware",
+                    "(Ljdk/incubator/vector/IntVector;" + sSpec + ")Ljdk/incubator/vector/DoubleVector;");
             intToLongNullAware = asm.poolMethod(helpersCls, "intToLongNullAware",
                     "(Ljdk/incubator/vector/IntVector;Ljdk/incubator/vector/LongVector;)Ljdk/incubator/vector/LongVector;");
             intToFloatNullAware = asm.poolMethod(helpersCls, "intToFloatNullAware",
@@ -1743,6 +1752,7 @@ public final class VectorBytecodeFilterCompiler {
             convL2I = poolStaticField(asm, vecOpsCls, "L2I", convType);
             convB2I = poolStaticField(asm, vecOpsCls, "B2I", convType);
             convS2I = poolStaticField(asm, vecOpsCls, "S2I", convType);
+            convI2D = poolStaticField(asm, vecOpsCls, "I2D", convType);
 
             // --- Per-type VecType pools ---
             String sLVec = "Ljdk/incubator/vector/LongVector;";
@@ -1861,6 +1871,7 @@ public final class VectorBytecodeFilterCompiler {
             if (fromType == I8_TYPE && toType == I4_TYPE) return convL2I;
             if (fromType == I1_TYPE && toType == I4_TYPE) return convB2I;
             if (fromType == I2_TYPE && toType == I4_TYPE) return convS2I;
+            if (fromType == I4_TYPE && toType == F8_TYPE) return convI2D;
             throw new UnsupportedOperationException("conversion: " + fromType + " -> " + toType);
         }
 

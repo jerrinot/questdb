@@ -811,6 +811,19 @@ public final class FilterHelpers {
         return converted.blend(Double.NaN, isNull.cast(jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED));
     }
 
+    public static jdk.incubator.vector.DoubleVector intToDoubleNullAware(
+            jdk.incubator.vector.IntVector src,
+            jdk.incubator.vector.VectorSpecies<Double> doubleSpecies
+    ) {
+        // Detect INT_NULL lanes before conversion
+        jdk.incubator.vector.VectorMask<Integer> isNull = src.eq(Numbers.INT_NULL);
+        // Convert I2D
+        jdk.incubator.vector.DoubleVector converted = (jdk.incubator.vector.DoubleVector)
+                src.convertShape(jdk.incubator.vector.VectorOperators.I2D, doubleSpecies, 0);
+        // Replace null lanes with NaN
+        return converted.blend(Double.NaN, isNull.cast(doubleSpecies));
+    }
+
     public static jdk.incubator.vector.LongVector intToLongNullAware(
             jdk.incubator.vector.IntVector src,
             jdk.incubator.vector.LongVector nullVec

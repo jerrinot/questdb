@@ -951,6 +951,27 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testMixedIntDoubleArithmeticComparison() throws Exception {
+        // col0(I4) + 1 > col1(F8) — I4 operand cast to F8 via I2D
+        int[] intData = new int[ROW_COUNT];
+        double[] doubleData = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            intData[i] = (i % 11 == 0) ? Numbers.INT_NULL : i - 5;
+            doubleData[i] = i * 0.5;
+        }
+
+        int mixedOptions = (3 << 1) | (2 << 4) | (1 << 6); // log2(8), mixed-size, null checks
+        assertParityIntDouble(intData, doubleData, ir(
+                insn(MEM, F8_TYPE, 1, 0),
+                insn(IMM, I4_TYPE, 1, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(ADD, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), mixedOptions);
+    }
+
+    @Test
     public void testMixedLongIntDoubleBenchmarkShape() throws Exception {
         long[] longData = new long[ROW_COUNT];
         int[] intData = new int[ROW_COUNT];
