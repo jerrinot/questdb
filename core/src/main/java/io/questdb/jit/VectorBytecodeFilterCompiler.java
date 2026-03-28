@@ -89,6 +89,12 @@ public final class VectorBytecodeFilterCompiler {
                 stackMapAttr, CR_SLOT_ROWS_COUNT, -1, CR_FIRST_FREE, true, primary, pureF8);
 
         asm.putShort(0);
+
+        String dumpPath = System.getProperty("questdb.jit.vector.dump");
+        if (dumpPath != null) {
+            asm.dump(dumpPath);
+        }
+
         return asm.newInstance();
     }
 
