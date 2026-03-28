@@ -951,6 +951,29 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testLargePredicateChainNearLimit() throws Exception {
+        // 100-predicate AND chain: col0 > 0 AND col0 > 1 AND ... AND col0 > 99
+        // Tests that the compiler handles large straight-line programs correctly.
+        int opCount = 100;
+        // Each predicate: IMM + MEM + GT = 3 ops, plus AND for all but first = opCount-1
+        // Total: 3*opCount + (opCount-1) + 1(RET) = 4*opCount
+        IrDecoder.Instruction[] instructions = new IrDecoder.Instruction[opCount * 4];
+        int idx = 0;
+        for (int p = 0; p < opCount; p++) {
+            instructions[idx++] = insn(IMM, I8_TYPE, p, 0);
+            instructions[idx++] = insn(MEM, I8_TYPE, 0, 0);
+            instructions[idx++] = insn(GT, 0, 0, 0);
+            if (p > 0) {
+                instructions[idx++] = insn(AND, 0, 0, 0);
+            }
+        }
+        instructions[idx] = insn(RET, 0, 0, 0);
+
+        long[] data = longCol(ROW_COUNT, i -> (long) i * 2);
+        assertParityWithOptions(data, instructions, LONG_OPTIONS);
+    }
+
+    @Test
     public void testMixedIntDoubleArithmeticComparison() throws Exception {
         // col0(I4) + 1 > col1(F8) — I4 operand cast to F8 via I2D
         int[] intData = new int[ROW_COUNT];
