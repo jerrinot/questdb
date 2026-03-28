@@ -100,6 +100,66 @@ public final class FilterHelpers {
         return jdk.incubator.vector.LongVector.fromArray(species, IOTA_LONG, 0);
     }
 
+    /**
+     * Returns a LongVector with all lanes set to LONG_NULL sentinel.
+     */
+    public static jdk.incubator.vector.LongVector longNullVector(jdk.incubator.vector.VectorSpecies<Long> species) {
+        return jdk.incubator.vector.LongVector.broadcast(species, io.questdb.std.Numbers.LONG_NULL);
+    }
+
+    /**
+     * Returns a DoubleVector with all lanes set to NaN (double null sentinel).
+     */
+    public static jdk.incubator.vector.DoubleVector doubleNanVector(jdk.incubator.vector.VectorSpecies<Double> species) {
+        return jdk.incubator.vector.DoubleVector.broadcast(species, Double.NaN);
+    }
+
+    // --- Vectorized null-aware comparisons ---
+
+    public static jdk.incubator.vector.VectorMask<Long> longNullLt(
+            jdk.incubator.vector.LongVector lhs,
+            jdk.incubator.vector.LongVector rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        jdk.incubator.vector.VectorMask<Long> anyNull = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec)
+                .or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec));
+        return lhs.compare(jdk.incubator.vector.VectorOperators.LT, rhs).and(anyNull.not());
+    }
+
+    public static jdk.incubator.vector.VectorMask<Long> longNullLe(
+            jdk.incubator.vector.LongVector lhs,
+            jdk.incubator.vector.LongVector rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        jdk.incubator.vector.VectorMask<Long> lhsNull = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        jdk.incubator.vector.VectorMask<Long> rhsNull = rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        jdk.incubator.vector.VectorMask<Long> anyNull = lhsNull.or(rhsNull);
+        jdk.incubator.vector.VectorMask<Long> bothNull = lhsNull.and(rhsNull);
+        return lhs.compare(jdk.incubator.vector.VectorOperators.LE, rhs).and(anyNull.not()).or(bothNull);
+    }
+
+    public static jdk.incubator.vector.VectorMask<Long> longNullGt(
+            jdk.incubator.vector.LongVector lhs,
+            jdk.incubator.vector.LongVector rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        jdk.incubator.vector.VectorMask<Long> anyNull = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec)
+                .or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec));
+        return lhs.compare(jdk.incubator.vector.VectorOperators.GT, rhs).and(anyNull.not());
+    }
+
+    public static jdk.incubator.vector.VectorMask<Long> longNullGe(
+            jdk.incubator.vector.LongVector lhs,
+            jdk.incubator.vector.LongVector rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        jdk.incubator.vector.VectorMask<Long> lhsNull = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        jdk.incubator.vector.VectorMask<Long> rhsNull = rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        jdk.incubator.vector.VectorMask<Long> anyNull = lhsNull.or(rhsNull);
+        jdk.incubator.vector.VectorMask<Long> bothNull = lhsNull.and(rhsNull);
+        return lhs.compare(jdk.incubator.vector.VectorOperators.GE, rhs).and(anyNull.not()).or(bothNull);
+    }
+
     // --- Column reads ---
 
     public static byte readByte(long dataAddress, int columnIndex, long row) {

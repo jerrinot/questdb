@@ -97,9 +97,7 @@ public final class VectorBytecodeFilterCompiler {
         if (program.getOptions().isScalarOnly()) {
             return false;
         }
-        if (program.getOptions().isNullChecksEnabled()) {
-            return false;
-        }
+        // Null-aware comparisons are implemented for I8 and F8 types.
         LoweredBlock block = program.getBlock(program.getEntryBlockId());
         for (int i = 0; i < block.getOpCount(); i++) {
             LoweredOp op = block.getOp(i);
@@ -168,7 +166,13 @@ public final class VectorBytecodeFilterCompiler {
         int nativeOrderSlot = firstFree + 5;
         int activeMaskSlot = firstFree + 6;
 
+        boolean nullChecks = program.getOptions().isNullChecksEnabled();
+
         int nextSlot = firstFree + 7;
+        int nullVecSlot = -1;
+        if (nullChecks) {
+            nullVecSlot = nextSlot++;
+        }
         int outputSegSlot = -1;
         int iotaSlot = -1;
         if (!isCountOnly) {
@@ -227,6 +231,18 @@ public final class VectorBytecodeFilterCompiler {
             asm.astore(iotaSlot);
         }
 
+        if (nullChecks) {
+            // Load null sentinel vector once per method
+            if (primaryType == F8_TYPE) {
+                asm.aload(speciesSlot);
+                asm.invokeStatic(pool.helpersDoubleNanVector);
+            } else {
+                asm.aload(speciesSlot);
+                asm.invokeStatic(pool.helpersLongNullVector);
+            }
+            asm.astore(nullVecSlot);
+        }
+
         asm.aconst_null();
         asm.astore(activeMaskSlot);
         for (int i = 0; i < tempCount; i++) {
@@ -252,7 +268,8 @@ public final class VectorBytecodeFilterCompiler {
         LoweredBlock block = program.getBlock(program.getEntryBlockId());
         for (int i = 0; i < block.getOpCount(); i++) {
             emitOp(asm, block.getOp(i), tempSlots, rowSlot, activeMaskSlot,
-                    speciesSlot, nativeOrderSlot, colSegSlots, varsSegSlot, pool);
+                    speciesSlot, nativeOrderSlot, colSegSlots, varsSegSlot, pool,
+                    nullChecks, nullVecSlot);
         }
 
         // === Terminator ===
@@ -385,14 +402,15 @@ public final class VectorBytecodeFilterCompiler {
     private static void emitOp(
             BytecodeAssembler asm, LoweredOp op, int[] tempSlots,
             int rowSlot, int activeMaskSlot, int speciesSlot, int nativeOrderSlot,
-            int[] colSegSlots, int varsSegSlot, Pool pool
+            int[] colSegSlots, int varsSegSlot, Pool pool,
+            boolean nullChecks, int nullVecSlot
     ) {
         switch (op) {
             case LoweredOp.LoadColumn lc -> emitLoadColumn(asm, lc, tempSlots, rowSlot,
                     activeMaskSlot, speciesSlot, nativeOrderSlot, colSegSlots, pool);
             case LoweredOp.LoadImm li -> emitLoadImm(asm, li, tempSlots, speciesSlot, pool);
             case LoweredOp.LoadVar lv -> emitLoadVar(asm, lv, tempSlots, speciesSlot, varsSegSlot, pool);
-            case LoweredOp.Compare c -> emitCompare(asm, c, tempSlots, pool);
+            case LoweredOp.Compare c -> emitCompare(asm, c, tempSlots, pool, nullChecks, nullVecSlot);
             case LoweredOp.BooleanOp bo -> emitBooleanOp(asm, bo, tempSlots, pool);
             case LoweredOp.Not n -> emitNot(asm, n, tempSlots, pool);
             case LoweredOp.Arithmetic a -> emitArithmetic(asm, a, tempSlots, pool);
@@ -475,15 +493,43 @@ public final class VectorBytecodeFilterCompiler {
         asm.astore(tempSlots[lv.dst()]);
     }
 
-    private static void emitCompare(BytecodeAssembler asm, LoweredOp.Compare c, int[] tempSlots, Pool pool) {
+    private static void emitCompare(BytecodeAssembler asm, LoweredOp.Compare c, int[] tempSlots,
+                                     Pool pool, boolean nullChecks, int nullVecSlot) {
         Pool.VecType vt = pool.vecType(c.operandType());
-        asm.aload(tempSlots[c.lhs()]);
-        asm.checkcast(vt.vecClass);
-        asm.getstatic(pool.comparisonOp(c.opcode()));
-        asm.aload(tempSlots[c.rhs()]);
-        asm.checkcast(vt.vecClass);
-        asm.invokeVirtual(vt.compare);
-        asm.astore(tempSlots[c.dst()]);
+
+        if (!nullChecks) {
+            // No null checks: direct compare
+            asm.aload(tempSlots[c.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.getstatic(pool.comparisonOp(c.opcode()));
+            asm.aload(tempSlots[c.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.invokeVirtual(vt.compare);
+            asm.astore(tempSlots[c.dst()]);
+        } else if (c.opcode() == EQ || c.opcode() == NE) {
+            // EQ/NE with null checks: sentinel comparison works naturally
+            // (NULL == NULL → true, NULL != non-NULL → true)
+            asm.aload(tempSlots[c.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.getstatic(pool.comparisonOp(c.opcode()));
+            asm.aload(tempSlots[c.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.invokeVirtual(vt.compare);
+            asm.astore(tempSlots[c.dst()]);
+        } else {
+            // Null-aware ordered comparison (LT, LE, GT, GE):
+            // Delegate to FilterHelpers which does the null-check logic in Java.
+            // C2 inlines these methods and intrinsifies the Vector API calls inside.
+            int helperMethod = pool.nullCompareHelper(c.operandType(), c.opcode());
+            asm.aload(tempSlots[c.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(tempSlots[c.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(nullVecSlot);
+            asm.checkcast(vt.vecClass);
+            asm.invokeStatic(helperMethod);
+            asm.astore(tempSlots[c.dst()]);
+        }
     }
 
     private static void emitBooleanOp(BytecodeAssembler asm, LoweredOp.BooleanOp bo, int[] tempSlots, Pool pool) {
@@ -571,6 +617,8 @@ public final class VectorBytecodeFilterCompiler {
         final int helpersLongSpecies;
         final int helpersDoubleSpecies;
         final int helpersNativeByteOrder;
+        final int helpersLongNullVector;
+        final int helpersDoubleNanVector;
         final int helpersColumnSegment;
         final int helpersSegment;
         final int helpersIotaVector;
@@ -596,6 +644,9 @@ public final class VectorBytecodeFilterCompiler {
 
         // VectorOperators conversion fields
         private int convI2F, convF2I, convL2D, convD2L;
+
+        // Null-aware comparison helpers
+        private int longNullLt, longNullLe, longNullGt, longNullGe;
 
         // LongVector-specific (always needed for row-ID output)
         final int longVecAddScalar;
@@ -656,6 +707,17 @@ public final class VectorBytecodeFilterCompiler {
             helpersSegment = asm.poolMethod(helpersCls, "segment", "(J)" + sMSeg);
             helpersIotaVector = asm.poolMethod(helpersCls, "iotaVector",
                     "(" + sSpec + ")Ljdk/incubator/vector/LongVector;");
+            helpersLongNullVector = asm.poolMethod(helpersCls, "longNullVector",
+                    "(" + sSpec + ")Ljdk/incubator/vector/LongVector;");
+            helpersDoubleNanVector = asm.poolMethod(helpersCls, "doubleNanVector",
+                    "(" + sSpec + ")Ljdk/incubator/vector/DoubleVector;");
+
+            // Null-aware comparison helpers
+            String longNullSig = "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;)" + sMask;
+            longNullLt = asm.poolMethod(helpersCls, "longNullLt", longNullSig);
+            longNullLe = asm.poolMethod(helpersCls, "longNullLe", longNullSig);
+            longNullGt = asm.poolMethod(helpersCls, "longNullGt", longNullSig);
+            longNullGe = asm.poolMethod(helpersCls, "longNullGe", longNullSig);
 
             // --- VectorSpecies (interface) ---
             speciesIndexInRange = asm.poolInterfaceMethod(vecSpeciesCls, "indexInRange", "(JJ)" + sMask);
@@ -745,6 +807,19 @@ public final class VectorBytecodeFilterCompiler {
                 case GE -> opGE;
                 default -> throw new UnsupportedOperationException("cmp: " + opcode);
             };
+        }
+
+        int nullCompareHelper(int operandType, int opcode) {
+            if (operandType == I8_TYPE) {
+                return switch (opcode) {
+                    case LT -> longNullLt;
+                    case LE -> longNullLe;
+                    case GT -> longNullGt;
+                    case GE -> longNullGe;
+                    default -> throw new UnsupportedOperationException("null cmp: " + opcode);
+                };
+            }
+            throw new UnsupportedOperationException("null compare for type: " + operandType);
         }
 
         int conversionOp(int fromType, int toType) {

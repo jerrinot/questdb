@@ -41,6 +41,8 @@ public class VectorBytecodeFilterCompilerTest {
 
     // Options: log2(8)=3 in bits 1-3, single-size hint in bits 4-5, no null checks
     private static final int LONG_OPTIONS = (3 << 1) | (1 << 4);
+    // Same but with null checks enabled (bit 6)
+    private static final int LONG_NULL_OPTIONS = (3 << 1) | (1 << 4) | (1 << 6);
 
     // Number of rows: 3 full vectors + partial tail to exercise tail handling
     private static final int ROW_COUNT = LongVector.SPECIES_PREFERRED.length() * 3 + 2;
@@ -193,6 +195,31 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testLongGtNullCheck() throws Exception {
+        // col0 > 42 with null checks enabled
+        // Include some LONG_NULL values — they should not match
+        long[] data = longCol(ROW_COUNT, i -> i == 3 || i == 7 ? io.questdb.std.Numbers.LONG_NULL : i * 10L);
+        assertParityWithOptions(data, ir(
+                insn(IMM, I8_TYPE, 42, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), LONG_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testLongLeNullCheck() throws Exception {
+        // col0 <= 50 with null checks — NULL <= NULL should be true
+        long[] data = longCol(ROW_COUNT, i -> i == 2 || i == 5 ? io.questdb.std.Numbers.LONG_NULL : i * 10L);
+        assertParityWithOptions(data, ir(
+                insn(IMM, I8_TYPE, 50, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(LE, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), LONG_NULL_OPTIONS);
+    }
+
+    @Test
     public void testEmptyInput() throws Exception {
         long[] data = new long[0];
         assertParity(data, ir(
@@ -218,6 +245,41 @@ public class VectorBytecodeFilterCompilerTest {
             data[i] = gen.generate(i);
         }
         return data;
+    }
+
+    private void assertParityWithOptions(long[] data, IrDecoder.Instruction[] instructions, int options) throws Exception {
+        int len = data.length;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long colData = Unsafe.malloc(Math.max(1, (long) len * Long.BYTES), MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putLong(colData + (long) i * Long.BYTES, data[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, options);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 1, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support this program", vector);
+            long actual = vector.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(colData, Math.max(1, (long) len * Long.BYTES), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     private void assertParity(long[] data, IrDecoder.Instruction[] instructions) throws Exception {
