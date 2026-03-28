@@ -195,9 +195,11 @@ public final class VectorBytecodeFilterCompiler {
         }
         int outputSegSlot = -1;
         int iotaSlot = -1;
+        int matchCountSlot = -1;
         if (!isCountOnly) {
             outputSegSlot = nextSlot++;
             iotaSlot = nextSlot++;
+            matchCountSlot = nextSlot++; // int, only live inside skip-guarded block
         }
 
         int maxColIndex = findMaxColumnIndex(program);
@@ -267,6 +269,10 @@ public final class VectorBytecodeFilterCompiler {
 
         asm.aconst_null();
         asm.astore(activeMaskSlot);
+        if (matchCountSlot >= 0) {
+            asm.iconst(0);
+            asm.istore(matchCountSlot);
+        }
         for (int i = 0; i < tempCount; i++) {
             asm.aconst_null();
             asm.astore(tempSlots[i]);
@@ -328,8 +334,12 @@ public final class VectorBytecodeFilterCompiler {
             asm.lstore(filteredCountSlot);
         } else {
             asm.astore(activeMaskSlot);
+
+            // Compute trueCount once and reuse for skip, masked store, and counter.
             asm.aload(activeMaskSlot);
             asm.invokeVirtual(pool.maskTrueCount);
+            asm.istore(matchCountSlot);
+            asm.iload(matchCountSlot);
             int skipBranch = asm.ifeq();
 
             // Row-ID output always uses LongVector (row IDs are longs).
@@ -337,7 +347,8 @@ public final class VectorBytecodeFilterCompiler {
             asm.lload(rowSlot);
             asm.invokeVirtual(pool.longVecAddScalar);
             asm.aload(activeMaskSlot);
-            if (primaryType == F8_TYPE) {
+            if (pureF8) {
+                // Pure F8: masks are VectorMask<Double>, cast to Long for compress
                 asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
                 asm.invokeVirtual(pool.maskCast);
             }
@@ -345,9 +356,7 @@ public final class VectorBytecodeFilterCompiler {
             // Stack: compressed(LongVector)
 
             // Masked store: writeCompressedRows(compressed, matchCount, output, offset, order)
-            asm.aload(activeMaskSlot);
-            asm.invokeVirtual(pool.maskTrueCount);
-            // Stack: compressed, matchCount(int)
+            asm.iload(matchCountSlot);
             asm.aload(outputSegSlot);
             asm.lload(filteredCountSlot);
             asm.ldc2_w(pool.longEight);
@@ -356,8 +365,7 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeStatic(pool.writeCompressedRows);
 
             // filteredCount += matchCount
-            asm.aload(activeMaskSlot);
-            asm.invokeVirtual(pool.maskTrueCount);
+            asm.iload(matchCountSlot);
             asm.i2l();
             asm.lload(filteredCountSlot);
             asm.ladd();
@@ -423,6 +431,7 @@ public final class VectorBytecodeFilterCompiler {
         if (!isCountOnly) {
             asm.putITEM_Object(pool.memSegClass);      // outputSegSlot
             asm.putITEM_Object(pool.longVectorClass);  // iotaSlot
+            asm.putITEM_Integer();                      // matchCountSlot
         }
         for (int i = 0; i <= maxColIndex; i++) {
             asm.putITEM_Object(pool.memSegClass); // colSegSlots[i]
