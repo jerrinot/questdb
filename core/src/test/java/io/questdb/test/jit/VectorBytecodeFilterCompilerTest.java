@@ -978,6 +978,177 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     // ========================
+    // Float (F4) type tests
+    // ========================
+
+    private static final int FLOAT_OPTIONS = (2 << 1) | (1 << 4); // log2(4), single-size
+    private static final int FLOAT_NULL_OPTIONS = FLOAT_OPTIONS | (1 << 6);
+
+    @Test
+    public void testFloatGt() throws Exception {
+        float[] data = new float[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = i * 1.5f;
+        }
+        assertParityFloatCol(data, ir(
+                new IrDecoder.Instruction(IMM, F4_TYPE, Float.floatToRawIntBits(10.0f), 0),
+                insn(MEM, F4_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
+    public void testFloatEqEpsilon() throws Exception {
+        float[] data = new float[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = switch (i % 4) {
+                case 0 -> 1.0f;
+                case 1 -> 1.0f + 1e-11f; // within epsilon
+                case 2 -> 1.0f + 1e-9f;  // outside epsilon
+                default -> 2.0f;
+            };
+        }
+        assertParityFloatCol(data, ir(
+                new IrDecoder.Instruction(IMM, F4_TYPE, Float.floatToRawIntBits(1.0f), 0),
+                insn(MEM, F4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
+    public void testFloatNaNHandling() throws Exception {
+        float[] data = new float[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = (i % 5 == 0) ? Float.NaN : i * 0.5f;
+        }
+        assertParityFloatColWithOptions(data, ir(
+                new IrDecoder.Instruction(IMM, F4_TYPE, Float.floatToRawIntBits(3.0f), 0),
+                insn(MEM, F4_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), FLOAT_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testFloatArithmetic() throws Exception {
+        float[] col0 = new float[ROW_COUNT];
+        float[] col1 = new float[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            col0[i] = i * 1.0f;
+            col1[i] = (i % 3 == 0) ? 0.0f : 2.0f;
+        }
+        assertParityTwoFloatCols(col0, col1, ir(
+                new IrDecoder.Instruction(IMM, F4_TYPE, Float.floatToRawIntBits(0.5f), 0),
+                insn(MEM, F4_TYPE, 0, 0),
+                insn(MEM, F4_TYPE, 1, 0),
+                insn(DIV, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), FLOAT_OPTIONS);
+    }
+
+    @Test
+    public void testFloatNegate() throws Exception {
+        float[] data = new float[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = i * 1.5f - 10.0f;
+        }
+        assertParityFloatCol(data, ir(
+                new IrDecoder.Instruction(IMM, F4_TYPE, Float.floatToRawIntBits(5.0f), 0),
+                insn(MEM, F4_TYPE, 0, 0),
+                insn(NEG, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    // ========================
+    // Float helpers
+    // ========================
+
+    private void assertParityFloatCol(float[] data, IrDecoder.Instruction[] instructions) throws Exception {
+        assertParityFloatColWithOptions(data, instructions, FLOAT_OPTIONS);
+    }
+
+    private void assertParityFloatColWithOptions(float[] data, IrDecoder.Instruction[] instructions, int options) throws Exception {
+        int len = data.length;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long colData = Unsafe.malloc(Math.max(1, (long) len * Float.BYTES), MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putFloat(colData + (long) i * Float.BYTES, data[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, options);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 1, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support F4 program", vector);
+            long actual = vector.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(colData, Math.max(1, (long) len * Float.BYTES), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private void assertParityTwoFloatCols(float[] col0, float[] col1,
+                                           IrDecoder.Instruction[] instructions, int options) throws Exception {
+        Assert.assertEquals(col0.length, col1.length);
+        int len = col0.length;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long c0 = Unsafe.malloc((long) len * Float.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long c1 = Unsafe.malloc((long) len * Float.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putFloat(c0 + (long) i * Float.BYTES, col0[i]);
+            Unsafe.getUnsafe().putFloat(c1 + (long) i * Float.BYTES, col1[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, c0);
+        Unsafe.getUnsafe().putLong(colPtrArray + 8, c1);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, options);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 2, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support F4 program", vector);
+            long actual = vector.filterRows(colPtrArray, 2, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(c0, (long) len * Float.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(c1, (long) len * Float.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 16, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    // ========================
     // Int helpers
     // ========================
 

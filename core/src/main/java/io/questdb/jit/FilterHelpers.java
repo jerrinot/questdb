@@ -109,6 +109,20 @@ public final class FilterHelpers {
     }
 
     /**
+     * Returns a FloatVector species whose lane count matches the preferred
+     * LongVector lane count. This lets mixed F4 programs keep a single
+     * row stride while using a narrower vector shape for floats.
+     */
+    public static jdk.incubator.vector.VectorSpecies<Float> floatSpeciesForLongRows() {
+        return jdk.incubator.vector.VectorSpecies.of(
+                float.class,
+                jdk.incubator.vector.VectorShape.forBitSize(
+                        jdk.incubator.vector.LongVector.SPECIES_PREFERRED.length() * Float.SIZE
+                )
+        );
+    }
+
+    /**
      * Creates the iota LongVector [0, 1, 2, ..., species.length()-1].
      * Called once at method entry for row-ID mode.
      */
@@ -389,6 +403,104 @@ public final class FilterHelpers {
         return lhs.compare(jdk.incubator.vector.VectorOperators.GE, rhs, anyNaN.not()).or(epsilonEq).or(bothNaN);
     }
 
+    // --- Vectorized float arithmetic (NaN + div-by-zero) ---
+
+    /**
+     * F4 arithmetic with NaN propagation and div-by-zero → NaN.
+     */
+    @SuppressWarnings("unchecked")
+    public static jdk.incubator.vector.FloatVector floatVecArithmetic(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs,
+            int opcode
+    ) {
+        if (opcode != DIV) {
+            return switch (opcode) {
+                case ADD -> lhs.add(rhs);
+                case SUB -> lhs.sub(rhs);
+                case MUL -> lhs.mul(rhs);
+                default -> throw new UnsupportedOperationException("arith op: " + opcode);
+            };
+        }
+        jdk.incubator.vector.VectorMask<Float> zeroDiv = rhs.compare(
+                jdk.incubator.vector.VectorOperators.EQ, 0.0f);
+        jdk.incubator.vector.VectorMask<Float> validMask = zeroDiv.not();
+        jdk.incubator.vector.FloatVector result = lhs.div(rhs, validMask);
+        return result.blend(Float.NaN, zeroDiv);
+    }
+
+    // --- Vectorized float comparisons (epsilon + NaN-aware) ---
+
+    private static final float VEC_FLOAT_EPSILON = FLOAT_EPSILON;
+
+    public static jdk.incubator.vector.VectorMask<Float> floatVecEq(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs
+    ) {
+        jdk.incubator.vector.VectorMask<Float> lhsNaN = lhs.test(jdk.incubator.vector.VectorOperators.IS_NAN);
+        jdk.incubator.vector.VectorMask<Float> rhsNaN = rhs.test(jdk.incubator.vector.VectorOperators.IS_NAN);
+        jdk.incubator.vector.VectorMask<Float> bothNaN = lhsNaN.and(rhsNaN);
+        jdk.incubator.vector.VectorMask<Float> anyNaN = lhsNaN.or(rhsNaN);
+        jdk.incubator.vector.VectorMask<Float> epsilonEq = lhs.sub(rhs).abs()
+                .compare(jdk.incubator.vector.VectorOperators.LE, VEC_FLOAT_EPSILON, anyNaN.not());
+        return epsilonEq.or(bothNaN);
+    }
+
+    public static jdk.incubator.vector.VectorMask<Float> floatVecNe(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs
+    ) {
+        return floatVecEq(lhs, rhs).not();
+    }
+
+    public static jdk.incubator.vector.VectorMask<Float> floatVecLt(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs
+    ) {
+        jdk.incubator.vector.VectorMask<Float> anyNaN = lhs.test(jdk.incubator.vector.VectorOperators.IS_NAN)
+                .or(rhs.test(jdk.incubator.vector.VectorOperators.IS_NAN));
+        jdk.incubator.vector.VectorMask<Float> epsilonEq = lhs.sub(rhs).abs()
+                .compare(jdk.incubator.vector.VectorOperators.LE, VEC_FLOAT_EPSILON, anyNaN.not());
+        return lhs.compare(jdk.incubator.vector.VectorOperators.LT, rhs, anyNaN.not()).and(epsilonEq.not());
+    }
+
+    public static jdk.incubator.vector.VectorMask<Float> floatVecLe(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs
+    ) {
+        jdk.incubator.vector.VectorMask<Float> lhsNaN = lhs.test(jdk.incubator.vector.VectorOperators.IS_NAN);
+        jdk.incubator.vector.VectorMask<Float> rhsNaN = rhs.test(jdk.incubator.vector.VectorOperators.IS_NAN);
+        jdk.incubator.vector.VectorMask<Float> bothNaN = lhsNaN.and(rhsNaN);
+        jdk.incubator.vector.VectorMask<Float> anyNaN = lhsNaN.or(rhsNaN);
+        jdk.incubator.vector.VectorMask<Float> epsilonEq = lhs.sub(rhs).abs()
+                .compare(jdk.incubator.vector.VectorOperators.LE, VEC_FLOAT_EPSILON, anyNaN.not());
+        return lhs.compare(jdk.incubator.vector.VectorOperators.LE, rhs, anyNaN.not()).or(epsilonEq).or(bothNaN);
+    }
+
+    public static jdk.incubator.vector.VectorMask<Float> floatVecGt(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs
+    ) {
+        jdk.incubator.vector.VectorMask<Float> anyNaN = lhs.test(jdk.incubator.vector.VectorOperators.IS_NAN)
+                .or(rhs.test(jdk.incubator.vector.VectorOperators.IS_NAN));
+        jdk.incubator.vector.VectorMask<Float> epsilonEq = lhs.sub(rhs).abs()
+                .compare(jdk.incubator.vector.VectorOperators.LE, VEC_FLOAT_EPSILON, anyNaN.not());
+        return lhs.compare(jdk.incubator.vector.VectorOperators.GT, rhs, anyNaN.not()).and(epsilonEq.not());
+    }
+
+    public static jdk.incubator.vector.VectorMask<Float> floatVecGe(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs
+    ) {
+        jdk.incubator.vector.VectorMask<Float> lhsNaN = lhs.test(jdk.incubator.vector.VectorOperators.IS_NAN);
+        jdk.incubator.vector.VectorMask<Float> rhsNaN = rhs.test(jdk.incubator.vector.VectorOperators.IS_NAN);
+        jdk.incubator.vector.VectorMask<Float> bothNaN = lhsNaN.and(rhsNaN);
+        jdk.incubator.vector.VectorMask<Float> anyNaN = lhsNaN.or(rhsNaN);
+        jdk.incubator.vector.VectorMask<Float> epsilonEq = lhs.sub(rhs).abs()
+                .compare(jdk.incubator.vector.VectorOperators.LE, VEC_FLOAT_EPSILON, anyNaN.not());
+        return lhs.compare(jdk.incubator.vector.VectorOperators.GE, rhs, anyNaN.not()).or(epsilonEq).or(bothNaN);
+    }
+
     // --- Column reads ---
 
     public static byte readByte(long dataAddress, int columnIndex, long row) {
@@ -529,6 +641,19 @@ public final class FilterHelpers {
                         jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED, 0);
         // Replace null lanes with NaN
         return converted.blend(Double.NaN, isNull.cast(jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED));
+    }
+
+    public static jdk.incubator.vector.FloatVector intToFloatNullAware(
+            jdk.incubator.vector.IntVector src,
+            jdk.incubator.vector.VectorSpecies<Float> floatSpecies
+    ) {
+        // Detect INT_NULL lanes
+        jdk.incubator.vector.VectorMask<Integer> isNull = src.eq(Numbers.INT_NULL);
+        // Convert I2F
+        jdk.incubator.vector.FloatVector converted = (jdk.incubator.vector.FloatVector)
+                src.convertShape(jdk.incubator.vector.VectorOperators.I2F, floatSpecies, 0);
+        // Replace null lanes with NaN
+        return converted.blend(Float.NaN, isNull.cast(floatSpecies));
     }
 
     // --- Output writes ---

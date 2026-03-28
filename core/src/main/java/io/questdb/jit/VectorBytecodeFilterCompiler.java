@@ -134,21 +134,26 @@ public final class VectorBytecodeFilterCompiler {
     }
 
     private static boolean isSupportedArithmeticType(int type) {
-        return type == I8_TYPE || type == F8_TYPE;
+        return type == I8_TYPE || type == F8_TYPE || type == F4_TYPE;
     }
 
     private static boolean isSupportedCompareType(int type) {
-        return type == I8_TYPE || type == F8_TYPE || type == I4_TYPE;
+        return type == I8_TYPE || type == F8_TYPE || type == I4_TYPE || type == F4_TYPE;
     }
 
     private static boolean isSupportedLoadType(int type) {
-        return type == I8_TYPE || type == F8_TYPE || type == I4_TYPE;
+        return type == I8_TYPE || type == F8_TYPE || type == I4_TYPE || type == F4_TYPE;
     }
 
     private static boolean isSupportedCast(LoweredOp.Cast c) {
-        // Same-width casts: I8<->F8
-        return (c.fromType() == I8_TYPE && c.toType() == F8_TYPE)
-                || (c.fromType() == F8_TYPE && c.toType() == I8_TYPE);
+        int from = c.fromType();
+        int to = c.toType();
+        // Same-width casts: I8<->F8, I4<->F4
+        if ((from == I8_TYPE && to == F8_TYPE) || (from == F8_TYPE && to == I8_TYPE)) return true;
+        if ((from == I4_TYPE && to == F4_TYPE) || (from == F4_TYPE && to == I4_TYPE)) return true;
+        // Cross-width float casts: F4<->F8
+        if ((from == F4_TYPE && to == F8_TYPE) || (from == F8_TYPE && to == F4_TYPE)) return true;
+        return false;
     }
 
     /**
@@ -164,12 +169,13 @@ public final class VectorBytecodeFilterCompiler {
      *                       IntVector species slot
      * @param maxColumnIndex highest column index seen across all LoadColumn ops
      */
-    record ProgramShape(boolean pureF8, boolean usesI4, int maxColumnIndex) {
+    record ProgramShape(boolean pureF8, boolean usesI4, boolean usesF4, int maxColumnIndex) {
 
         static ProgramShape analyze(LoweredProgram program) {
             boolean hasI8 = false;
             boolean hasCast = false;
             boolean usesI4 = false;
+            boolean usesF4 = false;
             int primaryType = I8_TYPE;
             boolean primarySet = false;
             int maxColIdx = 0;
@@ -185,28 +191,34 @@ public final class VectorBytecodeFilterCompiler {
                         }
                         if (lc.type() == I8_TYPE) hasI8 = true;
                         if (lc.type() == I4_TYPE) usesI4 = true;
+                        if (lc.type() == F4_TYPE) usesF4 = true;
                         maxColIdx = Math.max(maxColIdx, lc.columnIndex());
                     } else if (op instanceof LoweredOp.LoadVar lv) {
                         if (lv.type() == I8_TYPE) hasI8 = true;
                         if (lv.type() == I4_TYPE) usesI4 = true;
+                        if (lv.type() == F4_TYPE) usesF4 = true;
                     } else if (op instanceof LoweredOp.LoadImm li) {
                         if (li.type() == I8_TYPE) hasI8 = true;
                         if (li.type() == I4_TYPE) usesI4 = true;
+                        if (li.type() == F4_TYPE) usesF4 = true;
                     } else if (op instanceof LoweredOp.Compare c) {
                         if (c.operandType() == I4_TYPE) usesI4 = true;
+                        if (c.operandType() == F4_TYPE) usesF4 = true;
                     } else if (op instanceof LoweredOp.Arithmetic a) {
                         if (a.resultType() == I8_TYPE) hasI8 = true;
                         if (a.resultType() == I4_TYPE) usesI4 = true;
+                        if (a.resultType() == F4_TYPE) usesF4 = true;
                     } else if (op instanceof LoweredOp.Negate n) {
                         if (n.type() == I4_TYPE) usesI4 = true;
+                        if (n.type() == F4_TYPE) usesF4 = true;
                     } else if (op instanceof LoweredOp.Cast) {
                         hasCast = true;
                     }
                 }
             }
 
-            boolean pureF8 = !hasI8 && !hasCast && !usesI4 && primaryType == F8_TYPE;
-            return new ProgramShape(pureF8, usesI4, maxColIdx);
+            boolean pureF8 = !hasI8 && !hasCast && !usesI4 && !usesF4 && primaryType == F8_TYPE;
+            return new ProgramShape(pureF8, usesI4, usesF4, maxColIdx);
         }
     }
 
@@ -230,6 +242,7 @@ public final class VectorBytecodeFilterCompiler {
             int nativeOrderSlot,
             int activeMaskSlot,
             int intSpeciesSlot,
+            int floatSpeciesSlot,
             int nullVecSlot,
             int outputSegSlot,
             int iotaSlot,
@@ -247,6 +260,7 @@ public final class VectorBytecodeFilterCompiler {
                                    boolean isCountOnly, boolean nullChecks) {
             boolean pureF8 = shape.pureF8();
             boolean usesI4 = shape.usesI4();
+            boolean usesF4 = shape.usesF4();
             int filteredCountSlot = firstFree;
             int rowSlot = firstFree + 2;
             int strideSlot = firstFree + 4;
@@ -258,6 +272,10 @@ public final class VectorBytecodeFilterCompiler {
             int intSpeciesSlot = -1;
             if (usesI4) {
                 intSpeciesSlot = nextSlot++;
+            }
+            int floatSpeciesSlot = -1;
+            if (usesF4) {
+                floatSpeciesSlot = nextSlot++;
             }
             int nullVecSlot = -1;
             if (nullChecks && !pureF8) {
@@ -296,7 +314,7 @@ public final class VectorBytecodeFilterCompiler {
             return new SlotLayout(
                     filteredCountSlot, rowSlot, strideSlot,
                     speciesSlot, nativeOrderSlot, activeMaskSlot,
-                    intSpeciesSlot, nullVecSlot,
+                    intSpeciesSlot, floatSpeciesSlot, nullVecSlot,
                     outputSegSlot, iotaSlot, matchCountSlot, countAccSlot, fullMaskSlot,
                     colSegSlots, varsSegSlot, tempSlots,
                     maxLocals, objectLocalCount
@@ -343,7 +361,7 @@ public final class VectorBytecodeFilterCompiler {
 
         asm.startMethod(methodName, methodSig, 12, s.maxLocals());
 
-        emitSetup(ctx, block, filteredRowsSlot, isCountOnly, usesI4, needsNullVec);
+        emitSetup(ctx, block, filteredRowsSlot, isCountOnly, usesI4, shape.usesF4(), needsNullVec);
 
         // Count-only and row-ID paths are kept separate because they differ in:
         //   - reduction strategy: count-only accumulates a LongVector via masked
@@ -370,7 +388,8 @@ public final class VectorBytecodeFilterCompiler {
 
     private static void emitSetup(
             EmitContext ctx, LoweredBlock block,
-            int filteredRowsSlot, boolean isCountOnly, boolean usesI4, boolean needsNullVec
+            int filteredRowsSlot, boolean isCountOnly, boolean usesI4, boolean usesF4,
+            boolean needsNullVec
     ) {
         BytecodeAssembler asm = ctx.asm();
         Pool pool = ctx.pool();
@@ -394,6 +413,10 @@ public final class VectorBytecodeFilterCompiler {
         if (usesI4) {
             asm.invokeStatic(pool.helpersIntSpeciesForLongRows);
             asm.astore(s.intSpeciesSlot());
+        }
+        if (usesF4) {
+            asm.invokeStatic(pool.helpersFloatSpeciesForLongRows);
+            asm.astore(s.floatSpeciesSlot());
         }
         // Hoist species.length() as a long to avoid per-iteration invokeInterface + i2l.
         asm.aload(s.speciesSlot());
@@ -697,6 +720,9 @@ public final class VectorBytecodeFilterCompiler {
         if (usesI4) {
             asm.putITEM_Object(pool.vecSpeciesClass); // intSpeciesSlot
         }
+        if (shape.usesF4()) {
+            asm.putITEM_Object(pool.vecSpeciesClass); // floatSpeciesSlot
+        }
         if (needsNullVec) {
             asm.putITEM_Object(pool.longVectorClass); // nullVecSlot — always LongVector
         }
@@ -983,12 +1009,13 @@ public final class VectorBytecodeFilterCompiler {
                 }
             }
             case I4_TYPE -> asm.aload(s.intSpeciesSlot());
+            case F4_TYPE -> asm.aload(s.floatSpeciesSlot());
             default -> throw new UnsupportedOperationException("vector species for type: " + type);
         }
     }
 
     private static boolean needsLoadMaskCast(int type, boolean pureF8) {
-        return type == I4_TYPE || (!pureF8 && type == F8_TYPE);
+        return type == I4_TYPE || type == F4_TYPE || (!pureF8 && type == F8_TYPE);
     }
 
     // === Op emission ===
@@ -1105,6 +1132,18 @@ public final class VectorBytecodeFilterCompiler {
                 asm.invokeVirtual(pool.maskCast);
             }
             asm.astore(tempSlots[c.dst()]);
+        } else if (c.operandType() == F4_TYPE) {
+            // Float comparisons always use helpers (epsilon + NaN handling).
+            int helperMethod = pool.floatCompareHelper(c.opcode());
+            asm.aload(tempSlots[c.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(tempSlots[c.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.invokeStatic(helperMethod);
+            // Cast VectorMask<Float> → VectorMask<Long> for uniform mask type
+            asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+            asm.invokeVirtual(pool.maskCast);
+            asm.astore(tempSlots[c.dst()]);
         } else if (c.operandType() == I4_TYPE) {
             asm.aload(tempSlots[c.lhs()]);
             asm.checkcast(vt.vecClass);
@@ -1189,6 +1228,15 @@ public final class VectorBytecodeFilterCompiler {
             asm.iconst(a.opcode());
             asm.invokeStatic(pool.doubleVecArithmetic);
             asm.astore(tempSlots[a.dst()]);
+        } else if (a.resultType() == F4_TYPE) {
+            // F4: always use helper for NaN propagation and div-by-zero → NaN
+            asm.aload(tempSlots[a.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(tempSlots[a.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.iconst(a.opcode());
+            asm.invokeStatic(pool.floatVecArithmetic);
+            asm.astore(tempSlots[a.dst()]);
         } else if (ctx.nullChecks() && a.resultType() == I8_TYPE) {
             // I8 with null checks: use helper for LONG_NULL preservation
             asm.aload(tempSlots[a.lhs()]);
@@ -1242,9 +1290,15 @@ public final class VectorBytecodeFilterCompiler {
             asm.aload(ctx.s().nullVecSlot());
             asm.checkcast(pool.vecType(I8_TYPE).vecClass);
             asm.invokeStatic(pool.longToDoubleNullAware);
+        } else if (ctx.nullChecks() && c.fromType() == I4_TYPE && c.toType() == F4_TYPE) {
+            // Null-aware I4→F4: INT_NULL must become NaN, not -2.14e9.
+            emitTypeSpecies(ctx, F4_TYPE);
+            asm.invokeStatic(pool.intToFloatNullAware);
         } else {
             asm.getstatic(pool.conversionOp(c.fromType(), c.toType()));
-            asm.getstatic(pool.vecType(c.toType()).speciesPreferred);
+            // For I4/F4 targets, use the narrowed species (matching Long lane count)
+            // instead of SPECIES_PREFERRED which has more lanes on wide hardware.
+            emitTypeSpecies(ctx, c.toType());
             asm.iconst(0);
             asm.invokeVirtual(srcVt.convertShape);
         }
@@ -1266,6 +1320,7 @@ public final class VectorBytecodeFilterCompiler {
         final int helpersLongSpecies;
         final int helpersDoubleSpecies;
         final int helpersIntSpeciesForLongRows;
+        final int helpersFloatSpeciesForLongRows;
         final int helpersNativeByteOrder;
         final int helpersLongNullVector;
         final int helpersDoubleNanVector;
@@ -1293,18 +1348,22 @@ public final class VectorBytecodeFilterCompiler {
         private final int opEQ, opNE, opLT, opLE, opGT, opGE;
 
         // VectorOperators conversion fields
-        private final int convI2F, convF2I, convL2D, convD2L;
+        private final int convI2F, convF2I, convL2D, convD2L, convF2D, convD2F;
 
         // Null-aware comparison helpers (I8 and I4)
         private final int longNullLt, longNullLe, longNullGt, longNullGe;
         private final int intNullEq, intNullNe, intNullLt, intNullLe, intNullGt, intNullGe;
         // Double comparison helpers (epsilon + NaN)
         private final int doubleVecEq, doubleVecNe, doubleVecLt, doubleVecLe, doubleVecGt, doubleVecGe;
+        // Float comparison helpers (epsilon + NaN)
+        private final int floatVecEq, floatVecNe, floatVecLt, floatVecLe, floatVecGt, floatVecGe;
         // Arithmetic helpers
         final int longVecArithmeticNull;
         final int doubleVecArithmetic;
-        // Null-aware cast helper
+        final int floatVecArithmetic;
+        // Null-aware cast helpers
         final int longToDoubleNullAware;
+        final int intToFloatNullAware;
 
         // LongVector-specific (always needed for row-ID output)
         final int longVecAddScalar;
@@ -1363,6 +1422,7 @@ public final class VectorBytecodeFilterCompiler {
             helpersLongSpecies = asm.poolMethod(helpersCls, "longSpecies", "()" + sSpec);
             helpersDoubleSpecies = asm.poolMethod(helpersCls, "doubleSpecies", "()" + sSpec);
             helpersIntSpeciesForLongRows = asm.poolMethod(helpersCls, "intSpeciesForLongRows", "()" + sSpec);
+            helpersFloatSpeciesForLongRows = asm.poolMethod(helpersCls, "floatSpeciesForLongRows", "()" + sSpec);
             helpersNativeByteOrder = asm.poolMethod(helpersCls, "nativeByteOrder", "()Ljava/nio/ByteOrder;");
             helpersColumnSegment = asm.poolMethod(helpersCls, "columnSegment", "(JI)" + sMSeg);
             helpersSegment = asm.poolMethod(helpersCls, "segment", "(J)" + sMSeg);
@@ -1396,13 +1456,26 @@ public final class VectorBytecodeFilterCompiler {
             doubleVecGt = asm.poolMethod(helpersCls, "doubleVecGt", dblCmpSig);
             doubleVecGe = asm.poolMethod(helpersCls, "doubleVecGe", dblCmpSig);
 
+            // --- FilterHelpers: float comparison (epsilon + NaN) ---
+            String fltCmpSig = "(Ljdk/incubator/vector/FloatVector;Ljdk/incubator/vector/FloatVector;)" + sMask;
+            floatVecEq = asm.poolMethod(helpersCls, "floatVecEq", fltCmpSig);
+            floatVecNe = asm.poolMethod(helpersCls, "floatVecNe", fltCmpSig);
+            floatVecLt = asm.poolMethod(helpersCls, "floatVecLt", fltCmpSig);
+            floatVecLe = asm.poolMethod(helpersCls, "floatVecLe", fltCmpSig);
+            floatVecGt = asm.poolMethod(helpersCls, "floatVecGt", fltCmpSig);
+            floatVecGe = asm.poolMethod(helpersCls, "floatVecGe", fltCmpSig);
+
             // --- FilterHelpers: arithmetic and cast ---
             longVecArithmeticNull = asm.poolMethod(helpersCls, "longVecArithmeticNull",
                     "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;I)Ljdk/incubator/vector/LongVector;");
             doubleVecArithmetic = asm.poolMethod(helpersCls, "doubleVecArithmetic",
                     "(Ljdk/incubator/vector/DoubleVector;Ljdk/incubator/vector/DoubleVector;I)Ljdk/incubator/vector/DoubleVector;");
+            floatVecArithmetic = asm.poolMethod(helpersCls, "floatVecArithmetic",
+                    "(Ljdk/incubator/vector/FloatVector;Ljdk/incubator/vector/FloatVector;I)Ljdk/incubator/vector/FloatVector;");
             longToDoubleNullAware = asm.poolMethod(helpersCls, "longToDoubleNullAware",
                     "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;)Ljdk/incubator/vector/DoubleVector;");
+            intToFloatNullAware = asm.poolMethod(helpersCls, "intToFloatNullAware",
+                    "(Ljdk/incubator/vector/IntVector;" + sSpec + ")Ljdk/incubator/vector/FloatVector;");
 
             // --- VectorSpecies (interface) ---
             speciesIndexInRange = asm.poolInterfaceMethod(vecSpeciesCls, "indexInRange", "(JJ)" + sMask);
@@ -1444,6 +1517,8 @@ public final class VectorBytecodeFilterCompiler {
             convF2I = poolStaticField(asm, vecOpsCls, "F2I", convType);
             convL2D = poolStaticField(asm, vecOpsCls, "L2D", convType);
             convD2L = poolStaticField(asm, vecOpsCls, "D2L", convType);
+            convF2D = poolStaticField(asm, vecOpsCls, "F2D", convType);
+            convD2F = poolStaticField(asm, vecOpsCls, "D2F", convType);
 
             // --- Per-type VecType pools ---
             String sLVec = "Ljdk/incubator/vector/LongVector;";
@@ -1510,6 +1585,18 @@ public final class VectorBytecodeFilterCompiler {
             };
         }
 
+        int floatCompareHelper(int opcode) {
+            return switch (opcode) {
+                case EQ -> floatVecEq;
+                case NE -> floatVecNe;
+                case LT -> floatVecLt;
+                case LE -> floatVecLe;
+                case GT -> floatVecGt;
+                case GE -> floatVecGe;
+                default -> throw new UnsupportedOperationException("float cmp: " + opcode);
+            };
+        }
+
         int nullCompareHelper(int operandType, int opcode) {
             if (operandType == I8_TYPE) {
                 return switch (opcode) {
@@ -1539,6 +1626,8 @@ public final class VectorBytecodeFilterCompiler {
             if (fromType == F4_TYPE && toType == I4_TYPE) return convF2I;
             if (fromType == I8_TYPE && toType == F8_TYPE) return convL2D;
             if (fromType == F8_TYPE && toType == I8_TYPE) return convD2L;
+            if (fromType == F4_TYPE && toType == F8_TYPE) return convF2D;
+            if (fromType == F8_TYPE && toType == F4_TYPE) return convD2F;
             throw new UnsupportedOperationException("conversion: " + fromType + " -> " + toType);
         }
 
