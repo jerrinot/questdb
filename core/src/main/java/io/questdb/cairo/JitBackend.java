@@ -32,8 +32,7 @@ package io.questdb.cairo;
 public final class JitBackend {
     /**
      * Default: vectorized bytecode compiler for eligible programs (I8/F8,
-     * straight-line), scalar bytecode compiler as fallback for all others,
-     * interpreter as ultimate fallback.
+     * straight-line), scalar bytecode compiler for all others.
      */
     public static final int AUTO = 0;
     /**
@@ -41,11 +40,6 @@ public final class JitBackend {
      * Scalar vs SIMD is controlled by {@link SqlJitMode}.
      */
     public static final int CPP = 1;
-    /**
-     * Java interpreter ({@link io.questdb.jit.VectorFilterInterpreter}).
-     * Uses Vector API when eligible and {@link SqlJitMode#JIT_MODE_ENABLED}.
-     */
-    public static final int JAVA_INTERPRETED = 2;
     /**
      * Java scalar bytecode compiler ({@link io.questdb.jit.ScalarBytecodeFilterCompiler}).
      */
@@ -63,7 +57,6 @@ public final class JitBackend {
         return switch (backend) {
             case AUTO -> "auto";
             case CPP -> "cpp";
-            case JAVA_INTERPRETED -> "java_interpreted";
             case JAVA_COMPILED -> "java_compiled";
             case JAVA_VECTOR_COMPILED -> "java_vector_compiled";
             default -> "unknown";

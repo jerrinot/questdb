@@ -30,7 +30,6 @@ import io.questdb.griffin.SqlException;
 
 public class VectorCompiledFilter implements JitFilter {
     private ScalarBytecodeFilterCompiler.ScalarFilterBody bytecodeFilter;
-    private final VectorFilterInterpreter interpreter = new VectorFilterInterpreter();
     private VectorFilterBody vectorBytecodeFilter;
 
     @Override
@@ -65,15 +64,7 @@ public class VectorCompiledFilter implements JitFilter {
                     rowsCount
             );
         }
-        return interpreter.filter(
-                dataAddress,
-                dataSize,
-                varSizeAuxAddress,
-                varsAddress,
-                varsSize,
-                filteredRowsAddress,
-                rowsCount
-        );
+        throw new IllegalStateException("no compiled filter available");
     }
 
     @Override
@@ -86,22 +77,11 @@ public class VectorCompiledFilter implements JitFilter {
     }
 
     public void compile(MemoryCARW filter, int options, int backend) throws SqlException {
-        // The interpreter is always compiled as the ultimate fallback,
-        // unless a specific compiled backend is forced.
-        if (backend != JitBackend.JAVA_COMPILED && backend != JitBackend.JAVA_VECTOR_COMPILED) {
-            interpreter.compile(filter, options);
-        }
-        if (backend != JitBackend.JAVA_INTERPRETED) {
-            compileBytecode(filter, options, backend);
-        }
+        compileBytecode(filter, options, backend);
     }
 
     public boolean usesBytecode() {
         return bytecodeFilter != null || vectorBytecodeFilter != null;
-    }
-
-    public boolean usesVectorApi() {
-        return interpreter.usesVectorApi();
     }
 
     public boolean usesVectorBytecode() {

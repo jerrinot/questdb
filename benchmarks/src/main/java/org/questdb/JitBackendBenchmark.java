@@ -66,13 +66,13 @@ import java.util.concurrent.TimeUnit;
  * </ul>
  */
 @State(Scope.Benchmark)
-@BenchmarkMode(Mode.Throughput)
+@BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 public class JitBackendBenchmark {
     private static final int NUM_ROWS = 128 * 1024 * 1024;
     private static final CairoConfiguration configuration = new DefaultCairoConfiguration(System.getProperty("java.io.tmpdir"));
 
-    @Param({"DISABLED", "NATIVE_SIMD", "NATIVE_SCALAR", /*"JAVA_VECTOR_API", "JAVA_INTERPRETER", */"JAVA_BYTECODE", "JAVA_VECTOR_BYTECODE"})
+    @Param({"DISABLED", "NATIVE_SIMD", "NATIVE_SCALAR", "JAVA_BYTECODE", "JAVA_VECTOR_BYTECODE"})
     public Backend backend;
 
     @Param({"l > 42", "l > 42 AND d < 100.0", "l IN (1, 2, 3, 4, 5)", "l > 0 AND i != 0 AND d < 0.5 AND l < 1000000"})
@@ -96,15 +96,35 @@ public class JitBackendBenchmark {
                             null
                     );
             try {
-                engine.execute(
-                        "CREATE TABLE IF NOT EXISTS jit_bench AS (SELECT" +
-                                " rnd_long() l," +
-                                " rnd_double(0) d," +
-                                " rnd_int() i," +
-                                " timestamp_sequence(400_000_000_000, 500_000_000) ts" +
-                                " FROM long_sequence(" + NUM_ROWS + ")) TIMESTAMP(ts)",
-                        sqlExecutionContext
-                );
+                boolean needsCreate = true;
+                try (RecordCursorFactory factory = new SqlCompilerImpl(engine)
+                        .compile("SELECT count() FROM jit_bench", sqlExecutionContext)
+                        .getRecordCursorFactory();
+                     RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    if (cursor.hasNext() && cursor.getRecord().getLong(0) == NUM_ROWS) {
+                        needsCreate = false;
+                        System.out.println("jit_bench table exists with " + NUM_ROWS + " rows, reusing.");
+                    }
+                } catch (SqlException ignored) {
+                    // table does not exist
+                }
+
+                if (needsCreate) {
+                    try {
+                        engine.execute("DROP TABLE IF EXISTS jit_bench", sqlExecutionContext);
+                    } catch (SqlException ignored) {
+                    }
+                    System.out.println("Creating jit_bench table with " + NUM_ROWS + " rows...");
+                    engine.execute(
+                            "CREATE TABLE jit_bench AS (SELECT" +
+                                    " rnd_long() l," +
+                                    " rnd_double(0) d," +
+                                    " rnd_int() i," +
+                                    " timestamp_sequence(400_000_000_000, 500_000_000) ts" +
+                                    " FROM long_sequence(" + NUM_ROWS + ")) TIMESTAMP(ts)",
+                            sqlExecutionContext
+                    );
+                }
             } catch (SqlException e) {
                 e.printStackTrace(System.out);
             }
@@ -112,8 +132,8 @@ public class JitBackendBenchmark {
 
         Options opt = new OptionsBuilder()
                 .include(JitBackendBenchmark.class.getSimpleName())
-                .warmupIterations(1)
-                .measurementIterations(2)
+                .warmupIterations(0)
+                .measurementIterations(1)
                 .forks(1)
                 .build();
         new Runner(opt).run();
@@ -213,8 +233,6 @@ public class JitBackendBenchmark {
         DISABLED(SqlJitMode.JIT_MODE_DISABLED, JitBackend.AUTO),
         NATIVE_SIMD(SqlJitMode.JIT_MODE_ENABLED, JitBackend.CPP),
         NATIVE_SCALAR(SqlJitMode.JIT_MODE_FORCE_SCALAR, JitBackend.CPP),
-        JAVA_VECTOR_API(SqlJitMode.JIT_MODE_ENABLED, JitBackend.JAVA_INTERPRETED),
-        JAVA_INTERPRETER(SqlJitMode.JIT_MODE_FORCE_SCALAR, JitBackend.JAVA_INTERPRETED),
         JAVA_BYTECODE(SqlJitMode.JIT_MODE_FORCE_SCALAR, JitBackend.JAVA_COMPILED),
         JAVA_VECTOR_BYTECODE(SqlJitMode.JIT_MODE_ENABLED, JitBackend.JAVA_VECTOR_COMPILED);
 

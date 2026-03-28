@@ -78,7 +78,7 @@ import io.questdb.griffin.model.ExplainModel;
 import io.questdb.jit.JitFilter;
 import io.questdb.jit.JitUtil;
 import io.questdb.jit.VectorCompiledFilter;
-import io.questdb.jit.VectorFilterInterpreter;
+
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.mp.SCSequence;
@@ -2172,39 +2172,42 @@ public abstract class AbstractCairoTest extends AbstractTest {
     protected void assertSqlRunWithJit(CharSequence selectSql) throws Exception {
         try (RecordCursorFactory factory = select(selectSql)) {
             Assert.assertTrue("JIT was not enabled for selectSql: " + selectSql, factory.usesCompiledFilter());
-            final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
+            assertBytecodeCompiledIfJava(selectSql, factory);
             try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
                 while (cursor.hasNext()) {
                     // Iterate to force compiled filter execution.
                 }
             }
-            assertVectorApiExecutedIfSelected(selectSql, factory, vectorApiExecutionCount);
         }
     }
 
+    // Legacy name kept to minimize churn across callers in integration/regression tests.
+    // With the interpreter removed, this asserts bytecode compilation instead.
     protected final void assertVectorApiExecutedIfSelected(
             CharSequence sql,
             RecordCursorFactory factory,
             long beforeExecutionCount
     ) {
         if (beforeExecutionCount >= 0) {
-            Assert.assertTrue(
-                    "Vector API path was not executed for query: " + sql,
-                    VectorFilterInterpreter.getVectorApiExecutionCount() > beforeExecutionCount
-            );
+            assertBytecodeCompiledIfJava(sql, factory);
         }
     }
 
+    // Legacy name kept to minimize churn across callers.
+    // Returns 0 (enabling assertion) when a Java compiled filter is active, -1 otherwise.
     protected final long getVectorApiExecutionCountIfSelected(RecordCursorFactory factory) {
         final JitFilter compiledFilter = findCompiledFilter(factory);
-        // Only track the counter when the interpreter is the active execution path.
-        // When bytecode compilation succeeds, the interpreter is not called at runtime.
-        if (compiledFilter instanceof VectorCompiledFilter vcf
-                && !vcf.usesBytecode()
-                && vcf.usesVectorApi()) {
-            return VectorFilterInterpreter.getVectorApiExecutionCount();
+        if (compiledFilter instanceof VectorCompiledFilter) {
+            return 0;
         }
         return -1;
+    }
+
+    private void assertBytecodeCompiledIfJava(CharSequence sql, RecordCursorFactory factory) {
+        final JitFilter compiledFilter = findCompiledFilter(factory);
+        if (compiledFilter instanceof VectorCompiledFilter vcf) {
+            Assert.assertTrue("bytecode was not compiled for query: " + sql, vcf.usesBytecode());
+        }
     }
 
     protected final JitFilter findCompiledFilter(RecordCursorFactory factory) {

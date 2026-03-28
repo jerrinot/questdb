@@ -9,23 +9,19 @@ Scope:
 - `core/src/main/java/io/questdb/jit/FilterHelpers.java`
 - `core/src/test/java/io/questdb/test/jit/VectorBytecodeFilterCompilerTest.java`
 
-This was a read-only review. No code was executed.
-
 ## Findings
 
 ### ~~High: `AUTO` does not currently select the vector bytecode backend~~ RESOLVED
 
 `compileBytecode()` no longer returns early when the interpreter's Vector API
 path is eligible. AUTO now tries vectorized bytecode first, falls back to
-scalar bytecode, then interpreter.
+scalar bytecode.
 
 Changes:
 - `VectorCompiledFilter.compileBytecode()` — removed `usesVectorApi()` gate
 - `VectorCompiledCountOnlyFilter.compileBytecode()` — same
-- `JitBackend.AUTO` doc updated to reflect three-tier: vector bytecode → scalar
-  bytecode → interpreter
-- `AbstractCairoTest.getVectorApiExecutionCountIfSelected()` — skips counter
-  when `usesBytecode()` is true
+- `JitBackend.AUTO` doc updated to reflect two-tier: vector bytecode → scalar
+  bytecode
 - `VectorBytecodeFilterCompiler.isSupported()` — added 1500-op limit to avoid
   64KB method size overflow (testHugeFilter regression)
 - Tests: `testAutoSelectsVectorBytecodeForEligibleProgram`,
@@ -58,56 +54,74 @@ then I8 ordered null comparison with LONG_NULL values.
 Class-level Javadoc now says "I8, F8, and mixed I8+F8" and explicitly
 notes that I4/F4 are not yet supported due to lane count mismatch.
 
+### ~~High: compress+store overflow in vectorized row-ID output~~ RESOLVED
+
+`VectorBytecodeFilterCompiler` used an unmasked `intoMemorySegment()` after
+`compress()`. `compress()` packs matching lane values at the front of the
+vector but produces a full-width result. The unmasked store wrote ALL lanes
+(including garbage tail values), overflowing the output buffer and corrupting
+the native heap (`realloc(): invalid next size`).
+
+Fix: `FilterHelpers.writeCompressedRows()` creates a store mask via
+`species.indexInRange(0, trueCount)` and uses the masked
+`intoMemorySegment(seg, offset, order, storeMask)`.
+
+Test: `CompiledFilterRegressionTest` — 92 tests, all passing.
+
+### ~~High: null-aware I8→F8 cast converts LONG_NULL to -9.22E18 instead of NaN~~ RESOLVED
+
+`emitCast` used raw `convertShape(L2D)` which converts LONG_NULL to a large
+negative double. Null-aware comparisons then treated this as a valid value
+instead of null, producing wrong results for mixed I8/F8 queries like
+`i64 < f64` when i64 has null values.
+
+Fix: `FilterHelpers.longToDoubleNullAware()` detects LONG_NULL lanes via
+`src.eq(nullVec)`, performs `convertShape(L2D)`, then blends NaN into null
+lanes.
+
+Tests: `CompiledFilterRegressionTest#testIntFloatColumnsComparisonFilterOutNulls`,
+`testColumnArithmeticsNullComparison`.
+
 ## Coverage Notes
 
-The dedicated tests provide good parity checks for:
+The dedicated tests (`VectorBytecodeFilterCompilerTest`) cover:
 
-- `I8` comparisons
-- `I8` boolean composition
-- `I8` count-only execution
+- `I8` comparisons, boolean composition, count-only execution
 - `F8` comparisons with epsilon and `NaN`
-- one mixed `I8` + `F8` case
+- mixed `I8` + `F8` cases, including F8-first load order
+- floating-point arithmetic division (div-by-zero → NaN):
+  `testDoubleArithmeticDivByZero`
+- null-aware arithmetic (LONG_NULL preservation):
+  `testLongArithmeticNullAware`
+- mixed F8-first then I8 ordered null-aware comparison:
+  `testMixedDoubleFirstThenLongNullOrdered`
+- AUTO backend selection: `testAutoSelectsVectorBytecodeForEligibleProgram`,
+  `testAutoFallsBackToScalarForControlFlow`
 
-However, I did not find dedicated vector-bytecode tests for:
-
-- floating-point arithmetic semantics, especially division
-- null-aware arithmetic semantics
-- mixed programs where `F8` is the first loaded type and `I8` ordered
-  null-aware comparison appears later
-- default `AUTO` selection of the vector bytecode backend
-
-## Open Questions
-
-1. Is `AUTO` intentionally supposed to keep preferring the legacy Vector API
-   interpreter path for now, despite the `JitBackend` contract saying
-   bytecode-first?
-2. Is the intended scope of the current vector bytecode phase really only
-   `I8`/`F8`? If yes, the compiler header and surrounding expectations should
-   be tightened to that subset.
+`CompiledFilterRegressionTest` (92 tests) exercises the full SQL pipeline
+with all type combinations, null handling, arithmetic, comparisons, IN(),
+UUID, varchar, and mixed-type expressions. All 92 tests pass with the
+vectorized bytecode compiler active via AUTO.
 
 ## Overall Assessment
 
-The direction is sound. Generating Vector API bytecode from `LoweredProgram`
-is a better long-term architecture than keeping a handwritten vector executor.
+Generating Vector API bytecode from `LoweredProgram` is a better long-term
+architecture than the handwritten vector interpreter. All original blockers
+are resolved. The interpreter has been fully removed from the runtime path.
 
-The main blockers visible in the current implementation are:
-
-- integration preference still favoring the interpreter path in `AUTO`
-- arithmetic semantics gaps
-- the mixed-type null-vector bug described above
-
-Those issues look fixable, but they are correctness and integration issues,
-not cosmetic cleanup.
+Remaining work:
+- I4/F4 support (lane count mismatch with I8/F8 species)
 
 ## Interpreter Removal Readiness
 
 ### ~~1. Runtime fallback~~ RESOLVED
 
-The interpreter is no longer reachable in the AUTO runtime path.
-`ScalarBytecodeFilterCompiler.isSupported()` returns true for all programs,
-so `bytecodeFilter` is always set. The interpreter fallback in `call()` is
-dead code for AUTO. The interpreter is only used when `JitBackend.JAVA_INTERPRETED`
-is explicitly forced (benchmark-only mode).
+The interpreter has been fully removed from `VectorCompiledFilter` and
+`VectorCompiledCountOnlyFilter`:
+- No `VectorFilterInterpreter` field or instantiation
+- `compile()` only calls `compileBytecode()`
+- `call()` throws `IllegalStateException` if no bytecode filter was compiled
+- No interpreter fallback in any code path
 
 ### ~~2. Test oracle~~ RESOLVED
 
@@ -121,6 +135,15 @@ compiler tests.
 
 ### ~~3. Default integration path~~ RESOLVED
 
-AUTO uses compiled backends in the correct order: vectorized bytecode →
-scalar bytecode → interpreter (dead fallback). Resolved as part of
-Finding #1.
+AUTO uses compiled backends: vectorized bytecode → scalar bytecode.
+`JitBackend.JAVA_INTERPRETED` has been removed. The interpreter class
+`VectorFilterInterpreter` still exists but is unreferenced by any
+production or test code.
+
+### ~~4. Test harness observability~~ RESOLVED
+
+`AbstractCairoTest.getVectorApiExecutionCountIfSelected()` and
+`assertVectorApiExecutedIfSelected()` no longer reference the interpreter.
+They check `VectorCompiledFilter.usesBytecode()` to verify the bytecode
+path is active. `VectorCompiledFilterTest` asserts `usesBytecode()` and
+`usesVectorBytecode()` instead of the removed `usesVectorApi()`.

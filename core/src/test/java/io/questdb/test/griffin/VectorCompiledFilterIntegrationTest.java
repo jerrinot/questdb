@@ -30,7 +30,7 @@ import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory;
 import io.questdb.jit.VectorCompiledFilter;
-import io.questdb.jit.VectorFilterInterpreter;
+
 import io.questdb.std.str.StringSink;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
@@ -86,7 +86,6 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
             }
 
             actualSink.clear();
-            VectorFilterInterpreter.resetVectorApiExecutionCount();
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_FORCE_VECTOR);
             try (RecordCursorFactory factory = select(query)) {
                 Assert.assertTrue(factory.usesCompiledFilter());

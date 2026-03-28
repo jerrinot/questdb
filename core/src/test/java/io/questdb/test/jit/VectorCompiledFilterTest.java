@@ -95,8 +95,8 @@ public class VectorCompiledFilterTest {
 
             filter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
             countOnlyFilter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
-            Assert.assertTrue(filter.usesVectorApi());
-            Assert.assertTrue(countOnlyFilter.usesVectorApi());
+            Assert.assertTrue(filter.usesBytecode());
+            Assert.assertTrue(countOnlyFilter.usesBytecode());
 
             long count = filter.call(
                     dataAddresses.getAddress(),
@@ -150,7 +150,8 @@ public class VectorCompiledFilterTest {
             putOperator(ir, RET);
 
             filter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
-            Assert.assertFalse(filter.usesVectorApi());
+            Assert.assertTrue(filter.usesBytecode());
+            Assert.assertFalse(filter.usesVectorBytecode());
 
             long count = filter.call(
                     dataAddresses.getAddress(),
@@ -250,8 +251,8 @@ public class VectorCompiledFilterTest {
 
             filter.compile(ir, I1_SINGLE_SIZE_OPTIONS);
             countOnlyFilter.compile(ir, I1_SINGLE_SIZE_OPTIONS);
-            Assert.assertTrue(filter.usesVectorApi());
-            Assert.assertTrue(countOnlyFilter.usesVectorApi());
+            Assert.assertTrue(filter.usesBytecode());
+            Assert.assertTrue(countOnlyFilter.usesBytecode());
 
             long count = filter.call(
                     dataAddresses.getAddress(),
@@ -303,8 +304,8 @@ public class VectorCompiledFilterTest {
 
             filter.compile(ir, I2_SINGLE_SIZE_OPTIONS);
             countOnlyFilter.compile(ir, I2_SINGLE_SIZE_OPTIONS);
-            Assert.assertTrue(filter.usesVectorApi());
-            Assert.assertTrue(countOnlyFilter.usesVectorApi());
+            Assert.assertTrue(filter.usesBytecode());
+            Assert.assertTrue(countOnlyFilter.usesBytecode());
 
             long count = filter.call(
                     dataAddresses.getAddress(),
@@ -359,8 +360,8 @@ public class VectorCompiledFilterTest {
 
             filter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
             countOnlyFilter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
-            Assert.assertTrue(filter.usesVectorApi());
-            Assert.assertTrue(countOnlyFilter.usesVectorApi());
+            Assert.assertTrue(filter.usesBytecode());
+            Assert.assertTrue(countOnlyFilter.usesBytecode());
 
             long count = filter.call(
                     dataAddresses.getAddress(),
@@ -414,8 +415,8 @@ public class VectorCompiledFilterTest {
 
             filter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
             countOnlyFilter.compile(ir, I4_SINGLE_SIZE_OPTIONS);
-            Assert.assertTrue(filter.usesVectorApi());
-            Assert.assertTrue(countOnlyFilter.usesVectorApi());
+            Assert.assertTrue(filter.usesBytecode());
+            Assert.assertTrue(countOnlyFilter.usesBytecode());
 
             long count = filter.call(
                     dataAddresses.getAddress(),
@@ -469,8 +470,8 @@ public class VectorCompiledFilterTest {
 
             filter.compile(ir, F8_SINGLE_SIZE_OPTIONS);
             countOnlyFilter.compile(ir, F8_SINGLE_SIZE_OPTIONS);
-            Assert.assertTrue(filter.usesVectorApi());
-            Assert.assertTrue(countOnlyFilter.usesVectorApi());
+            Assert.assertTrue(filter.usesBytecode());
+            Assert.assertTrue(countOnlyFilter.usesBytecode());
 
             long count = filter.call(
                     dataAddresses.getAddress(),
@@ -517,7 +518,7 @@ public class VectorCompiledFilterTest {
             putOperator(ir, RET);
 
             filter.compile(ir, F8_SINGLE_SIZE_OPTIONS);
-            Assert.assertTrue(filter.usesVectorApi());
+            Assert.assertTrue(filter.usesBytecode());
 
             long count = filter.call(
                     dataAddresses.getAddress(),

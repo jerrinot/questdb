@@ -309,12 +309,19 @@ public final class VectorBytecodeFilterCompiler {
                 asm.invokeVirtual(pool.maskCast);
             }
             asm.invokeVirtual(pool.longVecCompress);
+            // Stack: compressed LongVector
+
+            // Write only the valid compressed elements via masked store.
+            // compress() packs matching lane values at the front but
+            // an unmasked intoMemorySegment() would write ALL lanes,
+            // overflowing the output buffer with garbage tail values.
+            asm.aload(activeMaskSlot);
             asm.aload(outputSegSlot);
             asm.lload(filteredCountSlot);
             asm.ldc2_w(pool.longEight);
             asm.lmul();
             asm.aload(nativeOrderSlot);
-            asm.invokeVirtual(pool.longVecIntoMemSeg);
+            asm.invokeStatic(pool.writeCompressedRows);
 
             asm.aload(activeMaskSlot);
             asm.invokeVirtual(pool.maskTrueCount);
@@ -433,7 +440,7 @@ public final class VectorBytecodeFilterCompiler {
                 asm.aload(tempSlots[m.src()]);
                 asm.astore(tempSlots[m.dst()]);
             }
-            case LoweredOp.Cast c -> emitCast(asm, c, tempSlots, speciesSlot, pool);
+            case LoweredOp.Cast c -> emitCast(asm, c, tempSlots, speciesSlot, pool, nullChecks, nullVecSlot);
             default -> throw new UnsupportedOperationException("Vector op: " + op);
         }
     }
@@ -617,18 +624,23 @@ public final class VectorBytecodeFilterCompiler {
     }
 
     private static void emitCast(BytecodeAssembler asm, LoweredOp.Cast c, int[] tempSlots,
-                                  int speciesSlot, Pool pool) {
-        // Same-width cast: I4<->F4 via convertShape(I2F/F2I), I8<->F8 via L2D/D2L
-        // Same-width types have identical lane counts, so part 0 covers all lanes.
+                                  int speciesSlot, Pool pool, boolean nullChecks, int nullVecSlot) {
+        // Same-width cast: I8<->F8 via L2D/D2L.
         Pool.VecType srcVt = pool.vecType(c.fromType());
         asm.aload(tempSlots[c.src()]);
         asm.checkcast(srcVt.vecClass);
-        asm.getstatic(pool.conversionOp(c.fromType(), c.toType()));
-        // Load target species: for same-width, we can use the speciesSlot (all same lanes)
-        // but convertShape needs the target VectorSpecies. Use getstatic on target's SPECIES_PREFERRED.
-        asm.getstatic(pool.vecType(c.toType()).speciesPreferred);
-        asm.iconst(0); // part 0 (same width → single part)
-        asm.invokeVirtual(srcVt.convertShape);
+
+        if (nullChecks && c.fromType() == I8_TYPE && c.toType() == F8_TYPE) {
+            // Null-aware I8→F8: LONG_NULL must become NaN, not -9.22E18.
+            asm.aload(nullVecSlot);
+            asm.checkcast(pool.vecType(I8_TYPE).vecClass);
+            asm.invokeStatic(pool.longToDoubleNullAware);
+        } else {
+            asm.getstatic(pool.conversionOp(c.fromType(), c.toType()));
+            asm.getstatic(pool.vecType(c.toType()).speciesPreferred);
+            asm.iconst(0);
+            asm.invokeVirtual(srcVt.convertShape);
+        }
         asm.checkcast(pool.vecType(c.toType()).vecClass);
         asm.astore(tempSlots[c.dst()]);
     }
@@ -695,11 +707,13 @@ public final class VectorBytecodeFilterCompiler {
         // Arithmetic helpers
         final int longVecArithmeticNull;
         final int doubleVecArithmetic;
+        // Null-aware cast helper
+        final int longToDoubleNullAware;
 
         // LongVector-specific (always needed for row-ID output)
         final int longVecAddScalar;
         final int longVecCompress;
-        final int longVecIntoMemSeg;
+        final int writeCompressedRows;
 
         // VectorMask methods
         final int maskAnd;
@@ -781,6 +795,8 @@ public final class VectorBytecodeFilterCompiler {
                     "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;I)Ljdk/incubator/vector/LongVector;");
             doubleVecArithmetic = asm.poolMethod(helpersCls, "doubleVecArithmetic",
                     "(Ljdk/incubator/vector/DoubleVector;Ljdk/incubator/vector/DoubleVector;I)Ljdk/incubator/vector/DoubleVector;");
+            longToDoubleNullAware = asm.poolMethod(helpersCls, "longToDoubleNullAware",
+                    "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;)Ljdk/incubator/vector/DoubleVector;");
 
             // --- VectorSpecies (interface) ---
             speciesIndexInRange = asm.poolInterfaceMethod(vecSpeciesCls, "indexInRange", "(JJ)" + sMask);
@@ -836,8 +852,9 @@ public final class VectorBytecodeFilterCompiler {
             // --- LongVector-specific (for row-ID output) ---
             longVecAddScalar = asm.poolMethod(longVecCls, "add", "(J)" + sLVec);
             longVecCompress = asm.poolMethod(longVecCls, "compress", "(" + sMask + ")" + sLVec);
-            longVecIntoMemSeg = asm.poolMethod(longVecCls, "intoMemorySegment",
-                    "(" + sMSeg + "J" + sBO + ")V");
+            writeCompressedRows = asm.poolMethod(asm.poolClass(FilterHelpers.class),
+                    "writeCompressedRows",
+                    "(" + sLVec + sMask + sMSeg + "J" + sBO + ")V");
 
             // --- VectorMask methods ---
             maskAnd = asm.poolMethod(vecMaskCls, "and", "(" + sMask + ")" + sMask);

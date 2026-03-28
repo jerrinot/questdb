@@ -427,7 +427,35 @@ public final class FilterHelpers {
         return UNSAFE.getLong(varsAddress + byteOffset + Long.BYTES);
     }
 
+    // --- Null-aware casts ---
+
+    public static jdk.incubator.vector.DoubleVector longToDoubleNullAware(
+            jdk.incubator.vector.LongVector src,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        // Detect LONG_NULL lanes
+        jdk.incubator.vector.VectorMask<Long> isNull = src.eq(nullVec);
+        // Convert L2D
+        jdk.incubator.vector.DoubleVector converted = (jdk.incubator.vector.DoubleVector)
+                src.convertShape(jdk.incubator.vector.VectorOperators.L2D,
+                        jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED, 0);
+        // Replace null lanes with NaN
+        return converted.blend(Double.NaN, isNull.cast(jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED));
+    }
+
     // --- Output writes ---
+
+    public static void writeCompressedRows(
+            jdk.incubator.vector.LongVector compressed,
+            jdk.incubator.vector.VectorMask<Long> resultMask,
+            java.lang.foreign.MemorySegment output,
+            long byteOffset,
+            java.nio.ByteOrder order
+    ) {
+        jdk.incubator.vector.VectorMask<Long> storeMask =
+                resultMask.vectorSpecies().indexInRange(0, resultMask.trueCount());
+        compressed.intoMemorySegment(output, byteOffset, order, storeMask);
+    }
 
     public static void writeRow(long filteredRowsAddress, long outputIndex, long row) {
         UNSAFE.putLong(filteredRowsAddress + (outputIndex << 3), row);
