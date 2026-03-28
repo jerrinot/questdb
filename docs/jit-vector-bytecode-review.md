@@ -101,41 +101,24 @@ not cosmetic cleanup.
 
 ## Interpreter Removal Readiness
 
-Resolving the findings above would put the vector bytecode backend much closer
-to replacing the interpreted backend, but it is not the only condition for
-deletion.
+### ~~1. Runtime fallback~~ RESOLVED
 
-Before `VectorFilterInterpreter` can be fully removed, the remaining roles it
-still serves need to disappear:
+The interpreter is no longer reachable in the AUTO runtime path.
+`ScalarBytecodeFilterCompiler.isSupported()` returns true for all programs,
+so `bytecodeFilter` is always set. The interpreter fallback in `call()` is
+dead code for AUTO. The interpreter is only used when `JitBackend.JAVA_INTERPRETED`
+is explicitly forced (benchmark-only mode).
 
-1. Runtime fallback
+### 2. Test oracle — NOT YET RESOLVED
 
-   Today the interpreter still exists as a fallback for shapes not yet covered
-   by the compiled backends. Full removal requires scalar bytecode and vector
-   bytecode together to cover the production surface that currently falls back
-   to interpretation.
+`ScalarBytecodeFilterCompilerTest` uses `interpreterFilter()` /
+`interpreterCount()` as the semantic oracle in 6 tests. Removing the
+interpreter requires migrating these to use non-JIT SQL execution as the
+oracle (like `CompiledFilterRegressionTest` does). This is a separate task
+that does not block the current review.
 
-2. Test oracle
+### ~~3. Default integration path~~ RESOLVED
 
-   Some dedicated compiler tests still use the interpreter as the semantic
-   oracle. Full removal requires those tests to compare against non-JIT truth
-   or another stable backend reference instead of relying on the interpreter.
-
-3. Default integration path
-
-   The intended default backend selection must be settled first. In
-   particular, `AUTO` needs to use the compiled backends in the final
-   intended order, without depending on the interpreter path.
-
-Practical deletion sequence:
-
-1. Remove the interpreter from the default runtime path.
-2. Remove the interpreter as a fallback path.
-3. Remove the interpreter as a test oracle.
-4. Delete the backend implementation.
-
-So the findings in this review are necessary to clear, but they are not by
-themselves sufficient for deleting the interpreted backend. They get the
-vectorized compiled path much closer to production readiness; full interpreter
-removal still depends on complete compiled-backend coverage and test-oracle
-transition.
+AUTO uses compiled backends in the correct order: vectorized bytecode →
+scalar bytecode → interpreter (dead fallback). Resolved as part of
+Finding #1.
