@@ -503,8 +503,17 @@ public final class VectorBytecodeFilterCompiler {
                                      Pool pool, boolean nullChecks, int nullVecSlot) {
         Pool.VecType vt = pool.vecType(c.operandType());
 
-        if (!nullChecks) {
-            // No null checks: direct compare
+        if (c.operandType() == F8_TYPE) {
+            // Double comparisons always use helpers (epsilon + NaN handling)
+            int helperMethod = pool.doubleCompareHelper(c.opcode());
+            asm.aload(tempSlots[c.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(tempSlots[c.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.invokeStatic(helperMethod);
+            asm.astore(tempSlots[c.dst()]);
+        } else if (!nullChecks) {
+            // I8 without null checks: direct compare
             asm.aload(tempSlots[c.lhs()]);
             asm.checkcast(vt.vecClass);
             asm.getstatic(pool.comparisonOp(c.opcode()));
@@ -513,8 +522,7 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeVirtual(vt.compare);
             asm.astore(tempSlots[c.dst()]);
         } else if (c.opcode() == EQ || c.opcode() == NE) {
-            // EQ/NE with null checks: sentinel comparison works naturally
-            // (NULL == NULL → true, NULL != non-NULL → true)
+            // I8 EQ/NE with null checks: LONG_NULL == LONG_NULL works naturally
             asm.aload(tempSlots[c.lhs()]);
             asm.checkcast(vt.vecClass);
             asm.getstatic(pool.comparisonOp(c.opcode()));
@@ -523,9 +531,7 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeVirtual(vt.compare);
             asm.astore(tempSlots[c.dst()]);
         } else {
-            // Null-aware ordered comparison (LT, LE, GT, GE):
-            // Delegate to FilterHelpers which does the null-check logic in Java.
-            // C2 inlines these methods and intrinsifies the Vector API calls inside.
+            // I8 null-aware ordered comparison (LT, LE, GT, GE)
             int helperMethod = pool.nullCompareHelper(c.operandType(), c.opcode());
             asm.aload(tempSlots[c.lhs()]);
             asm.checkcast(vt.vecClass);
@@ -650,8 +656,10 @@ public final class VectorBytecodeFilterCompiler {
         // VectorOperators conversion fields
         private int convI2F, convF2I, convL2D, convD2L;
 
-        // Null-aware comparison helpers
+        // Null-aware comparison helpers (I8)
         private int longNullLt, longNullLe, longNullGt, longNullGe;
+        // Double comparison helpers (epsilon + NaN)
+        private int doubleVecEq, doubleVecNe, doubleVecLt, doubleVecLe, doubleVecGt, doubleVecGe;
 
         // LongVector-specific (always needed for row-ID output)
         final int longVecAddScalar;
@@ -723,6 +731,15 @@ public final class VectorBytecodeFilterCompiler {
             longNullLe = asm.poolMethod(helpersCls, "longNullLe", longNullSig);
             longNullGt = asm.poolMethod(helpersCls, "longNullGt", longNullSig);
             longNullGe = asm.poolMethod(helpersCls, "longNullGe", longNullSig);
+
+            // Double comparison helpers (epsilon + NaN handling, always used for F8)
+            String dblCmpSig = "(Ljdk/incubator/vector/DoubleVector;Ljdk/incubator/vector/DoubleVector;)" + sMask;
+            doubleVecEq = asm.poolMethod(helpersCls, "doubleVecEq", dblCmpSig);
+            doubleVecNe = asm.poolMethod(helpersCls, "doubleVecNe", dblCmpSig);
+            doubleVecLt = asm.poolMethod(helpersCls, "doubleVecLt", dblCmpSig);
+            doubleVecLe = asm.poolMethod(helpersCls, "doubleVecLe", dblCmpSig);
+            doubleVecGt = asm.poolMethod(helpersCls, "doubleVecGt", dblCmpSig);
+            doubleVecGe = asm.poolMethod(helpersCls, "doubleVecGe", dblCmpSig);
 
             // --- VectorSpecies (interface) ---
             speciesIndexInRange = asm.poolInterfaceMethod(vecSpeciesCls, "indexInRange", "(JJ)" + sMask);
@@ -811,6 +828,18 @@ public final class VectorBytecodeFilterCompiler {
                 case GT -> opGT;
                 case GE -> opGE;
                 default -> throw new UnsupportedOperationException("cmp: " + opcode);
+            };
+        }
+
+        int doubleCompareHelper(int opcode) {
+            return switch (opcode) {
+                case EQ -> doubleVecEq;
+                case NE -> doubleVecNe;
+                case LT -> doubleVecLt;
+                case LE -> doubleVecLe;
+                case GT -> doubleVecGt;
+                case GE -> doubleVecGe;
+                default -> throw new UnsupportedOperationException("double cmp: " + opcode);
             };
         }
 

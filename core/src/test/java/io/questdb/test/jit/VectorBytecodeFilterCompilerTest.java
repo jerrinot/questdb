@@ -422,6 +422,43 @@ public class VectorBytecodeFilterCompilerTest {
     // ========================
 
     private static final int DOUBLE_OPTIONS = (3 << 1) | (1 << 4); // log2(8), single-size
+    private static final int DOUBLE_NULL_OPTIONS = (3 << 1) | (1 << 4) | (1 << 6); // + null checks
+
+    @Test
+    public void testDoubleEqEpsilon() throws Exception {
+        // col0 == 1.0 (epsilon comparison — near-equal values should match)
+        double[] data = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = switch (i % 4) {
+                case 0 -> 1.0;
+                case 1 -> 1.0 + 1e-11; // within epsilon → should match
+                case 2 -> 1.0 + 1e-9;  // outside epsilon → should NOT match
+                default -> 2.0;
+            };
+        }
+        assertParityDoubleCol(data, ir(
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(1.0), 0),
+                insn(MEM, F8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
+    public void testDoubleNaNHandling() throws Exception {
+        // col0 > 3.0 with NaN values — NaN should not match
+        double[] data = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = (i % 5 == 0) ? Double.NaN : i * 0.5;
+        }
+        // Use null-check options since NaN is the double null sentinel
+        assertParityDoubleColWithOptions(data, ir(
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(3.0), 0),
+                insn(MEM, F8_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), DOUBLE_NULL_OPTIONS);
+    }
 
     @Test
     public void testDoubleGt() throws Exception {
@@ -516,6 +553,41 @@ public class VectorBytecodeFilterCompilerTest {
     // ========================
     // Double helpers
     // ========================
+
+    private void assertParityDoubleColWithOptions(double[] data, IrDecoder.Instruction[] instructions, int options) throws Exception {
+        int len = data.length;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long colData = Unsafe.malloc(Math.max(1, (long) len * Double.BYTES), MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putDouble(colData + (long) i * Double.BYTES, data[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, options);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 1, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support this program", vector);
+            long actual = vector.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(colData, Math.max(1, (long) len * Double.BYTES), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
 
     private void assertParityDoubleCol(double[] data, IrDecoder.Instruction[] instructions) throws Exception {
         int len = data.length;
