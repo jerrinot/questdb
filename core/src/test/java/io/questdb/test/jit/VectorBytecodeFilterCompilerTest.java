@@ -223,6 +223,69 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testMixedDoubleFirstThenLongNullOrdered() throws Exception {
+        // F8 column first, then I8 ordered null comparison.
+        // This exercises the bug where nullVecSlot was DoubleVector
+        // but longNullGt expects LongVector.
+        double[] dblData = new double[ROW_COUNT];
+        long[] longData = longCol(ROW_COUNT, i -> i == 3 ? io.questdb.std.Numbers.LONG_NULL : i * 10L);
+        for (int i = 0; i < ROW_COUNT; i++) dblData[i] = i * 0.1;
+
+        int mixedOptions = (3 << 1) | (1 << 4) | (1 << 6); // log2(8), single-size, null checks
+
+        // col0(double) < 0.5 AND col1(long) > 25
+        // F8 is loaded FIRST — primaryType would have been F8 before the fix.
+        IrDecoder.Instruction[] instructions = ir(
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(0.5), 0),
+                insn(MEM, F8_TYPE, 0, 0),
+                insn(LT, 0, 0, 0),
+                insn(IMM, I8_TYPE, 25, 0),
+                insn(MEM, I8_TYPE, 1, 0),
+                insn(GT, 0, 0, 0),
+                insn(AND, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        );
+
+        int len = ROW_COUNT;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long col0 = Unsafe.malloc((long) len * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long col1 = Unsafe.malloc((long) len * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putDouble(col0 + (long) i * Double.BYTES, dblData[i]);
+            Unsafe.getUnsafe().putLong(col1 + (long) i * Long.BYTES, longData[i]);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, col0);
+        Unsafe.getUnsafe().putLong(colPtrArray + 8, col1);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, mixedOptions);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 2, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support mixed F8-first + I8", vector);
+            long actual = vector.filterRows(colPtrArray, 2, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(col0, (long) len * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(col1, (long) len * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 16, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
     public void testMixedLongAndDouble() throws Exception {
         // col0(long) > 25 AND col1(double) < 0.5
         // Mixed I8+F8 program — both types in one filter

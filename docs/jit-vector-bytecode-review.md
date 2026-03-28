@@ -62,38 +62,15 @@ Consequences:
 
 This is a backend-visible semantic mismatch, not just a performance issue.
 
-### High: mixed `F8` + `I8` ordered null-aware comparisons can use the wrong null vector type
+### ~~High: mixed `F8` + `I8` ordered null-aware comparisons can use the wrong null vector type~~ RESOLVED
 
-The compiler caches a single `nullVecSlot` based on `primaryType()`:
+`nullVecSlot` is now always populated with a LongVector regardless of
+`primaryType`. F8 comparisons detect NaN internally via `IS_NAN` in the
+`doubleVecEq/Ne/Lt/Le/Gt/Ge` helpers and never use `nullVecSlot`.
+StackMapTable declares `nullVecSlot` as LongVector.
 
-- `core/src/main/java/io/questdb/jit/VectorBytecodeFilterCompiler.java`
-  `primaryType()`
-- `core/src/main/java/io/questdb/jit/VectorBytecodeFilterCompiler.java`
-  setup in `emitMethod()`
-
-For null checks:
-
-- if `primaryType == F8_TYPE`, `nullVecSlot` is populated with a
-  `DoubleVector`
-- otherwise it is populated with a `LongVector`
-
-But ordered `I8` null-aware comparisons always dispatch to the long-vector
-helpers:
-
-- `core/src/main/java/io/questdb/jit/VectorBytecodeFilterCompiler.java`
-  `emitCompare()`
-- `core/src/main/java/io/questdb/jit/FilterHelpers.java`
-  `longNullLt/Le/Gt/Ge`
-
-That means a mixed program whose first loaded column is `F8`, but which later
-contains ordered `I8` null-aware comparisons, can pass a `DoubleVector`
-through `nullVecSlot` to helpers whose signature expects `LongVector`.
-
-The existing mixed test does not cover this shape because it puts the `I8`
-column first:
-
-- `core/src/test/java/io/questdb/test/jit/VectorBytecodeFilterCompilerTest.java`
-  `testMixedLongAndDouble()`
+Test: `testMixedDoubleFirstThenLongNullOrdered` — F8 column loaded first,
+then I8 ordered null comparison with LONG_NULL values.
 
 ### Medium: the implementation advertises a broader support surface than the gate actually allows
 
