@@ -1308,6 +1308,12 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
         assertInstruction(instructions[7], RET, 0, 0, 0);
     }
 
+    @Test
+    public void testShortCircuitCanBeDisabledForJavaVectorBackends() throws Exception {
+        serialize("along = 1 and anint = 2", false, false, true, false);
+        assertIR("(i32 2L)(i32 anint)(=)(i64 1L)(i64 along)(=)(&&)(ret)");
+    }
+
     private void assertIR(String message, String expectedIR) {
         TestIRSerializer ser = new TestIRSerializer(irMemory, metadata);
         String actualIR = ser.serialize();
@@ -1350,6 +1356,10 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
     }
 
     private int serialize(CharSequence seq, boolean scalar, boolean debug, boolean nullChecks) throws SqlException {
+        return serialize(seq, scalar, debug, nullChecks, true);
+    }
+
+    private int serialize(CharSequence seq, boolean scalar, boolean debug, boolean nullChecks, boolean enableShortCircuit) throws SqlException {
         irMemory.truncate();
         serializer.clear();
         bindVarFunctions.clear();
@@ -1357,7 +1367,7 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
         ExpressionNode node = expr(seq);
         try (PageFrameCursor cursor = factory.getPageFrameCursor(sqlExecutionContext, ORDER_ASC)) {
             return serializer.of(irMemory, sqlExecutionContext, metadata, cursor, bindVarFunctions)
-                    .serialize(node, scalar, debug, nullChecks);
+                    .serialize(node, scalar, debug, nullChecks, enableShortCircuit);
         }
     }
 

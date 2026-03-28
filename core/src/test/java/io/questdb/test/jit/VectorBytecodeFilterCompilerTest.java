@@ -29,6 +29,7 @@ import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.jit.*;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.Numbers;
 import io.questdb.std.Unsafe;
 import jdk.incubator.vector.LongVector;
 import org.junit.Assert;
@@ -712,6 +713,22 @@ public class VectorBytecodeFilterCompilerTest {
         return mem;
     }
 
+    private static long allocIntColumn(int[] data) {
+        long mem = Unsafe.malloc((long) data.length * Integer.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < data.length; i++) {
+            Unsafe.getUnsafe().putInt(mem + (long) i * Integer.BYTES, data[i]);
+        }
+        return mem;
+    }
+
+    private static long allocDoubleColumn(double[] data) {
+        long mem = Unsafe.malloc((long) data.length * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < data.length; i++) {
+            Unsafe.getUnsafe().putDouble(mem + (long) i * Double.BYTES, data[i]);
+        }
+        return mem;
+    }
+
     private static IrDecoder.Instruction[] ir(IrDecoder.Instruction... instructions) {
         return instructions;
     }
@@ -725,19 +742,134 @@ public class VectorBytecodeFilterCompilerTest {
     // ========================
 
     private static final int INT_OPTIONS = (2 << 1) | (1 << 4); // log2(4), single-size
+    private static final int INT_NULL_OPTIONS = INT_OPTIONS | (1 << 6);
 
     @Test
-    public void testIntNotSupportedYet() throws Exception {
-        // I4 programs are not vectorized yet (lane count mismatch with LongVector)
-        IrDecoder.Instruction[] instructions = ir(
-                insn(IMM, I4_TYPE, 5, 0),
+    public void testIntCompareSupported() throws Exception {
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = i - 5;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 0, 0),
                 insn(MEM, I4_TYPE, 0, 0),
-                insn(GT, 0, 0, 0),
+                insn(NE, 0, 0, 0),
                 insn(RET, 0, 0, 0)
-        );
-        LoweredProgram prog = IrLowering.lower(instructions, INT_OPTIONS);
-        VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
-        Assert.assertNull("I4 programs should fall back to scalar", vector);
+        ));
+    }
+
+    @Test
+    public void testIntCompareSupportedWithNullChecks() throws Exception {
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = (i % 11 == 0) ? Numbers.INT_NULL : i - 5;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 0, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(NE, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), INT_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testIntCompareWithIntNullImmediate() throws Exception {
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = (i % 7 == 0) ? Numbers.INT_NULL : i - 5;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, Numbers.INT_NULL, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(NE, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), INT_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testIntInWithNullImmediate() throws Exception {
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = switch (i % 6) {
+                case 0 -> Numbers.INT_NULL;
+                case 1 -> 3;
+                default -> i - 5;
+            };
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 3, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(IMM, I4_TYPE, Numbers.INT_NULL, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), INT_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testMixedLongIntDoubleBenchmarkShape() throws Exception {
+        long[] longData = new long[ROW_COUNT];
+        int[] intData = new int[ROW_COUNT];
+        double[] doubleData = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            longData[i] = i - (ROW_COUNT / 2L);
+            intData[i] = (i % 17) - 8;
+            doubleData[i] = i / (double) ROW_COUNT;
+        }
+
+        int mixedOptions = (3 << 1) | (2 << 4); // log2(8), mixed-size, no null checks
+        assertParityLongIntDouble(longData, intData, doubleData, ir(
+                insn(IMM, I8_TYPE, 0, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(IMM, I4_TYPE, 0, 0),
+                insn(MEM, I4_TYPE, 1, 0),
+                insn(NE, 0, 0, 0),
+                insn(AND, 0, 0, 0),
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(0.5), 0),
+                insn(MEM, F8_TYPE, 2, 0),
+                insn(LT, 0, 0, 0),
+                insn(AND, 0, 0, 0),
+                insn(IMM, I8_TYPE, 1_000_000, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(LT, 0, 0, 0),
+                insn(AND, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), mixedOptions);
+    }
+
+    @Test
+    public void testMixedLongIntDoubleBenchmarkShapeWithNullChecks() throws Exception {
+        long[] longData = new long[ROW_COUNT];
+        int[] intData = new int[ROW_COUNT];
+        double[] doubleData = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            longData[i] = (i % 23 == 0) ? Numbers.LONG_NULL : i - (ROW_COUNT / 2L);
+            intData[i] = (i % 17 == 0) ? Numbers.INT_NULL : (i % 17) - 8;
+            doubleData[i] = (i % 19 == 0) ? Double.NaN : i / (double) ROW_COUNT;
+        }
+
+        int mixedOptions = (3 << 1) | (2 << 4) | (1 << 6); // mixed-size + null checks
+        assertParityLongIntDouble(longData, intData, doubleData, ir(
+                insn(IMM, I8_TYPE, 0, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(IMM, I4_TYPE, 0, 0),
+                insn(MEM, I4_TYPE, 1, 0),
+                insn(NE, 0, 0, 0),
+                insn(AND, 0, 0, 0),
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(0.5), 0),
+                insn(MEM, F8_TYPE, 2, 0),
+                insn(LT, 0, 0, 0),
+                insn(AND, 0, 0, 0),
+                insn(IMM, I8_TYPE, 1_000_000, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(LT, 0, 0, 0),
+                insn(AND, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), mixedOptions);
     }
 
     // ========================
@@ -814,6 +946,10 @@ public class VectorBytecodeFilterCompilerTest {
     // ========================
 
     private void assertParityIntCol(int[] data, IrDecoder.Instruction[] instructions) throws Exception {
+        assertParityIntCol(data, instructions, INT_OPTIONS);
+    }
+
+    private void assertParityIntCol(int[] data, IrDecoder.Instruction[] instructions, int options) throws Exception {
         int len = data.length;
         int speciesLen = LongVector.SPECIES_PREFERRED.length();
         long colData = Unsafe.malloc(Math.max(1, (long) len * Integer.BYTES), MemoryTag.NATIVE_DEFAULT);
@@ -826,7 +962,7 @@ public class VectorBytecodeFilterCompilerTest {
         Unsafe.getUnsafe().putLong(colPtrArray, colData);
 
         try {
-            LoweredProgram prog = IrLowering.lower(instructions, INT_OPTIONS);
+            LoweredProgram prog = IrLowering.lower(instructions, options);
             ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
             long expected = scalar.filterRows(colPtrArray, 1, 0, 0, 0, expectedBuf, len);
 
@@ -870,6 +1006,52 @@ public class VectorBytecodeFilterCompilerTest {
         } finally {
             Unsafe.free(colData, Math.max(1, (long) len * Integer.BYTES), MemoryTag.NATIVE_DEFAULT);
             Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private void assertParityLongIntDouble(
+            long[] longData,
+            int[] intData,
+            double[] doubleData,
+            IrDecoder.Instruction[] instructions,
+            int options
+    ) throws Exception {
+        Assert.assertEquals(longData.length, intData.length);
+        Assert.assertEquals(longData.length, doubleData.length);
+        int len = longData.length;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long col0 = allocLongColumn(longData);
+        long col1 = allocIntColumn(intData);
+        long col2 = allocDoubleColumn(doubleData);
+        long colPtrArray = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        Unsafe.getUnsafe().putLong(colPtrArray, col0);
+        Unsafe.getUnsafe().putLong(colPtrArray + 8, col1);
+        Unsafe.getUnsafe().putLong(colPtrArray + 16, col2);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, options);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 3, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support mixed I8/I4/F8 compare-only program", vector);
+            long actual = vector.filterRows(colPtrArray, 3, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(col0, (long) len * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(col1, (long) len * Integer.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(col2, (long) len * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 24, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
         }
     }
 

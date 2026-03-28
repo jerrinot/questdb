@@ -95,6 +95,20 @@ public final class FilterHelpers {
     }
 
     /**
+     * Returns an IntVector species whose lane count matches the preferred
+     * LongVector lane count. This lets mixed I8/I4 programs keep a single
+     * row stride while using a narrower vector shape for ints.
+     */
+    public static jdk.incubator.vector.VectorSpecies<Integer> intSpeciesForLongRows() {
+        return jdk.incubator.vector.VectorSpecies.of(
+                int.class,
+                jdk.incubator.vector.VectorShape.forBitSize(
+                        jdk.incubator.vector.LongVector.SPECIES_PREFERRED.length() * Integer.SIZE
+                )
+        );
+    }
+
+    /**
      * Creates the iota LongVector [0, 1, 2, ..., species.length()-1].
      * Called once at method entry for row-ID mode.
      */
@@ -159,6 +173,80 @@ public final class FilterHelpers {
         jdk.incubator.vector.VectorMask<Long> rhsNull = rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
         jdk.incubator.vector.VectorMask<Long> anyNull = lhsNull.or(rhsNull);
         jdk.incubator.vector.VectorMask<Long> bothNull = lhsNull.and(rhsNull);
+        return lhs.compare(jdk.incubator.vector.VectorOperators.GE, rhs).and(anyNull.not()).or(bothNull);
+    }
+
+    public static jdk.incubator.vector.VectorMask<Integer> intVecNullEq(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs
+    ) {
+        return lhs.compare(jdk.incubator.vector.VectorOperators.EQ, rhs);
+    }
+
+    public static jdk.incubator.vector.VectorMask<Integer> intVecNullNe(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs
+    ) {
+        return lhs.compare(jdk.incubator.vector.VectorOperators.NE, rhs);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static jdk.incubator.vector.VectorMask<Integer> intVecNullLt(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs
+    ) {
+        jdk.incubator.vector.IntVector nullVec = jdk.incubator.vector.IntVector.broadcast(
+                (jdk.incubator.vector.VectorSpecies<Integer>) lhs.species(),
+                Numbers.INT_NULL
+        );
+        jdk.incubator.vector.VectorMask<Integer> anyNull = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec)
+                .or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec));
+        return lhs.compare(jdk.incubator.vector.VectorOperators.LT, rhs).and(anyNull.not());
+    }
+
+    @SuppressWarnings("unchecked")
+    public static jdk.incubator.vector.VectorMask<Integer> intVecNullLe(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs
+    ) {
+        jdk.incubator.vector.IntVector nullVec = jdk.incubator.vector.IntVector.broadcast(
+                (jdk.incubator.vector.VectorSpecies<Integer>) lhs.species(),
+                Numbers.INT_NULL
+        );
+        jdk.incubator.vector.VectorMask<Integer> lhsNull = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        jdk.incubator.vector.VectorMask<Integer> rhsNull = rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        jdk.incubator.vector.VectorMask<Integer> anyNull = lhsNull.or(rhsNull);
+        jdk.incubator.vector.VectorMask<Integer> bothNull = lhsNull.and(rhsNull);
+        return lhs.compare(jdk.incubator.vector.VectorOperators.LE, rhs).and(anyNull.not()).or(bothNull);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static jdk.incubator.vector.VectorMask<Integer> intVecNullGt(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs
+    ) {
+        jdk.incubator.vector.IntVector nullVec = jdk.incubator.vector.IntVector.broadcast(
+                (jdk.incubator.vector.VectorSpecies<Integer>) lhs.species(),
+                Numbers.INT_NULL
+        );
+        jdk.incubator.vector.VectorMask<Integer> anyNull = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec)
+                .or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec));
+        return lhs.compare(jdk.incubator.vector.VectorOperators.GT, rhs).and(anyNull.not());
+    }
+
+    @SuppressWarnings("unchecked")
+    public static jdk.incubator.vector.VectorMask<Integer> intVecNullGe(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs
+    ) {
+        jdk.incubator.vector.IntVector nullVec = jdk.incubator.vector.IntVector.broadcast(
+                (jdk.incubator.vector.VectorSpecies<Integer>) lhs.species(),
+                Numbers.INT_NULL
+        );
+        jdk.incubator.vector.VectorMask<Integer> lhsNull = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        jdk.incubator.vector.VectorMask<Integer> rhsNull = rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        jdk.incubator.vector.VectorMask<Integer> anyNull = lhsNull.or(rhsNull);
+        jdk.incubator.vector.VectorMask<Integer> bothNull = lhsNull.and(rhsNull);
         return lhs.compare(jdk.incubator.vector.VectorOperators.GE, rhs).and(anyNull.not()).or(bothNull);
     }
 

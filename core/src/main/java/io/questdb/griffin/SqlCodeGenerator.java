@@ -3239,14 +3239,21 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                     JitCountOnlyFilter compiledCountOnlyFilter = null;
                     try {
                         int jitOptions;
+                        final int jitBackend = executionContext.getJitBackend();
                         final ObjList<Function> bindVarFunctions = new ObjList<>();
                         try (PageFrameCursor cursor = factory.getPageFrameCursor(executionContext, ORDER_ANY)) {
                             final boolean forceScalar = jitMode == SqlJitMode.JIT_MODE_FORCE_SCALAR;
+                            final boolean enableShortCircuit = jitBackend != JitBackend.JAVA_VECTOR_COMPILED;
                             jitIRSerializer.of(jitIRMem, executionContext, factory.getMetadata(), cursor, bindVarFunctions);
-                            jitOptions = jitIRSerializer.serialize(filterExpr, forceScalar, enableJitDebug, enableJitNullChecks);
+                            jitOptions = jitIRSerializer.serialize(
+                                    filterExpr,
+                                    forceScalar,
+                                    enableJitDebug,
+                                    enableJitNullChecks,
+                                    enableShortCircuit
+                            );
                         }
 
-                        final int jitBackend = executionContext.getJitBackend();
                         if (jitBackend == JitBackend.CPP) {
                             CompiledFilter nativeFilter = new CompiledFilter();
                             nativeFilter.compile(jitIRMem, jitOptions);

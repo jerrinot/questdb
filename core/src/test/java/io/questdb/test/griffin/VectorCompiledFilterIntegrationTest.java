@@ -25,6 +25,7 @@
 package io.questdb.test.griffin;
 
 import io.questdb.cairo.CursorPrinter;
+import io.questdb.cairo.JitBackend;
 import io.questdb.cairo.SqlJitMode;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
@@ -39,6 +40,43 @@ import org.junit.Test;
 
 public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
     @Test
+    public void testMixedLongIntDoubleQueryUsesVectorBytecodeBackend() throws Exception {
+        assertMemoryLeak(() -> {
+            execute(
+                    "create table jit_bench as (" +
+                            "select rnd_long() l, rnd_double(0) d, rnd_int() i, timestamp_sequence(0, 1000000) ts " +
+                            "from long_sequence(1024)" +
+                            ") timestamp(ts)"
+            );
+
+            final String query = "select count() from jit_bench where l > 0 and i != 0 and d < 0.5 and l < 1000000";
+
+            long expectedCount;
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_DISABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
+            try (RecordCursorFactory factory = select(query)) {
+                Assert.assertFalse(factory.usesCompiledFilter());
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Assert.assertTrue(cursor.hasNext());
+                    expectedCount = cursor.getRecord().getLong(0);
+                }
+            }
+
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_ENABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.JAVA_VECTOR_COMPILED);
+            try (RecordCursorFactory factory = select(query)) {
+                Assert.assertTrue(factory.usesCompiledFilter());
+                assertVectorCompiledFilter(factory);
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Assert.assertTrue(cursor.hasNext());
+                    Assert.assertEquals(expectedCount, cursor.getRecord().getLong(0));
+                }
+                assertBytecodeCompiledIfJava(query, factory);
+            }
+        });
+    }
+
+    @Test
     public void testEnabledModeUsesJavaBackend() throws Exception {
         assertMemoryLeak(() -> {
             execute(
@@ -50,6 +88,7 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
 
             final String query = "select i64, i32 from x where i32 + 1 > 3 and i32 in (2, 5, 7)";
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_ENABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
             try (RecordCursorFactory factory = select(query)) {
                 Assert.assertTrue(factory.usesCompiledFilter());
                 assertVectorCompiledFilter(factory);
@@ -77,6 +116,7 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
 
             sink.clear();
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_DISABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
             try (RecordCursorFactory factory = select(query)) {
                 Assert.assertFalse(factory.usesCompiledFilter());
                 try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
@@ -86,6 +126,7 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
 
             actualSink.clear();
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_FORCE_VECTOR);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
             try (RecordCursorFactory factory = select(query)) {
                 Assert.assertTrue(factory.usesCompiledFilter());
                 assertVectorCompiledFilter(factory);
@@ -97,6 +138,7 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
             TestUtils.assertEquals("vector backend result mismatch", sink, actualSink);
 
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_DISABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
             long expectedCount;
             try (RecordCursorFactory factory = select(countQuery)) {
                 Assert.assertFalse(factory.usesCompiledFilter());
@@ -107,6 +149,7 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
             }
 
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_FORCE_VECTOR);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
             try (RecordCursorFactory factory = select(countQuery)) {
                 Assert.assertTrue(factory.usesCompiledFilter());
                 try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {

@@ -233,6 +233,16 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
      * @throws SqlException thrown when IR serialization failed.
      */
     public int serialize(ExpressionNode node, boolean forceScalar, boolean debug, boolean nullChecks) throws SqlException {
+        return serialize(node, forceScalar, debug, nullChecks, true);
+    }
+
+    public int serialize(
+            ExpressionNode node,
+            boolean forceScalar,
+            boolean debug,
+            boolean nullChecks,
+            boolean enableShortCircuit
+    ) throws SqlException {
         // Detect if scalar mode is guaranteed by checking for mixed column sizes.
         // Short-circuit optimizations (including IN() short-circuit) only work correctly
         // in scalar mode, so we only enable them when scalar mode is certain.
@@ -244,7 +254,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         }
 
         // Check if we can apply predicate reordering for short-circuit evaluation
-        if (ENABLE_SHORT_CIRCUIT && scalarModeDetected) {
+        if (ENABLE_SHORT_CIRCUIT && enableShortCircuit && scalarModeDetected) {
             if (isPureAndChain(node)) {
                 collectedPredicates.clear();
                 collectAndPredicates(node, collectedPredicates);
