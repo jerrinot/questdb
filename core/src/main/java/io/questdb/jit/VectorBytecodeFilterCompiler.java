@@ -258,7 +258,6 @@ public final class VectorBytecodeFilterCompiler {
         int exitBranch = asm.ifge();
 
         asm.aload(speciesSlot);
-        asm.checkcast(pool.vecSpeciesClass);
         asm.lload(rowSlot);
         asm.lload(rowsCountSlot);
         asm.invokeInterface(pool.speciesIndexInRange, 4);
@@ -280,33 +279,28 @@ public final class VectorBytecodeFilterCompiler {
             asm.aload(tempSlots[ret.src()]);
             asm.checkcast(pool.vectorMaskClass);
             asm.aload(activeMaskSlot);
-            asm.checkcast(pool.vectorMaskClass);
             asm.invokeVirtual(pool.maskAnd);
         }
+        // Stack: resultMask (VectorMask)
 
         if (isCountOnly) {
-            asm.checkcast(pool.vectorMaskClass);
             asm.invokeVirtual(pool.maskTrueCount);
             asm.i2l();
             asm.lload(filteredCountSlot);
             asm.ladd();
             asm.lstore(filteredCountSlot);
         } else {
-            asm.checkcast(pool.vectorMaskClass);
             asm.astore(activeMaskSlot);
             asm.aload(activeMaskSlot);
-            asm.checkcast(pool.vectorMaskClass);
             asm.invokeVirtual(pool.maskTrueCount);
             int skipBranch = asm.ifeq();
 
             // Row-ID output always uses LongVector (row IDs are longs).
             // If primary type is F8, cast the result mask to Long.
             asm.aload(iotaSlot);
-            asm.checkcast(pool.longVectorClass);
             asm.lload(rowSlot);
             asm.invokeVirtual(pool.longVecAddScalar);
             asm.aload(activeMaskSlot);
-            asm.checkcast(pool.vectorMaskClass);
             if (primaryType == F8_TYPE) {
                 // Cast VectorMask<Double> → VectorMask<Long> (same lane count)
                 asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
@@ -314,16 +308,13 @@ public final class VectorBytecodeFilterCompiler {
             }
             asm.invokeVirtual(pool.longVecCompress);
             asm.aload(outputSegSlot);
-            asm.checkcast(pool.memSegClass);
             asm.lload(filteredCountSlot);
             asm.ldc2_w(pool.longEight);
             asm.lmul();
             asm.aload(nativeOrderSlot);
-            asm.checkcast(pool.byteOrderClass);
             asm.invokeVirtual(pool.longVecIntoMemSeg);
 
             asm.aload(activeMaskSlot);
-            asm.checkcast(pool.vectorMaskClass);
             asm.invokeVirtual(pool.maskTrueCount);
             asm.i2l();
             asm.lload(filteredCountSlot);
@@ -337,7 +328,6 @@ public final class VectorBytecodeFilterCompiler {
         int nextStart = asm.position();
         asm.lload(rowSlot);
         asm.aload(speciesSlot);
-        asm.checkcast(pool.vecSpeciesClass);
         asm.invokeInterface(pool.speciesLength, 0);
         asm.i2l();
         asm.ladd();
@@ -364,20 +354,43 @@ public final class VectorBytecodeFilterCompiler {
         asm.putShort(1);
         asm.startStackMapTables(stackMapAttr, 3);
 
-        asm.putByte(0xff);
-        asm.putShort(loopBci);
+        // Build precise local type declarations for the full_frame.
+        // Typed locals eliminate checkcast overhead in the hot loop.
         int longParamCount = isCountOnly ? 6 : 7;
         int totalLocals = 1 + longParamCount + 2 + objectLocalCount;
+
+        asm.putByte(0xff); // full_frame
+        asm.putShort(loopBci);
         asm.putShort(totalLocals);
+        // this
         asm.putITEM_Object(pool.objectClassIndex);
+        // long params
         for (int i = 0; i < longParamCount; i++) {
             asm.putITEM_Long();
         }
+        // filteredCount, row
         asm.putITEM_Long();
         asm.putITEM_Long();
-        for (int i = 0; i < objectLocalCount; i++) {
-            asm.putITEM_Object(pool.objectClassIndex);
+        // Object locals with precise types (order must match slot allocation)
+        asm.putITEM_Object(pool.vecSpeciesClass); // speciesSlot
+        asm.putITEM_Object(pool.byteOrderClass);  // nativeOrderSlot
+        asm.putITEM_Object(pool.vectorMaskClass);  // activeMaskSlot
+        if (nullChecks) {
+            Pool.VecType nvt = pool.vecType(primaryType);
+            asm.putITEM_Object(nvt.vecClass); // nullVecSlot
         }
+        if (!isCountOnly) {
+            asm.putITEM_Object(pool.memSegClass);      // outputSegSlot
+            asm.putITEM_Object(pool.longVectorClass);  // iotaSlot
+        }
+        for (int i = 0; i <= maxColIndex; i++) {
+            asm.putITEM_Object(pool.memSegClass); // colSegSlots[i]
+        }
+        asm.putITEM_Object(pool.memSegClass); // varsSegSlot
+        for (int i = 0; i < tempCount; i++) {
+            asm.putITEM_Object(pool.objectClassIndex); // temp[i] — generic
+        }
+        // empty stack
         asm.putShort(0);
 
         emitSameFrame(asm, nextBci, loopBci);
@@ -431,16 +444,12 @@ public final class VectorBytecodeFilterCompiler {
     ) {
         Pool.VecType vt = pool.vecType(lc.type());
         asm.aload(speciesSlot);
-        asm.checkcast(pool.vecSpeciesClass);
         asm.aload(colSegSlots[lc.columnIndex()]);
-        asm.checkcast(pool.memSegClass);
         asm.lload(rowSlot);
         asm.ldc2_w(pool.ensureLongPooled(elementBytes(lc.type())));
         asm.lmul();
         asm.aload(nativeOrderSlot);
-        asm.checkcast(pool.byteOrderClass);
         asm.aload(activeMaskSlot);
-        asm.checkcast(pool.vectorMaskClass);
         asm.invokeStatic(vt.fromMemSegMasked);
         asm.astore(tempSlots[lc.dst()]);
     }
@@ -449,7 +458,6 @@ public final class VectorBytecodeFilterCompiler {
                                      int speciesSlot, Pool pool) {
         Pool.VecType vt = pool.vecType(li.type());
         asm.aload(speciesSlot);
-        asm.checkcast(pool.vecSpeciesClass);
         switch (li.type()) {
             case I4_TYPE -> asm.iconst((int) li.lo());
             case I8_TYPE -> asm.ldc2_w(pool.ensureLongPooled(li.lo()));
@@ -465,10 +473,8 @@ public final class VectorBytecodeFilterCompiler {
                                      int speciesSlot, int varsSegSlot, Pool pool) {
         Pool.VecType vt = pool.vecType(lv.type());
         asm.aload(speciesSlot);
-        asm.checkcast(pool.vecSpeciesClass);
         // Load scalar from vars segment and broadcast
         asm.aload(varsSegSlot);
-        asm.checkcast(pool.memSegClass);
         asm.getstatic(pool.varLayout(lv.type()));
         asm.ldc2_w(pool.ensureLongPooled(lv.byteOffset()));
         switch (lv.type()) {
@@ -526,7 +532,6 @@ public final class VectorBytecodeFilterCompiler {
             asm.aload(tempSlots[c.rhs()]);
             asm.checkcast(vt.vecClass);
             asm.aload(nullVecSlot);
-            asm.checkcast(vt.vecClass);
             asm.invokeStatic(helperMethod);
             asm.astore(tempSlots[c.dst()]);
         }
