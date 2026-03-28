@@ -97,6 +97,9 @@ public final class VectorBytecodeFilterCompiler {
         if (program.getOptions().isScalarOnly()) {
             return false;
         }
+        if (program.getOptions().isNullChecksEnabled()) {
+            return false;
+        }
         LoweredBlock block = program.getBlock(program.getEntryBlockId());
         for (int i = 0; i < block.getOpCount(); i++) {
             LoweredOp op = block.getOp(i);
