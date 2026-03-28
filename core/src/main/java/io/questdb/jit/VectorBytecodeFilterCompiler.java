@@ -187,13 +187,14 @@ public final class VectorBytecodeFilterCompiler {
     ) {
         int filteredCountSlot = firstFree;
         int rowSlot = firstFree + 2;
-        int speciesSlot = firstFree + 4;
-        int nativeOrderSlot = firstFree + 5;
-        int activeMaskSlot = firstFree + 6;
+        int strideSlot = firstFree + 4; // long: species.length(), hoisted before loop
+        int speciesSlot = firstFree + 6;
+        int nativeOrderSlot = firstFree + 7;
+        int activeMaskSlot = firstFree + 8;
 
         boolean nullChecks = program.getOptions().isNullChecksEnabled();
 
-        int nextSlot = firstFree + 7;
+        int nextSlot = firstFree + 9;
         int nullVecSlot = -1;
         boolean needsNullVec = nullChecks && !pureF8;
         if (needsNullVec) {
@@ -202,10 +203,13 @@ public final class VectorBytecodeFilterCompiler {
         int outputSegSlot = -1;
         int iotaSlot = -1;
         int matchCountSlot = -1;
+        int countAccSlot = -1;
+        int fullMaskSlot = -1;
         if (!isCountOnly) {
             outputSegSlot = nextSlot++;
             iotaSlot = nextSlot++;
             matchCountSlot = nextSlot++; // int, only live inside skip-guarded block
+            fullMaskSlot = nextSlot++;
         }
 
         int maxColIndex = findMaxColumnIndex(program);
@@ -214,13 +218,17 @@ public final class VectorBytecodeFilterCompiler {
             colSegSlots[i] = nextSlot++;
         }
         int varsSegSlot = nextSlot++;
+        if (isCountOnly) {
+            countAccSlot = nextSlot++;
+            fullMaskSlot = nextSlot++;
+        }
 
         int[] tempSlots = new int[tempCount];
         for (int i = 0; i < tempCount; i++) {
             tempSlots[i] = nextSlot++;
         }
         int maxLocals = nextSlot;
-        int objectLocalCount = maxLocals - (firstFree + 4);
+        int objectLocalCount = maxLocals - (firstFree + 6); // after filteredCount(2) + row(2) + stride(2)
 
         asm.startMethod(methodName, methodSig, 12, maxLocals);
 
@@ -240,6 +248,11 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeStatic(pool.helpersLongSpecies);
         }
         asm.astore(speciesSlot);
+        // Hoist species.length() as a long to avoid per-iteration invokeInterface + i2l.
+        asm.aload(speciesSlot);
+        asm.invokeInterface(pool.speciesLength, 0);
+        asm.i2l();
+        asm.lstore(strideSlot);
         asm.invokeStatic(pool.helpersNativeByteOrder);
         asm.astore(nativeOrderSlot);
 
@@ -272,6 +285,17 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeStatic(pool.helpersLongNullVector);
             asm.astore(nullVecSlot);
         }
+        if (isCountOnly) {
+            asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+            asm.lconst_0();
+            asm.invokeStatic(pool.vecType(I8_TYPE).broadcast);
+            asm.astore(countAccSlot);
+        }
+        asm.aload(speciesSlot);
+        asm.lconst_0();
+        asm.lload(strideSlot);
+        asm.invokeInterface(pool.speciesIndexInRange, 4);
+        asm.astore(fullMaskSlot);
 
         asm.aconst_null();
         asm.astore(activeMaskSlot);
@@ -287,6 +311,7 @@ public final class VectorBytecodeFilterCompiler {
         // Hoist loop-invariant ops (immediates and bind variables) out of the
         // hot loop. These values don't change between iterations.
         LoweredBlock block = program.getBlock(program.getEntryBlockId());
+        int[] useCounts = computeUseCounts(block, tempCount);
         for (int i = 0; i < block.getOpCount(); i++) {
             LoweredOp op = block.getOp(i);
             if (op instanceof LoweredOp.LoadImm li) {
@@ -297,71 +322,96 @@ public final class VectorBytecodeFilterCompiler {
         }
 
         // === LOOP ===
-        int loopStart = asm.position();
-        asm.lload(rowSlot);
-        asm.lload(rowsCountSlot);
-        asm.lcmp();
-        int exitBranch = asm.ifge();
-
-        asm.aload(speciesSlot);
-        asm.lload(rowSlot);
-        asm.lload(rowsCountSlot);
-        asm.invokeInterface(pool.speciesIndexInRange, 4);
-        asm.astore(activeMaskSlot);
-
-        // === Emit ops (skip hoisted LoadImm/LoadVar) ===
-        for (int i = 0; i < block.getOpCount(); i++) {
-            LoweredOp op = block.getOp(i);
-            if (op instanceof LoweredOp.LoadImm || op instanceof LoweredOp.LoadVar) {
-                continue;
-            }
-            emitOp(asm, op, tempSlots, rowSlot, activeMaskSlot,
-                    speciesSlot, nativeOrderSlot, colSegSlots, varsSegSlot, pool,
-                    nullChecks, nullVecSlot, pureF8);
-        }
-
-        // === Terminator ===
         Terminator.Return ret = (Terminator.Return) block.getTerminator();
-        if (ret.src() == Terminator.Return.ACCEPT) {
-            asm.aload(activeMaskSlot);
-        } else {
-            asm.aload(tempSlots[ret.src()]);
-            asm.checkcast(pool.vectorMaskClass);
-            asm.aload(activeMaskSlot);
-            asm.invokeVirtual(pool.maskAnd);
-        }
-        // Stack: resultMask (VectorMask)
+        int loopStart = asm.position();
+        int nextStart;
+        int exitStart;
+        int tailStart = -1;
 
         if (isCountOnly) {
-            asm.invokeVirtual(pool.maskTrueCount);
-            asm.i2l();
-            asm.lload(filteredCountSlot);
+            asm.lload(rowSlot);
+            asm.lload(strideSlot);
             asm.ladd();
+            asm.lload(rowsCountSlot);
+            asm.lcmp();
+            int tailBranch = asm.ifgt();
+
+            asm.aload(fullMaskSlot);
+            asm.astore(activeMaskSlot);
+            emitBlockOps(asm, block, useCounts, tempSlots, rowSlot, activeMaskSlot, speciesSlot,
+                    nativeOrderSlot, colSegSlots, varsSegSlot, pool, nullChecks, nullVecSlot, pureF8, false);
+            emitCountOnlyReduction(asm, ret, tempSlots, activeMaskSlot, countAccSlot, pool, pureF8);
+
+            nextStart = asm.position();
+            asm.lload(rowSlot);
+            asm.lload(strideSlot);
+            asm.ladd();
+            asm.lstore(rowSlot);
+            int backJmp = asm.goto_();
+            asm.setJmp(backJmp, loopStart);
+
+            tailStart = asm.position();
+            asm.setJmp(tailBranch, tailStart);
+            asm.lload(rowSlot);
+            asm.lload(rowsCountSlot);
+            asm.lcmp();
+            int exitBranch = asm.ifge();
+
+            asm.aload(speciesSlot);
+            asm.lload(rowSlot);
+            asm.lload(rowsCountSlot);
+            asm.invokeInterface(pool.speciesIndexInRange, 4);
+            asm.astore(activeMaskSlot);
+            emitBlockOps(asm, block, useCounts, tempSlots, rowSlot, activeMaskSlot, speciesSlot,
+                    nativeOrderSlot, colSegSlots, varsSegSlot, pool, nullChecks, nullVecSlot, pureF8, true);
+            emitCountOnlyReduction(asm, ret, tempSlots, activeMaskSlot, countAccSlot, pool, pureF8);
+
+            exitStart = asm.position();
+            asm.setJmp(exitBranch, exitStart);
+            asm.aload(countAccSlot);
+            asm.getstatic(pool.associativeAdd);
+            asm.invokeVirtual(pool.longVecReduceLanesToLong);
             asm.lstore(filteredCountSlot);
         } else {
+            asm.lload(rowSlot);
+            asm.lload(strideSlot);
+            asm.ladd();
+            asm.lload(rowsCountSlot);
+            asm.lcmp();
+            int tailBranch = asm.ifgt();
+
+            asm.aload(fullMaskSlot);
             asm.astore(activeMaskSlot);
 
-            // Compute trueCount once and reuse for skip, masked store, and counter.
+            emitBlockOps(asm, block, useCounts, tempSlots, rowSlot, activeMaskSlot, speciesSlot,
+                    nativeOrderSlot, colSegSlots, varsSegSlot, pool, nullChecks, nullVecSlot, pureF8, false);
+
+            if (ret.src() == Terminator.Return.ACCEPT) {
+                asm.aload(activeMaskSlot);
+            } else {
+                asm.aload(tempSlots[ret.src()]);
+                asm.checkcast(pool.vectorMaskClass);
+                asm.aload(activeMaskSlot);
+                asm.invokeVirtual(pool.maskAnd);
+            }
+            asm.astore(activeMaskSlot);
+
             asm.aload(activeMaskSlot);
             asm.invokeVirtual(pool.maskTrueCount);
             asm.istore(matchCountSlot);
             asm.iload(matchCountSlot);
             int skipBranch = asm.ifeq();
 
-            // Row-ID output always uses LongVector (row IDs are longs).
             asm.aload(iotaSlot);
             asm.lload(rowSlot);
             asm.invokeVirtual(pool.longVecAddScalar);
             asm.aload(activeMaskSlot);
             if (pureF8) {
-                // Pure F8: masks are VectorMask<Double>, cast to Long for compress
                 asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
                 asm.invokeVirtual(pool.maskCast);
             }
             asm.invokeVirtual(pool.longVecCompress);
-            // Stack: compressed(LongVector)
 
-            // Masked store: writeCompressedRows(compressed, matchCount, output, offset, order)
             asm.iload(matchCountSlot);
             asm.aload(outputSegSlot);
             asm.lload(filteredCountSlot);
@@ -370,31 +420,82 @@ public final class VectorBytecodeFilterCompiler {
             asm.aload(nativeOrderSlot);
             asm.invokeStatic(pool.writeCompressedRows);
 
-            // filteredCount += matchCount
             asm.iload(matchCountSlot);
             asm.i2l();
             asm.lload(filteredCountSlot);
             asm.ladd();
             asm.lstore(filteredCountSlot);
 
-            asm.setJmp(skipBranch, asm.position());
+            nextStart = asm.position();
+            asm.setJmp(skipBranch, nextStart);
+            asm.lload(rowSlot);
+            asm.lload(strideSlot);
+            asm.ladd();
+            asm.lstore(rowSlot);
+
+            int backJmp = asm.goto_();
+            asm.setJmp(backJmp, loopStart);
+
+            tailStart = asm.position();
+            asm.setJmp(tailBranch, tailStart);
+            asm.lload(rowSlot);
+            asm.lload(rowsCountSlot);
+            asm.lcmp();
+            int exitBranch = asm.ifge();
+
+            asm.aload(speciesSlot);
+            asm.lload(rowSlot);
+            asm.lload(rowsCountSlot);
+            asm.invokeInterface(pool.speciesIndexInRange, 4);
+            asm.astore(activeMaskSlot);
+
+            emitBlockOps(asm, block, useCounts, tempSlots, rowSlot, activeMaskSlot, speciesSlot,
+                    nativeOrderSlot, colSegSlots, varsSegSlot, pool, nullChecks, nullVecSlot, pureF8, true);
+
+            if (ret.src() == Terminator.Return.ACCEPT) {
+                asm.aload(activeMaskSlot);
+            } else {
+                asm.aload(tempSlots[ret.src()]);
+                asm.checkcast(pool.vectorMaskClass);
+                asm.aload(activeMaskSlot);
+                asm.invokeVirtual(pool.maskAnd);
+            }
+            asm.astore(activeMaskSlot);
+
+            asm.aload(activeMaskSlot);
+            asm.invokeVirtual(pool.maskTrueCount);
+            asm.istore(matchCountSlot);
+            asm.iload(matchCountSlot);
+            int tailSkipBranch = asm.ifeq();
+
+            asm.aload(iotaSlot);
+            asm.lload(rowSlot);
+            asm.invokeVirtual(pool.longVecAddScalar);
+            asm.aload(activeMaskSlot);
+            if (pureF8) {
+                asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+                asm.invokeVirtual(pool.maskCast);
+            }
+            asm.invokeVirtual(pool.longVecCompress);
+
+            asm.iload(matchCountSlot);
+            asm.aload(outputSegSlot);
+            asm.lload(filteredCountSlot);
+            asm.ldc2_w(pool.longEight);
+            asm.lmul();
+            asm.aload(nativeOrderSlot);
+            asm.invokeStatic(pool.writeCompressedRows);
+
+            asm.iload(matchCountSlot);
+            asm.i2l();
+            asm.lload(filteredCountSlot);
+            asm.ladd();
+            asm.lstore(filteredCountSlot);
+
+            exitStart = asm.position();
+            asm.setJmp(tailSkipBranch, exitStart);
+            asm.setJmp(exitBranch, exitStart);
         }
-
-        // === NEXT ===
-        int nextStart = asm.position();
-        asm.lload(rowSlot);
-        asm.aload(speciesSlot);
-        asm.invokeInterface(pool.speciesLength, 0);
-        asm.i2l();
-        asm.ladd();
-        asm.lstore(rowSlot);
-
-        int backJmp = asm.goto_();
-        asm.setJmp(backJmp, loopStart);
-
-        // === EXIT ===
-        int exitStart = asm.position();
-        asm.setJmp(exitBranch, exitStart);
         asm.lload(filteredCountSlot);
         asm.lreturn();
 
@@ -403,17 +504,19 @@ public final class VectorBytecodeFilterCompiler {
         int loopBci = loopStart - codeStart;
         int nextBci = nextStart - codeStart;
         int exitBci = exitStart - codeStart;
+        int tailBci = tailStart >= 0 ? tailStart - codeStart : -1;
 
         asm.endMethodCode();
         asm.putShort(0);
 
         asm.putShort(1);
-        asm.startStackMapTables(stackMapAttr, 3);
+        int stackMapCount = isCountOnly ? 3 : 4;
+        asm.startStackMapTables(stackMapAttr, stackMapCount);
 
         // Build precise local type declarations for the full_frame.
         // Typed locals eliminate checkcast overhead in the hot loop.
         int longParamCount = isCountOnly ? 6 : 7;
-        int totalLocals = 1 + longParamCount + 2 + objectLocalCount;
+        int totalLocals = 1 + longParamCount + 3 + objectLocalCount; // 3 = filteredCount + row + stride
 
         asm.putByte(0xff); // full_frame
         asm.putShort(loopBci);
@@ -424,7 +527,8 @@ public final class VectorBytecodeFilterCompiler {
         for (int i = 0; i < longParamCount; i++) {
             asm.putITEM_Long();
         }
-        // filteredCount, row
+        // filteredCount, row, stride
+        asm.putITEM_Long();
         asm.putITEM_Long();
         asm.putITEM_Long();
         // Object locals with precise types (order must match slot allocation)
@@ -438,22 +542,82 @@ public final class VectorBytecodeFilterCompiler {
             asm.putITEM_Object(pool.memSegClass);      // outputSegSlot
             asm.putITEM_Object(pool.longVectorClass);  // iotaSlot
             asm.putITEM_Integer();                      // matchCountSlot
+            asm.putITEM_Object(pool.vectorMaskClass);   // fullMaskSlot
         }
         for (int i = 0; i <= maxColIndex; i++) {
             asm.putITEM_Object(pool.memSegClass); // colSegSlots[i]
         }
         asm.putITEM_Object(pool.memSegClass); // varsSegSlot
+        if (isCountOnly) {
+            asm.putITEM_Object(pool.longVectorClass); // countAccSlot
+            asm.putITEM_Object(pool.vectorMaskClass); // fullMaskSlot
+        }
         for (int i = 0; i < tempCount; i++) {
             asm.putITEM_Object(pool.objectClassIndex); // temp[i] — generic
         }
         // empty stack
         asm.putShort(0);
 
-        emitSameFrame(asm, nextBci, loopBci);
-        emitSameFrame(asm, exitBci, nextBci);
+        if (isCountOnly) {
+            emitSameFrame(asm, tailBci, loopBci);
+            emitSameFrame(asm, exitBci, tailBci);
+        } else {
+            emitSameFrame(asm, nextBci, loopBci);
+            emitSameFrame(asm, tailBci, nextBci);
+            emitSameFrame(asm, exitBci, tailBci);
+        }
 
         asm.endStackMapTables();
         asm.endMethod();
+    }
+
+    private static int[] computeUseCounts(LoweredBlock block, int tempCount) {
+        int[] counts = new int[tempCount];
+        for (int i = 0; i < block.getOpCount(); i++) {
+            switch (block.getOp(i)) {
+                case LoweredOp.LoadColumn ignored -> {
+                }
+                case LoweredOp.LoadVarSizeHeader ignored -> {
+                }
+                case LoweredOp.LoadVar ignored -> {
+                }
+                case LoweredOp.LoadImm ignored -> {
+                }
+                case LoweredOp.Cast c -> counts[c.src()]++;
+                case LoweredOp.Compare c -> {
+                    counts[c.lhs()]++;
+                    counts[c.rhs()]++;
+                }
+                case LoweredOp.CompareI128 c -> {
+                    counts[c.lhs()]++;
+                    counts[c.rhs()]++;
+                }
+                case LoweredOp.Arithmetic a -> {
+                    counts[a.lhs()]++;
+                    counts[a.rhs()]++;
+                }
+                case LoweredOp.BooleanOp bo -> {
+                    counts[bo.lhs()]++;
+                    counts[bo.rhs()]++;
+                }
+                case LoweredOp.Negate neg -> counts[neg.src()]++;
+                case LoweredOp.Not n -> counts[n.src()]++;
+                case LoweredOp.Move m -> counts[m.src()]++;
+            }
+        }
+
+        switch (block.getTerminator()) {
+            case Terminator.Branch branch -> counts[branch.src()]++;
+            case Terminator.Return ret -> {
+                if (ret.src() >= 0) {
+                    counts[ret.src()]++;
+                }
+            }
+            case Terminator.Goto ignored -> {
+            }
+        }
+
+        return counts;
     }
 
     private static void emitSameFrame(BytecodeAssembler asm, int pos, int prevPos) {
@@ -466,17 +630,237 @@ public final class VectorBytecodeFilterCompiler {
         }
     }
 
+    private static void emitCountOnlyReduction(
+            BytecodeAssembler asm,
+            Terminator.Return ret,
+            int[] tempSlots,
+            int activeMaskSlot,
+            int countAccSlot,
+            Pool pool,
+            boolean pureF8
+    ) {
+        if (ret.src() == Terminator.Return.ACCEPT) {
+            asm.aload(activeMaskSlot);
+        } else {
+            asm.aload(tempSlots[ret.src()]);
+            asm.checkcast(pool.vectorMaskClass);
+            asm.aload(activeMaskSlot);
+            asm.invokeVirtual(pool.maskAnd);
+        }
+
+        if (pureF8) {
+            asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+            asm.invokeVirtual(pool.maskCast);
+        }
+        asm.astore(activeMaskSlot);
+        asm.aload(countAccSlot);
+        asm.lconst_1();
+        asm.aload(activeMaskSlot);
+        asm.invokeVirtual(pool.longVecAddScalarMasked);
+        asm.astore(countAccSlot);
+    }
+
+    private static void emitBlockOps(
+            BytecodeAssembler asm,
+            LoweredBlock block,
+            int[] useCounts,
+            int[] tempSlots,
+            int rowSlot,
+            int activeMaskSlot,
+            int speciesSlot,
+            int nativeOrderSlot,
+            int[] colSegSlots,
+            int varsSegSlot,
+            Pool pool,
+            boolean nullChecks,
+            int nullVecSlot,
+            boolean pureF8,
+            boolean maskedLoads
+    ) {
+        HashMap<Long, Integer> loadCache = new HashMap<>();
+        for (int i = 0; i < block.getOpCount(); i++) {
+            LoweredOp op = block.getOp(i);
+            int consumed = tryEmitLongInEqOrChain(
+                    asm,
+                    block,
+                    i,
+                    useCounts,
+                    tempSlots,
+                    rowSlot,
+                    activeMaskSlot,
+                    speciesSlot,
+                    nativeOrderSlot,
+                    colSegSlots,
+                    pool,
+                    nullChecks,
+                    pureF8,
+                    maskedLoads
+            );
+            if (consumed >= 0) {
+                i = consumed;
+                continue;
+            }
+            if (op instanceof LoweredOp.LoadImm || op instanceof LoweredOp.LoadVar) {
+                continue;
+            }
+            if (op instanceof LoweredOp.LoadColumn lc) {
+                long cacheKey = (((long) lc.type()) << 32) | (lc.columnIndex() & 0xffff_ffffL);
+                Integer cachedTemp = loadCache.get(cacheKey);
+                if (cachedTemp != null) {
+                    if (cachedTemp != lc.dst()) {
+                        asm.aload(tempSlots[cachedTemp]);
+                        asm.astore(tempSlots[lc.dst()]);
+                    }
+                } else {
+                    emitLoadColumn(asm, lc, tempSlots, rowSlot, activeMaskSlot,
+                            speciesSlot, nativeOrderSlot, colSegSlots, pool, pureF8, maskedLoads);
+                    loadCache.put(cacheKey, lc.dst());
+                }
+                continue;
+            }
+            emitOp(asm, op, tempSlots, rowSlot, activeMaskSlot,
+                    speciesSlot, nativeOrderSlot, colSegSlots, varsSegSlot, pool,
+                    nullChecks, nullVecSlot, pureF8, maskedLoads);
+        }
+    }
+
+    private static int tryEmitLongInEqOrChain(
+            BytecodeAssembler asm,
+            LoweredBlock block,
+            int startIndex,
+            int[] useCounts,
+            int[] tempSlots,
+            int rowSlot,
+            int activeMaskSlot,
+            int speciesSlot,
+            int nativeOrderSlot,
+            int[] colSegSlots,
+            Pool pool,
+            boolean nullChecks,
+            boolean pureF8,
+            boolean maskedLoads
+    ) {
+        if (!(block.getOp(startIndex) instanceof LoweredOp.LoadColumn firstLoad) || firstLoad.type() != I8_TYPE) {
+            return -1;
+        }
+        if (startIndex + 4 >= block.getOpCount()) {
+            return -1;
+        }
+        if (useCounts[firstLoad.dst()] != 1) {
+            return -1;
+        }
+
+        if (!(block.getOp(startIndex + 1) instanceof LoweredOp.Compare firstCompare)
+                || firstCompare.opcode() != EQ
+                || firstCompare.operandType() != I8_TYPE) {
+            return -1;
+        }
+        int firstValueTemp = eqOtherOperand(firstCompare, firstLoad.dst());
+        if (firstValueTemp < 0) {
+            return -1;
+        }
+
+        int accumTemp = firstCompare.dst();
+        int scan = startIndex + 2;
+        int chainLength = 1;
+
+        while (scan + 2 < block.getOpCount()) {
+            if (!(block.getOp(scan) instanceof LoweredOp.LoadColumn nextLoad)
+                    || nextLoad.type() != I8_TYPE
+                    || nextLoad.columnIndex() != firstLoad.columnIndex()) {
+                break;
+            }
+            if (useCounts[nextLoad.dst()] != 1) {
+                break;
+            }
+            if (!(block.getOp(scan + 1) instanceof LoweredOp.Compare nextCompare)
+                    || nextCompare.opcode() != EQ
+                    || nextCompare.operandType() != I8_TYPE) {
+                break;
+            }
+            if (eqOtherOperand(nextCompare, nextLoad.dst()) < 0) {
+                break;
+            }
+            if (!(block.getOp(scan + 2) instanceof LoweredOp.BooleanOp or)
+                    || or.opcode() != OR
+                    || !matchesBooleanInputs(or, accumTemp, nextCompare.dst())) {
+                break;
+            }
+            if (useCounts[accumTemp] != 1 || useCounts[nextCompare.dst()] != 1) {
+                break;
+            }
+            accumTemp = or.dst();
+            scan += 3;
+            chainLength++;
+        }
+
+        if (chainLength < 2) {
+            return -1;
+        }
+
+        emitLoadColumn(asm, firstLoad, tempSlots, rowSlot, activeMaskSlot, speciesSlot, nativeOrderSlot, colSegSlots, pool, pureF8, maskedLoads);
+        emitLongEqMaskFromLoadedValue(asm, tempSlots[firstLoad.dst()], tempSlots[firstValueTemp], pool);
+        asm.astore(tempSlots[firstCompare.dst()]);
+
+        int currentAccumTemp = firstCompare.dst();
+        int pos = startIndex + 2;
+        for (int i = 1; i < chainLength; i++) {
+            LoweredOp.LoadColumn load = (LoweredOp.LoadColumn) block.getOp(pos);
+            LoweredOp.Compare compare = (LoweredOp.Compare) block.getOp(pos + 1);
+            LoweredOp.BooleanOp or = (LoweredOp.BooleanOp) block.getOp(pos + 2);
+
+            emitLongEqMaskFromLoadedValue(asm, tempSlots[firstLoad.dst()], tempSlots[eqOtherOperand(compare, load.dst())], pool);
+            asm.astore(tempSlots[compare.dst()]);
+
+            asm.aload(tempSlots[currentAccumTemp]);
+            asm.checkcast(pool.vectorMaskClass);
+            asm.aload(tempSlots[compare.dst()]);
+            asm.checkcast(pool.vectorMaskClass);
+            asm.invokeVirtual(pool.maskOr);
+            asm.astore(tempSlots[or.dst()]);
+
+            currentAccumTemp = or.dst();
+            pos += 3;
+        }
+
+        return scan - 1;
+    }
+
+    private static int eqOtherOperand(LoweredOp.Compare compare, int loadTemp) {
+        if (compare.lhs() == loadTemp) {
+            return compare.rhs();
+        }
+        if (compare.rhs() == loadTemp) {
+            return compare.lhs();
+        }
+        return -1;
+    }
+
+    private static boolean matchesBooleanInputs(LoweredOp.BooleanOp op, int lhs, int rhs) {
+        return (op.lhs() == lhs && op.rhs() == rhs) || (op.lhs() == rhs && op.rhs() == lhs);
+    }
+
+    private static void emitLongEqMaskFromLoadedValue(BytecodeAssembler asm, int loadedSlot, int valueSlot, Pool pool) {
+        Pool.VecType vt = pool.vecType(I8_TYPE);
+        asm.aload(loadedSlot);
+        asm.checkcast(vt.vecClass);
+        asm.getstatic(pool.comparisonOp(EQ));
+        asm.aload(valueSlot);
+        asm.checkcast(vt.vecClass);
+        asm.invokeVirtual(vt.compare);
+    }
+
     // === Op emission ===
 
     private static void emitOp(
             BytecodeAssembler asm, LoweredOp op, int[] tempSlots,
             int rowSlot, int activeMaskSlot, int speciesSlot, int nativeOrderSlot,
             int[] colSegSlots, int varsSegSlot, Pool pool,
-            boolean nullChecks, int nullVecSlot, boolean pureF8
+            boolean nullChecks, int nullVecSlot, boolean pureF8, boolean maskedLoads
     ) {
         switch (op) {
             case LoweredOp.LoadColumn lc -> emitLoadColumn(asm, lc, tempSlots, rowSlot,
-                    activeMaskSlot, speciesSlot, nativeOrderSlot, colSegSlots, pool, pureF8);
+                    activeMaskSlot, speciesSlot, nativeOrderSlot, colSegSlots, pool, pureF8, maskedLoads);
             case LoweredOp.LoadImm li -> emitLoadImm(asm, li, tempSlots, speciesSlot, pool);
             case LoweredOp.LoadVar lv -> emitLoadVar(asm, lv, tempSlots, speciesSlot, varsSegSlot, pool);
             case LoweredOp.Compare c -> emitCompare(asm, c, tempSlots, pool, nullChecks, nullVecSlot, pureF8);
@@ -496,7 +880,7 @@ public final class VectorBytecodeFilterCompiler {
     private static void emitLoadColumn(
             BytecodeAssembler asm, LoweredOp.LoadColumn lc, int[] tempSlots,
             int rowSlot, int activeMaskSlot, int speciesSlot, int nativeOrderSlot,
-            int[] colSegSlots, Pool pool, boolean pureF8
+            int[] colSegSlots, Pool pool, boolean pureF8, boolean maskedLoads
     ) {
         Pool.VecType vt = pool.vecType(lc.type());
         asm.getstatic(vt.speciesPreferred); // type-correct species
@@ -505,14 +889,18 @@ public final class VectorBytecodeFilterCompiler {
         asm.ldc2_w(pool.ensureLongPooled(elementBytes(lc.type())));
         asm.lmul();
         asm.aload(nativeOrderSlot);
-        asm.aload(activeMaskSlot);
-        if (!pureF8) {
-            // Cast mask to match column type's species (same lane count, different element type).
-            // Pure F8 programs already have VectorMask<Double> from the loop species.
-            asm.getstatic(vt.speciesPreferred);
-            asm.invokeVirtual(pool.maskCast);
+        if (maskedLoads) {
+            asm.aload(activeMaskSlot);
+            if (!pureF8 && lc.type() == F8_TYPE) {
+                // Mixed program: loop species is Long, so activeMask is VectorMask<Long>.
+                // F8 loads need VectorMask<Double>. I8 loads already match — no cast.
+                asm.getstatic(vt.speciesPreferred);
+                asm.invokeVirtual(pool.maskCast);
+            }
+            asm.invokeStatic(vt.fromMemSegMasked);
+        } else {
+            asm.invokeStatic(vt.fromMemSeg);
         }
-        asm.invokeStatic(vt.fromMemSegMasked);
         asm.astore(tempSlots[lc.dst()]);
     }
 
@@ -764,7 +1152,9 @@ public final class VectorBytecodeFilterCompiler {
 
         // LongVector-specific (always needed for row-ID output)
         final int longVecAddScalar;
+        final int longVecAddScalarMasked;
         final int longVecCompress;
+        final int longVecReduceLanesToLong;
         final int writeCompressedRows;
 
         // VectorMask methods
@@ -773,6 +1163,7 @@ public final class VectorBytecodeFilterCompiler {
         final int maskNot;
         final int maskTrueCount;
         final int maskCast;
+        final int associativeAdd;
 
         // Pre-pooled constants
         final int longEight;
@@ -812,6 +1203,7 @@ public final class VectorBytecodeFilterCompiler {
             String sComp = "Ljdk/incubator/vector/VectorOperators$Comparison;";
             String sVec = "Ljdk/incubator/vector/Vector;";
             String sConv = "Ljdk/incubator/vector/VectorOperators$Conversion;";
+            String sAssoc = "Ljdk/incubator/vector/VectorOperators$Associative;";
 
             // --- FilterHelpers ---
             helpersLongSpecies = asm.poolMethod(helpersCls, "longSpecies", "()" + sSpec);
@@ -882,6 +1274,7 @@ public final class VectorBytecodeFilterCompiler {
             opLE = poolStaticField(asm, vecOpsCls, "LE", compType);
             opGT = poolStaticField(asm, vecOpsCls, "GT", compType);
             opGE = poolStaticField(asm, vecOpsCls, "GE", compType);
+            associativeAdd = poolStaticField(asm, vecOpsCls, "ADD", sAssoc);
 
             // --- Conversion ops (for Cast) ---
             String convType = "Ljdk/incubator/vector/VectorOperators$Conversion;";
@@ -903,7 +1296,9 @@ public final class VectorBytecodeFilterCompiler {
 
             // --- LongVector-specific (for row-ID output) ---
             longVecAddScalar = asm.poolMethod(longVecCls, "add", "(J)" + sLVec);
+            longVecAddScalarMasked = asm.poolMethod(longVecCls, "add", "(J" + sMask + ")" + sLVec);
             longVecCompress = asm.poolMethod(longVecCls, "compress", "(" + sMask + ")" + sLVec);
+            longVecReduceLanesToLong = asm.poolMethod(longVecCls, "reduceLanesToLong", "(" + sAssoc + ")J");
             writeCompressedRows = asm.poolMethod(asm.poolClass(FilterHelpers.class),
                     "writeCompressedRows",
                     "(" + sLVec + "I" + sMSeg + "J" + sBO + ")V");
@@ -1049,6 +1444,9 @@ public final class VectorBytecodeFilterCompiler {
         private static VecType poolVecType(BytecodeAssembler asm, int vecCls, String sVecType,
                                             String sSpec, String sMSeg, String sBO, String sMask,
                                             String sVec, String sConv, String scalarDesc) {
+            // fromMemorySegment(species, seg, offset, order) -> XxxVector
+            int fromMemSeg = asm.poolMethod(vecCls, "fromMemorySegment",
+                    "(" + sSpec + sMSeg + "J" + sBO + ")" + sVecType);
             // fromMemorySegment(species, seg, offset, order, mask) -> XxxVector
             int fromMemSegMasked = asm.poolMethod(vecCls, "fromMemorySegment",
                     "(" + sSpec + sMSeg + "J" + sBO + sMask + ")" + sVecType);
@@ -1078,12 +1476,13 @@ public final class VectorBytecodeFilterCompiler {
             int speciesPreferred = asm.poolField(vecCls,
                     asm.poolNameAndType(asm.poolUtf8("SPECIES_PREFERRED"), asm.poolUtf8(sSpec)));
 
-            return new VecType(vecCls, fromMemSegMasked, broadcast, compare,
+            return new VecType(vecCls, fromMemSeg, fromMemSegMasked, broadcast, compare,
                     add, sub, mul, div, neg, convertShape, speciesPreferred);
         }
 
         record VecType(
                 int vecClass,
+                int fromMemSeg,
                 int fromMemSegMasked,
                 int broadcast,
                 int compare,

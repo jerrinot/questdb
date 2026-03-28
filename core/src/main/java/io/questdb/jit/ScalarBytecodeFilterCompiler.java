@@ -67,7 +67,7 @@ public final class ScalarBytecodeFilterCompiler {
      * can handle correctly. Conservative: rejects programs with float/double
      * operations, I16 (UUID), var-size headers, and null checks until those
      * are proven. This ensures the bytecode path only activates for the
-     * subset with verified parity against the interpreter oracle.
+     * subset with verified parity against the regression test suite.
      */
     @SuppressWarnings("unused")
     private static boolean isSupported(LoweredProgram program) {

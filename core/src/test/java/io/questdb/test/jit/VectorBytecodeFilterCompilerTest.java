@@ -122,6 +122,60 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testLongIn5() throws Exception {
+        long[] data = longCol(ROW_COUNT, i -> (i % 7) + 1L);
+        assertParity(data, ir(
+                insn(IMM, I8_TYPE, 1, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(IMM, I8_TYPE, 2, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I8_TYPE, 3, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I8_TYPE, 4, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I8_TYPE, 5, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
+    public void testLongIn5CountOnly() throws Exception {
+        long[] data = longCol(ROW_COUNT, i -> (i % 7) + 1L);
+        assertCountParity(data, ir(
+                insn(IMM, I8_TYPE, 1, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(IMM, I8_TYPE, 2, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I8_TYPE, 3, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I8_TYPE, 4, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I8_TYPE, 5, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
     public void testLongNe() throws Exception {
         // col0 != 50
         assertParity(
