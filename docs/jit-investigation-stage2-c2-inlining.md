@@ -144,12 +144,12 @@ $JAVA_HOME/bin/java --add-modules jdk.incubator.vector \
   --add-opens java.base/jdk.internal.misc=ALL-UNNAMED \
   -XX:+UnlockDiagnosticVMOptions -XX:+PrintCompilation -XX:+PrintInlining \
   -cp core/target/classes:core/target/test-classes \
-  io.questdb.test.jit.VectorBytecodeC2Driver l_gt_42 2>&1 > /tmp/c2_l_gt_42.log
+  io.questdb.test.jit.VectorBytecodeC2Driver l_gt_42 > /tmp/c2_l_gt_42.log 2>&1
 
 # Mixed I8+F8 filter
 $JAVA_HOME/bin/java --add-modules jdk.incubator.vector \
   --add-opens java.base/jdk.internal.misc=ALL-UNNAMED \
   -XX:+UnlockDiagnosticVMOptions -XX:+PrintCompilation -XX:+PrintInlining \
   -cp core/target/classes:core/target/test-classes \
-  io.questdb.test.jit.VectorBytecodeC2Driver mixed 2>&1 > /tmp/c2_mixed.log
+  io.questdb.test.jit.VectorBytecodeC2Driver mixed > /tmp/c2_mixed.log 2>&1
 ```

@@ -170,5 +170,5 @@ LD_LIBRARY_PATH=/tmp/capstone-5.0.6 $JAVA_HOME/bin/java \
   "-XX:CompileCommand=print,io.questdb.jit.vgen::filterRows" \
   "-XX:CompileCommand=print,io.questdb.jit.vgen::countRows" \
   -cp core/target/classes:core/target/test-classes \
-  io.questdb.test.jit.VectorBytecodeC2Driver l_gt_42 2>&1 > /tmp/asm_l_gt_42.log
+  io.questdb.test.jit.VectorBytecodeC2Driver l_gt_42 > /tmp/asm_l_gt_42.log 2>&1
 ```

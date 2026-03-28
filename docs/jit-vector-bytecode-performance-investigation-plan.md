@@ -357,26 +357,26 @@ This plan is complete when we can answer, with evidence:
 
 ## Exit Criteria Answers
 
-1. **Why slower:** Per-call MemorySegment construction overhead, IN() not
-   vectorized (scalar fallback), safepoint poll. The hot loop itself is
-   near-optimal AVX-512 — C2 inlines everything and generates clean x86.
+1. **Why slower:** The hot loop machine code is near-optimal AVX-512 and
+   structurally more efficient per element than native AVX2. The gap comes
+   from overhead outside the hot loop: per-call MemorySegment construction,
+   IN() column re-loading, safepoint poll, possible AVX-512 throttling.
+   No per-cause timing isolation was performed; attribution is structural.
 
 2. **QuestDB-controlled:** IN() column-load deduplication (100%),
-   MemorySegment caching or avoidance (100%), I4 column support (100%),
-   redundant mask.cast (100%, but C2 handles it).
+   MemorySegment caching or avoidance (100%), I4 column support (100%).
 
-3. **HotSpot/Vector API:** Safepoint poll (~5%), reinterpretInternal too
-   big to inline (per-call overhead), AVX-512 throttling (unconfirmed).
+3. **HotSpot/Vector API:** Safepoint poll (JVM), reinterpretInternal too
+   big to inline (JDK), AVX-512 throttling (hardware, unconfirmed).
 
 4. **Top 3 optimizations:**
-   - IN() column-load deduplication (load column once per chunk, not N times)
-   - Cache/eliminate MemorySegment construction (~20-30% of simple filter gap)
-   - I4 (INT) column support (expand vectorizable programs)
+   - IN() column-load deduplication (load column once per chunk)
+   - Cache/eliminate MemorySegment construction
+   - I4 (INT) column support
 
-5. **Focus areas:** IN() column-load dedup (highest impact single item)
-   and MemorySegment optimization (broadest impact). NOT bytecode shape,
-   helper boundaries, row-id compaction, or HotSpot tuning — these are
-   already well-handled.
+5. **Focus areas:** IN() column-load dedup and MemorySegment optimization.
+   NOT bytecode shape, helper boundaries, row-id compaction, or HotSpot
+   tuning — these are already well-handled.
 
 ## Suggested First Pass
 

@@ -6,162 +6,195 @@ Date: 2026-03-28
 
 The native JIT backend uses asmjit to generate x86 machine code at runtime.
 The SIMD path targets AVX2 (256-bit YMM registers). **There is no AVX-512
-path in the native backend** — the codebase has zero references to AVX-512,
-ZMM registers, or 512-bit operations.
+path in the native backend.**
 
 On AVX-512-capable hardware (like the test machine), the Java Vector API
 path uses 512-bit ZMM registers while the native path uses 256-bit YMM
-registers. This means the Java path processes 2x more data per loop
-iteration.
+registers.
+
+## Method
+
+Both outputs are actual machine code dumps:
+- **Java Vector Bytecode**: captured via `-XX:+PrintAssembly` (Stage 3)
+- **Native asmjit**: captured via `cairo.sql.jit.debug.enabled=true`,
+  which activates asmjit's `FileLogger(stdout)` in `compiler.cpp:924`
+
+Driver: `NativeJitAsmDumpDriver` test with `SqlJitMode.JIT_MODE_ENABLED`
+and `JitBackend.CPP`.
+
+Important: `SqlJitMode.JIT_MODE_ENABLED = 0` (not 1, which is
+`FORCE_SCALAR`). Setting `setJitMode(1)` produces scalar output.
 
 ## Filter 1: `l > 42` (pure I8, null checks)
 
-### Native SIMD (AVX2) hot loop
+### Native SIMD (AVX2) — actual asmjit dump
 
-The native backend processes 4 longs per iteration using YMM registers:
+filterRows hot loop (4 longs per YMM iteration):
 
+```asm
+L3:
+vmovdqu    ymm0, ymmword ptr [r11+r8*8]   ; load 4 I64 values
+vpcmpgtq   ymm2, ymm0, ymm4               ; col > 42
+vpcmpeqq   ymm1, ymm0, ymmword ptr [L2+96]; col == LONG_NULL
+vpcmpeqq   ymm0, ymm4, ymmword ptr [L2+96]; 42 == LONG_NULL (always false)
+vpor       ymm1, ymm1, ymm0               ; anyNull = lhsNull | rhsNull
+vpcmpeqd   ymm0, ymm0, ymm0               ; ymm0 = all-ones (-1)
+vpxor      ymm0, ymm1, ymm0               ; neitherNull = NOT anyNull
+vpand      ymm0, ymm2, ymm0               ; result = (col>42) AND neitherNull
+vmovmskpd  esi, ymm0                       ; extract 4 mask bits → GPR
+test       esi, esi                        ; short-circuit if no match
+jz         L5
+; compress_register (PEXT+PDEP+VPERMPS):
+vpmovmskb  ecx, ymm0                      ; extract byte mask
+pext       edx, 1985229328, ecx            ; parallel bits extract
+pdep       rdx, rdx, 1085102592571150095   ; parallel bits deposit
+vmovq      xmm0, rdx                      ; move to XMM
+vpmovzxbd  ymm0, xmm0                     ; unpack to 32-bit indices
+vpermps    ymm0, ymm0, ymm3               ; gather matching row IDs
+vmovdqu    ymmword ptr [r9+rax*8], ymm0    ; store 4 row IDs (unmasked)
+popcnt     esi, esi                        ; count matches
+add        rax, rsi                        ; output_count += matches
+L5:
+vpaddq     ymm3, ymm3, ymm5               ; row_ids += [4,4,4,4]
+add        r8, 4                           ; index += 4
+cmp        r8, rdi                         ; index < stop
+short jl   L3
 ```
-vmovdqu     ymmword [rdi + idx*8], ymm0     ; load 4 I64 values
-vpcmpgtb    ymm1, ymm0, broadcast_42       ; compare GT (all lanes)
-vmovmskpd   r8d, ymm1                       ; extract 4 mask bits
-test        r8d, r8d                        ; short-circuit if no match
-jz          skip
-; compress_register: PEXT + PDEP + VPERMPS sequence
-vpermps     ymm2, ymm1, row_ids_reg         ; gather matching row IDs
-vmovdqu     [out + output_idx*8], ymm2       ; store (unmasked, overwrite ok)
-popcnt      r8d, r8d                        ; count matches
-add         output_idx, r8                  ; advance output
-skip:
-vpaddq      row_ids_reg, row_ids_step       ; increment row ID vector by 4
-add         idx, 4
-cmp         idx, stop
-jl          loop
+
+Tail (scalar, handles remaining 1-3 rows):
+```asm
+L6:
+mov        rdi, qword ptr [r11+r8*8]      ; load 1 value
+movabs     rcx, -9223372036854775808       ; LONG_NULL
+xor        rsi, rsi
+cmp        rdi, rcx
+rex setnz  sil                             ; lhsNotNull
+xor        rdx, rdx
+cmp        r10, rcx
+setnz      dl                             ; rhsNotNull (42 vs NULL, always 1)
+and        rdx, rsi                        ; bothNotNull
+xor        rcx, rcx
+cmp        rdi, r10
+setnle     cl                             ; col > 42
+and        rcx, rdx                        ; result = gt AND bothNotNull
+test       ecx, ecx
+jz         L8
+mov        qword ptr [r9+rax*8], r8        ; store row ID
+add        rax, 1
+L8:
+add        r8, 1
+cmp        r8, rbx
+short jl   L6
 ```
 
-Tail: separate scalar loop for remaining 1-3 elements.
-
-### Java Vector Bytecode (AVX-512) hot loop
-
-Processes 8 longs per iteration using ZMM registers:
-
+countRows hot loop (no row-ID output):
+```asm
+L3:
+vmovdqu    ymm0, ymmword ptr [r11+r8*8]   ; load 4 I64
+vpcmpgtq   ymm3, ymm0, ymm4               ; col > 42
+vpcmpeqq   ymm1, ymm0, ymmword ptr [L2+32]; col == LONG_NULL
+vpcmpeqq   ymm0, ymm4, ymmword ptr [L2+32]; 42 == LONG_NULL
+vpor       ymm1, ymm1, ymm0               ; anyNull
+vpcmpeqd   ymm0, ymm0, ymm0               ; all-ones
+vpxor      ymm0, ymm1, ymm0               ; neitherNull
+vpand      ymm0, ymm3, ymm0               ; result
+vpsubq     ymm2, ymm2, ymm0               ; acc -= mask (adds 1 per true lane)
+add        r8, 4
+cmp        r8, rcx
+short jl   L3
+; horizontal sum:
+vextracti128 xmm0, ymm2, 1
+vpaddq     xmm2, xmm2, xmm0
+vpshufd    xmm0, xmm2, 78
+vpaddq     xmm2, xmm2, xmm0
+vmovq      rax, xmm2
 ```
-vmovdqu64   (%r10), %zmm3 {%k7} {z}        ; masked load 8 I64 values
-vpcmpnleq   %zmm2, %zmm3, %k6              ; compare GT → mask register
-kmovq       %k6, %r10                       ; mask → GPR
-popcntq     %r10, %rcx                      ; count matches
-testl       %ecx, %ecx                      ; short-circuit if no match
+
+### Java Vector Bytecode (AVX-512) — observed in Stage 3
+
+filterRows hot loop (8 longs per ZMM iteration):
+
+```asm
+vmovdqu64   (%r10), %zmm3 {%k7} {z}    ; masked load 8 I64 values
+vpcmpnleq   %zmm2, %zmm3, %k6          ; compare GT → mask register k6
+kmovq       %k6, %r10                   ; mask → GPR
+popcntq     %r10, %rcx                  ; count matches
+testl       %ecx, %ecx                  ; short-circuit
 je          skip
-vpbroadcastq %rsi, %zmm3                    ; broadcast current row offset
-vpaddq      %zmm3, %zmm1, %zmm3            ; rowIds = iota + offset
-vpcompressq %zmm3, %zmm3 {%k6} {z}         ; compress row IDs (AVX-512)
-vmovdqu32   %zmm3, (%r10)                   ; store (fast path: all lanes)
-addq        %r9, %r11                       ; filteredCount += trueCount
-skip:
-; safepoint poll: testl %eax, (%r9)
-add         rsi, 8                          ; advance by 8 rows
+vpbroadcastq %rsi, %zmm3                ; broadcast current row offset
+vpaddq      %zmm3, %zmm1, %zmm3        ; rowIds = iota + offset
+vpcompressq %zmm3, %zmm3 {%k6} {z}     ; compress row IDs (single insn)
+vmovdqu32   %zmm3, (%r10)              ; store (fast path: all lanes)
+addq        %r9, %r11                   ; filteredCount += trueCount
 ```
+Plus safepoint poll (`testl %eax, (%r9)`) per iteration.
+
+Note: the Java path uses `longNullGt()` helper for null-aware GT. C2
+inlines this to equivalent `vpcmpeqq` + mask logic, similar to the native
+null check sequence. The Java hot loop shown above is the non-null-check
+variant (from Stage 3 driver which used no null checks). The benchmark
+runs with null checks, so the actual Java hot loop includes similar null
+sentinel detection instructions.
 
 ### Side-by-side comparison
 
-| Aspect | Native AVX2 | Java AVX-512 |
-|--------|------------|--------------|
+| Aspect | Native AVX2 (actual dump) | Java AVX-512 (actual dump) |
+|--------|--------------------------|---------------------------|
 | Vector width | 256-bit (4 longs) | 512-bit (8 longs) |
-| Core instructions/chunk | ~15 (match) / ~5 (no match) | ~10 (match) / ~5 (no match) |
-| Rows per chunk | 4 | 8 |
-| Compress strategy | PEXT+PDEP+VPERMPS (3-4 insns) | vpcompressq (1 insn) |
-| Store | Unmasked vmovdqu (256-bit) | Fast: unmasked vmovdqu32 (512-bit); Slow: masked |
-| Row-ID tracking | YMM register += [4,4,4,4] | broadcast(row) + iota.add(row) |
+| Rows per iteration | 4 | 8 |
+| Compare | `vpcmpgtq` | `vpcmpnleq` |
+| Null check | 4 insns: 2x `vpcmpeqq` + `vpor` + `vpxor` + `vpand` | Similar via C2-inlined `longNullGt` |
+| Mask extract | `vmovmskpd` → 4-bit GPR | `kmovq` → 8-bit k-register |
+| Compress | 6 insns: `vpmovmskb`+`pext`+`pdep`+`vmovq`+`vpmovzxbd`+`vpermps` | 1 insn: `vpcompressq` |
+| Store | Unmasked `vmovdqu` (256-bit) | Fast: unmasked; slow: masked |
+| Row-ID tracking | YMM += [4,4,4,4] per chunk | broadcast(row) + iota.add per chunk |
 | Safepoint poll | None | 1 instruction per iteration |
-| Tail handling | Scalar loop | indexInRange mask |
-| Null handling | cmp vs LONG_NULL per-element pre-scan | longNullGt helper (inline: cmp + mask AND) |
-| Bounds checks in loop | None | None (hoisted by C2) |
+| Tail handling | Scalar loop | `indexInRange` mask (no scalar tail) |
+| Constant fold | `42 == LONG_NULL` computed every chunk (wasted) | C2 may fold if inlined |
+| Count-only | `vpsubq` accumulator (no memory writes) | `trueCount` + `i2l` + `ladd` |
 
-### Key differences
+### Key observations
 
-1. **Java uses AVX-512, native uses AVX2.** The Java path processes 2x
-   more data per iteration. This is a significant advantage for Java on
-   AVX-512 hardware.
+1. **Java processes 2x more data per iteration** (8 vs 4 longs), but with
+   AVX-512 frequency throttling this may not translate to 2x throughput.
 
-2. **vpcompressq vs PEXT+PDEP+VPERMPS.** The Java path uses a single
-   AVX-512 compress instruction while native must emulate it with 3-4
-   AVX2 instructions.
+2. **Native wastes work on constant null check**: `vpcmpeqq ymm0, ymm4,
+   [L2+96]` compares 42 against LONG_NULL every iteration — the result is
+   always false. The asmjit compiler doesn't constant-fold this.
 
-3. **Safepoint poll.** The Java path adds one `testl` instruction per
-   loop iteration for safepoint polling. This is unavoidable in JVM code.
+3. **Compress cost**: native uses 6 instructions (PEXT+PDEP+VPERMPS chain)
+   vs Java's single `vpcompressq`. This is a significant per-chunk cost
+   when many rows match.
 
-4. **Row-ID computation.** Native tracks row IDs in a YMM register
-   (vpaddq per chunk). Java broadcasts the current row offset and adds
-   iota per chunk. Both approaches are similar cost.
+4. **Count-only path**: native accumulates via `vpsubq` (subtracting the
+   all-ones mask adds 1 per true lane), then does a 3-instruction
+   horizontal sum at loop exit. Java calls `trueCount()` per chunk which
+   C2 likely compiles to `popcnt`.
 
-5. **MemorySegment setup.** Every `filterRows()` call constructs
-   MemorySegment objects from raw addresses. The `reinterpretInternal`
-   (61 bytes) fails to inline. This is per-call overhead that native
-   doesn't have.
+5. **Safepoint poll**: Java adds 1 instruction per iteration. Native has
+   zero such overhead.
 
-## Filter 2: `l > 42 AND d < 100.0` (mixed I8+F8, null checks)
+## Filter 2: `l > 42 AND d < 100.0` (mixed I8+F8)
 
-### Native SIMD path
+Not yet dumped. Both I8 and F8 are 8 bytes, so `exec_hint = 1`
+(single-size). The native backend should use SIMD for this filter too.
+To be captured in a follow-up.
 
-The mixed I8+F8 filter has `exec_hint = 1` (single-size, both 8 bytes).
-The native backend DOES use SIMD for this — both I8 and F8 fit in 256-bit
-YMM registers with the same element count (4 per register). The loop
-processes both column comparisons vectorized and combines results with
-`vpand`.
+## Filter 3: `l IN (1, 2, 3, 4, 5)`
 
-### Java Vector Bytecode path
+Not yet dumped. For single-size columns, the IR serializer emits
+straight-line `EQ` + `OR` ops (no short-circuit). Both native and Java
+paths should vectorize this. To be captured in a follow-up.
 
-Uses AVX-512 with separate Long and Double vector loads. Mask cast overhead
-per chunk:
-1. `activeMask.cast(DoubleVector.SPECIES_PREFERRED)` for F8 load
-   (Long mask → Double mask via VectorSupport::convert)
-2. `doubleVecLt result.cast(LongVector.SPECIES_PREFERRED)` to normalize
-   (Double mask → Long mask via VectorSupport::convert)
+## Reproduction
 
-These compile to `VectorSupport::convert` intrinsics which C2 lowers to
-`kunpck`/`kmov` instructions. This is 2 extra mask conversion instructions
-per chunk that native doesn't need (native keeps everything in 256-bit
-register space with integer masks).
+```bash
+# Run from IDE: NativeJitAsmDumpDriver#dumpLongGt42
+# Or via Maven (stdout captured by surefire, check output file):
+export JAVA_HOME=/home/jara/.sdkman/candidates/java/25.0.2-amzn
+mvn -pl core -Dtest=NativeJitAsmDumpDriver#dumpLongGt42 \
+  "-DargLine=--add-modules jdk.incubator.vector" \
+  -Dmaven.test.redirectTestOutputToFile=true test
 
-### Side-by-side comparison (mixed)
-
-| Aspect | Native AVX2 | Java AVX-512 |
-|--------|------------|--------------|
-| Loop type | SIMD (both types vectorized) | SIMD (both types vectorized) |
-| Rows per chunk | 4 | 8 |
-| Mask conversions | 0 (uniform 256-bit) | 2 per chunk (Long↔Double) |
-| Null handling | Inlined per-element check | longNullGt helper (C2-inlined) |
-
-## Filter 3: `l IN (1, 2, 3, 4, 5)` (straight-line OR)
-
-### Native SIMD path
-
-Uses AVX2 SIMD with 4-element chunks. Each value in the IN list is
-compared vectorized, and results are OR'd together.
-
-### Java Vector Bytecode path
-
-**Vectorized.** For single-size columns (all LONG), the IR serializer
-emits plain `EQ` + `OR` ops (no short-circuit). The vector compiler
-accepts the straight-line program and generates AVX-512 code that:
-1. Loads the column once per IN value (5 loads for 5 values)
-2. Broadcasts each constant and compares
-3. ORs all masks together
-
-The IN() path is vectorized but loads the column 5 times per chunk
-(once per IN value) instead of once. The native backend similarly
-loads the column per value but at 256-bit width. The Java path
-processes 8 elements per load vs native's 4, but does 5 loads per
-chunk vs potentially fewer in native with register reuse.
-
-The 5.6x gap for IN() may come from:
-- Column re-loading overhead (5 vector loads vs 1 needed)
-- MemorySegment construction per call (same as other filters)
-- Possibly lower data cache efficiency with 5x 512-bit loads
-
-## Summary
-
-| Filter | Native | Java | Gap source |
-|--------|--------|------|------------|
-| `l > 42` | AVX2 (4 wide) | AVX-512 (8 wide) | Per-call setup, safepoint |
-| `l > 42 AND d < 100.0` | AVX2 (4 wide) | AVX-512 (8 wide) + mask cast | Setup + 2 mask casts/chunk |
-| `l IN (1,2,3,4,5)` | AVX2 (4 wide) | AVX-512 (8 wide), 5 loads/chunk | Column re-loads, setup |
+# Important: use SqlJitMode.JIT_MODE_ENABLED (= 0), not 1 (= FORCE_SCALAR)
+```
