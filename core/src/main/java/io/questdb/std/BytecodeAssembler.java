@@ -263,6 +263,10 @@ public class BytecodeAssembler {
         putByte(0x5b);
     }
 
+    public void swap() {
+        putByte(0x5f);
+    }
+
     public void endMethod() {
         putInt(codeAttributeStart - 4, position() - codeAttributeStart);
     }

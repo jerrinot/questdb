@@ -447,13 +447,13 @@ public final class FilterHelpers {
 
     public static void writeCompressedRows(
             jdk.incubator.vector.LongVector compressed,
-            jdk.incubator.vector.VectorMask<Long> resultMask,
+            int matchCount,
             java.lang.foreign.MemorySegment output,
             long byteOffset,
             java.nio.ByteOrder order
     ) {
         jdk.incubator.vector.VectorMask<Long> storeMask =
-                resultMask.vectorSpecies().indexInRange(0, resultMask.trueCount());
+                compressed.species().indexInRange(0, matchCount);
         compressed.intoMemorySegment(output, byteOffset, order, storeMask);
     }
 

@@ -252,6 +252,18 @@ public final class VectorBytecodeFilterCompiler {
             asm.astore(tempSlots[i]);
         }
 
+        // Hoist loop-invariant ops (immediates and bind variables) out of the
+        // hot loop. These values don't change between iterations.
+        LoweredBlock block = program.getBlock(program.getEntryBlockId());
+        for (int i = 0; i < block.getOpCount(); i++) {
+            LoweredOp op = block.getOp(i);
+            if (op instanceof LoweredOp.LoadImm li) {
+                emitLoadImm(asm, li, tempSlots, speciesSlot, pool);
+            } else if (op instanceof LoweredOp.LoadVar lv) {
+                emitLoadVar(asm, lv, tempSlots, speciesSlot, varsSegSlot, pool);
+            }
+        }
+
         // === LOOP ===
         int loopStart = asm.position();
         asm.lload(rowSlot);
@@ -265,10 +277,13 @@ public final class VectorBytecodeFilterCompiler {
         asm.invokeInterface(pool.speciesIndexInRange, 4);
         asm.astore(activeMaskSlot);
 
-        // === Emit ops ===
-        LoweredBlock block = program.getBlock(program.getEntryBlockId());
+        // === Emit ops (skip hoisted LoadImm/LoadVar) ===
         for (int i = 0; i < block.getOpCount(); i++) {
-            emitOp(asm, block.getOp(i), tempSlots, rowSlot, activeMaskSlot,
+            LoweredOp op = block.getOp(i);
+            if (op instanceof LoweredOp.LoadImm || op instanceof LoweredOp.LoadVar) {
+                continue;
+            }
+            emitOp(asm, op, tempSlots, rowSlot, activeMaskSlot,
                     speciesSlot, nativeOrderSlot, colSegSlots, varsSegSlot, pool,
                     nullChecks, nullVecSlot);
         }
@@ -298,24 +313,21 @@ public final class VectorBytecodeFilterCompiler {
             int skipBranch = asm.ifeq();
 
             // Row-ID output always uses LongVector (row IDs are longs).
-            // If primary type is F8, cast the result mask to Long.
             asm.aload(iotaSlot);
             asm.lload(rowSlot);
             asm.invokeVirtual(pool.longVecAddScalar);
             asm.aload(activeMaskSlot);
             if (primaryType == F8_TYPE) {
-                // Cast VectorMask<Double> → VectorMask<Long> (same lane count)
                 asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
                 asm.invokeVirtual(pool.maskCast);
             }
             asm.invokeVirtual(pool.longVecCompress);
-            // Stack: compressed LongVector
+            // Stack: compressed(LongVector)
 
-            // Write only the valid compressed elements via masked store.
-            // compress() packs matching lane values at the front but
-            // an unmasked intoMemorySegment() would write ALL lanes,
-            // overflowing the output buffer with garbage tail values.
+            // Masked store: writeCompressedRows(compressed, matchCount, output, offset, order)
             asm.aload(activeMaskSlot);
+            asm.invokeVirtual(pool.maskTrueCount);
+            // Stack: compressed, matchCount(int)
             asm.aload(outputSegSlot);
             asm.lload(filteredCountSlot);
             asm.ldc2_w(pool.longEight);
@@ -323,6 +335,7 @@ public final class VectorBytecodeFilterCompiler {
             asm.aload(nativeOrderSlot);
             asm.invokeStatic(pool.writeCompressedRows);
 
+            // filteredCount += matchCount
             asm.aload(activeMaskSlot);
             asm.invokeVirtual(pool.maskTrueCount);
             asm.i2l();
@@ -854,7 +867,7 @@ public final class VectorBytecodeFilterCompiler {
             longVecCompress = asm.poolMethod(longVecCls, "compress", "(" + sMask + ")" + sLVec);
             writeCompressedRows = asm.poolMethod(asm.poolClass(FilterHelpers.class),
                     "writeCompressedRows",
-                    "(" + sLVec + sMask + sMSeg + "J" + sBO + ")V");
+                    "(" + sLVec + "I" + sMSeg + "J" + sBO + ")V");
 
             // --- VectorMask methods ---
             maskAnd = asm.poolMethod(vecMaskCls, "and", "(" + sMask + ")" + sMask);
