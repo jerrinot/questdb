@@ -1851,16 +1851,14 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
     }
 
     /**
-     * A lightweight visitor that pre-scans the expression tree to detect if scalar mode
-     * will be used by the JIT backend.
+     * A lightweight visitor that pre-scans the expression tree to detect mixed column sizes.
      * <p>
-     * This detector is run BEFORE predicate reordering and short-circuit serialization
-     * to determine if short-circuit optimizations can be safely applied. Short-circuit
-     * evaluation (AND_SC, OR_SC opcodes) only works correctly in scalar mode because
-     * SIMD processes multiple rows in parallel and cannot branch per-lane.
-     * <p>
-     * Scalar mode is guaranteed when columns of different sizes are found (mixed sizes),
-     * which sets exec_hint to EXEC_HINT_MIXED_SIZE_TYPE, forcing the scalar code path.
+     * The caller decides whether mixed sizes should trigger short-circuit emission.
+     * For Java backends (AUTO, JAVA_VECTOR_COMPILED), mixed sizes do NOT trigger SC
+     * because the vector compiler can handle some mixed-size programs (e.g., I4 compare
+     * with I8/F8) and SC opcodes would prevent vectorization by introducing control flow.
+     * For the C++ native backend and Java scalar-only backend, mixed sizes trigger SC
+     * because those backends benefit from early-exit evaluation.
      */
     private class ScalarModeDetector implements PostOrderTreeTraversalAlgo.Visitor, Mutable {
         private final TypesObserver typesObserver = new TypesObserver();

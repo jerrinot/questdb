@@ -205,7 +205,7 @@ public final class VectorBytecodeFilterCompiler {
                 }
             }
 
-            boolean pureF8 = !hasI8 && !hasCast && primaryType == F8_TYPE;
+            boolean pureF8 = !hasI8 && !hasCast && !usesI4 && primaryType == F8_TYPE;
             return new ProgramShape(pureF8, usesI4, maxColIdx);
         }
     }

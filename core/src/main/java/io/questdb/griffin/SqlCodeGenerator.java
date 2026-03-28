@@ -3243,7 +3243,14 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                         final ObjList<Function> bindVarFunctions = new ObjList<>();
                         try (PageFrameCursor cursor = factory.getPageFrameCursor(executionContext, ORDER_ANY)) {
                             final boolean forceScalar = jitMode == SqlJitMode.JIT_MODE_FORCE_SCALAR;
-                            final boolean enableShortCircuit = jitBackend != JitBackend.JAVA_VECTOR_COMPILED;
+                            // Short-circuit opcodes (AND_SC, OR_SC) introduce control flow that
+                            // prevents Java vector-bytecode compilation. Only enable SC for
+                            // backends that never attempt vectorization: the native C++ backend
+                            // (which handles SC natively) and the Java scalar-only backend
+                            // (which benefits from early-exit evaluation). For AUTO and
+                            // JAVA_VECTOR_COMPILED, emit straight-line eager boolean IR so
+                            // the vector compiler gets a chance at mixed-size predicates.
+                            final boolean enableShortCircuit = jitBackend == JitBackend.CPP || jitBackend == JitBackend.JAVA_COMPILED;
                             jitIRSerializer.of(jitIRMem, executionContext, factory.getMetadata(), cursor, bindVarFunctions);
                             jitOptions = jitIRSerializer.serialize(
                                     filterExpr,

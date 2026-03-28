@@ -872,6 +872,42 @@ public class VectorBytecodeFilterCompilerTest {
         ), mixedOptions);
     }
 
+    @Test
+    public void testIntDoubleCompareAndWithoutLong() throws Exception {
+        // col0(I4) > 0 AND col1(F8) < 0.5 — no I8 column present
+        int[] intData = new int[ROW_COUNT];
+        double[] doubleData = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            intData[i] = (i % 17) - 8;
+            doubleData[i] = i / (double) ROW_COUNT;
+        }
+
+        // Test both with and without null checks
+        int mixedOptions = (3 << 1) | (2 << 4); // log2(8), mixed-size, no null checks
+        assertParityIntDouble(intData, doubleData, ir(
+                insn(IMM, I4_TYPE, 0, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(0.5), 0),
+                insn(MEM, F8_TYPE, 1, 0),
+                insn(LT, 0, 0, 0),
+                insn(AND, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), mixedOptions);
+
+        int mixedNullOptions = (3 << 1) | (2 << 4) | (1 << 6); // + null checks
+        assertParityIntDouble(intData, doubleData, ir(
+                insn(IMM, I4_TYPE, 0, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(0.5), 0),
+                insn(MEM, F8_TYPE, 1, 0),
+                insn(LT, 0, 0, 0),
+                insn(AND, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), mixedNullOptions);
+    }
+
     // ========================
     // Double (F8) type tests
     // ========================
@@ -1050,6 +1086,47 @@ public class VectorBytecodeFilterCompilerTest {
             Unsafe.free(col1, (long) len * Integer.BYTES, MemoryTag.NATIVE_DEFAULT);
             Unsafe.free(col2, (long) len * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
             Unsafe.free(colPtrArray, 24, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private void assertParityIntDouble(
+            int[] intData,
+            double[] doubleData,
+            IrDecoder.Instruction[] instructions,
+            int options
+    ) throws Exception {
+        Assert.assertEquals(intData.length, doubleData.length);
+        int len = intData.length;
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long col0 = allocIntColumn(intData);
+        long col1 = allocDoubleColumn(doubleData);
+        long colPtrArray = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        Unsafe.getUnsafe().putLong(colPtrArray, col0);
+        Unsafe.getUnsafe().putLong(colPtrArray + 8, col1);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, options);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(colPtrArray, 2, 0, 0, 0, expectedBuf, len);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support I4+F8 compare-only program", vector);
+            long actual = vector.filterRows(colPtrArray, 2, 0, 0, 0, outputBuf, len);
+
+            Assert.assertEquals("row count mismatch", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(col0, (long) len * Integer.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(col1, (long) len * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 16, MemoryTag.NATIVE_DEFAULT);
             Unsafe.free(outputBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
             Unsafe.free(expectedBuf, ((long) len + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
         }

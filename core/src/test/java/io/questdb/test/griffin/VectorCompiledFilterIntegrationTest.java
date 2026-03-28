@@ -161,6 +161,60 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
         });
     }
 
+    @Test
+    public void testAutoBackendMixedSizePredicateUsesVectorPath() throws Exception {
+        // Verifies that AUTO backend with mixed-size columns (I4 + F8) produces
+        // straight-line IR (no short-circuit) so the vector compiler can accept it.
+        assertMemoryLeak(() -> {
+            execute(
+                    "CREATE TABLE mixed AS (" +
+                            "SELECT rnd_long() l, rnd_double(0) d, rnd_int() i, timestamp_sequence(0, 1_000_000) ts " +
+                            "FROM long_sequence(1024)" +
+                            ") TIMESTAMP(ts)"
+            );
+
+            final String query = "SELECT count() FROM mixed WHERE i > 0 AND d < 0.5";
+
+            // Baseline: JIT disabled
+            long expectedCount;
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_DISABLED);
+            try (RecordCursorFactory factory = select(query)) {
+                Assert.assertFalse(factory.usesCompiledFilter());
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Assert.assertTrue(cursor.hasNext());
+                    expectedCount = cursor.getRecord().getLong(0);
+                }
+            }
+
+            // AUTO backend with mixed I4 + F8 (no I8): vector path should be taken
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_ENABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
+            try (RecordCursorFactory factory = select(query)) {
+                Assert.assertTrue("filter should be compiled", factory.usesCompiledFilter());
+                assertVectorCompiledFilter(factory);
+                assertVectorBytecodeUsed(factory);
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Assert.assertTrue(cursor.hasNext());
+                    Assert.assertEquals(expectedCount, cursor.getRecord().getLong(0));
+                }
+            }
+        });
+    }
+
+    private static void assertVectorBytecodeUsed(RecordCursorFactory factory) {
+        RecordCursorFactory current = factory;
+        while (current != null) {
+            if (current instanceof AsyncJitFilteredRecordCursorFactory ajf) {
+                if (ajf.getCompiledFilter() instanceof VectorCompiledFilter vcf) {
+                    Assert.assertTrue("expected vector bytecode, got scalar", vcf.usesVectorBytecode());
+                    return;
+                }
+            }
+            current = current.getBaseFactory();
+        }
+        Assert.fail("VectorCompiledFilter not found");
+    }
+
     private static void assertVectorCompiledFilter(RecordCursorFactory factory) {
         RecordCursorFactory current = factory;
         while (current != null) {
