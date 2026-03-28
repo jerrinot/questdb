@@ -296,6 +296,34 @@ public final class FilterHelpers {
     }
 
     /**
+     * I4 null-aware arithmetic. Preserves INT_NULL: if either operand is
+     * INT_NULL, the result is INT_NULL. Division by zero returns INT_NULL.
+     */
+    @SuppressWarnings("unchecked")
+    public static jdk.incubator.vector.IntVector intVecArithmeticNull(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs,
+            int opcode
+    ) {
+        jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL)
+                .or(rhs.eq(Numbers.INT_NULL));
+        if (opcode == DIV) {
+            jdk.incubator.vector.IntVector zero = jdk.incubator.vector.IntVector.zero(
+                    (jdk.incubator.vector.VectorSpecies<Integer>) lhs.species());
+            invalidMask = invalidMask.or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, zero));
+        }
+        jdk.incubator.vector.VectorMask<Integer> validMask = invalidMask.not();
+        jdk.incubator.vector.IntVector result = switch (opcode) {
+            case ADD -> lhs.add(rhs);
+            case SUB -> lhs.sub(rhs);
+            case MUL -> lhs.mul(rhs);
+            case DIV -> lhs.div(rhs, validMask);
+            default -> throw new UnsupportedOperationException("arith op: " + opcode);
+        };
+        return result.blend(Numbers.INT_NULL, invalidMask);
+    }
+
+    /**
      * F8 arithmetic with NaN propagation and div-by-zero → NaN.
      * Always used for double arithmetic regardless of null check mode,
      * because QuestDB requires NaN-on-zero-division (not IEEE infinity).
@@ -641,6 +669,20 @@ public final class FilterHelpers {
                         jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED, 0);
         // Replace null lanes with NaN
         return converted.blend(Double.NaN, isNull.cast(jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED));
+    }
+
+    public static jdk.incubator.vector.LongVector intToLongNullAware(
+            jdk.incubator.vector.IntVector src,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        // Detect INT_NULL lanes before conversion
+        jdk.incubator.vector.VectorMask<Integer> isNull = src.eq(Numbers.INT_NULL);
+        // Convert I2L — INT_NULL sign-extends to 0xFFFFFFFF80000000, not LONG_NULL
+        jdk.incubator.vector.LongVector converted = (jdk.incubator.vector.LongVector)
+                src.convertShape(jdk.incubator.vector.VectorOperators.I2L,
+                        nullVec.species(), 0);
+        // Replace sign-extended null lanes with LONG_NULL
+        return converted.blend(nullVec, isNull.cast(nullVec.species()));
     }
 
     public static jdk.incubator.vector.FloatVector intToFloatNullAware(

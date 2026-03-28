@@ -809,6 +809,56 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testIntArithmetic() throws Exception {
+        // (col0 + col0) > 10 — basic I4 arithmetic
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = i - 3;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 10, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(ADD, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
+    public void testIntArithmeticNullAware() throws Exception {
+        // (col0 + col0) > 10 with INT_NULL — null propagation
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = (i % 7 == 0) ? Numbers.INT_NULL : i - 3;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 10, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(ADD, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), INT_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testIntNegate() throws Exception {
+        // -col0 > 5 — I4 negation
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = i - 10;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 5, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(NEG, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
     public void testMixedLongIntDoubleBenchmarkShape() throws Exception {
         long[] longData = new long[ROW_COUNT];
         int[] intData = new int[ROW_COUNT];

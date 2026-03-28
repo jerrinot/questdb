@@ -134,7 +134,7 @@ public final class VectorBytecodeFilterCompiler {
     }
 
     private static boolean isSupportedArithmeticType(int type) {
-        return type == I8_TYPE || type == F8_TYPE || type == F4_TYPE;
+        return type == I8_TYPE || type == F8_TYPE || type == I4_TYPE || type == F4_TYPE;
     }
 
     private static boolean isSupportedCompareType(int type) {
@@ -151,8 +151,9 @@ public final class VectorBytecodeFilterCompiler {
         // Same-width casts: I8<->F8, I4<->F4
         if ((from == I8_TYPE && to == F8_TYPE) || (from == F8_TYPE && to == I8_TYPE)) return true;
         if ((from == I4_TYPE && to == F4_TYPE) || (from == F4_TYPE && to == I4_TYPE)) return true;
-        // Cross-width float casts: F4<->F8
+        // Cross-width casts: F4<->F8, I4<->I8
         if ((from == F4_TYPE && to == F8_TYPE) || (from == F8_TYPE && to == F4_TYPE)) return true;
+        if ((from == I4_TYPE && to == I8_TYPE) || (from == I8_TYPE && to == I4_TYPE)) return true;
         return false;
     }
 
@@ -1247,8 +1248,17 @@ public final class VectorBytecodeFilterCompiler {
             asm.iconst(a.opcode());
             asm.invokeStatic(pool.longVecArithmeticNull);
             asm.astore(tempSlots[a.dst()]);
+        } else if (ctx.nullChecks() && a.resultType() == I4_TYPE) {
+            // I4 with null checks: use helper for INT_NULL preservation
+            asm.aload(tempSlots[a.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.aload(tempSlots[a.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.iconst(a.opcode());
+            asm.invokeStatic(pool.intVecArithmeticNull);
+            asm.astore(tempSlots[a.dst()]);
         } else {
-            // I8 without null checks: raw vector arithmetic
+            // I8/I4 without null checks: raw vector arithmetic
             asm.aload(tempSlots[a.lhs()]);
             asm.checkcast(vt.vecClass);
             asm.aload(tempSlots[a.rhs()]);
@@ -1294,6 +1304,11 @@ public final class VectorBytecodeFilterCompiler {
             // Null-aware I4→F4: INT_NULL must become NaN, not -2.14e9.
             emitTypeSpecies(ctx, F4_TYPE);
             asm.invokeStatic(pool.intToFloatNullAware);
+        } else if (ctx.nullChecks() && c.fromType() == I4_TYPE && c.toType() == I8_TYPE) {
+            // Null-aware I4→I8: INT_NULL sign-extends to 0xFFFFFFFF80000000,
+            // not LONG_NULL. Detect and replace with proper LONG_NULL.
+            asm.aload(ctx.s().nullVecSlot());
+            asm.invokeStatic(pool.intToLongNullAware);
         } else {
             asm.getstatic(pool.conversionOp(c.fromType(), c.toType()));
             // For I4/F4 targets, use the narrowed species (matching Long lane count)
@@ -1348,7 +1363,7 @@ public final class VectorBytecodeFilterCompiler {
         private final int opEQ, opNE, opLT, opLE, opGT, opGE;
 
         // VectorOperators conversion fields
-        private final int convI2F, convF2I, convL2D, convD2L, convF2D, convD2F;
+        private final int convI2F, convF2I, convL2D, convD2L, convF2D, convD2F, convI2L, convL2I;
 
         // Null-aware comparison helpers (I8 and I4)
         private final int longNullLt, longNullLe, longNullGt, longNullGe;
@@ -1359,10 +1374,12 @@ public final class VectorBytecodeFilterCompiler {
         private final int floatVecEq, floatVecNe, floatVecLt, floatVecLe, floatVecGt, floatVecGe;
         // Arithmetic helpers
         final int longVecArithmeticNull;
+        final int intVecArithmeticNull;
         final int doubleVecArithmetic;
         final int floatVecArithmetic;
         // Null-aware cast helpers
         final int longToDoubleNullAware;
+        final int intToLongNullAware;
         final int intToFloatNullAware;
 
         // LongVector-specific (always needed for row-ID output)
@@ -1468,12 +1485,16 @@ public final class VectorBytecodeFilterCompiler {
             // --- FilterHelpers: arithmetic and cast ---
             longVecArithmeticNull = asm.poolMethod(helpersCls, "longVecArithmeticNull",
                     "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;I)Ljdk/incubator/vector/LongVector;");
+            intVecArithmeticNull = asm.poolMethod(helpersCls, "intVecArithmeticNull",
+                    "(Ljdk/incubator/vector/IntVector;Ljdk/incubator/vector/IntVector;I)Ljdk/incubator/vector/IntVector;");
             doubleVecArithmetic = asm.poolMethod(helpersCls, "doubleVecArithmetic",
                     "(Ljdk/incubator/vector/DoubleVector;Ljdk/incubator/vector/DoubleVector;I)Ljdk/incubator/vector/DoubleVector;");
             floatVecArithmetic = asm.poolMethod(helpersCls, "floatVecArithmetic",
                     "(Ljdk/incubator/vector/FloatVector;Ljdk/incubator/vector/FloatVector;I)Ljdk/incubator/vector/FloatVector;");
             longToDoubleNullAware = asm.poolMethod(helpersCls, "longToDoubleNullAware",
                     "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;)Ljdk/incubator/vector/DoubleVector;");
+            intToLongNullAware = asm.poolMethod(helpersCls, "intToLongNullAware",
+                    "(Ljdk/incubator/vector/IntVector;Ljdk/incubator/vector/LongVector;)Ljdk/incubator/vector/LongVector;");
             intToFloatNullAware = asm.poolMethod(helpersCls, "intToFloatNullAware",
                     "(Ljdk/incubator/vector/IntVector;" + sSpec + ")Ljdk/incubator/vector/FloatVector;");
 
@@ -1519,6 +1540,8 @@ public final class VectorBytecodeFilterCompiler {
             convD2L = poolStaticField(asm, vecOpsCls, "D2L", convType);
             convF2D = poolStaticField(asm, vecOpsCls, "F2D", convType);
             convD2F = poolStaticField(asm, vecOpsCls, "D2F", convType);
+            convI2L = poolStaticField(asm, vecOpsCls, "I2L", convType);
+            convL2I = poolStaticField(asm, vecOpsCls, "L2I", convType);
 
             // --- Per-type VecType pools ---
             String sLVec = "Ljdk/incubator/vector/LongVector;";
@@ -1628,6 +1651,8 @@ public final class VectorBytecodeFilterCompiler {
             if (fromType == F8_TYPE && toType == I8_TYPE) return convD2L;
             if (fromType == F4_TYPE && toType == F8_TYPE) return convF2D;
             if (fromType == F8_TYPE && toType == F4_TYPE) return convD2F;
+            if (fromType == I4_TYPE && toType == I8_TYPE) return convI2L;
+            if (fromType == I8_TYPE && toType == I4_TYPE) return convL2I;
             throw new UnsupportedOperationException("conversion: " + fromType + " -> " + toType);
         }
 
