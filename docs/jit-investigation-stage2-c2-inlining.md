@@ -95,6 +95,46 @@ The redundant `activeMask.cast(LongVector.SPECIES_PREFERRED)` for the I8
 column load (same species → no-op) is also inlined and should be eliminated
 by C2 as dead code.
 
+## Filter 3: `l IN (1, 2, 3, 4, 5)` (pure I8, straight-line OR)
+
+### Compilation status
+
+| Method | Bytecode size | C2 tier | OSR | Notes |
+|--------|--------------|---------|-----|-------|
+| `filterRows` | 542 bytes | 4 | Yes (@ 163) | Tier-3 compile initially skipped due register pressure |
+| `countRows` | 484 bytes | 4 | Yes (@ 145) | Tier-3 compile initially skipped due register pressure |
+
+Observed C2 log lines:
+
+```text
+io.questdb.jit.vgen/...::filterRows (542 bytes)
+  COMPILE SKIPPED: out of virtual registers in linear scan (retry at different tier)
+
+io.questdb.jit.vgen/...::countRows (484 bytes)
+  COMPILE SKIPPED: out of virtual registers in linear scan (retry at different tier)
+```
+
+This is the first strong backend-specific signal that the current vector
+bytecode shape is stressing HotSpot's register allocator for the five-way
+`IN()` OR chain.
+
+### Inlining status — hot loop operations
+
+| Operation | Inlined? | Notes |
+|-----------|----------|-------|
+| `indexInRange` | Yes | force inline by annotation |
+| 5x `LongVector.fromMemorySegment` | Yes | intrinsic path preserved for every load |
+| 5x `LongVector.compare(EQ, ...)` | Yes | intrinsic path preserved |
+| 4x `VectorMask.or` | Yes | force inline by annotation |
+| `VectorMask.trueCount` | Yes | intrinsic path preserved |
+| `LongVector.add(long)` | Yes | force inline by annotation |
+| `LongVector.compress(mask)` | Yes | force inline by annotation |
+| `FilterHelpers.writeCompressedRows` | Yes | inline (hot) |
+
+So the `IN()` gap is not caused by failed inlining. The generated method is
+large enough and wide enough in live values that HotSpot struggles with
+register allocation before eventually producing tier-4 code.
+
 ## Key findings
 
 1. **No inlining failures in the hot loop.** All Vector API operations and
@@ -108,11 +148,18 @@ by C2 as dead code.
    resolve to `VectorSupport` intrinsics and are late-inlined by C2.
 
 4. **Method sizes are safe.** 214 bytes (pure I8) and 313 bytes (mixed
-   I8+F8) are far below the 8KB threshold.
+   I8+F8) are far below the 8KB threshold. `IN()` is bigger at 542 / 484
+   bytes, but still nowhere near HugeMethodLimit.
 
 5. **The only failed inline is `reinterpretInternal` (61 bytes)** —
    `MemorySegment.reinterpret()` in the setup path. This runs once per
    `filterRows()` call (not per chunk) and is a negligible cost.
+
+6. **`IN()` exposes real register-pressure costs.** The first tier-3 C2
+   attempts for both generated `IN()` methods are skipped with `out of
+   virtual registers in linear scan`. That does not block tier-4 codegen,
+   but it is hard evidence that the current five-broadcast / five-compare /
+   OR-chain shape is materially heavier for HotSpot than the simpler filters.
 
 ## Implications for the performance gap
 
@@ -127,6 +174,7 @@ The gap must come from either:
   (register allocation, spills, instruction selection)
 - fundamental Vector API overhead (MemorySegment access path, mask
   handling, compress intrinsic quality)
+- register pressure in larger straight-line vector programs such as `IN()`
 - row-ID compaction strategy differences (compress+masked store vs.
   native scatter/pack)
 - or simply that native SIMD has less overhead per loop iteration

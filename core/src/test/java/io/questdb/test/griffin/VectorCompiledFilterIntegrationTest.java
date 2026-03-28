@@ -53,11 +53,10 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
             try (RecordCursorFactory factory = select(query)) {
                 Assert.assertTrue(factory.usesCompiledFilter());
                 assertVectorCompiledFilter(factory);
-                final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
                 try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
                     CursorPrinter.println(cursor, factory.getMetadata(), sink);
                 }
-                assertVectorApiExecutedIfSelected(query, factory, vectorApiExecutionCount);
+                assertBytecodeCompiledIfJava(query, factory);
             }
         });
     }
@@ -90,11 +89,10 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
             try (RecordCursorFactory factory = select(query)) {
                 Assert.assertTrue(factory.usesCompiledFilter());
                 assertVectorCompiledFilter(factory);
-                final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
                 try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
                     CursorPrinter.println(cursor, factory.getMetadata(), actualSink);
                 }
-                assertVectorApiExecutedIfSelected(query, factory, vectorApiExecutionCount);
+                assertBytecodeCompiledIfJava(query, factory);
             }
             TestUtils.assertEquals("vector backend result mismatch", sink, actualSink);
 
@@ -111,12 +109,11 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
             sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_FORCE_VECTOR);
             try (RecordCursorFactory factory = select(countQuery)) {
                 Assert.assertTrue(factory.usesCompiledFilter());
-                final long vectorApiExecutionCount = getVectorApiExecutionCountIfSelected(factory);
                 try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
                     Assert.assertTrue(cursor.hasNext());
                     Assert.assertEquals(expectedCount, cursor.getRecord().getLong(0));
                 }
-                assertVectorApiExecutedIfSelected(countQuery, factory, vectorApiExecutionCount);
+                assertBytecodeCompiledIfJava(countQuery, factory);
             }
         });
     }

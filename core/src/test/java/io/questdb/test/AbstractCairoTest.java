@@ -2181,29 +2181,21 @@ public abstract class AbstractCairoTest extends AbstractTest {
         }
     }
 
-    // Legacy name kept to minimize churn across callers in integration/regression tests.
-    // With the interpreter removed, this asserts bytecode compilation instead.
-    protected final void assertVectorApiExecutedIfSelected(
-            CharSequence sql,
-            RecordCursorFactory factory,
-            long beforeExecutionCount
-    ) {
-        if (beforeExecutionCount >= 0) {
-            assertBytecodeCompiledIfJava(sql, factory);
-        }
-    }
-
-    // Legacy name kept to minimize churn across callers.
-    // Returns 0 (enabling assertion) when a Java compiled filter is active, -1 otherwise.
-    protected final long getVectorApiExecutionCountIfSelected(RecordCursorFactory factory) {
+    /**
+     * Returns {@code true} when the factory uses a Java bytecode-compiled filter
+     * (vector or scalar), {@code false} when using native CPP or no JIT filter.
+     * Callers use this to conditionally assert that the Java compiler path ran.
+     */
+    protected final boolean isJavaBytecodeFilterActive(RecordCursorFactory factory) {
         final JitFilter compiledFilter = findCompiledFilter(factory);
-        if (compiledFilter instanceof VectorCompiledFilter) {
-            return 0;
-        }
-        return -1;
+        return compiledFilter instanceof VectorCompiledFilter;
     }
 
-    private void assertBytecodeCompiledIfJava(CharSequence sql, RecordCursorFactory factory) {
+    /**
+     * Asserts that, if a Java bytecode filter is active, the bytecode compilation
+     * actually succeeded (i.e. {@link VectorCompiledFilter#usesBytecode()} is true).
+     */
+    protected final void assertBytecodeCompiledIfJava(CharSequence sql, RecordCursorFactory factory) {
         final JitFilter compiledFilter = findCompiledFilter(factory);
         if (compiledFilter instanceof VectorCompiledFilter vcf) {
             Assert.assertTrue("bytecode was not compiled for query: " + sql, vcf.usesBytecode());

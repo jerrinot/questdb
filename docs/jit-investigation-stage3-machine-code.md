@@ -118,6 +118,101 @@ From the original bytecode, C2 eliminated:
    edge), adding one instruction per loop iteration. This is unavoidable
    in JVM hot loops.
 
+## Filter: `l IN (1, 2, 3, 4, 5)` (pure I8, straight-line OR)
+
+### C2 output summary
+
+HotSpot emits a real vectorized `IN()` loop for both row-ID and count-only
+paths. The loop is not scalarized and still uses AVX-512 `ZMM` registers.
+
+The key new facts versus the simpler `l > 42` filter are:
+
+- the hot loop performs **5 separate masked loads** of the same column per
+  chunk
+- it performs **5 separate equality compares**
+- it accumulates the result with **4 `korb` mask ORs**
+- both generated methods were first seen by C2 as
+  `COMPILE SKIPPED: out of virtual registers in linear scan`
+
+### filterRows hot loop — observed sequence
+
+Excerpt from the tier-4 dump:
+
+```asm
+vmovdqu64   (%r11), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm4, %zmm0, %k7
+
+vmovdqu64   (%r11), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm8, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r11), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm7, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r11), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm6, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r10), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm5, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+kmovq       %k7, %r11
+popcntq     %r11, %r10
+vpbroadcastq %r13, %zmm0
+vpaddq      %zmm0, %zmm3, %zmm0
+vpcompressq %zmm0, %zmm10 {%k7} {z}
+```
+
+This confirms that the bytecode-level repeated `MEM col0` operations survive
+all the way into machine code. C2 does **not** collapse the five loads into a
+single load plus multiple compares.
+
+### countRows hot loop — observed sequence
+
+Excerpt from the tier-4 dump:
+
+```asm
+vmovdqu64   (%r8), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm2, %zmm0, %k7
+
+vmovdqu64   (%rcx), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm6, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r8), %zmm8 {%k4} {z}
+vpcmpeqq    %zmm9, %zmm8, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r8), %zmm8 {%k4} {z}
+vpcmpeqq    %zmm4, %zmm8, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r9), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm3, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+kmovq       %k7, %r9
+popcntq     %r9, %rcx
+addq        %rdi, %r9
+```
+
+The count-only `IN()` path still uses **per-chunk `popcnt`**. It does not
+adopt the native AVX2 strategy of accumulating mask results in a vector and
+doing one horizontal reduction after the main loop.
+
+### What this means
+
+1. **Repeated loads are real**, not just a bytecode artifact.
+2. **Register pressure is also real.** The five broadcast constants plus the
+   live mask/iota/setup state are enough to trigger the linear-scan
+   register-pressure warning before tier-4 retry.
+3. **The Java `IN()` gap is not explained by lack of vectorization.** The
+   loop is fully vectorized, but it is still a heavy straight-line program.
+4. **Count-only has a separate weakness.** The Java path pays `popcnt`
+   every chunk, while the native count-only backend accumulates in-vector.
+
 ## Comparison with expected native AVX2/AVX-512 equivalent
 
 For reference, the ideal native AVX-512 loop for `col > 42` would be:
@@ -150,12 +245,17 @@ Possible remaining sources of the gap:
 1. **Safepoint poll overhead** — ~3-5% for simple filters, unavoidable
 2. **MemorySegment setup cost** — per-call segment construction and bounds
    checking (before the loop)
-3. **Row-ID compaction strategy** — the native backend may use a different
-   output strategy (e.g., direct scatter, or different buffering)
-4. **Benchmark mode differences** — the JMH benchmark may measure the full
+3. **Register pressure in larger vectorized programs** — confirmed for `IN()`
+   by `out of virtual registers in linear scan`
+4. **Repeated column loads for straight-line `IN()`** — confirmed to survive
+   into machine code
+5. **Row-ID compaction strategy** — still needs direct side-by-side review
+   against the native loop
+6. **Benchmark mode differences** — the JMH benchmark may measure the full
    call path including segment setup, not just the hot loop
 
-**Stage 4 (native comparison) will quantify these differences.**
+**Stage 4 (native comparison) must now distinguish simple-predicate gaps from
+`IN()`-specific gaps.**
 
 ## Reproduction
 

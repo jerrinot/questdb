@@ -180,11 +180,148 @@ Not yet dumped. Both I8 and F8 are 8 bytes, so `exec_hint = 1`
 (single-size). The native backend should use SIMD for this filter too.
 To be captured in a follow-up.
 
-## Filter 3: `l IN (1, 2, 3, 4, 5)`
+## Filter 3: `l IN (1, 2, 3, 4, 5)` (pure I8, straight-line OR)
 
-Not yet dumped. For single-size columns, the IR serializer emits
-straight-line `EQ` + `OR` ops (no short-circuit). Both native and Java
-paths should vectorize this. To be captured in a follow-up.
+### Native SIMD (AVX2) — actual asmjit dump
+
+filterRows hot loop:
+
+```asm
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm4, ymm0, ymm11
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm3, ymm0, ymm10
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm2, ymm0, ymm9
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm1, ymm0, ymm8
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm0, ymm0, ymm7
+vpor       ymm0, ymm0, ymm1
+vpor       ymm0, ymm0, ymm2
+vpor       ymm0, ymm0, ymm3
+vpor       ymm0, ymm0, ymm4
+vmovmskpd  esi, ymm0
+test       esi, esi
+jz         L5
+; compress_register:
+vpmovmskb  ecx, ymm0
+pext       edx, 1985229328, ecx
+pdep       rdx, rdx, 1085102592571150095
+vpmovzxbd  ymm0, xmm0
+vpermps    ymm0, ymm0, ymm5
+vmovdqu    ymmword ptr [r9+rax*8], ymm0
+popcnt     esi, esi
+add        rax, rsi
+```
+
+countRows hot loop:
+
+```asm
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm5, ymm0, ymm10
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm4, ymm0, ymm9
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm2, ymm0, ymm8
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm1, ymm0, ymm7
+vmovdqu    ymm0, ymmword ptr [rbx+r8*8]
+vpcmpeqq   ymm0, ymm0, ymm6
+vpor       ymm0, ymm0, ymm1
+vpor       ymm0, ymm0, ymm2
+vpor       ymm0, ymm0, ymm4
+vpor       ymm0, ymm0, ymm5
+vpsubq     ymm3, ymm3, ymm0
+```
+
+The native `IN()` path therefore also reloads the same column once per value.
+That matters: repeated loads are an optimization opportunity, but they are **not
+the main explanation of the Java-vs-native gap**, because both backends do it.
+
+### Java Vector Bytecode (AVX-512) — actual tier-4 dump
+
+filterRows hot loop:
+
+```asm
+vmovdqu64   (%r11), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm4, %zmm0, %k7
+
+vmovdqu64   (%r11), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm8, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r11), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm7, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r11), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm6, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r10), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm5, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+kmovq       %k7, %r11
+popcntq     %r11, %r10
+vpbroadcastq %r13, %zmm0
+vpaddq      %zmm0, %zmm3, %zmm0
+vpcompressq %zmm0, %zmm10 {%k7} {z}
+```
+
+countRows hot loop:
+
+```asm
+vmovdqu64   (%r8), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm2, %zmm0, %k7
+
+vmovdqu64   (%rcx), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm6, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r8), %zmm8 {%k4} {z}
+vpcmpeqq    %zmm9, %zmm8, %k6
+korb        %k6, %k7, %k7
+
+vmovdqu64   (%r9), %zmm0 {%k4} {z}
+vpcmpeqq    %zmm3, %zmm0, %k6
+korb        %k6, %k7, %k7
+
+kmovq       %k7, %r9
+popcntq     %r9, %rcx
+```
+
+C2 also reports, for both generated `IN()` methods:
+
+```text
+COMPILE SKIPPED: out of virtual registers in linear scan (retry at different tier)
+```
+
+### Side-by-side comparison for `IN()`
+
+| Aspect | Native AVX2 | Java AVX-512 |
+|--------|-------------|--------------|
+| Vector width | 256-bit / 4 longs | 512-bit / 8 longs |
+| Column loads per chunk | 5 | 5 |
+| Compares per chunk | 5 `vpcmpeqq` | 5 `vpcmpeqq` |
+| Mask OR chain | 4 `vpor` | 4 `korb` |
+| Row compaction | `vmovmskpd` + `pext` + `pdep` + `vpermps` | `kmovq` + `vpcompressq` |
+| Count-only reduction | vector accumulation (`vpsubq`) | per-chunk `popcntq` |
+| Setup path | raw pointers | `MemorySegment` construction and checks |
+| Register-pressure warning | none observed | yes, from C2 linear scan |
+
+### What changed in the investigation
+
+1. **`IN()` is definitely vectorized on both sides.**
+2. **Both backends reload the column once per compare.** Column-load
+   deduplication is still worth doing, but it no longer explains the relative
+   benchmark gap by itself.
+3. **Java's two clearest backend-specific disadvantages are now visible:**
+   - heavier setup through `MemorySegment`
+   - higher register pressure in the five-way straight-line OR shape
+4. **Count-only is structurally weaker on Java for `IN()`.** Native uses
+   vector accumulation; Java still does `popcnt` every chunk.
 
 ## Reproduction
 

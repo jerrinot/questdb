@@ -136,14 +136,15 @@ compiler tests.
 ### ~~3. Default integration path~~ RESOLVED
 
 AUTO uses compiled backends: vectorized bytecode → scalar bytecode.
-`JitBackend.JAVA_INTERPRETED` has been removed. The interpreter class
-`VectorFilterInterpreter` still exists but is unreferenced by any
-production or test code.
+`JitBackend.JAVA_INTERPRETED` has been removed. `VectorFilterInterpreter`
+and `VectorApiFilterExecutor` have been deleted from the codebase.
 
 ### ~~4. Test harness observability~~ RESOLVED
 
-`AbstractCairoTest.getVectorApiExecutionCountIfSelected()` and
-`assertVectorApiExecutedIfSelected()` no longer reference the interpreter.
-They check `VectorCompiledFilter.usesBytecode()` to verify the bytecode
-path is active. `VectorCompiledFilterTest` asserts `usesBytecode()` and
+Legacy-named methods `getVectorApiExecutionCountIfSelected()` and
+`assertVectorApiExecutedIfSelected()` have been replaced with
+`isJavaBytecodeFilterActive()` and `assertBytecodeCompiledIfJava()`.
+Callers in `CompiledFilterRegressionTest` and
+`VectorCompiledFilterIntegrationTest` now use the new names directly.
+`VectorCompiledFilterTest` asserts `usesBytecode()` and
 `usesVectorBytecode()` instead of the removed `usesVectorApi()`.
