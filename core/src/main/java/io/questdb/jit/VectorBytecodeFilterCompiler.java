@@ -121,7 +121,7 @@ public final class VectorBytecodeFilterCompiler {
         }
         for (int i = 0; i < block.getOpCount(); i++) {
             LoweredOp op = block.getOp(i);
-            if (op instanceof LoweredOp.CompareI128) return false;
+            // CompareI128 is supported (UUID EQ/NE only)
             if (op instanceof LoweredOp.LoadColumn lc && !isSupportedLoadType(lc.type())) return false;
             if (op instanceof LoweredOp.LoadVar lv && !isSupportedLoadType(lv.type())) return false;
             if (op instanceof LoweredOp.LoadImm li && !isSupportedLoadType(li.type())) return false;
@@ -143,7 +143,7 @@ public final class VectorBytecodeFilterCompiler {
 
     private static boolean isSupportedLoadType(int type) {
         return type == I8_TYPE || type == F8_TYPE || type == I4_TYPE || type == F4_TYPE
-                || type == I1_TYPE || type == I2_TYPE;
+                || type == I1_TYPE || type == I2_TYPE || type == I16_TYPE;
     }
 
     private static boolean isSupportedCast(LoweredOp.Cast c) {
@@ -246,6 +246,7 @@ public final class VectorBytecodeFilterCompiler {
             case I2_TYPE -> 2;
             case I4_TYPE, F4_TYPE -> 4;
             case I8_TYPE, F8_TYPE -> 8;
+            case I16_TYPE -> 16;
             default -> throw new UnsupportedOperationException("element size for type: " + type);
         };
     }
@@ -366,7 +367,8 @@ public final class VectorBytecodeFilterCompiler {
             Pool pool,
             SlotLayout s,
             boolean nullChecks,
-            boolean pureF8
+            boolean pureF8,
+            LoweredBlock block
     ) {}
 
     // === Method emission ===
@@ -383,8 +385,8 @@ public final class VectorBytecodeFilterCompiler {
         boolean needsNullVec = nullChecks && !pureF8;
 
         SlotLayout s = SlotLayout.allocate(firstFree, tempCount, shape, isCountOnly, nullChecks);
-        EmitContext ctx = new EmitContext(asm, pool, s, nullChecks, pureF8);
         LoweredBlock block = program.getBlock(program.getEntryBlockId());
+        EmitContext ctx = new EmitContext(asm, pool, s, nullChecks, pureF8, block);
         int[] useCounts = computeUseCounts(block, tempCount);
         Terminator.Return ret = (Terminator.Return) block.getTerminator();
 
@@ -524,9 +526,9 @@ public final class VectorBytecodeFilterCompiler {
         // hot loop. These values don't change between iterations.
         for (int i = 0; i < block.getOpCount(); i++) {
             LoweredOp op = block.getOp(i);
-            if (op instanceof LoweredOp.LoadImm li) {
+            if (op instanceof LoweredOp.LoadImm li && li.type() != I16_TYPE) {
                 emitLoadImm(ctx, li);
-            } else if (op instanceof LoweredOp.LoadVar lv) {
+            } else if (op instanceof LoweredOp.LoadVar lv && lv.type() != I16_TYPE) {
                 emitLoadVar(ctx, lv);
             }
         }
@@ -901,7 +903,15 @@ public final class VectorBytecodeFilterCompiler {
                 i = consumed;
                 continue;
             }
+            if (op instanceof LoweredOp.LoadImm li && li.type() == I16_TYPE) {
+                // I16 immediates are consumed directly by CompareI128
+                continue;
+            }
             if (op instanceof LoweredOp.LoadImm || op instanceof LoweredOp.LoadVar) {
+                continue;
+            }
+            if (op instanceof LoweredOp.LoadColumn lc && lc.type() == I16_TYPE) {
+                // I16 column loads are consumed directly by CompareI128
                 continue;
             }
             if (op instanceof LoweredOp.LoadColumn lc) {
@@ -1086,6 +1096,7 @@ public final class VectorBytecodeFilterCompiler {
                 asm.astore(tempSlots[m.dst()]);
             }
             case LoweredOp.Cast c -> emitCast(ctx, c);
+            case LoweredOp.CompareI128 c128 -> emitCompareI128(ctx, c128);
             default -> throw new UnsupportedOperationException("Vector op: " + op);
         }
     }
@@ -1291,6 +1302,69 @@ public final class VectorBytecodeFilterCompiler {
         asm.astore(tempSlots[n.dst()]);
     }
 
+    private static void emitCompareI128(EmitContext ctx, LoweredOp.CompareI128 c128) {
+        BytecodeAssembler asm = ctx.asm();
+        Pool pool = ctx.pool();
+        SlotLayout s = ctx.s();
+        int[] tempSlots = s.tempSlots();
+        LoweredBlock block = ctx.block();
+
+        // Look up source ops for lhs and rhs by scanning the block
+        LoweredOp lhsOp = findOpByDst(block, c128.lhs());
+        LoweredOp rhsOp = findOpByDst(block, c128.rhs());
+
+        // Push species FIRST — it stays underneath while the i128 helper runs.
+        // After the helper returns long, the stack is [VectorSpecies, long]
+        // which matches VectorMask.fromLong(VectorSpecies, long).
+        asm.aload(s.speciesSlot());
+
+        if (lhsOp instanceof LoweredOp.LoadColumn lc && rhsOp instanceof LoweredOp.LoadImm li) {
+            asm.lload(SLOT_DATA_ADDR);
+            asm.iconst(lc.columnIndex());
+            asm.lload(s.rowSlot());
+            asm.aload(s.speciesSlot());
+            asm.invokeInterface(pool.speciesLength, 0);
+            asm.ldc2_w(pool.ensureLongPooled(li.lo()));
+            asm.ldc2_w(pool.ensureLongPooled(li.hi()));
+            asm.iconst(c128.opcode());
+            asm.invokeStatic(pool.i128CompareColumnImm);
+        } else if (lhsOp instanceof LoweredOp.LoadColumn lc && rhsOp instanceof LoweredOp.LoadVar lv) {
+            asm.lload(SLOT_DATA_ADDR);
+            asm.iconst(lc.columnIndex());
+            asm.lload(s.rowSlot());
+            asm.aload(s.speciesSlot());
+            asm.invokeInterface(pool.speciesLength, 0);
+            asm.lload(SLOT_VARS_ADDR);
+            asm.ldc(pool.ensureIntPooled((int) lv.byteOffset()));
+            asm.iconst(c128.opcode());
+            asm.invokeStatic(pool.i128CompareColumnVar);
+        } else if (lhsOp instanceof LoweredOp.LoadColumn lc1 && rhsOp instanceof LoweredOp.LoadColumn lc2) {
+            asm.lload(SLOT_DATA_ADDR);
+            asm.iconst(lc1.columnIndex());
+            asm.iconst(lc2.columnIndex());
+            asm.lload(s.rowSlot());
+            asm.aload(s.speciesSlot());
+            asm.invokeInterface(pool.speciesLength, 0);
+            asm.iconst(c128.opcode());
+            asm.invokeStatic(pool.i128CompareColumns);
+        } else {
+            throw new UnsupportedOperationException("I128 compare: unsupported operand combination");
+        }
+        // Stack: [VectorSpecies, long] → fromLong(VectorSpecies, long) → VectorMask
+        asm.invokeStatic(pool.maskFromLong);
+        asm.astore(tempSlots[c128.dst()]);
+    }
+
+    private static LoweredOp findOpByDst(LoweredBlock block, int tempId) {
+        for (int i = 0; i < block.getOpCount(); i++) {
+            LoweredOp op = block.getOp(i);
+            if (op instanceof LoweredOp.LoadColumn lc && lc.dst() == tempId) return op;
+            if (op instanceof LoweredOp.LoadImm li && li.dst() == tempId) return op;
+            if (op instanceof LoweredOp.LoadVar lv && lv.dst() == tempId) return op;
+        }
+        throw new IllegalStateException("I128 source temp " + tempId + " not found");
+    }
+
     private static void emitArithmetic(EmitContext ctx, LoweredOp.Arithmetic a) {
         BytecodeAssembler asm = ctx.asm();
         Pool pool = ctx.pool();
@@ -1469,6 +1543,12 @@ public final class VectorBytecodeFilterCompiler {
         final int gatherStringHeaders;
         final int gatherBinaryHeaders;
         final int gatherVarcharHeaders;
+        // I128 (UUID) comparison helpers
+        final int i128CompareColumnImm;
+        final int i128CompareColumnVar;
+        final int i128CompareColumns;
+        // VectorMask.fromLong (for I128 bitmask → mask conversion)
+        final int maskFromLong;
 
         // LongVector-specific (always needed for row-ID output)
         final int longVecAddScalar;
@@ -1597,6 +1677,17 @@ public final class VectorBytecodeFilterCompiler {
                     "(JJI" + "J" + sSpec + ")Ljdk/incubator/vector/LongVector;");
             gatherVarcharHeaders = asm.poolMethod(helpersCls, "gatherVarcharHeaders",
                     "(JI" + "J" + sSpec + ")Ljdk/incubator/vector/LongVector;");
+
+            // --- FilterHelpers: I128 (UUID) comparisons ---
+            i128CompareColumnImm = asm.poolMethod(helpersCls, "i128CompareColumnImm",
+                    "(JIJIJJI)J");
+            i128CompareColumnVar = asm.poolMethod(helpersCls, "i128CompareColumnVar",
+                    "(JIJIJII)J");
+            i128CompareColumns = asm.poolMethod(helpersCls, "i128CompareColumns",
+                    "(JIIJII)J");
+
+            // --- VectorMask.fromLong (static method) ---
+            maskFromLong = asm.poolMethod(vecMaskCls, "fromLong", "(" + sSpec + "J)" + sMask);
 
             // --- VectorSpecies (interface) ---
             speciesIndexInRange = asm.poolInterfaceMethod(vecSpeciesCls, "indexInRange", "(JJ)" + sMask);
@@ -1847,12 +1938,19 @@ public final class VectorBytecodeFilterCompiler {
                             case I8_TYPE -> doPoolLong(asm, li.lo());
                             case F8_TYPE -> doPoolDouble(asm, Double.longBitsToDouble(li.lo()));
                             case F4_TYPE -> doPoolFloat(asm, Float.intBitsToFloat((int) li.lo()));
+                            case I16_TYPE -> {
+                                doPoolLong(asm, li.lo());
+                                doPoolLong(asm, li.hi());
+                            }
                         }
                     }
                     if (op instanceof LoweredOp.LoadVar lv) {
                         doPoolLong(asm, lv.byteOffset());
+                        if (lv.type() == I16_TYPE) {
+                            doPoolInt(asm, (int) lv.byteOffset());
+                        }
                     }
-                    if (op instanceof LoweredOp.LoadColumn lc) {
+                    if (op instanceof LoweredOp.LoadColumn lc && lc.type() != I16_TYPE) {
                         doPoolLong(asm, elementBytes(lc.type()));
                     }
                 }

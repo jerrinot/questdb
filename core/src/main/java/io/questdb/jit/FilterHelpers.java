@@ -690,6 +690,81 @@ public final class FilterHelpers {
         return jdk.incubator.vector.LongVector.fromArray(species, buf, 0);
     }
 
+    // --- Vectorized I128 (UUID) comparison ---
+
+    /**
+     * Compares a UUID column against an immediate UUID value across a chunk of rows.
+     * Returns a bitmask where bit i is set if row (startRow+i) matches.
+     * The caller converts this to VectorMask via VectorMask.fromLong().
+     */
+    public static long i128CompareColumnImm(
+            long dataAddress, int colIdx, long startRow, int count,
+            long immLo, long immHi, int opcode
+    ) {
+        long bits = 0;
+        long colAddr = UNSAFE.getLong(dataAddress + ((long) colIdx << 3));
+        for (int i = 0; i < count; i++) {
+            long lo, hi;
+            if (colAddr == 0) {
+                lo = 0;
+                hi = 0;
+            } else {
+                long offset = (startRow + i) << 4;
+                lo = UNSAFE.getLong(colAddr + offset);
+                hi = UNSAFE.getLong(colAddr + offset + 8);
+            }
+            boolean match = (opcode == EQ)
+                    ? (lo == immLo && hi == immHi)
+                    : (lo != immLo || hi != immHi);
+            if (match) {
+                bits |= (1L << i);
+            }
+        }
+        return bits;
+    }
+
+    /**
+     * Compares a UUID column against a bind variable UUID value.
+     */
+    public static long i128CompareColumnVar(
+            long dataAddress, int colIdx, long startRow, int count,
+            long varsAddress, int varByteOffset, int opcode
+    ) {
+        long immLo = UNSAFE.getLong(varsAddress + varByteOffset);
+        long immHi = UNSAFE.getLong(varsAddress + varByteOffset + 8);
+        return i128CompareColumnImm(dataAddress, colIdx, startRow, count, immLo, immHi, opcode);
+    }
+
+    /**
+     * Compares two UUID columns.
+     */
+    public static long i128CompareColumns(
+            long dataAddress, int colIdx1, int colIdx2, long startRow, int count,
+            int opcode
+    ) {
+        long bits = 0;
+        long colAddr1 = UNSAFE.getLong(dataAddress + ((long) colIdx1 << 3));
+        long colAddr2 = UNSAFE.getLong(dataAddress + ((long) colIdx2 << 3));
+        for (int i = 0; i < count; i++) {
+            long lo1, hi1, lo2, hi2;
+            if (colAddr1 == 0) { lo1 = 0; hi1 = 0; } else {
+                long off = (startRow + i) << 4;
+                lo1 = UNSAFE.getLong(colAddr1 + off);
+                hi1 = UNSAFE.getLong(colAddr1 + off + 8);
+            }
+            if (colAddr2 == 0) { lo2 = 0; hi2 = 0; } else {
+                long off = (startRow + i) << 4;
+                lo2 = UNSAFE.getLong(colAddr2 + off);
+                hi2 = UNSAFE.getLong(colAddr2 + off + 8);
+            }
+            boolean match = (opcode == EQ)
+                    ? (lo1 == lo2 && hi1 == hi2)
+                    : (lo1 != lo2 || hi1 != hi2);
+            if (match) bits |= (1L << i);
+        }
+        return bits;
+    }
+
     // --- Bind variable reads ---
 
     public static byte readVarByte(long varsAddress, int byteOffset) {
