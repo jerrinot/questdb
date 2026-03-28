@@ -36,14 +36,17 @@ Changes:
 
 ### ~~Medium: the row-id path does redundant per-chunk work~~ RESOLVED
 
-`writeCompressedRows()` now takes `matchCount` as an `int` parameter instead
-of computing `trueCount()` internally. Total `trueCount()` calls per chunk
-reduced from 3 (skip + helper + counter) to 2 (skip + counter).
+`matchCount` is now computed once via `mask.trueCount()` and stored in a
+dedicated `int` local (`matchCountSlot`). The stored value is reused for
+the skip branch (`ifeq`), the `writeCompressedRows` masked store parameter,
+and the `filteredCount += matchCount` update. Total `trueCount()` calls per
+chunk reduced from 3 to 1.
 
-The extra F8 mask cast before `compress()` is necessary for the Long compress
-operation and cannot be removed. However, for pure F8 programs the compare
-result is now already `VectorMask<Double>`, so only the single final cast
-remains at the compress boundary.
+The mask cast before `compress()` now keys on `pureF8` instead of
+`primaryType == F8_TYPE`. Mixed I8+F8 programs already normalize masks to
+`VectorMask<Long>` in `emitCompare`, so the cast was redundant for them.
+Pure F8 programs cast `VectorMask<Double>` → `VectorMask<Long>` once at
+the compress boundary only.
 
 ### Medium: temporary locals are still typed as generic `Object`
 
