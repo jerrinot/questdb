@@ -202,10 +202,11 @@ public final class VectorBytecodeFilterCompiler {
         asm.lconst_0();
         asm.lstore(rowSlot);
 
-        // Load the species matching the primary data type.
-        // For I8: LongVector.SPECIES_PREFERRED
-        // For F8: DoubleVector.SPECIES_PREFERRED (same lane count as Long)
-        asm.invokeStatic(primaryType == F8_TYPE ? pool.helpersDoubleSpecies : pool.helpersLongSpecies);
+        // Always use LongVector.SPECIES_PREFERRED for the loop species.
+        // This makes activeMask always VectorMask<Long>, providing a
+        // consistent mask type for BooleanOp AND/OR across mixed I8+F8.
+        // Data loads cast the mask to their type; compare results cast back.
+        asm.invokeStatic(pool.helpersLongSpecies);
         asm.astore(speciesSlot);
         asm.invokeStatic(pool.helpersNativeByteOrder);
         asm.astore(nativeOrderSlot);
@@ -232,12 +233,14 @@ public final class VectorBytecodeFilterCompiler {
         }
 
         if (nullChecks) {
-            // Load null sentinel vector once per method
+            // Load null sentinel vector once per method.
+            // For I8: broadcast LONG_NULL using Long species
+            // For F8: broadcast NaN using Double species
             if (primaryType == F8_TYPE) {
-                asm.aload(speciesSlot);
+                asm.invokeStatic(pool.helpersDoubleSpecies);
                 asm.invokeStatic(pool.helpersDoubleNanVector);
             } else {
-                asm.aload(speciesSlot);
+                asm.aload(speciesSlot); // Long species
                 asm.invokeStatic(pool.helpersLongNullVector);
             }
             asm.astore(nullVecSlot);
@@ -443,13 +446,16 @@ public final class VectorBytecodeFilterCompiler {
             int[] colSegSlots, Pool pool
     ) {
         Pool.VecType vt = pool.vecType(lc.type());
-        asm.aload(speciesSlot);
+        asm.getstatic(vt.speciesPreferred); // type-correct species
         asm.aload(colSegSlots[lc.columnIndex()]);
         asm.lload(rowSlot);
         asm.ldc2_w(pool.ensureLongPooled(elementBytes(lc.type())));
         asm.lmul();
         asm.aload(nativeOrderSlot);
         asm.aload(activeMaskSlot);
+        // Cast mask to match column type's species (same lane count, different element type)
+        asm.getstatic(vt.speciesPreferred);
+        asm.invokeVirtual(pool.maskCast);
         asm.invokeStatic(vt.fromMemSegMasked);
         asm.astore(tempSlots[lc.dst()]);
     }
@@ -457,7 +463,7 @@ public final class VectorBytecodeFilterCompiler {
     private static void emitLoadImm(BytecodeAssembler asm, LoweredOp.LoadImm li, int[] tempSlots,
                                      int speciesSlot, Pool pool) {
         Pool.VecType vt = pool.vecType(li.type());
-        asm.aload(speciesSlot);
+        asm.getstatic(vt.speciesPreferred); // type-correct species
         switch (li.type()) {
             case I4_TYPE -> asm.iconst((int) li.lo());
             case I8_TYPE -> asm.ldc2_w(pool.ensureLongPooled(li.lo()));
@@ -472,7 +478,7 @@ public final class VectorBytecodeFilterCompiler {
     private static void emitLoadVar(BytecodeAssembler asm, LoweredOp.LoadVar lv, int[] tempSlots,
                                      int speciesSlot, int varsSegSlot, Pool pool) {
         Pool.VecType vt = pool.vecType(lv.type());
-        asm.aload(speciesSlot);
+        asm.getstatic(vt.speciesPreferred); // type-correct species
         // Load scalar from vars segment and broadcast
         asm.aload(varsSegSlot);
         asm.getstatic(pool.varLayout(lv.type()));
@@ -504,13 +510,17 @@ public final class VectorBytecodeFilterCompiler {
         Pool.VecType vt = pool.vecType(c.operandType());
 
         if (c.operandType() == F8_TYPE) {
-            // Double comparisons always use helpers (epsilon + NaN handling)
+            // Double comparisons always use helpers (epsilon + NaN handling).
+            // Result is VectorMask<Double>; cast to Long for mask interop.
             int helperMethod = pool.doubleCompareHelper(c.opcode());
             asm.aload(tempSlots[c.lhs()]);
             asm.checkcast(vt.vecClass);
             asm.aload(tempSlots[c.rhs()]);
             asm.checkcast(vt.vecClass);
             asm.invokeStatic(helperMethod);
+            // Cast VectorMask<Double> → VectorMask<Long> for uniform mask type
+            asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+            asm.invokeVirtual(pool.maskCast);
             asm.astore(tempSlots[c.dst()]);
         } else if (!nullChecks) {
             // I8 without null checks: direct compare
