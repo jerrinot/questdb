@@ -270,6 +270,7 @@ public final class VectorBytecodeFilterCompiler {
             int byteSpeciesSlot,
             int shortSpeciesSlot,
             int nullVecSlot,
+            int nullMaskCacheSlot,
             int outputSegSlot,
             int iotaSlot,
             int matchCountSlot,
@@ -312,8 +313,10 @@ public final class VectorBytecodeFilterCompiler {
                 shortSpeciesSlot = nextSlot++;
             }
             int nullVecSlot = -1;
+            int nullMaskCacheSlot = -1;
             if (nullChecks && !pureF8) {
                 nullVecSlot = nextSlot++;
+                nullMaskCacheSlot = nextSlot++;
             }
             int outputSegSlot = -1;
             int iotaSlot = -1;
@@ -349,7 +352,7 @@ public final class VectorBytecodeFilterCompiler {
                     filteredCountSlot, rowSlot, strideSlot,
                     speciesSlot, nativeOrderSlot, activeMaskSlot,
                     intSpeciesSlot, floatSpeciesSlot, byteSpeciesSlot, shortSpeciesSlot,
-                    nullVecSlot,
+                    nullVecSlot, nullMaskCacheSlot,
                     outputSegSlot, iotaSlot, matchCountSlot, countAccSlot, fullMaskSlot,
                     colSegSlots, varsSegSlot, tempSlots,
                     maxLocals, objectLocalCount
@@ -373,7 +376,10 @@ public final class VectorBytecodeFilterCompiler {
             SlotLayout s,
             boolean nullChecks,
             boolean pureF8,
-            LoweredBlock block
+            LoweredBlock block,
+            // Tracks which lhs temp ID has its null mask cached in nullMaskCacheSlot.
+            // cachedNullMaskOwner[0] == -1 means no mask is cached.
+            int[] cachedNullMaskOwner
     ) {}
 
     // === Method emission ===
@@ -391,7 +397,7 @@ public final class VectorBytecodeFilterCompiler {
 
         SlotLayout s = SlotLayout.allocate(firstFree, tempCount, shape, isCountOnly, nullChecks);
         LoweredBlock block = program.getBlock(program.getEntryBlockId());
-        EmitContext ctx = new EmitContext(asm, pool, s, nullChecks, pureF8, block);
+        EmitContext ctx = new EmitContext(asm, pool, s, nullChecks, pureF8, block, new int[]{-1});
         int[] useCounts = computeUseCounts(block, tempCount);
         Terminator.Return ret = (Terminator.Return) block.getTerminator();
 
@@ -500,6 +506,8 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeStatic(pool.helpersLongSpecies);
             asm.invokeStatic(pool.helpersLongNullVector);
             asm.astore(s.nullVecSlot());
+            asm.aconst_null();
+            asm.astore(s.nullMaskCacheSlot());
         }
         if (isCountOnly) {
             // countAccSlot is kept allocated for stack-map stability but unused.
@@ -776,6 +784,7 @@ public final class VectorBytecodeFilterCompiler {
         }
         if (needsNullVec) {
             asm.putITEM_Object(pool.longVectorClass); // nullVecSlot — always LongVector
+            asm.putITEM_Object(pool.vectorMaskClass);  // nullMaskCacheSlot
         }
         if (!isCountOnly) {
             asm.putITEM_Object(pool.memSegClass);      // outputSegSlot
@@ -905,6 +914,8 @@ public final class VectorBytecodeFilterCompiler {
         BytecodeAssembler asm = ctx.asm();
         int[] tempSlots = ctx.s().tempSlots();
         HashMap<Long, Integer> loadCache = new HashMap<>();
+        // Invalidate cached null mask — column data changes each iteration.
+        ctx.cachedNullMaskOwner()[0] = -1;
         for (int i = 0; i < block.getOpCount(); i++) {
             LoweredOp op = block.getOp(i);
             int consumed = tryEmitLongInEqOrChain(ctx, block, i, useCounts, maskedLoads);
@@ -1276,8 +1287,42 @@ public final class VectorBytecodeFilterCompiler {
             asm.checkcast(vt.vecClass);
             asm.invokeVirtual(vt.compare);
             asm.astore(tempSlots[c.dst()]);
+        } else if (ctx.s().nullMaskCacheSlot() >= 0 && isNonNullImmediateTemp(ctx.block(), c.rhs())) {
+            // I8 null-aware ordered comparison where rhs is a compile-time
+            // constant (never LONG_NULL).  Compute the lhs null mask once,
+            // cache it in nullMaskCacheSlot, and reuse for all subsequent
+            // comparisons on the same column vector.
+            //
+            // Emits: lhs.compare(op, rhs).andNot(nullMask)
+            //
+            // This replaces the longNullGt/Lt/Ge/Le helpers which do
+            // 5 mask ops per call (lhs==null, rhs==null, or, compare, and-not).
+            // With caching: 1 null compare (first time) + 1 andNot per predicate.
+            if (ctx.cachedNullMaskOwner()[0] != c.lhs()) {
+                // Compute lhs null mask: lhs.compare(EQ, nullVec)
+                asm.aload(tempSlots[c.lhs()]);
+                asm.checkcast(vt.vecClass);
+                asm.getstatic(pool.comparisonOp(EQ));
+                asm.aload(ctx.s().nullVecSlot());
+                asm.checkcast(vt.vecClass);
+                asm.invokeVirtual(vt.compare);
+                asm.astore(ctx.s().nullMaskCacheSlot());
+                ctx.cachedNullMaskOwner()[0] = c.lhs();
+            }
+            // result = lhs.compare(op, rhs).andNot(nullMask)
+            asm.aload(tempSlots[c.lhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.getstatic(pool.comparisonOp(c.opcode()));
+            asm.aload(tempSlots[c.rhs()]);
+            asm.checkcast(vt.vecClass);
+            asm.invokeVirtual(vt.compare);
+            asm.aload(ctx.s().nullMaskCacheSlot());
+            asm.checkcast(pool.vectorMaskClass);
+            asm.invokeVirtual(pool.maskAndNot);
+            asm.astore(tempSlots[c.dst()]);
         } else {
-            // I8 null-aware ordered comparison (LT, LE, GT, GE)
+            // I8 null-aware ordered comparison — general case (both operands
+            // may be null, or rhs is not an immediate).
             int helperMethod = pool.nullCompareHelper(c.operandType(), c.opcode());
             asm.aload(tempSlots[c.lhs()]);
             asm.checkcast(vt.vecClass);
@@ -1287,6 +1332,19 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeStatic(helperMethod);
             asm.astore(tempSlots[c.dst()]);
         }
+    }
+
+    /**
+     * Returns true when the given temp was produced by a LoadImm with a value
+     * that is NOT the LONG_NULL sentinel — i.e. a non-null compile-time constant.
+     */
+    private static boolean isNonNullImmediateTemp(LoweredBlock block, int tempId) {
+        for (int i = 0; i < block.getOpCount(); i++) {
+            if (block.getOp(i) instanceof LoweredOp.LoadImm li && li.dst() == tempId) {
+                return li.lo() != io.questdb.std.Numbers.LONG_NULL;
+            }
+        }
+        return false;
     }
 
     private static void emitBooleanOp(EmitContext ctx, LoweredOp.BooleanOp bo) {
@@ -1683,6 +1741,7 @@ public final class VectorBytecodeFilterCompiler {
 
         // VectorMask methods
         final int maskAnd;
+        final int maskAndNot;
         final int maskOr;
         final int maskNot;
         final int maskTrueCount;
@@ -1898,6 +1957,7 @@ public final class VectorBytecodeFilterCompiler {
 
             // --- VectorMask methods ---
             maskAnd = asm.poolMethod(vecMaskCls, "and", "(" + sMask + ")" + sMask);
+            maskAndNot = asm.poolMethod(vecMaskCls, "andNot", "(" + sMask + ")" + sMask);
             maskOr = asm.poolMethod(vecMaskCls, "or", "(" + sMask + ")" + sMask);
             maskNot = asm.poolMethod(vecMaskCls, "not", "()" + sMask);
             maskTrueCount = asm.poolMethod(vecMaskCls, "trueCount", "()I");
