@@ -143,3 +143,27 @@ add    rcx, r10                   ; scalar accumulate
 | IPC                |   2.51  |          1.21 |        ~2.50 |
 | L1-dcache-misses   |   1.3M  |          5.9M |        ~1.3M |
 | frontend stalls    |    17M  |           76M |         ~17M |
+
+## Final Outcome
+
+Exit criterion 1 from the playbook is met:
+
+> JAVA_VECTOR_BYTECODE is measurably faster than NATIVE_SIMD on at least one
+> simple supported family and is not materially worse on the others.
+
+Java Vector Bytecode achieves:
+
+- **Parity** on all three standard guardrail filters (l > 42, l > 42 AND d <
+  100.0, l IN (1..5)) in both row-ID and count-only modes
+- **9x faster** on the mixed I8+I4+F8 four-column filter, because Java AVX-512
+  processes 8 lanes per iteration while native AVX2 processes 4
+
+One code change was required: replace the count-only vector accumulator
+(`LongVector.add(1L, mask)`) with a scalar accumulator (`mask.trueCount()` +
+`ladd`). The vector accumulator caused C2 OSR to heap-allocate a new `long[8]`
+per iteration, which was the dominant cost for count-only queries.
+
+No remaining optimization candidates were identified that are within QuestDB's
+control. The MemorySegment scope check (~6 instructions per iteration) remains
+as a fixed per-iteration cost imposed by the JDK, but it is fully hidden by
+memory-bandwidth saturation at the current loop throughput.
