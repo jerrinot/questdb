@@ -35,6 +35,7 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.CommitMode;
 import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.JitBackend;
 import io.questdb.cairo.SqlJitMode;
 import io.questdb.cairo.TableUtils;
 import io.questdb.cutlass.http.HttpFullFatServerConfiguration;
@@ -1626,6 +1627,33 @@ public class PropServerConfigurationTest {
             PropServerConfiguration configuration = newPropServerConfiguration(properties);
             Assert.assertNull(configuration.getHttpServerConfiguration().getStaticContentProcessorConfiguration().getKeepAliveHeader());
         }
+    }
+
+    @Test
+    public void testSqlJitBackend() throws Exception {
+        Properties properties = new Properties();
+        PropServerConfiguration configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(JitBackend.AUTO, configuration.getCairoConfiguration().getSqlJitBackend());
+
+        properties.setProperty("cairo.sql.jit.backend", "auto");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(JitBackend.AUTO, configuration.getCairoConfiguration().getSqlJitBackend());
+
+        properties.setProperty("cairo.sql.jit.backend", "cpp");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(JitBackend.CPP, configuration.getCairoConfiguration().getSqlJitBackend());
+
+        properties.setProperty("cairo.sql.jit.backend", "java");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(JitBackend.JAVA_VECTOR_COMPILED, configuration.getCairoConfiguration().getSqlJitBackend());
+
+        properties.setProperty("cairo.sql.jit.backend", "java_scalar");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(JitBackend.JAVA_COMPILED, configuration.getCairoConfiguration().getSqlJitBackend());
+
+        properties.setProperty("cairo.sql.jit.backend", "foobar");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(JitBackend.AUTO, configuration.getCairoConfiguration().getSqlJitBackend());
     }
 
     @Test

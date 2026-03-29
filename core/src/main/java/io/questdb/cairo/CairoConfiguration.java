@@ -623,6 +623,8 @@ public interface CairoConfiguration {
 
     int getSqlJitMaxInListSizeThreshold();
 
+    int getSqlJitBackend();
+
     int getSqlJitMode();
 
     int getSqlJoinContextPoolCapacity();

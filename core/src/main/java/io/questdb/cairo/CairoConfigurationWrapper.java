@@ -1032,6 +1032,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public int getSqlJitBackend() {
+        return getDelegate().getSqlJitBackend();
+    }
+
+    @Override
     public int getSqlJitMode() {
         return getDelegate().getSqlJitMode();
     }

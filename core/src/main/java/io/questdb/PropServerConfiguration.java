@@ -32,6 +32,7 @@ import io.questdb.cairo.CommitMode;
 import io.questdb.cairo.MicrosTimestampDriver;
 import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.JitBackend;
 import io.questdb.cairo.SqlJitMode;
 import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreakerConfiguration;
@@ -458,6 +459,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final int sqlJitBindVarsMemoryPageSize;
     private final boolean sqlJitDebugEnabled;
     private final int sqlJitIRMemoryMaxPages;
+    private final int sqlJitBackend;
     private final int sqlJitIRMemoryPageSize;
     private final int sqlJitMaxInListSizeThreshold;
     private final int sqlJitMode;
@@ -1594,6 +1596,7 @@ public class PropServerConfiguration implements ServerConfiguration {
             this.sqlSmallPageFrameMinRows = getInt(properties, env, PropertyKey.CAIRO_SMALL_SQL_PAGE_FRAME_MIN_ROWS, 10_000);
             this.sqlSmallPageFrameMaxRows = getInt(properties, env, PropertyKey.CAIRO_SMALL_SQL_PAGE_FRAME_MAX_ROWS, 100_000);
 
+            this.sqlJitBackend = getSqlJitBackend(properties, env);
             this.sqlJitMode = getSqlJitMode(properties, env);
             this.sqlJitIRMemoryPageSize = getIntSize(properties, env, PropertyKey.CAIRO_SQL_JIT_IR_MEMORY_PAGE_SIZE, 8 * 1024);
             this.sqlJitIRMemoryMaxPages = getInt(properties, env, PropertyKey.CAIRO_SQL_JIT_IR_MEMORY_MAX_PAGES, 8);
@@ -2260,6 +2263,24 @@ public class PropServerConfiguration implements ServerConfiguration {
             case "h" -> CommonUtils.TIMESTAMP_UNIT_HOURS;
             default -> CommonUtils.TIMESTAMP_UNIT_NANOS;
         };
+    }
+
+    private int getSqlJitBackend(Properties properties, @Nullable Map<String, String> env) {
+        final String value = getString(properties, env, PropertyKey.CAIRO_SQL_JIT_BACKEND, "auto");
+        assert value != null;
+        if (Chars.equalsLowerCaseAscii(value, "auto")) {
+            return JitBackend.AUTO;
+        }
+        if (Chars.equalsLowerCaseAscii(value, "cpp")) {
+            return JitBackend.CPP;
+        }
+        if (Chars.equalsLowerCaseAscii(value, "java")) {
+            return JitBackend.JAVA_VECTOR_COMPILED;
+        }
+        if (Chars.equalsLowerCaseAscii(value, "java_scalar")) {
+            return JitBackend.JAVA_COMPILED;
+        }
+        return JitBackend.AUTO;
     }
 
     private int getSqlJitMode(Properties properties, @Nullable Map<String, String> env) {
@@ -4194,6 +4215,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public int getSqlJitMaxInListSizeThreshold() {
             return sqlJitMaxInListSizeThreshold;
+        }
+
+        @Override
+        public int getSqlJitBackend() {
+            return sqlJitBackend;
         }
 
         @Override

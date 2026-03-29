@@ -118,6 +118,7 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
         microClock = cairoConfiguration.getMicrosecondClock();
         nanoClock = cairoConfiguration.getNanosecondClock();
         securityContext = DenyAllSecurityContext.INSTANCE;
+        jitBackend = cairoConfiguration.getSqlJitBackend();
         jitMode = cairoConfiguration.getSqlJitMode();
         parallelFilterEnabled = cairoConfiguration.isSqlParallelFilterEnabled() && sharedQueryWorkerCount > 0;
         parallelGroupByEnabled = cairoConfiguration.isSqlParallelGroupByEnabled() && sharedQueryWorkerCount > 0;
