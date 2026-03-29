@@ -939,8 +939,14 @@ public final class ScalarBytecodeFilterCompiler {
                 asm.dload(lhsSlot);
                 asm.dload(rhsSlot);
                 if (op.opcode() == DIV || nullChecks) {
-                    asm.iconst(op.opcode());
-                    asm.invokeStatic(pm.doubleArithmeticNull);
+                    int f8method = switch (op.opcode()) {
+                        case ADD -> pm.doubleAddNull;
+                        case SUB -> pm.doubleSubNull;
+                        case MUL -> pm.doubleMulNull;
+                        case DIV -> pm.doubleDivNull;
+                        default -> throw new IllegalStateException("unsupported f8 arithmetic: " + op.opcode());
+                    };
+                    asm.invokeStatic(f8method);
                 } else {
                     switch (op.opcode()) {
                         case ADD -> asm.dadd();
@@ -1176,7 +1182,7 @@ public final class ScalarBytecodeFilterCompiler {
         final int intArithmeticNull;
         final int longArithmeticNull;
         final int floatArithmeticNull;
-        final int doubleArithmeticNull;
+        final int doubleAddNull, doubleSubNull, doubleMulNull, doubleDivNull;
 
         // I128 comparisons
         final int i128Eq;
@@ -1270,7 +1276,10 @@ public final class ScalarBytecodeFilterCompiler {
             intArithmeticNull = asm.poolMethod(fh, "intArithmeticNull", "(III)I");
             longArithmeticNull = asm.poolMethod(fh, "longArithmeticNull", "(JJI)J");
             floatArithmeticNull = asm.poolMethod(fh, "floatArithmeticNull", "(FFI)F");
-            doubleArithmeticNull = asm.poolMethod(fh, "doubleArithmeticNull", "(DDI)D");
+            doubleAddNull = asm.poolMethod(fh, "doubleAddNull", "(DD)D");
+            doubleSubNull = asm.poolMethod(fh, "doubleSubNull", "(DD)D");
+            doubleMulNull = asm.poolMethod(fh, "doubleMulNull", "(DD)D");
+            doubleDivNull = asm.poolMethod(fh, "doubleDivNull", "(DD)D");
 
             i128Eq = asm.poolMethod(fh, "i128Eq", "(JJJJ)Z");
             i128Ne = asm.poolMethod(fh, "i128Ne", "(JJJJ)Z");

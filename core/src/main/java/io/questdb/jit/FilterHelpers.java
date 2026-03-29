@@ -299,56 +299,92 @@ public final class FilterHelpers {
      * LONG_NULL, the result is LONG_NULL. Division by zero returns LONG_NULL.
      */
     @SuppressWarnings("unchecked")
-    public static jdk.incubator.vector.LongVector longVecArithmeticNull(
+    public static jdk.incubator.vector.LongVector longVecAddNull(
             jdk.incubator.vector.LongVector lhs,
             jdk.incubator.vector.LongVector rhs,
-            jdk.incubator.vector.LongVector nullVec,
-            int opcode
+            jdk.incubator.vector.LongVector nullVec
     ) {
         jdk.incubator.vector.VectorMask<Long> invalidMask = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec)
                 .or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec));
-        if (opcode == DIV) {
-            jdk.incubator.vector.LongVector zero = jdk.incubator.vector.LongVector.zero(
-                    (jdk.incubator.vector.VectorSpecies<Long>) lhs.species());
-            invalidMask = invalidMask.or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, zero));
-        }
-        jdk.incubator.vector.VectorMask<Long> validMask = invalidMask.not();
-        jdk.incubator.vector.LongVector result = switch (opcode) {
-            case ADD -> lhs.add(rhs);
-            case SUB -> lhs.sub(rhs);
-            case MUL -> lhs.mul(rhs);
-            case DIV -> lhs.div(rhs, validMask);
-            default -> throw new UnsupportedOperationException("arith op: " + opcode);
-        };
-        return result.blend(nullVec, invalidMask);
+        return lhs.add(rhs).blend(nullVec, invalidMask);
+    }
+
+    public static jdk.incubator.vector.LongVector longVecSubNull(
+            jdk.incubator.vector.LongVector lhs,
+            jdk.incubator.vector.LongVector rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        jdk.incubator.vector.VectorMask<Long> invalidMask = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec)
+                .or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec));
+        return lhs.sub(rhs).blend(nullVec, invalidMask);
+    }
+
+    public static jdk.incubator.vector.LongVector longVecMulNull(
+            jdk.incubator.vector.LongVector lhs,
+            jdk.incubator.vector.LongVector rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        jdk.incubator.vector.VectorMask<Long> invalidMask = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec)
+                .or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec));
+        return lhs.mul(rhs).blend(nullVec, invalidMask);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static jdk.incubator.vector.LongVector longVecDivNull(
+            jdk.incubator.vector.LongVector lhs,
+            jdk.incubator.vector.LongVector rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        jdk.incubator.vector.VectorMask<Long> invalidMask = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec)
+                .or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec));
+        jdk.incubator.vector.LongVector zero = jdk.incubator.vector.LongVector.zero(
+                (jdk.incubator.vector.VectorSpecies<Long>) lhs.species());
+        invalidMask = invalidMask.or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, zero));
+        return lhs.div(rhs, invalidMask.not()).blend(nullVec, invalidMask);
     }
 
     /**
      * I4 null-aware arithmetic. Preserves INT_NULL: if either operand is
      * INT_NULL, the result is INT_NULL. Division by zero returns INT_NULL.
      */
-    @SuppressWarnings("unchecked")
-    public static jdk.incubator.vector.IntVector intVecArithmeticNull(
+    public static jdk.incubator.vector.IntVector intVecAddNull(
             jdk.incubator.vector.IntVector lhs,
-            jdk.incubator.vector.IntVector rhs,
-            int opcode
+            jdk.incubator.vector.IntVector rhs
     ) {
         jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL)
                 .or(rhs.eq(Numbers.INT_NULL));
-        if (opcode == DIV) {
-            jdk.incubator.vector.IntVector zero = jdk.incubator.vector.IntVector.zero(
-                    (jdk.incubator.vector.VectorSpecies<Integer>) lhs.species());
-            invalidMask = invalidMask.or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, zero));
-        }
-        jdk.incubator.vector.VectorMask<Integer> validMask = invalidMask.not();
-        jdk.incubator.vector.IntVector result = switch (opcode) {
-            case ADD -> lhs.add(rhs);
-            case SUB -> lhs.sub(rhs);
-            case MUL -> lhs.mul(rhs);
-            case DIV -> lhs.div(rhs, validMask);
-            default -> throw new UnsupportedOperationException("arith op: " + opcode);
-        };
-        return result.blend(Numbers.INT_NULL, invalidMask);
+        return lhs.add(rhs).blend(Numbers.INT_NULL, invalidMask);
+    }
+
+    public static jdk.incubator.vector.IntVector intVecSubNull(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs
+    ) {
+        jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL)
+                .or(rhs.eq(Numbers.INT_NULL));
+        return lhs.sub(rhs).blend(Numbers.INT_NULL, invalidMask);
+    }
+
+    public static jdk.incubator.vector.IntVector intVecMulNull(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs
+    ) {
+        jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL)
+                .or(rhs.eq(Numbers.INT_NULL));
+        return lhs.mul(rhs).blend(Numbers.INT_NULL, invalidMask);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static jdk.incubator.vector.IntVector intVecDivNull(
+            jdk.incubator.vector.IntVector lhs,
+            jdk.incubator.vector.IntVector rhs
+    ) {
+        jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL)
+                .or(rhs.eq(Numbers.INT_NULL));
+        jdk.incubator.vector.IntVector zero = jdk.incubator.vector.IntVector.zero(
+                (jdk.incubator.vector.VectorSpecies<Integer>) lhs.species());
+        invalidMask = invalidMask.or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, zero));
+        return lhs.div(rhs, invalidMask.not()).blend(Numbers.INT_NULL, invalidMask);
     }
 
     /**
@@ -356,27 +392,34 @@ public final class FilterHelpers {
      * Always used for double arithmetic regardless of null check mode,
      * because QuestDB requires NaN-on-zero-division (not IEEE infinity).
      */
-    @SuppressWarnings("unchecked")
-    public static jdk.incubator.vector.DoubleVector doubleVecArithmetic(
+    public static jdk.incubator.vector.DoubleVector doubleVecAdd(
             jdk.incubator.vector.DoubleVector lhs,
-            jdk.incubator.vector.DoubleVector rhs,
-            int opcode
+            jdk.incubator.vector.DoubleVector rhs
     ) {
-        if (opcode != DIV) {
-            // ADD/SUB/MUL: NaN propagates naturally via IEEE semantics
-            return switch (opcode) {
-                case ADD -> lhs.add(rhs);
-                case SUB -> lhs.sub(rhs);
-                case MUL -> lhs.mul(rhs);
-                default -> throw new UnsupportedOperationException("arith op: " + opcode);
-            };
-        }
-        // DIV: IEEE gives ±Infinity on zero-division, QuestDB wants NaN
+        return lhs.add(rhs);
+    }
+
+    public static jdk.incubator.vector.DoubleVector doubleVecSub(
+            jdk.incubator.vector.DoubleVector lhs,
+            jdk.incubator.vector.DoubleVector rhs
+    ) {
+        return lhs.sub(rhs);
+    }
+
+    public static jdk.incubator.vector.DoubleVector doubleVecMul(
+            jdk.incubator.vector.DoubleVector lhs,
+            jdk.incubator.vector.DoubleVector rhs
+    ) {
+        return lhs.mul(rhs);
+    }
+
+    public static jdk.incubator.vector.DoubleVector doubleVecDiv(
+            jdk.incubator.vector.DoubleVector lhs,
+            jdk.incubator.vector.DoubleVector rhs
+    ) {
         jdk.incubator.vector.VectorMask<Double> zeroDiv = rhs.compare(
                 jdk.incubator.vector.VectorOperators.EQ, 0.0);
-        jdk.incubator.vector.VectorMask<Double> validMask = zeroDiv.not();
-        jdk.incubator.vector.DoubleVector result = lhs.div(rhs, validMask);
-        return result.blend(Double.NaN, zeroDiv);
+        return lhs.div(rhs, zeroDiv.not()).blend(Double.NaN, zeroDiv);
     }
 
     // --- Vectorized double comparisons (epsilon + NaN-aware) ---
@@ -464,25 +507,34 @@ public final class FilterHelpers {
     /**
      * F4 arithmetic with NaN propagation and div-by-zero → NaN.
      */
-    @SuppressWarnings("unchecked")
-    public static jdk.incubator.vector.FloatVector floatVecArithmetic(
+    public static jdk.incubator.vector.FloatVector floatVecAdd(
             jdk.incubator.vector.FloatVector lhs,
-            jdk.incubator.vector.FloatVector rhs,
-            int opcode
+            jdk.incubator.vector.FloatVector rhs
     ) {
-        if (opcode != DIV) {
-            return switch (opcode) {
-                case ADD -> lhs.add(rhs);
-                case SUB -> lhs.sub(rhs);
-                case MUL -> lhs.mul(rhs);
-                default -> throw new UnsupportedOperationException("arith op: " + opcode);
-            };
-        }
+        return lhs.add(rhs);
+    }
+
+    public static jdk.incubator.vector.FloatVector floatVecSub(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs
+    ) {
+        return lhs.sub(rhs);
+    }
+
+    public static jdk.incubator.vector.FloatVector floatVecMul(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs
+    ) {
+        return lhs.mul(rhs);
+    }
+
+    public static jdk.incubator.vector.FloatVector floatVecDiv(
+            jdk.incubator.vector.FloatVector lhs,
+            jdk.incubator.vector.FloatVector rhs
+    ) {
         jdk.incubator.vector.VectorMask<Float> zeroDiv = rhs.compare(
                 jdk.incubator.vector.VectorOperators.EQ, 0.0f);
-        jdk.incubator.vector.VectorMask<Float> validMask = zeroDiv.not();
-        jdk.incubator.vector.FloatVector result = lhs.div(rhs, validMask);
-        return result.blend(Float.NaN, zeroDiv);
+        return lhs.div(rhs, zeroDiv.not()).blend(Float.NaN, zeroDiv);
     }
 
     // --- Vectorized float comparisons (epsilon + NaN-aware) ---
@@ -1184,17 +1236,24 @@ public final class FilterHelpers {
         };
     }
 
-    public static double doubleArithmeticNull(double a, double b, int opcode) {
-        if (Double.isNaN(a) || Double.isNaN(b)) {
-            return Double.NaN;
-        }
-        return switch (opcode) {
-            case 14 -> a + b; // ADD
-            case 15 -> a - b; // SUB
-            case 16 -> a * b; // MUL
-            case 17 -> b == 0 ? Double.NaN : a / b; // DIV
-            default -> throw new IllegalArgumentException("unsupported double opcode: " + opcode);
-        };
+    public static double doubleAddNull(double a, double b) {
+        if (Double.isNaN(a) || Double.isNaN(b)) return Double.NaN;
+        return a + b;
+    }
+
+    public static double doubleSubNull(double a, double b) {
+        if (Double.isNaN(a) || Double.isNaN(b)) return Double.NaN;
+        return a - b;
+    }
+
+    public static double doubleMulNull(double a, double b) {
+        if (Double.isNaN(a) || Double.isNaN(b)) return Double.NaN;
+        return a * b;
+    }
+
+    public static double doubleDivNull(double a, double b) {
+        if (Double.isNaN(a) || Double.isNaN(b)) return Double.NaN;
+        return b == 0 ? Double.NaN : a / b;
     }
 
     // --- I128 (UUID) comparisons ---

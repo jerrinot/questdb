@@ -1453,41 +1453,65 @@ public final class VectorBytecodeFilterCompiler {
         Pool.VecType vt = pool.vecType(a.resultType());
 
         if (a.resultType() == F8_TYPE) {
-            // F8: always use helper for NaN propagation and div-by-zero → NaN
+            // F8: per-op helper for NaN propagation and div-by-zero → NaN
             asm.aload(tempSlots[a.lhs()]);
             asm.checkcast(vt.vecClass);
             asm.aload(tempSlots[a.rhs()]);
             asm.checkcast(vt.vecClass);
-            asm.iconst(a.opcode());
-            asm.invokeStatic(pool.doubleVecArithmetic);
+            int f8method = switch (a.opcode()) {
+                case ADD -> pool.doubleVecAdd;
+                case SUB -> pool.doubleVecSub;
+                case MUL -> pool.doubleVecMul;
+                case DIV -> pool.doubleVecDiv;
+                default -> throw new UnsupportedOperationException("F8 arith op: " + a.opcode());
+            };
+            asm.invokeStatic(f8method);
             asm.astore(tempSlots[a.dst()]);
         } else if (a.resultType() == F4_TYPE) {
-            // F4: always use helper for NaN propagation and div-by-zero → NaN
+            // F4: per-op helper for NaN propagation and div-by-zero → NaN
             asm.aload(tempSlots[a.lhs()]);
             asm.checkcast(vt.vecClass);
             asm.aload(tempSlots[a.rhs()]);
             asm.checkcast(vt.vecClass);
-            asm.iconst(a.opcode());
-            asm.invokeStatic(pool.floatVecArithmetic);
+            int f4method = switch (a.opcode()) {
+                case ADD -> pool.floatVecAdd;
+                case SUB -> pool.floatVecSub;
+                case MUL -> pool.floatVecMul;
+                case DIV -> pool.floatVecDiv;
+                default -> throw new UnsupportedOperationException("F4 arith op: " + a.opcode());
+            };
+            asm.invokeStatic(f4method);
             asm.astore(tempSlots[a.dst()]);
         } else if (ctx.nullChecks() && a.resultType() == I8_TYPE) {
-            // I8 with null checks: use helper for LONG_NULL preservation
+            // I8 with null checks: per-op helper for LONG_NULL preservation
             asm.aload(tempSlots[a.lhs()]);
             asm.checkcast(vt.vecClass);
             asm.aload(tempSlots[a.rhs()]);
             asm.checkcast(vt.vecClass);
             asm.aload(ctx.s().nullVecSlot());
-            asm.iconst(a.opcode());
-            asm.invokeStatic(pool.longVecArithmeticNull);
+            int i8method = switch (a.opcode()) {
+                case ADD -> pool.longVecAddNull;
+                case SUB -> pool.longVecSubNull;
+                case MUL -> pool.longVecMulNull;
+                case DIV -> pool.longVecDivNull;
+                default -> throw new UnsupportedOperationException("I8 arith op: " + a.opcode());
+            };
+            asm.invokeStatic(i8method);
             asm.astore(tempSlots[a.dst()]);
         } else if (ctx.nullChecks() && a.resultType() == I4_TYPE) {
-            // I4 with null checks: use helper for INT_NULL preservation
+            // I4 with null checks: per-op helper for INT_NULL preservation
             asm.aload(tempSlots[a.lhs()]);
             asm.checkcast(vt.vecClass);
             asm.aload(tempSlots[a.rhs()]);
             asm.checkcast(vt.vecClass);
-            asm.iconst(a.opcode());
-            asm.invokeStatic(pool.intVecArithmeticNull);
+            int i4method = switch (a.opcode()) {
+                case ADD -> pool.intVecAddNull;
+                case SUB -> pool.intVecSubNull;
+                case MUL -> pool.intVecMulNull;
+                case DIV -> pool.intVecDivNull;
+                default -> throw new UnsupportedOperationException("I4 arith op: " + a.opcode());
+            };
+            asm.invokeStatic(i4method);
             asm.astore(tempSlots[a.dst()]);
         } else {
             // I8/I4 without null checks: raw vector arithmetic
@@ -1726,10 +1750,11 @@ public final class VectorBytecodeFilterCompiler {
         // Float comparison helpers (epsilon + NaN)
         private final int floatVecEq, floatVecNe, floatVecLt, floatVecLe, floatVecGt, floatVecGe;
         // Arithmetic helpers
-        final int longVecArithmeticNull;
-        final int intVecArithmeticNull;
-        final int doubleVecArithmetic;
-        final int floatVecArithmetic;
+        // Per-operation arithmetic helpers (no runtime opcode switch)
+        final int longVecAddNull, longVecSubNull, longVecMulNull, longVecDivNull;
+        final int intVecAddNull, intVecSubNull, intVecMulNull, intVecDivNull;
+        final int doubleVecAdd, doubleVecSub, doubleVecMul, doubleVecDiv;
+        final int floatVecAdd, floatVecSub, floatVecMul, floatVecDiv;
         // Null-aware cast helpers
         final int longToDoubleNullAware;
         final int intToDoubleNullAware;
@@ -1851,15 +1876,27 @@ public final class VectorBytecodeFilterCompiler {
             floatVecGt = asm.poolMethod(helpersCls, "floatVecGt", fltCmpSig);
             floatVecGe = asm.poolMethod(helpersCls, "floatVecGe", fltCmpSig);
 
-            // --- FilterHelpers: arithmetic and cast ---
-            longVecArithmeticNull = asm.poolMethod(helpersCls, "longVecArithmeticNull",
-                    "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;I)Ljdk/incubator/vector/LongVector;");
-            intVecArithmeticNull = asm.poolMethod(helpersCls, "intVecArithmeticNull",
-                    "(Ljdk/incubator/vector/IntVector;Ljdk/incubator/vector/IntVector;I)Ljdk/incubator/vector/IntVector;");
-            doubleVecArithmetic = asm.poolMethod(helpersCls, "doubleVecArithmetic",
-                    "(Ljdk/incubator/vector/DoubleVector;Ljdk/incubator/vector/DoubleVector;I)Ljdk/incubator/vector/DoubleVector;");
-            floatVecArithmetic = asm.poolMethod(helpersCls, "floatVecArithmetic",
-                    "(Ljdk/incubator/vector/FloatVector;Ljdk/incubator/vector/FloatVector;I)Ljdk/incubator/vector/FloatVector;");
+            // --- FilterHelpers: per-operation arithmetic helpers ---
+            String sLV = "Ljdk/incubator/vector/LongVector;";
+            String sIV = "Ljdk/incubator/vector/IntVector;";
+            String sDV = "Ljdk/incubator/vector/DoubleVector;";
+            String sFV = "Ljdk/incubator/vector/FloatVector;";
+            longVecAddNull = asm.poolMethod(helpersCls, "longVecAddNull", "(" + sLV + sLV + sLV + ")" + sLV);
+            longVecSubNull = asm.poolMethod(helpersCls, "longVecSubNull", "(" + sLV + sLV + sLV + ")" + sLV);
+            longVecMulNull = asm.poolMethod(helpersCls, "longVecMulNull", "(" + sLV + sLV + sLV + ")" + sLV);
+            longVecDivNull = asm.poolMethod(helpersCls, "longVecDivNull", "(" + sLV + sLV + sLV + ")" + sLV);
+            intVecAddNull = asm.poolMethod(helpersCls, "intVecAddNull", "(" + sIV + sIV + ")" + sIV);
+            intVecSubNull = asm.poolMethod(helpersCls, "intVecSubNull", "(" + sIV + sIV + ")" + sIV);
+            intVecMulNull = asm.poolMethod(helpersCls, "intVecMulNull", "(" + sIV + sIV + ")" + sIV);
+            intVecDivNull = asm.poolMethod(helpersCls, "intVecDivNull", "(" + sIV + sIV + ")" + sIV);
+            doubleVecAdd = asm.poolMethod(helpersCls, "doubleVecAdd", "(" + sDV + sDV + ")" + sDV);
+            doubleVecSub = asm.poolMethod(helpersCls, "doubleVecSub", "(" + sDV + sDV + ")" + sDV);
+            doubleVecMul = asm.poolMethod(helpersCls, "doubleVecMul", "(" + sDV + sDV + ")" + sDV);
+            doubleVecDiv = asm.poolMethod(helpersCls, "doubleVecDiv", "(" + sDV + sDV + ")" + sDV);
+            floatVecAdd = asm.poolMethod(helpersCls, "floatVecAdd", "(" + sFV + sFV + ")" + sFV);
+            floatVecSub = asm.poolMethod(helpersCls, "floatVecSub", "(" + sFV + sFV + ")" + sFV);
+            floatVecMul = asm.poolMethod(helpersCls, "floatVecMul", "(" + sFV + sFV + ")" + sFV);
+            floatVecDiv = asm.poolMethod(helpersCls, "floatVecDiv", "(" + sFV + sFV + ")" + sFV);
             longToDoubleNullAware = asm.poolMethod(helpersCls, "longToDoubleNullAware",
                     "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;)Ljdk/incubator/vector/DoubleVector;");
             intToDoubleNullAware = asm.poolMethod(helpersCls, "intToDoubleNullAware",
