@@ -177,6 +177,40 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testLongIn11() throws Exception {
+        long[] data = longCol(ROW_COUNT, i -> (i % 16) + 1L);
+        IrDecoder.Instruction[] insnList = new IrDecoder.Instruction[11 * 3 + 10 + 1];
+        int idx = 0;
+        for (int v = 1; v <= 11; v++) {
+            insnList[idx++] = insn(IMM, I8_TYPE, v, 0);
+            insnList[idx++] = insn(MEM, I8_TYPE, 0, 0);
+            insnList[idx++] = insn(EQ, 0, 0, 0);
+            if (v > 1) {
+                insnList[idx++] = insn(OR, 0, 0, 0);
+            }
+        }
+        insnList[idx] = insn(RET, 0, 0, 0);
+        assertParity(data, ir(insnList));
+    }
+
+    @Test
+    public void testLongIn11CountOnly() throws Exception {
+        long[] data = longCol(ROW_COUNT, i -> (i % 16) + 1L);
+        IrDecoder.Instruction[] insnList = new IrDecoder.Instruction[11 * 3 + 10 + 1];
+        int idx = 0;
+        for (int v = 1; v <= 11; v++) {
+            insnList[idx++] = insn(IMM, I8_TYPE, v, 0);
+            insnList[idx++] = insn(MEM, I8_TYPE, 0, 0);
+            insnList[idx++] = insn(EQ, 0, 0, 0);
+            if (v > 1) {
+                insnList[idx++] = insn(OR, 0, 0, 0);
+            }
+        }
+        insnList[idx] = insn(RET, 0, 0, 0);
+        assertCountParity(data, ir(insnList));
+    }
+
+    @Test
     public void testLongNe() throws Exception {
         // col0 != 50
         assertParity(

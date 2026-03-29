@@ -980,8 +980,17 @@ public final class VectorBytecodeFilterCompiler {
         int scan = startIndex + 2;
         int chainLength = 1;
 
-        while (scan + 2 < block.getOpCount()) {
-            if (!(block.getOp(scan) instanceof LoweredOp.LoadColumn nextLoad)
+        while (scan < block.getOpCount()) {
+            // Skip LoadImm/LoadVar ops that precede the next chain link.
+            int s = scan;
+            while (s < block.getOpCount() && (block.getOp(s) instanceof LoweredOp.LoadImm
+                    || block.getOp(s) instanceof LoweredOp.LoadVar)) {
+                s++;
+            }
+            if (s + 2 >= block.getOpCount()) {
+                break;
+            }
+            if (!(block.getOp(s) instanceof LoweredOp.LoadColumn nextLoad)
                     || nextLoad.type() != I8_TYPE
                     || nextLoad.columnIndex() != firstLoad.columnIndex()) {
                 break;
@@ -989,7 +998,7 @@ public final class VectorBytecodeFilterCompiler {
             if (useCounts[nextLoad.dst()] != 1) {
                 break;
             }
-            if (!(block.getOp(scan + 1) instanceof LoweredOp.Compare nextCompare)
+            if (!(block.getOp(s + 1) instanceof LoweredOp.Compare nextCompare)
                     || nextCompare.opcode() != EQ
                     || nextCompare.operandType() != I8_TYPE) {
                 break;
@@ -997,7 +1006,7 @@ public final class VectorBytecodeFilterCompiler {
             if (eqOtherOperand(nextCompare, nextLoad.dst()) < 0) {
                 break;
             }
-            if (!(block.getOp(scan + 2) instanceof LoweredOp.BooleanOp or)
+            if (!(block.getOp(s + 2) instanceof LoweredOp.BooleanOp or)
                     || or.opcode() != OR
                     || !matchesBooleanInputs(or, accumTemp, nextCompare.dst())) {
                 break;
@@ -1006,7 +1015,7 @@ public final class VectorBytecodeFilterCompiler {
                 break;
             }
             accumTemp = or.dst();
-            scan += 3;
+            scan = s + 3;
             chainLength++;
         }
 
@@ -1018,28 +1027,33 @@ public final class VectorBytecodeFilterCompiler {
         Pool pool = ctx.pool();
         int[] tempSlots = ctx.s().tempSlots();
 
+        // Emit the first compare.  Store the running OR accumulator in the
+        // slot that the rest of the program expects the final result in
+        // (accumTemp — the last OR's dst from the scan phase above).
+        int resultSlot = tempSlots[accumTemp];
         emitLoadColumn(ctx, firstLoad, maskedLoads);
         emitLongEqMaskFromLoadedValue(asm, tempSlots[firstLoad.dst()], tempSlots[firstValueTemp], pool);
-        asm.astore(tempSlots[firstCompare.dst()]);
+        asm.astore(resultSlot);
 
-        int currentAccumTemp = firstCompare.dst();
         int pos = startIndex + 2;
         for (int i = 1; i < chainLength; i++) {
+            // Skip LoadImm/LoadVar ops preceding the next chain link.
+            while (block.getOp(pos) instanceof LoweredOp.LoadImm
+                    || block.getOp(pos) instanceof LoweredOp.LoadVar) {
+                pos++;
+            }
             LoweredOp.LoadColumn load = (LoweredOp.LoadColumn) block.getOp(pos);
             LoweredOp.Compare compare = (LoweredOp.Compare) block.getOp(pos + 1);
-            LoweredOp.BooleanOp or = (LoweredOp.BooleanOp) block.getOp(pos + 2);
 
-            emitLongEqMaskFromLoadedValue(asm, tempSlots[firstLoad.dst()], tempSlots[eqOtherOperand(compare, load.dst())], pool);
-            asm.astore(tempSlots[compare.dst()]);
-
-            asm.aload(tempSlots[currentAccumTemp]);
+            // Load the running accumulator, emit the next compare (result stays
+            // on the JVM stack), then OR directly — no intermediate temp store.
+            asm.aload(resultSlot);
             asm.checkcast(pool.vectorMaskClass);
-            asm.aload(tempSlots[compare.dst()]);
+            emitLongEqMaskFromLoadedValue(asm, tempSlots[firstLoad.dst()], tempSlots[eqOtherOperand(compare, load.dst())], pool);
             asm.checkcast(pool.vectorMaskClass);
             asm.invokeVirtual(pool.maskOr);
-            asm.astore(tempSlots[or.dst()]);
+            asm.astore(resultSlot);
 
-            currentAccumTemp = or.dst();
             pos += 3;
         }
 

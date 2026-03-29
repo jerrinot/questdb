@@ -57,10 +57,11 @@ public class VectorBytecodeC2Driver {
         switch (filter) {
             case "l_gt_42" -> runLongGt42();
             case "in5" -> runLongIn5();
+            case "in11" -> runLongInN(11);
             case "mixed" -> runMixedLongDouble();
             default -> {
                 System.err.println("Unknown filter: " + filter);
-                System.err.println("Available: l_gt_42, in5, mixed");
+                System.err.println("Available: l_gt_42, in5, in11, mixed");
                 System.exit(1);
             }
         }
@@ -160,6 +161,58 @@ public class VectorBytecodeC2Driver {
 
         for (int i = 0; i < ROW_COUNT; i++) {
             // Sparse matches keep the filter realistic and avoid "all lanes match" bias.
+            Unsafe.getUnsafe().putLong(colData + (long) i * Long.BYTES, (i % 16) + 1L);
+        }
+        Unsafe.getUnsafe().putLong(colPtrArray, colData);
+
+        try {
+            long result = 0;
+            for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+                result = body.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, ROW_COUNT);
+            }
+            System.err.println("filterRows result: " + result + " rows matched");
+
+            for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+                result = body.countRows(colPtrArray, 1, 0, 0, 0, ROW_COUNT);
+            }
+            System.err.println("countRows result: " + result + " rows counted");
+        } finally {
+            Unsafe.free(colData, (long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void runLongInN(int n) throws Exception {
+        System.err.println("=== Filter: l IN (1.." + n + ") (pure I8, straight-line OR) ===");
+
+        int options = (3 << 1) | (1 << 4);
+        int insnCount = n * 3 + (n - 1) + 1; // n×(IMM,MEM,EQ) + (n-1)×OR + RET
+        IrDecoder.Instruction[] instructions = new IrDecoder.Instruction[insnCount];
+        int idx = 0;
+        for (int v = 1; v <= n; v++) {
+            instructions[idx++] = new IrDecoder.Instruction(IMM, I8_TYPE, v, 0);
+            instructions[idx++] = new IrDecoder.Instruction(MEM, I8_TYPE, 0, 0);
+            instructions[idx++] = new IrDecoder.Instruction(EQ, 0, 0, 0);
+            if (v > 1) {
+                instructions[idx++] = new IrDecoder.Instruction(OR, 0, 0, 0);
+            }
+        }
+        instructions[idx] = new IrDecoder.Instruction(RET, 0, 0, 0);
+
+        LoweredProgram prog = IrLowering.lower(instructions, options);
+        VectorFilterBody body = VectorBytecodeFilterCompiler.compile(prog);
+        if (body == null) {
+            System.err.println("ERROR: vector compiler rejected program");
+            System.exit(1);
+        }
+
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        long colData = Unsafe.malloc((long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+
+        for (int i = 0; i < ROW_COUNT; i++) {
             Unsafe.getUnsafe().putLong(colData + (long) i * Long.BYTES, (i % 16) + 1L);
         }
         Unsafe.getUnsafe().putLong(colPtrArray, colData);
