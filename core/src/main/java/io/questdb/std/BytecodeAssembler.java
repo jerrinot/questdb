@@ -250,6 +250,17 @@ public class BytecodeAssembler {
         }
     }
 
+    public byte[] toByteArray() {
+        int p = buf.position();
+        int l = buf.limit();
+        buf.flip();
+        byte[] bytes = new byte[buf.remaining()];
+        buf.get(bytes);
+        buf.limit(l);
+        buf.position(p);
+        return bytes;
+    }
+
     public void dup() {
         putByte(0x59);
     }

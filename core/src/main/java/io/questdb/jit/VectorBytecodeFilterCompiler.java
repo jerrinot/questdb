@@ -102,6 +102,9 @@ public final class VectorBytecodeFilterCompiler {
         if (dumpPath != null) {
             asm.dump(dumpPath);
         }
+        if (Boolean.getBoolean("questdb.jit.vector.decompile")) {
+            decompileToStderr(asm);
+        }
 
         return asm.newInstance();
     }
@@ -1480,6 +1483,116 @@ public final class VectorBytecodeFilterCompiler {
         }
         asm.checkcast(pool.vecType(c.toType()).vecClass);
         asm.astore(tempSlots[c.dst()]);
+    }
+
+    // === Debug: decompile generated class ===
+
+    /**
+     * Decompiles the generated class bytes and prints the result to stderr.
+     * Uses Vineflower/Fernflower via reflection so there is no compile-time
+     * dependency — the decompiler JAR only needs to be on the classpath at
+     * runtime (e.g. test scope).  Falls back to javap if unavailable.
+     * <p>
+     * Enable with {@code -Dquestdb.jit.vector.decompile=true}.
+     */
+    private static void decompileToStderr(BytecodeAssembler asm) {
+        byte[] classBytes = asm.toByteArray();
+        try {
+            // Try Vineflower/Fernflower first (produces readable Java source)
+            Class.forName("org.jetbrains.java.decompiler.api.Decompiler");
+            decompileWithVineflower(classBytes);
+        } catch (ClassNotFoundException e) {
+            // Vineflower not on classpath — fall back to javap
+            decompileWithJavap(classBytes);
+        } catch (Exception e) {
+            System.err.println("Decompilation failed: " + e.getMessage());
+            decompileWithJavap(classBytes);
+        }
+    }
+
+    private static void decompileWithVineflower(byte[] classBytes) throws Exception {
+        // Vineflower 1.11+ uses a builder API:
+        //   Decompiler.builder()
+        //       .inputs(File...)
+        //       .output(IResultSaver)
+        //       .build()
+        //       .decompile()
+        //
+        // All calls use reflection to avoid a compile-time dependency.
+        var result = new Object() {
+            String source;
+        };
+
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+
+        // IResultSaver proxy — captures the decompiled source text
+        Class<?> saverIface = cl.loadClass("org.jetbrains.java.decompiler.main.extern.IResultSaver");
+        Object saverProxy = java.lang.reflect.Proxy.newProxyInstance(cl, new Class<?>[]{saverIface},
+                (proxy, method, args) -> {
+                    if ("saveClassFile".equals(method.getName())) {
+                        // args: String path, String qualifiedName, String entryName, String content, int[] mapping
+                        result.source = (String) args[3];
+                    }
+                    return null;
+                });
+
+        // Write class bytes to a temp file (Vineflower reads from File)
+        java.io.File tmp = java.io.File.createTempFile("vgen", ".class");
+        try {
+            try (var fos = new java.io.FileOutputStream(tmp)) {
+                fos.write(classBytes);
+            }
+
+            Class<?> decompilerClass = cl.loadClass("org.jetbrains.java.decompiler.api.Decompiler");
+            Class<?> builderClass = cl.loadClass("org.jetbrains.java.decompiler.api.Decompiler$Builder");
+
+            // Decompiler.builder()
+            Object builder = decompilerClass.getMethod("builder").invoke(null);
+
+            // .inputs(File...)
+            builderClass.getMethod("inputs", java.io.File[].class)
+                    .invoke(builder, (Object) new java.io.File[]{tmp});
+
+            // .output(IResultSaver)
+            builderClass.getMethod("output", saverIface).invoke(builder, saverProxy);
+
+            // .build()
+            Object decompiler = builderClass.getMethod("build").invoke(builder);
+
+            // .decompile()
+            decompilerClass.getMethod("decompile").invoke(decompiler);
+        } finally {
+            tmp.delete();
+        }
+
+        if (result.source != null) {
+            System.err.println("=== Decompiled vector filter (Vineflower) ===");
+            System.err.println(result.source);
+        } else {
+            System.err.println("Vineflower produced no output, falling back to javap");
+            decompileWithJavap(classBytes);
+        }
+    }
+
+    private static void decompileWithJavap(byte[] classBytes) {
+        try {
+            java.io.File tmp = java.io.File.createTempFile("vgen", ".class");
+            try {
+                try (var fos = new java.io.FileOutputStream(tmp)) {
+                    fos.write(classBytes);
+                }
+                ProcessBuilder pb = new ProcessBuilder("javap", "-c", "-p", tmp.getAbsolutePath());
+                pb.redirectErrorStream(true);
+                Process p = pb.start();
+                System.err.println("=== Disassembled vector filter (javap) ===");
+                p.getInputStream().transferTo(System.err);
+                p.waitFor();
+            } finally {
+                tmp.delete();
+            }
+        } catch (Exception e) {
+            System.err.println("javap fallback failed: " + e.getMessage());
+        }
     }
 
     // === Constant pool ===

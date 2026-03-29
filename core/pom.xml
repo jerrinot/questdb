@@ -706,6 +706,12 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>org.vineflower</groupId>
+            <artifactId>vineflower</artifactId>
+            <version>1.11.1</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <version>42.7.7</version>
