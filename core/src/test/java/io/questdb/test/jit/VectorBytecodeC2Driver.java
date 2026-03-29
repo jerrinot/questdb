@@ -57,6 +57,7 @@ public class VectorBytecodeC2Driver {
         switch (filter) {
             case "l_gt_42" -> runLongGt42();
             case "in5" -> runLongIn5();
+            case "in9" -> runLongInN(9);
             case "in11" -> runLongInN(11);
             case "mixed" -> runMixedLongDouble();
             default -> {
