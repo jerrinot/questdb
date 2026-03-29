@@ -499,9 +499,11 @@ public final class VectorBytecodeFilterCompiler {
             asm.astore(s.nullVecSlot());
         }
         if (isCountOnly) {
-            asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
-            asm.lconst_0();
-            asm.invokeStatic(pool.vecType(I8_TYPE).broadcast);
+            // countAccSlot is kept allocated for stack-map stability but unused.
+            // Count-only reduction accumulates into filteredCountSlot via scalar
+            // trueCount() + ladd, which avoids creating a LongVector accumulator
+            // that OSR C2 would struggle to scalarize.
+            asm.aconst_null();
             asm.astore(s.countAccSlot());
         }
         // fullMaskSlot holds species.indexInRange(0, stride) — a mask with all
@@ -583,10 +585,7 @@ public final class VectorBytecodeFilterCompiler {
 
         int exitStart = asm.position();
         asm.setJmp(exitBranch, exitStart);
-        asm.aload(s.countAccSlot());
-        asm.getstatic(pool.associativeAdd);
-        asm.invokeVirtual(pool.longVecReduceLanesToLong);
-        asm.lstore(s.filteredCountSlot());
+        // filteredCountSlot already holds the scalar count — no vector reduction needed.
 
         return new LoopEmission(loopStart, nextStart, tailStart, exitStart);
     }
@@ -871,6 +870,7 @@ public final class VectorBytecodeFilterCompiler {
         Pool pool = ctx.pool();
         SlotLayout s = ctx.s();
 
+        // Finalize the result mask into activeMaskSlot.
         if (ret.src() == Terminator.Return.ACCEPT) {
             asm.aload(s.activeMaskSlot());
         } else {
@@ -884,12 +884,16 @@ public final class VectorBytecodeFilterCompiler {
             asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
             asm.invokeVirtual(pool.maskCast);
         }
-        asm.astore(s.activeMaskSlot());
-        asm.aload(s.countAccSlot());
-        asm.lconst_1();
-        asm.aload(s.activeMaskSlot());
-        asm.invokeVirtual(pool.longVecAddScalarMasked);
-        asm.astore(s.countAccSlot());
+
+        // Accumulate matching rows via scalar trueCount() + ladd.
+        // This avoids creating a LongVector accumulator per iteration,
+        // which OSR C2 struggles to scalarize into a ZMM register.
+        // The trueCount() intrinsic maps to kmov + popcnt (2 cycles).
+        asm.invokeVirtual(pool.maskTrueCount);
+        asm.i2l();
+        asm.lload(s.filteredCountSlot());
+        asm.ladd();
+        asm.lstore(s.filteredCountSlot());
     }
 
     private static void emitBlockOps(
