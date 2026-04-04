@@ -24,264 +24,151 @@
 
 package io.questdb.test.jit;
 
-import io.questdb.jit.IrDecoder;
-import io.questdb.jit.IrLowering;
-import io.questdb.jit.LoweredProgram;
-import io.questdb.jit.VectorBytecodeFilterCompiler;
-import io.questdb.jit.VectorFilterBody;
-import io.questdb.std.MemoryTag;
-import io.questdb.std.Unsafe;
-import jdk.incubator.vector.LongVector;
-
-import static io.questdb.jit.CompiledFilterIRSerializer.*;
+import io.questdb.cairo.JitBackend;
+import io.questdb.cairo.SqlJitMode;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory;
+import io.questdb.jit.VectorCompiledFilter;
+import io.questdb.test.AbstractCairoTest;
+import org.junit.Assert;
+import org.junit.Test;
 
 /**
- * Standalone driver for C2 compilation analysis of vector bytecode filters.
- * Run with diagnostic JVM flags to capture inlining and compilation decisions.
+ * Drives the Java vector-bytecode JIT through the real SQL execution path so
+ * the generated filter can be C2-compiled and inspected with JVM diagnostics.
  *
- * Usage:
- *   java --add-modules jdk.incubator.vector \
- *        -XX:+UnlockDiagnosticVMOptions \
- *        -XX:+PrintCompilation \
- *        -XX:+PrintInlining \
- *        -cp <classpath> io.questdb.test.jit.VectorBytecodeC2Driver
+ * Example:
+ *   mvn -pl core -Dtest=VectorBytecodeC2Driver#dumpIntRange test
  */
-public class VectorBytecodeC2Driver {
+public class VectorBytecodeC2Driver extends AbstractCairoTest {
 
-    private static final int ROW_COUNT = 4096;
+    private static final String CREATE_TABLE_SQL = "CREATE TABLE jit_bench AS (" +
+            "SELECT" +
+            " x AS l," +
+            " x * 1.5 AS d," +
+            " CAST(x AS INT) AS i," +
+            " timestamp_sequence(0, 1_000_000) ts" +
+            " FROM long_sequence(4096)" +
+            ") TIMESTAMP(ts) PARTITION BY HOUR BYPASS WAL";
     private static final int WARMUP_ITERATIONS = 20_000;
 
-    public static void main(String[] args) throws Exception {
-        String filter = args.length > 0 ? args[0] : "l_gt_42";
+    @Test
+    public void dumpIn5() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l IN (1, 2, 3, 4, 5)", true);
+    }
 
-        switch (filter) {
-            case "l_gt_42" -> runLongGt42();
-            case "in5" -> runLongIn5();
-            case "in9" -> runLongInN(9);
-            case "in11" -> runLongInN(11);
-            case "mixed" -> runMixedLongDouble();
-            default -> {
-                System.err.println("Unknown filter: " + filter);
-                System.err.println("Available: l_gt_42, in5, in11, mixed");
-                System.exit(1);
-            }
+    @Test
+    public void dumpIntIn5() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE i IN (1, 2, 3, 4, 5)", true);
+    }
+
+    @Test
+    public void dumpIntRange() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE i > 0 AND i < 100", true);
+    }
+
+    @Test
+    public void dumpIntEqOrAllInt() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE i = 111111111 OR i = 222222222 OR i = 33_333_3333", true);
+    }
+
+    @Test
+    public void dumpIntEqOrMixedIntLong() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE i = 111111111 OR i = 222222222 OR i = 333_333_3333", false);
+    }
+
+    @Test
+    public void dumpLongGt42() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > 42", true);
+    }
+
+    @Test
+    public void dumpMixed() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > 42 AND d < 100.0", true);
+    }
+
+    private static final class SilentSqlExecutionContext extends SqlExecutionContextImpl {
+        private SilentSqlExecutionContext() {
+            super(engine, 1);
+        }
+
+        @Override
+        public boolean shouldLogSql() {
+            return false;
         }
     }
 
-    private static void runLongGt42() throws Exception {
-        System.err.println("=== Filter: l > 42 (pure I8) ===");
-
-        int options = (3 << 1) | (1 << 4); // log2(8), single-size, no null checks
-        IrDecoder.Instruction[] instructions = {
-                new IrDecoder.Instruction(IMM, I8_TYPE, 42, 0),
-                new IrDecoder.Instruction(MEM, I8_TYPE, 0, 0),
-                new IrDecoder.Instruction(GT, 0, 0, 0),
-                new IrDecoder.Instruction(RET, 0, 0, 0)
-        };
-
-        LoweredProgram prog = IrLowering.lower(instructions, options);
-        VectorFilterBody body = VectorBytecodeFilterCompiler.compile(prog);
-        if (body == null) {
-            System.err.println("ERROR: vector compiler rejected program");
-            System.exit(1);
-        }
-
-        int speciesLen = LongVector.SPECIES_PREFERRED.length();
-        long colData = Unsafe.malloc((long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
-        long outputBuf = Unsafe.malloc(((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-
-        for (int i = 0; i < ROW_COUNT; i++) {
-            Unsafe.getUnsafe().putLong(colData + (long) i * Long.BYTES, i * 10L);
-        }
-        Unsafe.getUnsafe().putLong(colPtrArray, colData);
-
-        try {
-            // Warm up to trigger C2 compilation
-            long result = 0;
-            for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                result = body.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, ROW_COUNT);
+    private static void assertVectorBytecodeUsed(RecordCursorFactory factory) {
+        RecordCursorFactory current = factory;
+        while (current != null) {
+            if (current instanceof AsyncJitFilteredRecordCursorFactory ajf) {
+                if (ajf.getCompiledFilter() instanceof VectorCompiledFilter vcf) {
+                    Assert.assertTrue("expected vector bytecode, got scalar", vcf.usesVectorBytecode());
+                    return;
+                }
             }
-            System.err.println("filterRows result: " + result + " rows matched");
-
-            // Count-only path
-            for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                result = body.countRows(colPtrArray, 1, 0, 0, 0, ROW_COUNT);
-            }
-            System.err.println("countRows result: " + result + " rows counted");
-        } finally {
-            Unsafe.free(colData, (long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
-            Unsafe.free(outputBuf, ((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            current = current.getBaseFactory();
         }
+        Assert.fail("VectorCompiledFilter not found");
     }
 
-    private static void runLongIn5() throws Exception {
-        System.err.println("=== Filter: l IN (1, 2, 3, 4, 5) (pure I8, straight-line OR) ===");
-
-        int options = (3 << 1) | (1 << 4); // log2(8), single-size, no null checks
-        IrDecoder.Instruction[] instructions = {
-                new IrDecoder.Instruction(IMM, I8_TYPE, 1, 0),
-                new IrDecoder.Instruction(MEM, I8_TYPE, 0, 0),
-                new IrDecoder.Instruction(EQ, 0, 0, 0),
-
-                new IrDecoder.Instruction(IMM, I8_TYPE, 2, 0),
-                new IrDecoder.Instruction(MEM, I8_TYPE, 0, 0),
-                new IrDecoder.Instruction(EQ, 0, 0, 0),
-                new IrDecoder.Instruction(OR, 0, 0, 0),
-
-                new IrDecoder.Instruction(IMM, I8_TYPE, 3, 0),
-                new IrDecoder.Instruction(MEM, I8_TYPE, 0, 0),
-                new IrDecoder.Instruction(EQ, 0, 0, 0),
-                new IrDecoder.Instruction(OR, 0, 0, 0),
-
-                new IrDecoder.Instruction(IMM, I8_TYPE, 4, 0),
-                new IrDecoder.Instruction(MEM, I8_TYPE, 0, 0),
-                new IrDecoder.Instruction(EQ, 0, 0, 0),
-                new IrDecoder.Instruction(OR, 0, 0, 0),
-
-                new IrDecoder.Instruction(IMM, I8_TYPE, 5, 0),
-                new IrDecoder.Instruction(MEM, I8_TYPE, 0, 0),
-                new IrDecoder.Instruction(EQ, 0, 0, 0),
-                new IrDecoder.Instruction(OR, 0, 0, 0),
-
-                new IrDecoder.Instruction(RET, 0, 0, 0)
-        };
-
-        LoweredProgram prog = IrLowering.lower(instructions, options);
-        VectorFilterBody body = VectorBytecodeFilterCompiler.compile(prog);
-        if (body == null) {
-            System.err.println("ERROR: vector compiler rejected program");
-            System.exit(1);
-        }
-
-        int speciesLen = LongVector.SPECIES_PREFERRED.length();
-        long colData = Unsafe.malloc((long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
-        long outputBuf = Unsafe.malloc(((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-
-        for (int i = 0; i < ROW_COUNT; i++) {
-            // Sparse matches keep the filter realistic and avoid "all lanes match" bias.
-            Unsafe.getUnsafe().putLong(colData + (long) i * Long.BYTES, (i % 16) + 1L);
-        }
-        Unsafe.getUnsafe().putLong(colPtrArray, colData);
-
-        try {
-            long result = 0;
-            for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                result = body.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, ROW_COUNT);
+    private static void assertVectorCompiledFilter(RecordCursorFactory factory) {
+        RecordCursorFactory current = factory;
+        while (current != null) {
+            if (current instanceof AsyncJitFilteredRecordCursorFactory ajf) {
+                Assert.assertEquals(VectorCompiledFilter.class.getName(), ajf.getCompiledFilter().getClass().getName());
+                return;
             }
-            System.err.println("filterRows result: " + result + " rows matched");
-
-            for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                result = body.countRows(colPtrArray, 1, 0, 0, 0, ROW_COUNT);
-            }
-            System.err.println("countRows result: " + result + " rows counted");
-        } finally {
-            Unsafe.free(colData, (long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
-            Unsafe.free(outputBuf, ((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            current = current.getBaseFactory();
         }
+        Assert.fail("compiled filter factory not found");
     }
 
-    private static void runLongInN(int n) throws Exception {
-        System.err.println("=== Filter: l IN (1.." + n + ") (pure I8, straight-line OR) ===");
-
-        int options = (3 << 1) | (1 << 4);
-        int insnCount = n * 3 + (n - 1) + 1; // n×(IMM,MEM,EQ) + (n-1)×OR + RET
-        IrDecoder.Instruction[] instructions = new IrDecoder.Instruction[insnCount];
-        int idx = 0;
-        for (int v = 1; v <= n; v++) {
-            instructions[idx++] = new IrDecoder.Instruction(IMM, I8_TYPE, v, 0);
-            instructions[idx++] = new IrDecoder.Instruction(MEM, I8_TYPE, 0, 0);
-            instructions[idx++] = new IrDecoder.Instruction(EQ, 0, 0, 0);
-            if (v > 1) {
-                instructions[idx++] = new IrDecoder.Instruction(OR, 0, 0, 0);
-            }
+    private static long drainCursor(RecordCursor cursor) {
+        long rows = 0;
+        while (cursor.hasNext()) {
+            rows++;
         }
-        instructions[idx] = new IrDecoder.Instruction(RET, 0, 0, 0);
-
-        LoweredProgram prog = IrLowering.lower(instructions, options);
-        VectorFilterBody body = VectorBytecodeFilterCompiler.compile(prog);
-        if (body == null) {
-            System.err.println("ERROR: vector compiler rejected program");
-            System.exit(1);
-        }
-
-        int speciesLen = LongVector.SPECIES_PREFERRED.length();
-        long colData = Unsafe.malloc((long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-        long colPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
-        long outputBuf = Unsafe.malloc(((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-
-        for (int i = 0; i < ROW_COUNT; i++) {
-            Unsafe.getUnsafe().putLong(colData + (long) i * Long.BYTES, (i % 16) + 1L);
-        }
-        Unsafe.getUnsafe().putLong(colPtrArray, colData);
-
-        try {
-            long result = 0;
-            for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                result = body.filterRows(colPtrArray, 1, 0, 0, 0, outputBuf, ROW_COUNT);
-            }
-            System.err.println("filterRows result: " + result + " rows matched");
-
-            for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                result = body.countRows(colPtrArray, 1, 0, 0, 0, ROW_COUNT);
-            }
-            System.err.println("countRows result: " + result + " rows counted");
-        } finally {
-            Unsafe.free(colData, (long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-            Unsafe.free(colPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
-            Unsafe.free(outputBuf, ((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-        }
+        return rows;
     }
 
-    private static void runMixedLongDouble() throws Exception {
-        System.err.println("=== Filter: l > 25 AND d < 0.5 (mixed I8+F8, null checks) ===");
+    private void driveJavaVectorQuery(String sql, boolean expectCompiledFilter) throws Exception {
+        assertMemoryLeak(() -> {
+            SilentSqlExecutionContext executionContext = new SilentSqlExecutionContext();
+            executionContext.with(sqlExecutionContext.getSecurityContext(), sqlExecutionContext.getBindVariableService());
+            executionContext.setParallelFilterEnabled(sqlExecutionContext.isParallelFilterEnabled());
+            executionContext.setParallelGroupByEnabled(sqlExecutionContext.isParallelGroupByEnabled());
+            executionContext.setParallelTopKEnabled(sqlExecutionContext.isParallelTopKEnabled());
+            executionContext.setParallelHorizonJoinEnabled(sqlExecutionContext.isParallelHorizonJoinEnabled());
+            executionContext.setParallelWindowJoinEnabled(sqlExecutionContext.isParallelWindowJoinEnabled());
+            executionContext.setParallelReadParquetEnabled(sqlExecutionContext.isParallelReadParquetEnabled());
+            executionContext.setParquetRowGroupPruningEnabled(sqlExecutionContext.isParquetRowGroupPruningEnabled());
 
-        int options = (3 << 1) | (1 << 4) | (1 << 6); // log2(8), single-size, null checks
-        IrDecoder.Instruction[] instructions = {
-                new IrDecoder.Instruction(IMM, I8_TYPE, 25, 0),
-                new IrDecoder.Instruction(MEM, I8_TYPE, 0, 0),
-                new IrDecoder.Instruction(GT, 0, 0, 0),
-                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(0.5), 0),
-                new IrDecoder.Instruction(MEM, F8_TYPE, 1, 0),
-                new IrDecoder.Instruction(LT, 0, 0, 0),
-                new IrDecoder.Instruction(AND, 0, 0, 0),
-                new IrDecoder.Instruction(RET, 0, 0, 0)
-        };
+            execute(CREATE_TABLE_SQL, executionContext);
 
-        LoweredProgram prog = IrLowering.lower(instructions, options);
-        VectorFilterBody body = VectorBytecodeFilterCompiler.compile(prog);
-        if (body == null) {
-            System.err.println("ERROR: vector compiler rejected program");
-            System.exit(1);
-        }
+            executionContext.setJitMode(SqlJitMode.JIT_MODE_ENABLED);
+            executionContext.setJitBackend(JitBackend.JAVA_VECTOR_COMPILED);
 
-        int speciesLen = LongVector.SPECIES_PREFERRED.length();
-        long col0 = Unsafe.malloc((long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-        long col1 = Unsafe.malloc((long) ROW_COUNT * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
-        long colPtrArray = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
-        long outputBuf = Unsafe.malloc(((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            System.out.println("=== " + sql + " ===");
+            try (RecordCursorFactory factory = select(sql, executionContext)) {
+                if (expectCompiledFilter) {
+                    Assert.assertTrue("query should use a compiled filter", factory.usesCompiledFilter());
+                    assertVectorCompiledFilter(factory);
+                    assertVectorBytecodeUsed(factory);
+                } else {
+                    System.err.println("usesCompiledFilter=" + factory.usesCompiledFilter());
+                }
 
-        for (int i = 0; i < ROW_COUNT; i++) {
-            Unsafe.getUnsafe().putLong(col0 + (long) i * Long.BYTES, i * 10L);
-            Unsafe.getUnsafe().putDouble(col1 + (long) i * Double.BYTES, i * 0.1);
-        }
-        Unsafe.getUnsafe().putLong(colPtrArray, col0);
-        Unsafe.getUnsafe().putLong(colPtrArray + 8, col1);
-
-        try {
-            long result = 0;
-            for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-                result = body.filterRows(colPtrArray, 2, 0, 0, 0, outputBuf, ROW_COUNT);
+                long rows = 0;
+                for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+                    try (RecordCursor cursor = factory.getCursor(executionContext)) {
+                        rows = drainCursor(cursor);
+                    }
+                }
+                System.err.println("Rows matched: " + rows);
             }
-            System.err.println("filterRows result: " + result + " rows matched");
-        } finally {
-            Unsafe.free(col0, (long) ROW_COUNT * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-            Unsafe.free(col1, (long) ROW_COUNT * Double.BYTES, MemoryTag.NATIVE_DEFAULT);
-            Unsafe.free(colPtrArray, 16, MemoryTag.NATIVE_DEFAULT);
-            Unsafe.free(outputBuf, ((long) ROW_COUNT + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 }

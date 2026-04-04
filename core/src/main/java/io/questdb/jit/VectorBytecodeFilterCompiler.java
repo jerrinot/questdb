@@ -918,6 +918,11 @@ public final class VectorBytecodeFilterCompiler {
         ctx.cachedNullMaskOwner()[0] = -1;
         for (int i = 0; i < block.getOpCount(); i++) {
             LoweredOp op = block.getOp(i);
+            int consumedInt = tryEmitIntInEqOrChain(ctx, block, i, useCounts, maskedLoads);
+            if (consumedInt >= 0) {
+                i = consumedInt;
+                continue;
+            }
             int consumed = tryEmitLongInEqOrChain(ctx, block, i, useCounts, maskedLoads);
             if (consumed >= 0) {
                 i = consumed;
@@ -950,6 +955,113 @@ public final class VectorBytecodeFilterCompiler {
             }
             emitOp(ctx, op, maskedLoads);
         }
+    }
+
+    private static int tryEmitIntInEqOrChain(
+            EmitContext ctx, LoweredBlock block, int startIndex,
+            int[] useCounts, boolean maskedLoads
+    ) {
+        if (!(block.getOp(startIndex) instanceof LoweredOp.LoadColumn firstLoad) || firstLoad.type() != I4_TYPE) {
+            return -1;
+        }
+        if (startIndex + 4 >= block.getOpCount()) {
+            return -1;
+        }
+        if (useCounts[firstLoad.dst()] != 1) {
+            return -1;
+        }
+
+        if (!(block.getOp(startIndex + 1) instanceof LoweredOp.Compare firstCompare)
+                || firstCompare.opcode() != EQ
+                || firstCompare.operandType() != I4_TYPE) {
+            return -1;
+        }
+        int firstValueTemp = eqOtherOperand(firstCompare, firstLoad.dst());
+        if (firstValueTemp < 0) {
+            return -1;
+        }
+
+        int accumTemp = firstCompare.dst();
+        int scan = startIndex + 2;
+        int chainLength = 1;
+
+        while (scan < block.getOpCount()) {
+            int s = scan;
+            while (s < block.getOpCount() && (block.getOp(s) instanceof LoweredOp.LoadImm
+                    || block.getOp(s) instanceof LoweredOp.LoadVar)) {
+                s++;
+            }
+            if (s + 2 >= block.getOpCount()) {
+                break;
+            }
+            if (!(block.getOp(s) instanceof LoweredOp.LoadColumn nextLoad)
+                    || nextLoad.type() != I4_TYPE
+                    || nextLoad.columnIndex() != firstLoad.columnIndex()) {
+                break;
+            }
+            if (useCounts[nextLoad.dst()] != 1) {
+                break;
+            }
+            if (!(block.getOp(s + 1) instanceof LoweredOp.Compare nextCompare)
+                    || nextCompare.opcode() != EQ
+                    || nextCompare.operandType() != I4_TYPE) {
+                break;
+            }
+            if (eqOtherOperand(nextCompare, nextLoad.dst()) < 0) {
+                break;
+            }
+            if (!(block.getOp(s + 2) instanceof LoweredOp.BooleanOp or)
+                    || or.opcode() != OR
+                    || !matchesBooleanInputs(or, accumTemp, nextCompare.dst())) {
+                break;
+            }
+            if (useCounts[accumTemp] != 1 || useCounts[nextCompare.dst()] != 1) {
+                break;
+            }
+            accumTemp = or.dst();
+            scan = s + 3;
+            chainLength++;
+        }
+
+        if (chainLength < 2) {
+            return -1;
+        }
+
+        BytecodeAssembler asm = ctx.asm();
+        Pool pool = ctx.pool();
+        int[] tempSlots = ctx.s().tempSlots();
+
+        int resultSlot = tempSlots[accumTemp];
+        emitLoadColumn(ctx, firstLoad, maskedLoads);
+        emitIntEqMaskFromOperand(ctx, firstLoad.dst(), firstValueTemp);
+        asm.astore(resultSlot);
+
+        int pos = startIndex + 2;
+        for (int i = 1; i < chainLength; i++) {
+            while (block.getOp(pos) instanceof LoweredOp.LoadImm
+                    || block.getOp(pos) instanceof LoweredOp.LoadVar) {
+                pos++;
+            }
+            LoweredOp.LoadColumn load = (LoweredOp.LoadColumn) block.getOp(pos);
+            LoweredOp.Compare compare = (LoweredOp.Compare) block.getOp(pos + 1);
+
+            asm.aload(resultSlot);
+            asm.checkcast(pool.vectorMaskClass);
+            emitIntEqMaskFromOperand(ctx, firstLoad.dst(), eqOtherOperand(compare, load.dst()));
+            asm.checkcast(pool.vectorMaskClass);
+            asm.invokeVirtual(pool.maskOr);
+            asm.astore(resultSlot);
+
+            pos += 3;
+        }
+
+        asm.aload(resultSlot);
+        asm.checkcast(pool.vectorMaskClass);
+        asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+        asm.invokeVirtual(pool.maskCast);
+        asm.astore(resultSlot);
+
+        return scan - 1;
     }
 
     private static int tryEmitLongInEqOrChain(
@@ -1082,6 +1194,27 @@ public final class VectorBytecodeFilterCompiler {
         asm.aload(valueSlot);
         asm.checkcast(vt.vecClass);
         asm.invokeVirtual(vt.compare);
+    }
+
+    private static void emitIntEqMaskFromLoadedValue(BytecodeAssembler asm, int loadedSlot, int valueSlot, Pool pool) {
+        Pool.VecType vt = pool.vecType(I4_TYPE);
+        asm.aload(loadedSlot);
+        asm.checkcast(vt.vecClass);
+        asm.getstatic(pool.comparisonOp(EQ));
+        asm.aload(valueSlot);
+        asm.checkcast(vt.vecClass);
+        asm.invokeVirtual(vt.compare);
+    }
+
+    private static void emitIntEqMaskFromOperand(EmitContext ctx, int loadedTemp, int valueTemp) {
+        LoweredOp.LoadImm imm = findLoadImmByDst(ctx.block(), valueTemp);
+        if (imm != null && imm.type() == I4_TYPE) {
+            emitScalarCompare(ctx, loadedTemp, imm.lo(), I4_TYPE, EQ);
+            return;
+        }
+
+        int[] tempSlots = ctx.s().tempSlots();
+        emitIntEqMaskFromLoadedValue(ctx.asm(), tempSlots[loadedTemp], tempSlots[valueTemp], ctx.pool());
     }
 
     private static void emitTypeSpecies(EmitContext ctx, int type) {
@@ -1240,6 +1373,7 @@ public final class VectorBytecodeFilterCompiler {
         int[] tempSlots = ctx.s().tempSlots();
         boolean nullChecks = ctx.nullChecks();
         Pool.VecType vt = pool.vecType(c.operandType());
+        ImmediateCompare immediateCompare = findImmediateCompare(ctx.block(), c);
 
         if (c.operandType() == F8_TYPE) {
             // Double comparisons always use helpers (epsilon + NaN handling).
@@ -1268,6 +1402,9 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeVirtual(pool.maskCast);
             asm.astore(tempSlots[c.dst()]);
         } else if (c.operandType() == I4_TYPE) {
+            if (tryEmitScalarImmediateCompare(ctx, c, immediateCompare)) {
+                return;
+            }
             asm.aload(tempSlots[c.lhs()]);
             asm.checkcast(vt.vecClass);
             if (nullChecks) {
@@ -1284,6 +1421,9 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeVirtual(pool.maskCast);
             asm.astore(tempSlots[c.dst()]);
         } else if (!nullChecks) {
+            if (tryEmitScalarImmediateCompare(ctx, c, immediateCompare)) {
+                return;
+            }
             // I8 without null checks: direct compare
             asm.aload(tempSlots[c.lhs()]);
             asm.checkcast(vt.vecClass);
@@ -1293,6 +1433,9 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeVirtual(vt.compare);
             asm.astore(tempSlots[c.dst()]);
         } else if (c.opcode() == EQ || c.opcode() == NE) {
+            if (tryEmitScalarImmediateCompare(ctx, c, immediateCompare)) {
+                return;
+            }
             // I8 EQ/NE with null checks: LONG_NULL == LONG_NULL works naturally
             asm.aload(tempSlots[c.lhs()]);
             asm.checkcast(vt.vecClass);
@@ -1301,6 +1444,8 @@ public final class VectorBytecodeFilterCompiler {
             asm.checkcast(vt.vecClass);
             asm.invokeVirtual(vt.compare);
             asm.astore(tempSlots[c.dst()]);
+        } else if (tryEmitScalarImmediateCompare(ctx, c, immediateCompare)) {
+            return;
         } else if (ctx.s().nullMaskCacheSlot() >= 0 && isNonNullImmediateTemp(ctx.block(), c.rhs())) {
             // I8 null-aware ordered comparison where rhs is a compile-time
             // constant (never LONG_NULL).  Compute the lhs null mask once,
@@ -1348,14 +1493,167 @@ public final class VectorBytecodeFilterCompiler {
         }
     }
 
+    private static boolean tryEmitScalarImmediateCompare(
+            EmitContext ctx,
+            LoweredOp.Compare c,
+            ImmediateCompare immediateCompare
+    ) {
+        if (immediateCompare == null || immediateCompare.imm().type() != c.operandType()) {
+            return false;
+        }
+
+        final int operandType = c.operandType();
+        if (operandType != I4_TYPE && operandType != I8_TYPE) {
+            return false;
+        }
+
+        BytecodeAssembler asm = ctx.asm();
+        Pool pool = ctx.pool();
+        int[] tempSlots = ctx.s().tempSlots();
+        final boolean nullChecks = ctx.nullChecks();
+
+        if (!nullChecks || immediateCompare.opcode() == EQ || immediateCompare.opcode() == NE) {
+            emitScalarCompare(ctx, immediateCompare.vectorTemp(), immediateCompare.imm().lo(), operandType, immediateCompare.opcode());
+            if (operandType == I4_TYPE) {
+                asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+                asm.invokeVirtual(pool.maskCast);
+            }
+            asm.astore(tempSlots[c.dst()]);
+            return true;
+        }
+
+        if (!isNonNullImmediate(immediateCompare.imm()) || ctx.s().nullMaskCacheSlot() < 0) {
+            return false;
+        }
+
+        if (ctx.cachedNullMaskOwner()[0] != immediateCompare.vectorTemp()) {
+            emitScalarCompare(ctx, immediateCompare.vectorTemp(), nullSentinel(operandType), operandType, EQ);
+            if (operandType == I4_TYPE) {
+                asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+                asm.invokeVirtual(pool.maskCast);
+            }
+            asm.astore(ctx.s().nullMaskCacheSlot());
+            ctx.cachedNullMaskOwner()[0] = immediateCompare.vectorTemp();
+        }
+
+        emitScalarCompare(ctx, immediateCompare.vectorTemp(), immediateCompare.imm().lo(), operandType, immediateCompare.opcode());
+        if (operandType == I4_TYPE) {
+            asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
+            asm.invokeVirtual(pool.maskCast);
+        }
+        asm.aload(ctx.s().nullMaskCacheSlot());
+        asm.checkcast(pool.vectorMaskClass);
+        asm.invokeVirtual(pool.maskAndNot);
+        asm.astore(tempSlots[c.dst()]);
+        return true;
+    }
+
+    private static void emitScalarCompare(EmitContext ctx, int vectorTemp, long scalar, int operandType, int opcode) {
+        BytecodeAssembler asm = ctx.asm();
+        Pool pool = ctx.pool();
+        Pool.VecType vt = pool.vecType(operandType);
+        int[] tempSlots = ctx.s().tempSlots();
+
+        asm.aload(tempSlots[vectorTemp]);
+        asm.checkcast(vt.vecClass);
+        asm.getstatic(pool.comparisonOp(opcode));
+        emitScalarImmediate(asm, pool, operandType, scalar);
+        asm.invokeVirtual(vt.compareScalar);
+    }
+
+    private static void emitScalarImmediate(BytecodeAssembler asm, Pool pool, int operandType, long scalar) {
+        switch (operandType) {
+            case I4_TYPE -> emitIntConst(asm, (int) scalar, pool);
+            case I8_TYPE -> asm.ldc2_w(pool.ensureLongPooled(scalar));
+            case F4_TYPE -> asm.ldc(pool.ensureFloatPooled(Float.intBitsToFloat((int) scalar)));
+            case F8_TYPE -> asm.ldc2_w(pool.ensureDoublePooled(Double.longBitsToDouble(scalar)));
+            default -> throw new UnsupportedOperationException("Scalar immediate type: " + operandType);
+        }
+    }
+
+    private static LoweredOp.LoadImm findLoadImmByDst(LoweredBlock block, int tempId) {
+        for (int i = 0; i < block.getOpCount(); i++) {
+            LoweredOp op = block.getOp(i);
+            if (op instanceof LoweredOp.LoadImm li && li.dst() == tempId) {
+                return li;
+            }
+        }
+        return null;
+    }
+
+    private static ImmediateCompare findImmediateCompare(LoweredBlock block, LoweredOp.Compare c) {
+        LoweredOp.LoadImm rhsImm = findLoadImmByDst(block, c.rhs());
+        LoweredOp.LoadImm lhsImm = findLoadImmByDst(block, c.lhs());
+        if (lhsImm != null && rhsImm != null) {
+            return null;
+        }
+        if (rhsImm != null) {
+            return new ImmediateCompare(c.lhs(), rhsImm, c.opcode());
+        }
+
+        if (lhsImm != null) {
+            return new ImmediateCompare(c.rhs(), lhsImm, swapCompareOpcode(c.opcode()));
+        }
+        return null;
+    }
+
+    private static ImmediateArithmetic findImmediateArithmetic(LoweredBlock block, LoweredOp.Arithmetic a) {
+        LoweredOp.LoadImm rhsImm = findLoadImmByDst(block, a.rhs());
+        LoweredOp.LoadImm lhsImm = findLoadImmByDst(block, a.lhs());
+        if (lhsImm != null && rhsImm != null) {
+            return null;
+        }
+        if (rhsImm != null) {
+            return new ImmediateArithmetic(a.lhs(), rhsImm);
+        }
+        if (lhsImm != null && isCommutativeArithmetic(a.opcode())) {
+            return new ImmediateArithmetic(a.rhs(), lhsImm);
+        }
+        return null;
+    }
+
+    private static boolean isNonNullImmediate(LoweredOp.LoadImm imm) {
+        return imm.lo() != nullSentinel(imm.type());
+    }
+
+    private static long nullSentinel(int operandType) {
+        return switch (operandType) {
+            case I4_TYPE -> io.questdb.std.Numbers.INT_NULL;
+            case I8_TYPE -> io.questdb.std.Numbers.LONG_NULL;
+            default -> throw new UnsupportedOperationException("Null sentinel for type: " + operandType);
+        };
+    }
+
+    private static int swapCompareOpcode(int opcode) {
+        return switch (opcode) {
+            case LT -> GT;
+            case LE -> GE;
+            case GT -> LT;
+            case GE -> LE;
+            case EQ, NE -> opcode;
+            default -> throw new UnsupportedOperationException("swap compare opcode: " + opcode);
+        };
+    }
+
+    private static boolean isCommutativeArithmetic(int opcode) {
+        return opcode == ADD || opcode == MUL;
+    }
+
+    private record ImmediateArithmetic(int vectorTemp, LoweredOp.LoadImm imm) {
+    }
+
+    private record ImmediateCompare(int vectorTemp, LoweredOp.LoadImm imm, int opcode) {
+    }
+
     /**
      * Returns true when the given temp was produced by a LoadImm with a value
-     * that is NOT the LONG_NULL sentinel — i.e. a non-null compile-time constant.
+     * that is not the null sentinel for its type — i.e. a non-null
+     * compile-time constant.
      */
     private static boolean isNonNullImmediateTemp(LoweredBlock block, int tempId) {
         for (int i = 0; i < block.getOpCount(); i++) {
             if (block.getOp(i) instanceof LoweredOp.LoadImm li && li.dst() == tempId) {
-                return li.lo() != io.questdb.std.Numbers.LONG_NULL;
+                return isNonNullImmediate(li);
             }
         }
         return false;
@@ -1451,6 +1749,11 @@ public final class VectorBytecodeFilterCompiler {
         Pool pool = ctx.pool();
         int[] tempSlots = ctx.s().tempSlots();
         Pool.VecType vt = pool.vecType(a.resultType());
+        ImmediateArithmetic immediateArithmetic = findImmediateArithmetic(ctx.block(), a);
+
+        if (tryEmitScalarImmediateArithmetic(ctx, a, immediateArithmetic)) {
+            return;
+        }
 
         if (a.resultType() == F8_TYPE) {
             // F8: per-op helper for NaN propagation and div-by-zero → NaN
@@ -1529,6 +1832,85 @@ public final class VectorBytecodeFilterCompiler {
             asm.invokeVirtual(method);
             asm.astore(tempSlots[a.dst()]);
         }
+    }
+
+    private static boolean tryEmitScalarImmediateArithmetic(
+            EmitContext ctx,
+            LoweredOp.Arithmetic a,
+            ImmediateArithmetic immediateArithmetic
+    ) {
+        if (immediateArithmetic == null || immediateArithmetic.imm().type() != a.resultType()) {
+            return false;
+        }
+
+        BytecodeAssembler asm = ctx.asm();
+        Pool pool = ctx.pool();
+        int[] tempSlots = ctx.s().tempSlots();
+        Pool.VecType vt = pool.vecType(a.resultType());
+
+        switch (a.resultType()) {
+            case F8_TYPE -> {
+                asm.aload(tempSlots[immediateArithmetic.vectorTemp()]);
+                asm.checkcast(vt.vecClass);
+                emitScalarImmediate(asm, pool, a.resultType(), immediateArithmetic.imm().lo());
+                asm.invokeStatic(pool.doubleArithmeticHelperScalar(a.opcode()));
+            }
+            case F4_TYPE -> {
+                asm.aload(tempSlots[immediateArithmetic.vectorTemp()]);
+                asm.checkcast(vt.vecClass);
+                emitScalarImmediate(asm, pool, a.resultType(), immediateArithmetic.imm().lo());
+                asm.invokeStatic(pool.floatArithmeticHelperScalar(a.opcode()));
+            }
+            case I8_TYPE -> {
+                if (ctx.nullChecks()) {
+                    asm.aload(tempSlots[immediateArithmetic.vectorTemp()]);
+                    asm.checkcast(vt.vecClass);
+                    emitScalarImmediate(asm, pool, a.resultType(), immediateArithmetic.imm().lo());
+                    asm.aload(ctx.s().nullVecSlot());
+                    asm.invokeStatic(pool.nullArithmeticHelperScalar(a.resultType(), a.opcode()));
+                } else {
+                    emitScalarArithmetic(ctx, immediateArithmetic.vectorTemp(), immediateArithmetic.imm().lo(), a.resultType(), a.opcode());
+                }
+            }
+            case I4_TYPE -> {
+                if (ctx.nullChecks()) {
+                    asm.aload(tempSlots[immediateArithmetic.vectorTemp()]);
+                    asm.checkcast(vt.vecClass);
+                    emitScalarImmediate(asm, pool, a.resultType(), immediateArithmetic.imm().lo());
+                    asm.invokeStatic(pool.nullArithmeticHelperScalar(a.resultType(), a.opcode()));
+                } else {
+                    emitScalarArithmetic(ctx, immediateArithmetic.vectorTemp(), immediateArithmetic.imm().lo(), a.resultType(), a.opcode());
+                }
+            }
+            default -> {
+                return false;
+            }
+        }
+
+        asm.astore(tempSlots[a.dst()]);
+        return true;
+    }
+
+    private static void emitScalarArithmetic(EmitContext ctx, int vectorTemp, long scalar, int operandType, int opcode) {
+        BytecodeAssembler asm = ctx.asm();
+        Pool pool = ctx.pool();
+        Pool.VecType vt = pool.vecType(operandType);
+        int[] tempSlots = ctx.s().tempSlots();
+
+        asm.aload(tempSlots[vectorTemp]);
+        asm.checkcast(vt.vecClass);
+        emitScalarImmediate(asm, pool, operandType, scalar);
+        asm.invokeVirtual(scalarArithmeticMethod(vt, opcode));
+    }
+
+    private static int scalarArithmeticMethod(Pool.VecType vt, int opcode) {
+        return switch (opcode) {
+            case ADD -> vt.addScalar;
+            case SUB -> vt.subScalar;
+            case MUL -> vt.mulScalar;
+            case DIV -> vt.divScalar;
+            default -> throw new UnsupportedOperationException("scalar arith op: " + opcode);
+        };
     }
 
     private static void emitNegate(EmitContext ctx, LoweredOp.Negate neg) {
@@ -1752,9 +2134,13 @@ public final class VectorBytecodeFilterCompiler {
         // Arithmetic helpers
         // Per-operation arithmetic helpers (no runtime opcode switch)
         final int longVecAddNull, longVecSubNull, longVecMulNull, longVecDivNull;
+        final int longVecAddNullScalar, longVecSubNullScalar, longVecMulNullScalar, longVecDivNullScalar;
         final int intVecAddNull, intVecSubNull, intVecMulNull, intVecDivNull;
+        final int intVecAddNullScalar, intVecSubNullScalar, intVecMulNullScalar, intVecDivNullScalar;
         final int doubleVecAdd, doubleVecSub, doubleVecMul, doubleVecDiv;
+        final int doubleVecAddScalar, doubleVecSubScalar, doubleVecMulScalar, doubleVecDivScalar;
         final int floatVecAdd, floatVecSub, floatVecMul, floatVecDiv;
+        final int floatVecAddScalar, floatVecSubScalar, floatVecMulScalar, floatVecDivScalar;
         // Null-aware cast helpers
         final int longToDoubleNullAware;
         final int intToDoubleNullAware;
@@ -1885,18 +2271,34 @@ public final class VectorBytecodeFilterCompiler {
             longVecSubNull = asm.poolMethod(helpersCls, "longVecSubNull", "(" + sLV + sLV + sLV + ")" + sLV);
             longVecMulNull = asm.poolMethod(helpersCls, "longVecMulNull", "(" + sLV + sLV + sLV + ")" + sLV);
             longVecDivNull = asm.poolMethod(helpersCls, "longVecDivNull", "(" + sLV + sLV + sLV + ")" + sLV);
+            longVecAddNullScalar = asm.poolMethod(helpersCls, "longVecAddNull", "(" + sLV + "J" + sLV + ")" + sLV);
+            longVecSubNullScalar = asm.poolMethod(helpersCls, "longVecSubNull", "(" + sLV + "J" + sLV + ")" + sLV);
+            longVecMulNullScalar = asm.poolMethod(helpersCls, "longVecMulNull", "(" + sLV + "J" + sLV + ")" + sLV);
+            longVecDivNullScalar = asm.poolMethod(helpersCls, "longVecDivNull", "(" + sLV + "J" + sLV + ")" + sLV);
             intVecAddNull = asm.poolMethod(helpersCls, "intVecAddNull", "(" + sIV + sIV + ")" + sIV);
             intVecSubNull = asm.poolMethod(helpersCls, "intVecSubNull", "(" + sIV + sIV + ")" + sIV);
             intVecMulNull = asm.poolMethod(helpersCls, "intVecMulNull", "(" + sIV + sIV + ")" + sIV);
             intVecDivNull = asm.poolMethod(helpersCls, "intVecDivNull", "(" + sIV + sIV + ")" + sIV);
+            intVecAddNullScalar = asm.poolMethod(helpersCls, "intVecAddNull", "(" + sIV + "I)" + sIV);
+            intVecSubNullScalar = asm.poolMethod(helpersCls, "intVecSubNull", "(" + sIV + "I)" + sIV);
+            intVecMulNullScalar = asm.poolMethod(helpersCls, "intVecMulNull", "(" + sIV + "I)" + sIV);
+            intVecDivNullScalar = asm.poolMethod(helpersCls, "intVecDivNull", "(" + sIV + "I)" + sIV);
             doubleVecAdd = asm.poolMethod(helpersCls, "doubleVecAdd", "(" + sDV + sDV + ")" + sDV);
             doubleVecSub = asm.poolMethod(helpersCls, "doubleVecSub", "(" + sDV + sDV + ")" + sDV);
             doubleVecMul = asm.poolMethod(helpersCls, "doubleVecMul", "(" + sDV + sDV + ")" + sDV);
             doubleVecDiv = asm.poolMethod(helpersCls, "doubleVecDiv", "(" + sDV + sDV + ")" + sDV);
+            doubleVecAddScalar = asm.poolMethod(helpersCls, "doubleVecAdd", "(" + sDV + "D)" + sDV);
+            doubleVecSubScalar = asm.poolMethod(helpersCls, "doubleVecSub", "(" + sDV + "D)" + sDV);
+            doubleVecMulScalar = asm.poolMethod(helpersCls, "doubleVecMul", "(" + sDV + "D)" + sDV);
+            doubleVecDivScalar = asm.poolMethod(helpersCls, "doubleVecDiv", "(" + sDV + "D)" + sDV);
             floatVecAdd = asm.poolMethod(helpersCls, "floatVecAdd", "(" + sFV + sFV + ")" + sFV);
             floatVecSub = asm.poolMethod(helpersCls, "floatVecSub", "(" + sFV + sFV + ")" + sFV);
             floatVecMul = asm.poolMethod(helpersCls, "floatVecMul", "(" + sFV + sFV + ")" + sFV);
             floatVecDiv = asm.poolMethod(helpersCls, "floatVecDiv", "(" + sFV + sFV + ")" + sFV);
+            floatVecAddScalar = asm.poolMethod(helpersCls, "floatVecAdd", "(" + sFV + "F)" + sFV);
+            floatVecSubScalar = asm.poolMethod(helpersCls, "floatVecSub", "(" + sFV + "F)" + sFV);
+            floatVecMulScalar = asm.poolMethod(helpersCls, "floatVecMul", "(" + sFV + "F)" + sFV);
+            floatVecDivScalar = asm.poolMethod(helpersCls, "floatVecDiv", "(" + sFV + "F)" + sFV);
             longToDoubleNullAware = asm.poolMethod(helpersCls, "longToDoubleNullAware",
                     "(Ljdk/incubator/vector/LongVector;Ljdk/incubator/vector/LongVector;)Ljdk/incubator/vector/DoubleVector;");
             intToDoubleNullAware = asm.poolMethod(helpersCls, "intToDoubleNullAware",
@@ -2064,6 +2466,26 @@ public final class VectorBytecodeFilterCompiler {
             };
         }
 
+        int doubleArithmeticHelperScalar(int opcode) {
+            return switch (opcode) {
+                case ADD -> doubleVecAddScalar;
+                case SUB -> doubleVecSubScalar;
+                case MUL -> doubleVecMulScalar;
+                case DIV -> doubleVecDivScalar;
+                default -> throw new UnsupportedOperationException("double scalar arith: " + opcode);
+            };
+        }
+
+        int floatArithmeticHelperScalar(int opcode) {
+            return switch (opcode) {
+                case ADD -> floatVecAddScalar;
+                case SUB -> floatVecSubScalar;
+                case MUL -> floatVecMulScalar;
+                case DIV -> floatVecDivScalar;
+                default -> throw new UnsupportedOperationException("float scalar arith: " + opcode);
+            };
+        }
+
         int nullCompareHelper(int operandType, int opcode) {
             if (operandType == I8_TYPE) {
                 return switch (opcode) {
@@ -2086,6 +2508,28 @@ public final class VectorBytecodeFilterCompiler {
                 };
             }
             throw new UnsupportedOperationException("null compare for type: " + operandType);
+        }
+
+        int nullArithmeticHelperScalar(int operandType, int opcode) {
+            if (operandType == I8_TYPE) {
+                return switch (opcode) {
+                    case ADD -> longVecAddNullScalar;
+                    case SUB -> longVecSubNullScalar;
+                    case MUL -> longVecMulNullScalar;
+                    case DIV -> longVecDivNullScalar;
+                    default -> throw new UnsupportedOperationException("null scalar arith: " + opcode);
+                };
+            }
+            if (operandType == I4_TYPE) {
+                return switch (opcode) {
+                    case ADD -> intVecAddNullScalar;
+                    case SUB -> intVecSubNullScalar;
+                    case MUL -> intVecMulNullScalar;
+                    case DIV -> intVecDivNullScalar;
+                    default -> throw new UnsupportedOperationException("null scalar arith: " + opcode);
+                };
+            }
+            throw new UnsupportedOperationException("null scalar arithmetic for type: " + operandType);
         }
 
         int conversionOp(int fromType, int toType) {
@@ -2197,6 +2641,8 @@ public final class VectorBytecodeFilterCompiler {
             // Ensure element-byte constants are pooled for all types used
             doPoolLong(asm, 4L);
             doPoolLong(asm, 8L);
+            doPoolInt(asm, io.questdb.std.Numbers.INT_NULL);
+            doPoolLong(asm, io.questdb.std.Numbers.LONG_NULL);
         }
 
         private static int poolStaticField(BytecodeAssembler asm, int classCp, String name, String type) {
@@ -2220,12 +2666,20 @@ public final class VectorBytecodeFilterCompiler {
             // compare(Comparison, Vector) -> VectorMask (generic erased to Vector)
             int compare = asm.poolMethod(vecCls, "compare",
                     "(" + "Ljdk/incubator/vector/VectorOperators$Comparison;" + sVec + ")" + sMask);
+            // compare(Comparison, scalar) -> VectorMask
+            int compareScalar = asm.poolMethod(vecCls, "compare",
+                    "(" + "Ljdk/incubator/vector/VectorOperators$Comparison;" + scalarDesc + ")" + sMask);
 
             // add/sub/mul/div(Vector) -> XxxVector
             int add = asm.poolMethod(vecCls, "add", "(" + sVec + ")" + sVecType);
             int sub = asm.poolMethod(vecCls, "sub", "(" + sVec + ")" + sVecType);
             int mul = asm.poolMethod(vecCls, "mul", "(" + sVec + ")" + sVecType);
             int div = asm.poolMethod(vecCls, "div", "(" + sVec + ")" + sVecType);
+            // add/sub/mul/div(scalar) -> XxxVector
+            int addScalar = asm.poolMethod(vecCls, "add", "(" + scalarDesc + ")" + sVecType);
+            int subScalar = asm.poolMethod(vecCls, "sub", "(" + scalarDesc + ")" + sVecType);
+            int mulScalar = asm.poolMethod(vecCls, "mul", "(" + scalarDesc + ")" + sVecType);
+            int divScalar = asm.poolMethod(vecCls, "div", "(" + scalarDesc + ")" + sVecType);
 
             // neg() -> XxxVector
             int neg = asm.poolMethod(vecCls, "neg", "()" + sVecType);
@@ -2238,8 +2692,9 @@ public final class VectorBytecodeFilterCompiler {
             int speciesPreferred = asm.poolField(vecCls,
                     asm.poolNameAndType(asm.poolUtf8("SPECIES_PREFERRED"), asm.poolUtf8(sSpec)));
 
-            return new VecType(vecCls, fromMemSeg, fromMemSegMasked, broadcast, compare,
-                    add, sub, mul, div, neg, convertShape, speciesPreferred);
+            return new VecType(vecCls, fromMemSeg, fromMemSegMasked, broadcast, compare, compareScalar,
+                    add, sub, mul, div, addScalar, subScalar, mulScalar, divScalar,
+                    neg, convertShape, speciesPreferred);
         }
 
         record VecType(
@@ -2248,7 +2703,10 @@ public final class VectorBytecodeFilterCompiler {
                 int fromMemSegMasked,
                 int broadcast,
                 int compare,
-                int add, int sub, int mul, int div, int neg,
+                int compareScalar,
+                int add, int sub, int mul, int div,
+                int addScalar, int subScalar, int mulScalar, int divScalar,
+                int neg,
                 int convertShape,
                 int speciesPreferred
         ) {}

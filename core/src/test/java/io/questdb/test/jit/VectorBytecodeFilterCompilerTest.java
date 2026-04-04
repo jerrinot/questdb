@@ -259,6 +259,21 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testLongImmediateArithmetic() throws Exception {
+        assertParity(
+                longCol(ROW_COUNT, i -> i * 10L),
+                ir(
+                        insn(IMM, I8_TYPE, 100, 0),
+                        insn(MEM, I8_TYPE, 0, 0),
+                        insn(IMM, I8_TYPE, 5, 0),
+                        insn(ADD, 0, 0, 0),
+                        insn(GT, 0, 0, 0),
+                        insn(RET, 0, 0, 0)
+                )
+        );
+    }
+
+    @Test
     public void testAllMatch() throws Exception {
         // col0 >= 0 (everything matches)
         assertParity(
@@ -448,6 +463,19 @@ public class VectorBytecodeFilterCompilerTest {
                 insn(MEM, I8_TYPE, 0, 0),
                 insn(MEM, I8_TYPE, 0, 0),
                 insn(ADD, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), LONG_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testLongImmediateArithmeticNullAware() throws Exception {
+        long[] data = longCol(ROW_COUNT, i -> i % 9 == 0 ? io.questdb.std.Numbers.LONG_NULL : i * 10L);
+        assertParityWithOptions(data, ir(
+                insn(IMM, I8_TYPE, 20, 0),
+                insn(MEM, I8_TYPE, 0, 0),
+                insn(IMM, I8_TYPE, 2, 0),
+                insn(DIV, 0, 0, 0),
                 insn(GT, 0, 0, 0),
                 insn(RET, 0, 0, 0)
         ), LONG_NULL_OPTIONS);
@@ -793,6 +821,66 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testIntIn5() throws Exception {
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = (i % 7) + 1;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 1, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(IMM, I4_TYPE, 2, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I4_TYPE, 3, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I4_TYPE, 4, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I4_TYPE, 5, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
+    public void testIntIn5CountOnly() throws Exception {
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = (i % 7) + 1;
+        }
+        assertCountParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 1, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(IMM, I4_TYPE, 2, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I4_TYPE, 3, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I4_TYPE, 4, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(IMM, I4_TYPE, 5, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(EQ, 0, 0, 0),
+                insn(OR, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
     public void testIntCompareSupportedWithNullChecks() throws Exception {
         int[] data = new int[ROW_COUNT];
         for (int i = 0; i < ROW_COUNT; i++) {
@@ -860,6 +948,22 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testIntImmediateArithmetic() throws Exception {
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = i - 3;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 10, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(IMM, I4_TYPE, 3, 0),
+                insn(MUL, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
     public void testIntArithmeticNullAware() throws Exception {
         // (col0 + col0) > 10 with INT_NULL — null propagation
         int[] data = new int[ROW_COUNT];
@@ -872,6 +976,40 @@ public class VectorBytecodeFilterCompilerTest {
                 insn(MEM, I4_TYPE, 0, 0),
                 insn(ADD, 0, 0, 0),
                 insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), INT_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testIntImmediateArithmeticNullAware() throws Exception {
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = (i % 7 == 0) ? Numbers.INT_NULL : i - 3;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 2, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(IMM, I4_TYPE, 2, 0),
+                insn(DIV, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ), INT_NULL_OPTIONS);
+    }
+
+    @Test
+    public void testIntImmediateRangeWithNullChecks() throws Exception {
+        int[] data = new int[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = (i % 13 == 0) ? Numbers.INT_NULL : (i % 140) - 20;
+        }
+        assertParityIntCol(data, ir(
+                insn(IMM, I4_TYPE, 0, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(IMM, I4_TYPE, 100, 0),
+                insn(MEM, I4_TYPE, 0, 0),
+                insn(LT, 0, 0, 0),
+                insn(AND, 0, 0, 0),
                 insn(RET, 0, 0, 0)
         ), INT_NULL_OPTIONS);
     }
@@ -1172,6 +1310,22 @@ public class VectorBytecodeFilterCompilerTest {
     }
 
     @Test
+    public void testDoubleImmediateArithmetic() throws Exception {
+        double[] data = new double[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = i * 1.0;
+        }
+        assertParityDoubleCol(data, ir(
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(0.5), 0),
+                insn(MEM, F8_TYPE, 0, 0),
+                new IrDecoder.Instruction(IMM, F8_TYPE, Double.doubleToRawLongBits(2.0), 0),
+                insn(DIV, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
+    }
+
+    @Test
     public void testDoubleGt() throws Exception {
         // col0 > 3.14
         double[] data = new double[ROW_COUNT];
@@ -1267,6 +1421,22 @@ public class VectorBytecodeFilterCompilerTest {
                 insn(GT, 0, 0, 0),
                 insn(RET, 0, 0, 0)
         ), FLOAT_OPTIONS);
+    }
+
+    @Test
+    public void testFloatImmediateArithmetic() throws Exception {
+        float[] data = new float[ROW_COUNT];
+        for (int i = 0; i < ROW_COUNT; i++) {
+            data[i] = i * 1.0f;
+        }
+        assertParityFloatCol(data, ir(
+                new IrDecoder.Instruction(IMM, F4_TYPE, Float.floatToRawIntBits(0.5f), 0),
+                insn(MEM, F4_TYPE, 0, 0),
+                new IrDecoder.Instruction(IMM, F4_TYPE, Float.floatToRawIntBits(2.0f), 0),
+                insn(DIV, 0, 0, 0),
+                insn(GT, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        ));
     }
 
     @Test

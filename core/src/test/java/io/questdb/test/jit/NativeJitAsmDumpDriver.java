@@ -43,10 +43,33 @@ import org.junit.Test;
  *   mvn -pl core -Dtest=NativeJitAsmDumpDriver#dumpIn5 test
  */
 public class NativeJitAsmDumpDriver extends AbstractCairoTest {
+    private static final String CREATE_BENCH_SQL = "CREATE TABLE jit_bench AS (" +
+            "SELECT" +
+            " x AS l," +
+            " x * 1.5 AS d," +
+            " CAST(x AS INT) AS i," +
+            " timestamp_sequence(0, 1_000_000) ts" +
+            " FROM long_sequence(4096)" +
+            ") TIMESTAMP(ts) PARTITION BY HOUR BYPASS WAL";
 
     @Test
     public void dumpIn5() throws Exception {
         dumpNativeAsm("l IN (1, 2, 3, 4, 5)");
+    }
+
+    @Test
+    public void dumpIntRangeSelect() throws Exception {
+        dumpNativeSelect("i > 0 AND i < 100");
+    }
+
+    @Test
+    public void dumpIntEqOrAllIntSelect() throws Exception {
+        dumpNativeSelect("i = 111111111 OR i = 222222222 OR i = 33_333_3333");
+    }
+
+    @Test
+    public void dumpIntEqOrMixedIntLongSelect() throws Exception {
+        dumpNativeSelect("i = 111111111 OR i = 222222222 OR i = 333_333_3333");
     }
 
     @Test
@@ -61,6 +84,7 @@ public class NativeJitAsmDumpDriver extends AbstractCairoTest {
 
     private void dumpNativeAsm(String whereClause) throws Exception {
         node1.setProperty(PropertyKey.CAIRO_SQL_JIT_DEBUG_ENABLED, true);
+        node1.setProperty(PropertyKey.LOG_SQL_QUERY_PROGRESS_EXE, false);
         assertMemoryLeak(() -> {
             execute("CREATE TABLE jit_dump AS (" +
                     "SELECT" +
@@ -81,6 +105,28 @@ public class NativeJitAsmDumpDriver extends AbstractCairoTest {
                 if (cursor.hasNext()) {
                     System.err.println("Result: " + cursor.getRecord().getLong(0));
                 }
+            }
+        });
+    }
+
+    private void dumpNativeSelect(String whereClause) throws Exception {
+        node1.setProperty(PropertyKey.CAIRO_SQL_JIT_DEBUG_ENABLED, true);
+        node1.setProperty(PropertyKey.LOG_SQL_QUERY_PROGRESS_EXE, false);
+        assertMemoryLeak(() -> {
+            execute(CREATE_BENCH_SQL);
+
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_ENABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.CPP);
+
+            String sql = "SELECT * FROM jit_bench WHERE " + whereClause;
+            System.out.println("=== " + sql + " ===");
+            try (RecordCursorFactory factory = select(sql);
+                 RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                long rows = 0;
+                while (cursor.hasNext()) {
+                    rows++;
+                }
+                System.err.println("Rows matched: " + rows);
             }
         });
     }

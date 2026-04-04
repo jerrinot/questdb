@@ -309,6 +309,18 @@ public final class FilterHelpers {
         return lhs.add(rhs).blend(nullVec, invalidMask);
     }
 
+    public static jdk.incubator.vector.LongVector longVecAddNull(
+            jdk.incubator.vector.LongVector lhs,
+            long rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        if (rhs == Numbers.LONG_NULL) {
+            return nullVec;
+        }
+        jdk.incubator.vector.VectorMask<Long> invalidMask = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        return lhs.add(rhs).blend(nullVec, invalidMask);
+    }
+
     public static jdk.incubator.vector.LongVector longVecSubNull(
             jdk.incubator.vector.LongVector lhs,
             jdk.incubator.vector.LongVector rhs,
@@ -319,6 +331,18 @@ public final class FilterHelpers {
         return lhs.sub(rhs).blend(nullVec, invalidMask);
     }
 
+    public static jdk.incubator.vector.LongVector longVecSubNull(
+            jdk.incubator.vector.LongVector lhs,
+            long rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        if (rhs == Numbers.LONG_NULL) {
+            return nullVec;
+        }
+        jdk.incubator.vector.VectorMask<Long> invalidMask = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        return lhs.sub(rhs).blend(nullVec, invalidMask);
+    }
+
     public static jdk.incubator.vector.LongVector longVecMulNull(
             jdk.incubator.vector.LongVector lhs,
             jdk.incubator.vector.LongVector rhs,
@@ -326,6 +350,18 @@ public final class FilterHelpers {
     ) {
         jdk.incubator.vector.VectorMask<Long> invalidMask = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec)
                 .or(rhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec));
+        return lhs.mul(rhs).blend(nullVec, invalidMask);
+    }
+
+    public static jdk.incubator.vector.LongVector longVecMulNull(
+            jdk.incubator.vector.LongVector lhs,
+            long rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        if (rhs == Numbers.LONG_NULL) {
+            return nullVec;
+        }
+        jdk.incubator.vector.VectorMask<Long> invalidMask = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
         return lhs.mul(rhs).blend(nullVec, invalidMask);
     }
 
@@ -343,6 +379,18 @@ public final class FilterHelpers {
         return lhs.div(rhs, invalidMask.not()).blend(nullVec, invalidMask);
     }
 
+    public static jdk.incubator.vector.LongVector longVecDivNull(
+            jdk.incubator.vector.LongVector lhs,
+            long rhs,
+            jdk.incubator.vector.LongVector nullVec
+    ) {
+        if (rhs == Numbers.LONG_NULL || rhs == 0L) {
+            return nullVec;
+        }
+        jdk.incubator.vector.VectorMask<Long> invalidMask = lhs.compare(jdk.incubator.vector.VectorOperators.EQ, nullVec);
+        return lhs.div(rhs).blend(nullVec, invalidMask);
+    }
+
     /**
      * I4 null-aware arithmetic. Preserves INT_NULL: if either operand is
      * INT_NULL, the result is INT_NULL. Division by zero returns INT_NULL.
@@ -356,6 +404,17 @@ public final class FilterHelpers {
         return lhs.add(rhs).blend(Numbers.INT_NULL, invalidMask);
     }
 
+    public static jdk.incubator.vector.IntVector intVecAddNull(
+            jdk.incubator.vector.IntVector lhs,
+            int rhs
+    ) {
+        if (rhs == Numbers.INT_NULL) {
+            return jdk.incubator.vector.IntVector.broadcast(lhs.species(), Numbers.INT_NULL);
+        }
+        jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL);
+        return lhs.add(rhs).blend(Numbers.INT_NULL, invalidMask);
+    }
+
     public static jdk.incubator.vector.IntVector intVecSubNull(
             jdk.incubator.vector.IntVector lhs,
             jdk.incubator.vector.IntVector rhs
@@ -365,12 +424,34 @@ public final class FilterHelpers {
         return lhs.sub(rhs).blend(Numbers.INT_NULL, invalidMask);
     }
 
+    public static jdk.incubator.vector.IntVector intVecSubNull(
+            jdk.incubator.vector.IntVector lhs,
+            int rhs
+    ) {
+        if (rhs == Numbers.INT_NULL) {
+            return jdk.incubator.vector.IntVector.broadcast(lhs.species(), Numbers.INT_NULL);
+        }
+        jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL);
+        return lhs.sub(rhs).blend(Numbers.INT_NULL, invalidMask);
+    }
+
     public static jdk.incubator.vector.IntVector intVecMulNull(
             jdk.incubator.vector.IntVector lhs,
             jdk.incubator.vector.IntVector rhs
     ) {
         jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL)
                 .or(rhs.eq(Numbers.INT_NULL));
+        return lhs.mul(rhs).blend(Numbers.INT_NULL, invalidMask);
+    }
+
+    public static jdk.incubator.vector.IntVector intVecMulNull(
+            jdk.incubator.vector.IntVector lhs,
+            int rhs
+    ) {
+        if (rhs == Numbers.INT_NULL) {
+            return jdk.incubator.vector.IntVector.broadcast(lhs.species(), Numbers.INT_NULL);
+        }
+        jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL);
         return lhs.mul(rhs).blend(Numbers.INT_NULL, invalidMask);
     }
 
@@ -387,6 +468,17 @@ public final class FilterHelpers {
         return lhs.div(rhs, invalidMask.not()).blend(Numbers.INT_NULL, invalidMask);
     }
 
+    public static jdk.incubator.vector.IntVector intVecDivNull(
+            jdk.incubator.vector.IntVector lhs,
+            int rhs
+    ) {
+        if (rhs == Numbers.INT_NULL || rhs == 0) {
+            return jdk.incubator.vector.IntVector.broadcast(lhs.species(), Numbers.INT_NULL);
+        }
+        jdk.incubator.vector.VectorMask<Integer> invalidMask = lhs.eq(Numbers.INT_NULL);
+        return lhs.div(rhs).blend(Numbers.INT_NULL, invalidMask);
+    }
+
     /**
      * F8 arithmetic with NaN propagation and div-by-zero → NaN.
      * Always used for double arithmetic regardless of null check mode,
@@ -399,9 +491,23 @@ public final class FilterHelpers {
         return lhs.add(rhs);
     }
 
+    public static jdk.incubator.vector.DoubleVector doubleVecAdd(
+            jdk.incubator.vector.DoubleVector lhs,
+            double rhs
+    ) {
+        return lhs.add(rhs);
+    }
+
     public static jdk.incubator.vector.DoubleVector doubleVecSub(
             jdk.incubator.vector.DoubleVector lhs,
             jdk.incubator.vector.DoubleVector rhs
+    ) {
+        return lhs.sub(rhs);
+    }
+
+    public static jdk.incubator.vector.DoubleVector doubleVecSub(
+            jdk.incubator.vector.DoubleVector lhs,
+            double rhs
     ) {
         return lhs.sub(rhs);
     }
@@ -413,6 +519,13 @@ public final class FilterHelpers {
         return lhs.mul(rhs);
     }
 
+    public static jdk.incubator.vector.DoubleVector doubleVecMul(
+            jdk.incubator.vector.DoubleVector lhs,
+            double rhs
+    ) {
+        return lhs.mul(rhs);
+    }
+
     public static jdk.incubator.vector.DoubleVector doubleVecDiv(
             jdk.incubator.vector.DoubleVector lhs,
             jdk.incubator.vector.DoubleVector rhs
@@ -420,6 +533,16 @@ public final class FilterHelpers {
         jdk.incubator.vector.VectorMask<Double> zeroDiv = rhs.compare(
                 jdk.incubator.vector.VectorOperators.EQ, 0.0);
         return lhs.div(rhs, zeroDiv.not()).blend(Double.NaN, zeroDiv);
+    }
+
+    public static jdk.incubator.vector.DoubleVector doubleVecDiv(
+            jdk.incubator.vector.DoubleVector lhs,
+            double rhs
+    ) {
+        if (rhs == 0.0d) {
+            return jdk.incubator.vector.DoubleVector.broadcast(lhs.species(), Double.NaN);
+        }
+        return lhs.div(rhs);
     }
 
     // --- Vectorized double comparisons (epsilon + NaN-aware) ---
@@ -514,9 +637,23 @@ public final class FilterHelpers {
         return lhs.add(rhs);
     }
 
+    public static jdk.incubator.vector.FloatVector floatVecAdd(
+            jdk.incubator.vector.FloatVector lhs,
+            float rhs
+    ) {
+        return lhs.add(rhs);
+    }
+
     public static jdk.incubator.vector.FloatVector floatVecSub(
             jdk.incubator.vector.FloatVector lhs,
             jdk.incubator.vector.FloatVector rhs
+    ) {
+        return lhs.sub(rhs);
+    }
+
+    public static jdk.incubator.vector.FloatVector floatVecSub(
+            jdk.incubator.vector.FloatVector lhs,
+            float rhs
     ) {
         return lhs.sub(rhs);
     }
@@ -528,6 +665,13 @@ public final class FilterHelpers {
         return lhs.mul(rhs);
     }
 
+    public static jdk.incubator.vector.FloatVector floatVecMul(
+            jdk.incubator.vector.FloatVector lhs,
+            float rhs
+    ) {
+        return lhs.mul(rhs);
+    }
+
     public static jdk.incubator.vector.FloatVector floatVecDiv(
             jdk.incubator.vector.FloatVector lhs,
             jdk.incubator.vector.FloatVector rhs
@@ -535,6 +679,16 @@ public final class FilterHelpers {
         jdk.incubator.vector.VectorMask<Float> zeroDiv = rhs.compare(
                 jdk.incubator.vector.VectorOperators.EQ, 0.0f);
         return lhs.div(rhs, zeroDiv.not()).blend(Float.NaN, zeroDiv);
+    }
+
+    public static jdk.incubator.vector.FloatVector floatVecDiv(
+            jdk.incubator.vector.FloatVector lhs,
+            float rhs
+    ) {
+        if (rhs == 0.0f) {
+            return jdk.incubator.vector.FloatVector.broadcast(lhs.species(), Float.NaN);
+        }
+        return lhs.div(rhs);
     }
 
     // --- Vectorized float comparisons (epsilon + NaN-aware) ---
