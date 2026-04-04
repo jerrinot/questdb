@@ -732,8 +732,8 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
         Map<String, Integer> filterToOptions = new HashMap<>();
         filterToOptions.put("abyte + abyte = 0", 1);
         filterToOptions.put("ashort - ashort = 0", 2);
-        filterToOptions.put("abyte * ashort = 0", 2);
-        filterToOptions.put("1 * abyte / ashort = 0", 2);
+        filterToOptions.put("abyte * ashort = 0", 4);
+        filterToOptions.put("1 * abyte / ashort = 0", 4);
 
         for (Map.Entry<String, Integer> entry : filterToOptions.entrySet()) {
             int options = serialize(entry.getKey(), false, false, false);
@@ -806,7 +806,7 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
         filterToOptions.put("atimestampns <> null", 8);
         filterToOptions.put("adouble = 0", 8);
         filterToOptions.put("adouble = 0 and along = 0", 8);
-        filterToOptions.put("astring = null", 8);
+        filterToOptions.put("astring = null", 4);
         filterToOptions.put("abinary = null", 8);
         filterToOptions.put("avarchar = null", 8);
         // 16B
@@ -886,6 +886,37 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
     }
 
     @Test
+    public void testOversizedIntLiteralPromotesToLongImmediate() throws Exception {
+        int options = serialize(
+                "anint = 111111111 or anint = 222222222 or anint = 3333333333",
+                false,
+                false,
+                true,
+                false
+        );
+
+        assertIR("(i64 3333333333L)(i32 anint)(=)(i32 222222222L)(i32 anint)(=)(i32 111111111L)(i32 anint)(=)(||)(||)(ret)");
+        assertOptionsHint(null, options, OptionsHint.MIXED_SIZES);
+        assertOptionsSize("oversized int literal should widen predicate to 8-byte", options, 8);
+    }
+
+    @Test
+    public void testOversizedIntLiteralTriggersShortCircuitPlanning() throws Exception {
+        serialize("anint = 111111111 or anint = 222222222 or anint = 3333333333");
+        assertIR("(i32 111111111L)(i32 anint)(=)(||_sc)(i32 222222222L)(i32 anint)(=)(||_sc)(i64 3333333333L)(i32 anint)(=)(ret)");
+    }
+
+    @Test
+    public void testOversizedIntBindVariableTriggersShortCircuitPlanning() throws Exception {
+        bindVariableService.clear();
+        bindVariableService.setInt("anint", 111111111);
+        bindVariableService.setLong(0, 3333333333L);
+
+        serialize("anint = :anint or anint = $1");
+        assertIR("(i32 :0)(i32 anint)(=)(||_sc)(i64 :1)(i32 anint)(=)(ret)");
+    }
+
+    @Test
     public void testSameSizeNoShortCircuit() throws Exception {
         // Same size columns -> SIMD possible -> no short-circuit
         serialize("along = 1 and adouble = 2.0");
@@ -928,6 +959,14 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
         assertIR("(string_header astring)(i32 -1L)(<>)(ret)");
         serialize("null = astring");
         assertIR("(string_header astring)(i32 -1L)(=)(ret)");
+    }
+
+    @Test
+    public void testStringHeaderNullCheckDoesNotForceMixedSizeShortCircuit() throws Exception {
+        int options = serialize("astring = null or anint = 1", false, false, true);
+        assertIR("(i32 1L)(i32 anint)(=)(i32 -1L)(string_header astring)(=)(||)(ret)");
+        assertOptionsHint("string header null checks should stay on the single-size path", options, OptionsHint.SINGLE_SIZE);
+        assertOptionsSize("string header null checks should use the lowered 4-byte width", options, 4);
     }
 
     @Test

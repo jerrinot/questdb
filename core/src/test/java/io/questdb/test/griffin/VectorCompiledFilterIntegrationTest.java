@@ -201,6 +201,45 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
         });
     }
 
+    @Test
+    public void testOversizedIntLiteralOrChainUsesVectorPath() throws Exception {
+        assertMemoryLeak(() -> {
+            execute(
+                    "create table x as (" +
+                            "select case when x = 1 then 111111111 when x = 2 then 222222222 else cast(x as int) end i, " +
+                            "timestamp_sequence(0, 1000000) ts " +
+                            "from long_sequence(1024)" +
+                            ") timestamp(ts)"
+            );
+
+            final String query = "select i from x where i = 111111111 or i = 222222222 or i = 3333333333";
+            final StringSink actualSink = new StringSink();
+
+            sink.clear();
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_DISABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
+            try (RecordCursorFactory factory = select(query)) {
+                Assert.assertFalse(factory.usesCompiledFilter());
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    CursorPrinter.println(cursor, factory.getMetadata(), sink);
+                }
+            }
+
+            actualSink.clear();
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_ENABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.JAVA_VECTOR_COMPILED);
+            try (RecordCursorFactory factory = select(query)) {
+                Assert.assertTrue("filter should be compiled", factory.usesCompiledFilter());
+                assertVectorCompiledFilter(factory);
+                assertVectorBytecodeUsed(factory);
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    CursorPrinter.println(cursor, factory.getMetadata(), actualSink);
+                }
+            }
+            TestUtils.assertEquals("vector backend result mismatch", sink, actualSink);
+        });
+    }
+
     private static void assertVectorBytecodeUsed(RecordCursorFactory factory) {
         RecordCursorFactory current = factory;
         while (current != null) {

@@ -143,7 +143,6 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
     // List to collect predicates from AND chains for reordering
     private final ObjList<ExpressionNode> collectedPredicates = new ObjList<>();
     private final PredicateContext predicateContext = new PredicateContext();
-    private final ScalarModeDetector scalarModeDetector = new ScalarModeDetector();
     private final StringSink sink = new StringSink();
     private final PostOrderTreeTraversalAlgo traverseAlgo = new PostOrderTreeTraversalAlgo();
     private final IntStack typeStack = new IntStack();
@@ -253,29 +252,19 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         // I1/I2 → I4 widening and don't need forceScalarMode for narrow types.
         isJavaVectorCapable = !enableShortCircuit;
 
-        // Detect if scalar mode is guaranteed by checking for mixed column sizes.
-        // Short-circuit optimizations (including IN() short-circuit) only work correctly
-        // in scalar mode, so we only enable them when scalar mode is certain.
-        boolean scalarModeDetected = forceScalar;
-        if (!scalarModeDetected) {
-            scalarModeDetector.clear();
-            traverseAlgo.traverse(node, scalarModeDetector);
-            scalarModeDetected = scalarModeDetector.hasMixedSizes();
-        }
-
         // Check if we can apply predicate reordering for short-circuit evaluation
-        if (ENABLE_SHORT_CIRCUIT && enableShortCircuit && scalarModeDetected) {
+        if (ENABLE_SHORT_CIRCUIT && enableShortCircuit) {
             if (isPureAndChain(node)) {
                 collectedPredicates.clear();
                 collectAndPredicates(node, collectedPredicates);
-                if (collectedPredicates.size() > 1) {
+                if (collectedPredicates.size() > 1 && (forceScalar || chainHasMixedSizes(collectedPredicates))) {
                     sortPredicatesByPriority(collectedPredicates);
                     return serializePredicatesAndSc(collectedPredicates, forceScalar, debug, nullChecks);
                 }
             } else if (isPureOrChain(node)) {
                 collectedPredicates.clear();
                 collectOrPredicates(node, collectedPredicates);
-                if (collectedPredicates.size() > 1) {
+                if (collectedPredicates.size() > 1 && (forceScalar || chainHasMixedSizes(collectedPredicates))) {
                     sortPredicatesByInvertedPriority(collectedPredicates);
                     return serializePredicatesOrSc(collectedPredicates, forceScalar, debug, nullChecks);
                 }
@@ -530,6 +519,210 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
             collectOrPredicates(node.rhs, predicates);
         } else {
             predicates.add(node);
+        }
+    }
+
+    private boolean chainHasMixedSizes(ObjList<ExpressionNode> predicates) throws SqlException {
+        TypesObserver chainTypes = new TypesObserver();
+        for (int i = 0, n = predicates.size(); i < n; i++) {
+            chainTypes.mergeFrom(analyzePredicateTypes(predicates.getQuick(i)));
+        }
+        return chainTypes.hasMixedSizes();
+    }
+
+    private TypesObserver analyzePredicateTypes(ExpressionNode predicate) throws SqlException {
+        PredicateContext context = new PredicateContext();
+        PredicateTypeCollector collector = new PredicateTypeCollector(context);
+        traverseAlgo.traverse(predicate, collector);
+        observePredicateConstantTypes(predicate, context);
+        return context.globalTypesObserver;
+    }
+
+    private int inferConstantType(PredicateContext context, int position, CharSequence token, boolean negated) throws SqlException {
+        final int len = token.length();
+        final int typeCode = context.localTypesObserver.constantTypeCode();
+        if (typeCode == UNDEFINED_CODE) {
+            throw SqlException.position(position).put("all constants expression: ").put(token);
+        }
+
+        if (SqlKeywords.isNullKeyword(token)) {
+            return emittedNullType(typeCode);
+        }
+
+        if (context.columnType == ColumnType.SYMBOL) {
+            return emittedSymbolType(position, token, context);
+        }
+
+        if (Chars.isQuoted(token)) {
+            if (ColumnType.isTimestamp(context.columnType)) {
+                try {
+                    ColumnType.getTimestampDriver(context.columnType).parseQuotedLiteral(token);
+                    return I8_TYPE;
+                } catch (NumericException e) {
+                    throw SqlException.invalidDate(token, position);
+                }
+            } else if (context.columnType == ColumnType.DATE) {
+                try {
+                    MicrosTimestampDriver.INSTANCE.toDate(MicrosTimestampDriver.INSTANCE.parseQuotedLiteral(token));
+                    return I8_TYPE;
+                } catch (NumericException e) {
+                    throw SqlException.invalidDate(token, position);
+                }
+            } else if (len == 3) {
+                if (context.columnType != ColumnType.CHAR) {
+                    throw SqlException.position(position).put("char constant in non-char expression: ").put(token);
+                }
+                return I2_TYPE;
+            } else if (len == 2 + Uuid.UUID_LENGTH) {
+                if (context.columnType != ColumnType.UUID) {
+                    throw SqlException.position(position).put("uuid constant in non-uuid expression: ").put(token);
+                }
+                try {
+                    Uuid.checkDashesAndLength(token, 1, token.length() - 1);
+                    Uuid.parseLo(token, 1);
+                    Uuid.parseHi(token, 1);
+                    return I16_TYPE;
+                } catch (NumericException e) {
+                    throw SqlException.position(position).put("invalid uuid constant: ").put(token);
+                }
+            }
+            throw SqlException.position(position).put("unsupported string constant: ").put(token);
+        }
+
+        if (SqlKeywords.isTrueKeyword(token) || SqlKeywords.isFalseKeyword(token)) {
+            if (context.columnType != ColumnType.BOOLEAN) {
+                throw SqlException.position(position).put("boolean constant in non-boolean expression: ").put(token);
+            }
+            return I1_TYPE;
+        }
+
+        if (len > 1 && token.charAt(0) == '#') {
+            if (isGeoHash(context.columnType)) {
+                ConstantFunction geoConstant = GeoHashUtil.parseGeoHashConstant(position, token, len);
+                if (geoConstant != null) {
+                    validateGeoHashType(position, geoConstant, typeCode);
+                    return typeCode;
+                }
+            } else {
+                throw SqlException.position(position).put("geo hash constant in non-geo hash expression: ").put(token);
+            }
+        }
+
+        if (!isNumeric(context.columnType) && !ColumnType.isTimestamp(context.columnType)) {
+            throw SqlException.position(position).put("numeric constant in non-numeric expression: ").put(token);
+        }
+        if (context.localTypesObserver.hasMixedSizes()) {
+            return inferUntypedNumberType(position, token, negated);
+        }
+        return inferTypedNumberType(position, token, typeCode, negated);
+    }
+
+    private int inferTypedNumberType(int position, CharSequence token, int typeCode, boolean negated) throws SqlException {
+        try {
+            return switch (typeCode) {
+                case I1_TYPE -> {
+                    Numbers.parseInt(token);
+                    yield I1_TYPE;
+                }
+                case I2_TYPE -> {
+                    Numbers.parseInt(token);
+                    yield I2_TYPE;
+                }
+                case I4_TYPE, F4_TYPE -> {
+                    try {
+                        Numbers.parseInt(token);
+                        yield I4_TYPE;
+                    } catch (NumericException e) {
+                        try {
+                            Numbers.parseLong(token);
+                            yield I8_TYPE;
+                        } catch (NumericException ignored) {
+                            Numbers.parseFloat(token);
+                            yield F4_TYPE;
+                        }
+                    }
+                }
+                case I8_TYPE, F8_TYPE -> {
+                    try {
+                        Numbers.parseLong(token);
+                        yield I8_TYPE;
+                    } catch (NumericException e) {
+                        Numbers.parseDouble(token);
+                        yield F8_TYPE;
+                    }
+                }
+                default -> throw SqlException.position(position)
+                        .put("unexpected non-numeric constant: ").put(token)
+                        .put(", expected type: ").put(typeCode);
+            };
+        } catch (NumericException e) {
+            throw SqlException.position(position)
+                    .put("could not parse constant: ").put(token)
+                    .put(", expected type: ").put(typeCode);
+        }
+    }
+
+    private int inferUntypedNumberType(int position, CharSequence token, boolean negated) throws SqlException {
+        try {
+            Numbers.parseInt(token);
+            return I4_TYPE;
+        } catch (NumericException ignore) {
+        }
+
+        try {
+            Numbers.parseLong(token);
+            return I8_TYPE;
+        } catch (NumericException ignore) {
+        }
+
+        try {
+            Numbers.parseDouble(token);
+            return F8_TYPE;
+        } catch (NumericException ignore) {
+        }
+
+        try {
+            Numbers.parseFloat(token);
+            return F4_TYPE;
+        } catch (NumericException ignore) {
+        }
+
+        throw SqlException.position(position).put("unexpected non-numeric constant: ").put(token);
+    }
+
+    private void observePredicateConstantTypes(ExpressionNode node, PredicateContext context) throws SqlException {
+        if (node == null) {
+            return;
+        }
+
+        if (SqlKeywords.isInKeyword(node.token) && ColumnType.isTimestamp(context.columnType)) {
+            return;
+        }
+
+        if (node.type == ExpressionNode.OPERATION && node.paramCount == 1 && Chars.equals(node.token, "-")) {
+            ExpressionNode nextNode = node.lhs != null ? node.lhs : node.rhs;
+            if (nextNode != null && nextNode.paramCount == 0 && nextNode.type == ExpressionNode.CONSTANT) {
+                int typeCode = inferConstantType(context, nextNode.position, nextNode.token, true);
+                context.localTypesObserver.observe(typeCode);
+                context.globalTypesObserver.observe(typeCode);
+                return;
+            }
+        }
+
+        if (node.type == ExpressionNode.CONSTANT) {
+            int typeCode = inferConstantType(context, node.position, node.token, false);
+            context.localTypesObserver.observe(typeCode);
+            context.globalTypesObserver.observe(typeCode);
+            return;
+        }
+
+        if (node.args != null && node.args.size() > 0) {
+            for (int i = 0, n = node.args.size(); i < n; i++) {
+                observePredicateConstantTypes(node.args.getQuick(i), context);
+            }
+        } else {
+            observePredicateConstantTypes(node.lhs, context);
+            observePredicateConstantTypes(node.rhs, context);
         }
     }
 
@@ -893,12 +1086,12 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         }
 
         if (SqlKeywords.isNullKeyword(token)) {
-            serializeNull(offset, position, typeCode, predicateContext.columnType);
+            observeConstantType(serializeNull(offset, position, typeCode, predicateContext.columnType));
             return;
         }
 
         if (predicateContext.columnType == ColumnType.SYMBOL) {
-            serializeSymbolConstant(offset, position, token);
+            observeConstantType(serializeSymbolConstant(offset, position, token));
             return;
         }
 
@@ -911,6 +1104,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
                             I8_TYPE,
                             ColumnType.getTimestampDriver(predicateContext.columnType).parseQuotedLiteral(token)
                     );
+                    observeConstantType(I8_TYPE);
                 } catch (NumericException e) {
                     throw SqlException.invalidDate(token, position);
                 }
@@ -920,6 +1114,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
                     // This is a hack for DATA column type. We use a TIMESTAMP specific driver to
                     // do the work and then derive millis
                     putOperand(offset, IMM, I8_TYPE, MicrosTimestampDriver.INSTANCE.toDate(MicrosTimestampDriver.INSTANCE.parseQuotedLiteral(token)));
+                    observeConstantType(I8_TYPE);
                 } catch (NumericException e) {
                     throw SqlException.invalidDate(token, position);
                 }
@@ -930,6 +1125,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
                 }
                 // this is 'x' - char
                 putOperand(offset, IMM, I2_TYPE, token.charAt(1));
+                observeConstantType(I2_TYPE);
                 return;
             } else if (len == 2 + Uuid.UUID_LENGTH) {
                 if (predicateContext.columnType != ColumnType.UUID) {
@@ -939,6 +1135,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
                     // skip first and last char which are quotes
                     Uuid.checkDashesAndLength(token, 1, token.length() - 1);
                     putOperand(offset, IMM, I16_TYPE, Uuid.parseLo(token, 1), Uuid.parseHi(token, 1));
+                    observeConstantType(I16_TYPE);
                 } catch (NumericException e) {
                     throw SqlException.position(position).put("invalid uuid constant: ").put(token);
                 }
@@ -952,6 +1149,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
                 throw SqlException.position(position).put("boolean constant in non-boolean expression: ").put(token);
             }
             putOperand(offset, IMM, I1_TYPE, 1);
+            observeConstantType(I1_TYPE);
             return;
         }
 
@@ -960,6 +1158,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
                 throw SqlException.position(position).put("boolean constant in non-boolean expression: ").put(token);
             }
             putOperand(offset, IMM, I1_TYPE, 0);
+            observeConstantType(I1_TYPE);
             return;
         }
 
@@ -979,9 +1178,9 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
             throw SqlException.position(position).put("numeric constant in non-numeric expression: ").put(token);
         }
         if (predicateContext.localTypesObserver.hasMixedSizes()) {
-            serializeUntypedNumber(offset, position, token, negated);
+            observeConstantType(serializeUntypedNumber(offset, position, token, negated));
         } else {
-            serializeNumber(offset, position, token, typeCode, negated);
+            observeConstantType(serializeNumber(offset, position, token, typeCode, negated));
         }
     }
 
@@ -1126,20 +1325,20 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         }
     }
 
-    private void serializeNull(long offset, int position, int typeCode, int columnType) throws SqlException {
+    private int serializeNull(long offset, int position, int typeCode, int columnType) throws SqlException {
         switch (typeCode) {
             case I1_TYPE:
                 if (!isGeoHash(columnType)) {
                     throw SqlException.position(position).put("byte type is not nullable");
                 }
                 putOperand(offset, IMM, typeCode, GeoHashes.BYTE_NULL);
-                break;
+                return typeCode;
             case I2_TYPE:
                 if (!isGeoHash(columnType)) {
                     throw SqlException.position(position).put("short type is not nullable");
                 }
                 putOperand(offset, IMM, typeCode, GeoHashes.SHORT_NULL);
-                break;
+                return typeCode;
             case I4_TYPE:
                 switch (ColumnType.tagOf(columnType)) {
                     case ColumnType.GEOBYTE:
@@ -1148,42 +1347,41 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
                     case ColumnType.GEOLONG:
                     case ColumnType.GEOHASH:
                         putOperand(offset, IMM, typeCode, GeoHashes.INT_NULL);
-                        break;
+                        return typeCode;
                     case ColumnType.IPv4:
                         putOperand(offset, IMM, typeCode, Numbers.IPv4_NULL);
-                        break;
+                        return typeCode;
                     default:
                         putOperand(offset, IMM, typeCode, Numbers.INT_NULL);
-                        break;
+                        return typeCode;
                 }
-                break;
             case I8_TYPE:
                 putOperand(offset, IMM, typeCode, isGeoHash(columnType) ? GeoHashes.NULL : Numbers.LONG_NULL);
-                break;
+                return typeCode;
             case F4_TYPE:
                 putDoubleOperand(offset, typeCode, Float.NaN);
-                break;
+                return typeCode;
             case F8_TYPE:
                 putDoubleOperand(offset, typeCode, Double.NaN);
-                break;
+                return typeCode;
             case I16_TYPE:
                 putOperand(offset, IMM, typeCode, Numbers.LONG_NULL, Numbers.LONG_NULL);
-                break;
+                return typeCode;
             case STRING_HEADER_TYPE:
                 putOperand(offset, IMM, I4_TYPE, TableUtils.NULL_LEN);
-                break;
+                return I4_TYPE;
             case BINARY_HEADER_TYPE:
                 putOperand(offset, IMM, I8_TYPE, TableUtils.NULL_LEN);
-                break;
+                return I8_TYPE;
             case VARCHAR_HEADER_TYPE: // varchar headers are stored in aux vector
                 putOperand(offset, IMM, I8_TYPE, VarcharTypeDriver.VARCHAR_HEADER_FLAG_NULL);
-                break;
+                return I8_TYPE;
             default:
                 throw SqlException.position(position).put("unexpected null type: ").put(typeCode);
         }
     }
 
-    private void serializeNumber(
+    private int serializeNumber(
             long offset,
             int position,
             final CharSequence token,
@@ -1196,31 +1394,39 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
                 case I1_TYPE:
                     final byte b = (byte) Numbers.parseInt(token);
                     putOperand(offset, IMM, I1_TYPE, sign * b);
-                    break;
+                    return I1_TYPE;
                 case I2_TYPE:
                     final short s = (short) Numbers.parseInt(token);
                     putOperand(offset, IMM, I2_TYPE, sign * s);
-                    break;
+                    return I2_TYPE;
                 case I4_TYPE:
                 case F4_TYPE:
                     try {
                         final int i = Numbers.parseInt(token);
                         putOperand(offset, IMM, I4_TYPE, sign * i);
+                        return I4_TYPE;
                     } catch (NumericException e) {
-                        final float fi = Numbers.parseFloat(token);
-                        putDoubleOperand(offset, F4_TYPE, sign * fi);
+                        try {
+                            final long l = Numbers.parseLong(token);
+                            putOperand(offset, IMM, I8_TYPE, sign * l);
+                            return I8_TYPE;
+                        } catch (NumericException ignored) {
+                            final float fi = Numbers.parseFloat(token);
+                            putDoubleOperand(offset, F4_TYPE, sign * fi);
+                            return F4_TYPE;
+                        }
                     }
-                    break;
                 case I8_TYPE:
                 case F8_TYPE:
                     try {
                         final long l = Numbers.parseLong(token);
                         putOperand(offset, IMM, I8_TYPE, sign * l);
+                        return I8_TYPE;
                     } catch (NumericException e) {
                         final double dl = Numbers.parseDouble(token);
                         putDoubleOperand(offset, F8_TYPE, sign * dl);
+                        return F8_TYPE;
                     }
-                    break;
                 default:
                     throw SqlException.position(position)
                             .put("unexpected non-numeric constant: ").put(token)
@@ -1340,7 +1546,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
             final int execHint = getExecHint(forceScalar);
             if (execHint == EXEC_HINT_SINGLE_SIZE_TYPE) {
                 // We could handle this via the non-short-circuit code path, but if we get here,
-                // it means that scalarModeDetector did a false-positive scalar mode detection.
+                // it means that the mixed-size pre-scan did a false-positive scalar mode detection.
                 // In such case, it's a bug we should fix, so let's fail JIT compilation to flag that.
                 throw SqlException.position(0).put("expected scalar compilation mode, got: ").put(execHint);
             }
@@ -1382,7 +1588,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
             final int execHint = getExecHint(forceScalar);
             if (execHint == EXEC_HINT_SINGLE_SIZE_TYPE) {
                 // We could handle this via the non-short-circuit code path, but if we get here,
-                // it means that scalarModeDetector did a false-positive scalar mode detection.
+                // it means that the mixed-size pre-scan did a false-positive scalar mode detection.
                 // In such case, it's a bug we should fix, so let's fail JIT compilation to flag that.
                 throw SqlException.position(0).put("expected scalar compilation mode, got: ").put(execHint);
             }
@@ -1396,7 +1602,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         }
     }
 
-    private void serializeSymbolConstant(long offset, int position, final CharSequence token) throws SqlException {
+    private int serializeSymbolConstant(long offset, int position, final CharSequence token) throws SqlException {
         final int len = token.length();
         CharSequence symbol = token;
         if (Chars.isQuoted(token)) {
@@ -1416,7 +1622,7 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         if (key != SymbolTable.VALUE_NOT_FOUND) {
             // Known symbol constant case
             putOperand(offset, IMM, I4_TYPE, key);
-            return;
+            return I4_TYPE;
         }
 
         // Unknown symbol constant case. Create a fake bind variable function to handle it.
@@ -1426,40 +1632,102 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
 
         int typeCode = bindVariableTypeCode(ColumnType.STRING);
         putOperand(offset, VAR, typeCode, index);
+        return typeCode;
     }
 
-    private void serializeUntypedNumber(long offset, int position, final CharSequence token, boolean negated) throws SqlException {
+    private int serializeUntypedNumber(long offset, int position, final CharSequence token, boolean negated) throws SqlException {
         long sign = negated ? -1 : 1;
 
         try {
             final int i = Numbers.parseInt(token);
             putOperand(offset, IMM, I4_TYPE, sign * i);
-            return;
+            return I4_TYPE;
         } catch (NumericException ignore) {
         }
 
         try {
             final long l = Numbers.parseLong(token);
             putOperand(offset, IMM, I8_TYPE, sign * l);
-            return;
+            return I8_TYPE;
         } catch (NumericException ignore) {
         }
 
         try {
             final double d = Numbers.parseDouble(token);
             putDoubleOperand(offset, F8_TYPE, sign * d);
-            return;
+            return F8_TYPE;
         } catch (NumericException ignore) {
         }
 
         try {
             final float f = Numbers.parseFloat(token);
             putDoubleOperand(offset, F4_TYPE, sign * f);
-            return;
+            return F4_TYPE;
         } catch (NumericException ignore) {
         }
 
         throw SqlException.position(position).put("unexpected non-numeric constant: ").put(token);
+    }
+
+    private int emittedNullType(int typeCode) throws SqlException {
+        return switch (typeCode) {
+            case I1_TYPE, I2_TYPE, I4_TYPE, I8_TYPE, F4_TYPE, F8_TYPE, I16_TYPE -> typeCode;
+            case STRING_HEADER_TYPE -> I4_TYPE;
+            case BINARY_HEADER_TYPE, VARCHAR_HEADER_TYPE -> I8_TYPE;
+            default -> throw SqlException.position(0).put("unexpected null type: ").put(typeCode);
+        };
+    }
+
+    private int emittedSymbolType(int position, CharSequence token, PredicateContext context) throws SqlException {
+        final int len = token.length();
+        CharSequence symbol = token;
+        if (Chars.isQuoted(token)) {
+            if (len < 3) {
+                throw SqlException.position(position).put("unsupported symbol constant: ").put(token);
+            }
+            sink.clear();
+            Chars.unescape(symbol, 1, len - 1, '\'', sink);
+            symbol = sink;
+        }
+
+        if (context.symbolTable == null || context.symbolColumnIndex == -1) {
+            throw SqlException.position(position).put("reader or column index is missing for symbol constant: ").put(token);
+        }
+
+        final int key = context.symbolTable.keyOf(symbol);
+        if (key != SymbolTable.VALUE_NOT_FOUND) {
+            return I4_TYPE;
+        }
+
+        return bindVariableTypeCode(ColumnType.STRING);
+    }
+
+    private void observeConstantType(int typeCode) {
+        predicateContext.localTypesObserver.observe(typeCode);
+        predicateContext.globalTypesObserver.observe(typeCode);
+    }
+
+    private void validateGeoHashType(int position, ConstantFunction geoHashConstant, int typeCode) throws SqlException {
+        try {
+            switch (typeCode) {
+                case I1_TYPE:
+                    geoHashConstant.getGeoByte(null);
+                    return;
+                case I2_TYPE:
+                    geoHashConstant.getGeoShort(null);
+                    return;
+                case I4_TYPE:
+                    geoHashConstant.getGeoInt(null);
+                    return;
+                case I8_TYPE:
+                    geoHashConstant.getGeoLong(null);
+                    return;
+                default:
+                    throw SqlException.position(position).put("unexpected type code for geo hash: ").put(typeCode);
+            }
+        } catch (UnsupportedOperationException e) {
+            throw SqlException.position(position).put("unexpected type for geo hash: ").put(typeCode);
+        }
     }
 
     /**
@@ -1502,6 +1770,31 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
 
         SqlWrapperException(SqlException wrappedException) {
             this.wrappedException = wrappedException;
+        }
+    }
+
+    private class PredicateTypeCollector implements PostOrderTreeTraversalAlgo.Visitor {
+        private final PredicateContext context;
+
+        private PredicateTypeCollector(PredicateContext context) {
+            this.context = context;
+        }
+
+        @Override
+        public boolean descend(ExpressionNode node) throws SqlException {
+            if (node.token == null) {
+                throw SqlException.position(node.position)
+                        .put("non-null token expected: ")
+                        .put(node.token);
+            }
+
+            context.onNodeDescended(node);
+            return true;
+        }
+
+        @Override
+        public void visit(ExpressionNode node) throws SqlException {
+            context.onNodeVisited(node);
         }
     }
 
@@ -1581,6 +1874,14 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
             }
         }
 
+        public void mergeFrom(TypesObserver other) {
+            for (int i = 0; i < sizes.length; i++) {
+                if (other.sizes[i] > 0) {
+                    sizes[i] = other.sizes[i];
+                }
+            }
+        }
+
         private static int indexToTypeCode(int index) {
             return switch (index) {
                 case I1_INDEX -> I1_TYPE;
@@ -1621,7 +1922,8 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
                 case I1_TYPE -> 1;
                 case I2_TYPE -> 2;
                 case I4_TYPE, F4_TYPE -> 4;
-                case I8_TYPE, F8_TYPE, STRING_HEADER_TYPE, BINARY_HEADER_TYPE, VARCHAR_HEADER_TYPE -> 8;
+                case STRING_HEADER_TYPE -> 4;
+                case I8_TYPE, F8_TYPE, BINARY_HEADER_TYPE, VARCHAR_HEADER_TYPE -> 8;
                 case I16_TYPE -> 16;
                 default -> 0;
             };
@@ -1864,43 +2166,4 @@ public class CompiledFilterIRSerializer implements PostOrderTreeTraversalAlgo.Vi
         }
     }
 
-    /**
-     * A lightweight visitor that pre-scans the expression tree to detect mixed column sizes.
-     * <p>
-     * The caller decides whether mixed sizes should trigger short-circuit emission.
-     * For Java backends (AUTO, JAVA_VECTOR_COMPILED), mixed sizes do NOT trigger SC
-     * because the vector compiler can handle some mixed-size programs (e.g., I4 compare
-     * with I8/F8) and SC opcodes would prevent vectorization by introducing control flow.
-     * For the C++ native backend and Java scalar-only backend, mixed sizes trigger SC
-     * because those backends benefit from early-exit evaluation.
-     */
-    private class ScalarModeDetector implements PostOrderTreeTraversalAlgo.Visitor, Mutable {
-        private final TypesObserver typesObserver = new TypesObserver();
-
-        @Override
-        public void clear() {
-            typesObserver.clear();
-        }
-
-        @Override
-        public boolean descend(ExpressionNode node) {
-            return true; // Always descend
-        }
-
-        @Override
-        public void visit(ExpressionNode node) {
-            if (node.type == ExpressionNode.LITERAL) {
-                int columnIndex = metadata.getColumnIndexQuiet(node.token);
-                if (columnIndex != -1) {
-                    int columnType = metadata.getColumnType(columnIndex);
-                    int typeCode = columnTypeCode(ColumnType.tagOf(columnType));
-                    typesObserver.observe(typeCode);
-                }
-            }
-        }
-
-        boolean hasMixedSizes() {
-            return typesObserver.hasMixedSizes();
-        }
-    }
 }

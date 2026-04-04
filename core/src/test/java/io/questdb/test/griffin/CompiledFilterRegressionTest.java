@@ -1208,6 +1208,17 @@ public class CompiledFilterRegressionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testOversizedIntLiteralOrChain() throws Exception {
+        final String query = "x where " +
+                "i = 111111111 or i = 222222222 or i = 3333333333";
+        final String ddl = "create table x as " +
+                "(select timestamp_sequence(400000000000, 500000000) as k," +
+                " case when x = 1 then 111111111 when x = 2 then 222222222 else cast(x as int) end i" +
+                " from long_sequence(" + N_SIMD_WITH_SCALAR_TAIL + ")) timestamp(k)";
+        assertQueryNotNull(query, ddl);
+    }
+
+    @Test
     public void testShortCircuitFlagOptimizationUuid() throws Exception {
         // Tests flag-based optimization for UUID (i128) comparisons.
         // UUID comparison uses pcmpeqb + pmovmskb + cmp, then JE/JNE.
