@@ -25,6 +25,7 @@
 package io.questdb.test.jit;
 
 import io.questdb.cairo.JitBackend;
+import io.questdb.cairo.VarcharTypeDriver;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.jit.*;
@@ -614,6 +615,188 @@ public class VectorBytecodeFilterCompilerTest {
                 insn(GT, 0, 0, 0),
                 insn(RET, 0, 0, 0)
         ));
+    }
+
+    // ========================
+    // Var-size header tail handling
+    // ========================
+
+    @Test
+    public void testVarcharIsNotNullTailHandling() throws Exception {
+        // Regression test: gatherVarcharHeaders must not read past the valid
+        // row count in the tail (partial last vector chunk).
+        // Before the fix, it gathered a full species-width of aux entries even
+        // when fewer rows remained, reading past mapped memory (SIGSEGV).
+        //
+        // Setup: allocate ROW_COUNT valid aux entries followed by a "poison"
+        // region of non-null headers. If the tail gather reads the poison,
+        // the vector path produces extra false-positive matches that the
+        // scalar oracle does not, causing a parity failure.
+
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        // 3 full vectors + partial tail of 2
+        int rowCount = speciesLen * 3 + 2;
+
+        long nullHeader = VarcharTypeDriver.VARCHAR_HEADER_FLAG_NULL;
+        // Non-null inline varchar: size=3, inlined flag set
+        long nonNullHeader = (3L << 4) | 1L;
+
+        // varchar IS NOT NULL: header != VARCHAR_HEADER_FLAG_NULL
+        IrDecoder.Instruction[] instructions = ir(
+                insn(IMM, I8_TYPE, nullHeader, 0),
+                insn(MEM, VARCHAR_HEADER_TYPE, 0, 0),
+                insn(NE, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        );
+
+        int auxEntryBytes = VarcharTypeDriver.VARCHAR_AUX_WIDTH_BYTES;
+        // Allocate valid + poison region (speciesLen extra entries)
+        int totalEntries = rowCount + speciesLen;
+        long auxData = Unsafe.malloc((long) totalEntries * auxEntryBytes, MemoryTag.NATIVE_DEFAULT);
+        long auxPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long dataPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long outputBuf = Unsafe.malloc(((long) rowCount + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        long expectedBuf = Unsafe.malloc(((long) rowCount + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+
+        // Fill valid region: alternate non-null and null
+        for (int i = 0; i < rowCount; i++) {
+            long header = (i % 3 == 0) ? nullHeader : nonNullHeader;
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes, header);
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes + 8, 0L);
+        }
+        // Fill poison region with non-null headers (would cause false positives)
+        for (int i = rowCount; i < totalEntries; i++) {
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes, nonNullHeader);
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes + 8, 0L);
+        }
+
+        Unsafe.getUnsafe().putLong(auxPtrArray, auxData);
+        Unsafe.getUnsafe().putLong(dataPtrArray, 0L);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, LONG_OPTIONS);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.filterRows(dataPtrArray, 1, auxPtrArray, 0, 0, expectedBuf, rowCount);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull("vector compiler should support varchar IS NOT NULL", vector);
+            long actual = vector.filterRows(dataPtrArray, 1, auxPtrArray, 0, 0, outputBuf, rowCount);
+
+            Assert.assertEquals("row count mismatch (tail may have read poison entries)", expected, actual);
+            for (long i = 0; i < actual; i++) {
+                Assert.assertEquals("row mismatch at index " + i,
+                        Unsafe.getUnsafe().getLong(expectedBuf + i * 8),
+                        Unsafe.getUnsafe().getLong(outputBuf + i * 8));
+            }
+        } finally {
+            Unsafe.free(auxData, (long) totalEntries * auxEntryBytes, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(auxPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(dataPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(outputBuf, ((long) rowCount + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(expectedBuf, ((long) rowCount + speciesLen) * Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testVarcharIsNotNullCountTailHandling() throws Exception {
+        // Same as testVarcharIsNotNullTailHandling but for countRows path.
+        int speciesLen = LongVector.SPECIES_PREFERRED.length();
+        int rowCount = speciesLen * 3 + 2;
+
+        long nullHeader = VarcharTypeDriver.VARCHAR_HEADER_FLAG_NULL;
+        long nonNullHeader = (3L << 4) | 1L;
+
+        IrDecoder.Instruction[] instructions = ir(
+                insn(IMM, I8_TYPE, nullHeader, 0),
+                insn(MEM, VARCHAR_HEADER_TYPE, 0, 0),
+                insn(NE, 0, 0, 0),
+                insn(RET, 0, 0, 0)
+        );
+
+        int auxEntryBytes = VarcharTypeDriver.VARCHAR_AUX_WIDTH_BYTES;
+        int totalEntries = rowCount + speciesLen;
+        long auxData = Unsafe.malloc((long) totalEntries * auxEntryBytes, MemoryTag.NATIVE_DEFAULT);
+        long auxPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+        long dataPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+
+        for (int i = 0; i < rowCount; i++) {
+            long header = (i % 3 == 0) ? nullHeader : nonNullHeader;
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes, header);
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes + 8, 0L);
+        }
+        for (int i = rowCount; i < totalEntries; i++) {
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes, nonNullHeader);
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes + 8, 0L);
+        }
+
+        Unsafe.getUnsafe().putLong(auxPtrArray, auxData);
+        Unsafe.getUnsafe().putLong(dataPtrArray, 0L);
+
+        try {
+            LoweredProgram prog = IrLowering.lower(instructions, LONG_OPTIONS);
+            ScalarBytecodeFilterCompiler.ScalarFilterBody scalar = ScalarBytecodeFilterCompiler.compile(prog);
+            long expected = scalar.countRows(dataPtrArray, 1, auxPtrArray, 0, 0, rowCount);
+
+            VectorFilterBody vector = VectorBytecodeFilterCompiler.compile(prog);
+            Assert.assertNotNull(vector);
+            long actual = vector.countRows(dataPtrArray, 1, auxPtrArray, 0, 0, rowCount);
+
+            Assert.assertEquals("count mismatch (tail may have read poison entries)", expected, actual);
+        } finally {
+            Unsafe.free(auxData, (long) totalEntries * auxEntryBytes, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(auxPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(dataPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testGatherVarcharHeadersPartialRowCount() {
+        // Direct test: gatherVarcharHeaders with rowCount < species.length()
+        // must leave unfilled lanes as zero and not read past the valid region.
+        var species = LongVector.SPECIES_PREFERRED;
+        int speciesLen = species.length();
+        int auxEntryBytes = VarcharTypeDriver.VARCHAR_AUX_WIDTH_BYTES;
+        long nonNullHeader = (3L << 4) | 1L;
+
+        // Allocate exactly speciesLen aux entries, all non-null
+        long auxData = Unsafe.malloc((long) speciesLen * auxEntryBytes, MemoryTag.NATIVE_DEFAULT);
+        long auxPtrArray = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+
+        for (int i = 0; i < speciesLen; i++) {
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes, nonNullHeader);
+            Unsafe.getUnsafe().putLong(auxData + (long) i * auxEntryBytes + 8, 0L);
+        }
+        Unsafe.getUnsafe().putLong(auxPtrArray, auxData);
+
+        try {
+            // Request only 2 rows — lanes 2..speciesLen-1 must be zero
+            int partialCount = 2;
+            LongVector result = FilterHelpers.gatherVarcharHeaders(auxPtrArray, 0, 0, partialCount, species);
+            for (int i = 0; i < speciesLen; i++) {
+                long lane = result.lane(i);
+                if (i < partialCount) {
+                    Assert.assertEquals("lane " + i + " should contain non-null header", nonNullHeader, lane);
+                } else {
+                    Assert.assertEquals("lane " + i + " should be zero (unfilled)", 0L, lane);
+                }
+            }
+
+            // Request 0 rows — all lanes must be zero
+            LongVector empty = FilterHelpers.gatherVarcharHeaders(auxPtrArray, 0, 0, 0, species);
+            for (int i = 0; i < speciesLen; i++) {
+                Assert.assertEquals("lane " + i + " should be zero for rowCount=0", 0L, empty.lane(i));
+            }
+
+            // Request full species — all lanes should be filled
+            LongVector full = FilterHelpers.gatherVarcharHeaders(auxPtrArray, 0, 0, speciesLen, species);
+            for (int i = 0; i < speciesLen; i++) {
+                Assert.assertEquals("lane " + i + " should contain header for full gather",
+                        nonNullHeader, full.lane(i));
+            }
+        } finally {
+            Unsafe.free(auxData, (long) speciesLen * auxEntryBytes, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(auxPtrArray, 8, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     // ========================

@@ -1002,35 +1002,41 @@ public final class FilterHelpers {
     // --- Vectorized var-size header gathers ---
     // These gather scalar headers into a vector for subsequent NULL check comparison.
     // The int[]/long[] allocations are scalar-replaced by C2 escape analysis.
+    // The rowCount parameter limits reads to valid rows in the tail (partial
+    // last vector chunk). Without this bound, the gather reads past the end of
+    // mapped aux memory, causing a SIGSEGV on page-frame boundaries.
 
     public static jdk.incubator.vector.IntVector gatherStringHeaders(
-            long dataAddress, long varSizeAuxAddress, int columnIndex, long startRow,
+            long dataAddress, long varSizeAuxAddress, int columnIndex, long startRow, int rowCount,
             jdk.incubator.vector.VectorSpecies<Integer> species
     ) {
         int[] buf = new int[species.length()];
-        for (int i = 0; i < buf.length; i++) {
+        int limit = Math.min(rowCount, buf.length);
+        for (int i = 0; i < limit; i++) {
             buf[i] = readStringHeader(dataAddress, varSizeAuxAddress, columnIndex, startRow + i);
         }
         return jdk.incubator.vector.IntVector.fromArray(species, buf, 0);
     }
 
     public static jdk.incubator.vector.LongVector gatherBinaryHeaders(
-            long dataAddress, long varSizeAuxAddress, int columnIndex, long startRow,
+            long dataAddress, long varSizeAuxAddress, int columnIndex, long startRow, int rowCount,
             jdk.incubator.vector.VectorSpecies<Long> species
     ) {
         long[] buf = new long[species.length()];
-        for (int i = 0; i < buf.length; i++) {
+        int limit = Math.min(rowCount, buf.length);
+        for (int i = 0; i < limit; i++) {
             buf[i] = readBinaryHeader(dataAddress, varSizeAuxAddress, columnIndex, startRow + i);
         }
         return jdk.incubator.vector.LongVector.fromArray(species, buf, 0);
     }
 
     public static jdk.incubator.vector.LongVector gatherVarcharHeaders(
-            long varSizeAuxAddress, int columnIndex, long startRow,
+            long varSizeAuxAddress, int columnIndex, long startRow, int rowCount,
             jdk.incubator.vector.VectorSpecies<Long> species
     ) {
         long[] buf = new long[species.length()];
-        for (int i = 0; i < buf.length; i++) {
+        int limit = Math.min(rowCount, buf.length);
+        for (int i = 0; i < limit; i++) {
             buf[i] = readVarcharHeader(varSizeAuxAddress, columnIndex, startRow + i);
         }
         return jdk.incubator.vector.LongVector.fromArray(species, buf, 0);

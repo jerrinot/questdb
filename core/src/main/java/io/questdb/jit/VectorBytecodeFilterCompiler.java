@@ -1267,7 +1267,7 @@ public final class VectorBytecodeFilterCompiler {
         int[] tempSlots = ctx.s().tempSlots();
         switch (op) {
             case LoweredOp.LoadColumn lc -> emitLoadColumn(ctx, lc, maskedLoads);
-            case LoweredOp.LoadVarSizeHeader vh -> emitLoadVarSizeHeader(ctx, vh);
+            case LoweredOp.LoadVarSizeHeader vh -> emitLoadVarSizeHeader(ctx, vh, maskedLoads);
             case LoweredOp.LoadImm li -> emitLoadImm(ctx, li);
             case LoweredOp.LoadVar lv -> emitLoadVar(ctx, lv);
             case LoweredOp.Compare c -> emitCompare(ctx, c);
@@ -1311,15 +1311,15 @@ public final class VectorBytecodeFilterCompiler {
         asm.astore(s.tempSlots()[lc.dst()]);
     }
 
-    private static void emitLoadVarSizeHeader(EmitContext ctx, LoweredOp.LoadVarSizeHeader vh) {
+    private static void emitLoadVarSizeHeader(EmitContext ctx, LoweredOp.LoadVarSizeHeader vh, boolean maskedLoads) {
         BytecodeAssembler asm = ctx.asm();
         Pool pool = ctx.pool();
         SlotLayout s = ctx.s();
         int normalizedType = IrLowering.normalizeVarSizeType(vh.headerType());
         // Gather header values via scalar helper → vector
-        // STRING_HEADER → gatherStringHeaders(dataAddr, auxAddr, col, row, intSpecies) → IntVector
-        // BINARY_HEADER → gatherBinaryHeaders(dataAddr, auxAddr, col, row, longSpecies) → LongVector
-        // VARCHAR_HEADER → gatherVarcharHeaders(auxAddr, col, row, longSpecies) → LongVector
+        // STRING_HEADER → gatherStringHeaders(dataAddr, auxAddr, col, row, count, intSpecies) → IntVector
+        // BINARY_HEADER → gatherBinaryHeaders(dataAddr, auxAddr, col, row, count, longSpecies) → LongVector
+        // VARCHAR_HEADER → gatherVarcharHeaders(auxAddr, col, row, count, longSpecies) → LongVector
         int gatherMethod = pool.headerGatherMethod(vh.headerType());
         if (vh.headerType() != VARCHAR_HEADER_TYPE) {
             asm.lload(SLOT_DATA_ADDR);
@@ -1327,6 +1327,17 @@ public final class VectorBytecodeFilterCompiler {
         asm.lload(SLOT_VAR_SIZE_AUX);
         asm.iconst(vh.columnIndex());
         asm.lload(s.rowSlot());
+        // Pass valid lane count: on the tail path (maskedLoads), only
+        // activeMask.trueCount() rows remain; on the main path, all
+        // stride lanes are valid. Without this bound, the gather reads
+        // past the end of mapped aux memory (SIGSEGV).
+        if (maskedLoads) {
+            asm.aload(s.activeMaskSlot());
+            asm.invokeVirtual(pool.maskTrueCount);
+        } else {
+            asm.lload(s.strideSlot());
+            asm.l2i();
+        }
         if (normalizedType == I4_TYPE) {
             asm.aload(s.intSpeciesSlot());
         } else {
@@ -2380,11 +2391,11 @@ public final class VectorBytecodeFilterCompiler {
 
             // --- FilterHelpers: var-size header gathers ---
             gatherStringHeaders = asm.poolMethod(helpersCls, "gatherStringHeaders",
-                    "(JJI" + "J" + sSpec + ")Ljdk/incubator/vector/IntVector;");
+                    "(JJIJ" + "I" + sSpec + ")Ljdk/incubator/vector/IntVector;");
             gatherBinaryHeaders = asm.poolMethod(helpersCls, "gatherBinaryHeaders",
-                    "(JJI" + "J" + sSpec + ")Ljdk/incubator/vector/LongVector;");
+                    "(JJIJ" + "I" + sSpec + ")Ljdk/incubator/vector/LongVector;");
             gatherVarcharHeaders = asm.poolMethod(helpersCls, "gatherVarcharHeaders",
-                    "(JI" + "J" + sSpec + ")Ljdk/incubator/vector/LongVector;");
+                    "(JIJ" + "I" + sSpec + ")Ljdk/incubator/vector/LongVector;");
 
             // --- FilterHelpers: I128 (UUID) comparisons ---
             i128CompareColumnImm = asm.poolMethod(helpersCls, "i128CompareColumnImm",
