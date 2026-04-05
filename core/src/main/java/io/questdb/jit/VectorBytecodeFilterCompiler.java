@@ -324,7 +324,8 @@ public final class VectorBytecodeFilterCompiler {
             int countAccSlot = -1;
             int fullMaskSlot = -1;
             if (!isCountOnly) {
-                outputSegSlot = nextSlot++;
+                outputSegSlot = nextSlot;
+                nextSlot += 2; // long slot (raw address)
                 iotaSlot = nextSlot++;
                 matchCountSlot = nextSlot++;
                 fullMaskSlot = nextSlot++;
@@ -333,7 +334,8 @@ public final class VectorBytecodeFilterCompiler {
             int maxColIndex = shape.maxColumnIndex();
             int[] colSegSlots = new int[maxColIndex + 1];
             for (int i = 0; i <= maxColIndex; i++) {
-                colSegSlots[i] = nextSlot++;
+                colSegSlots[i] = nextSlot;
+                nextSlot += 2; // long slot (raw column address)
             }
             int varsSegSlot = nextSlot++;
             if (isCountOnly) {
@@ -481,8 +483,8 @@ public final class VectorBytecodeFilterCompiler {
         for (int i = 0; i < s.colSegSlots().length; i++) {
             asm.lload(SLOT_DATA_ADDR);
             asm.iconst(i);
-            asm.invokeStatic(pool.helpersColumnSegment);
-            asm.astore(s.colSegSlots()[i]);
+            asm.invokeStatic(pool.helpersColumnAddress);
+            asm.lstore(s.colSegSlots()[i]);
         }
 
         asm.lload(SLOT_VARS_ADDR);
@@ -491,8 +493,7 @@ public final class VectorBytecodeFilterCompiler {
 
         if (!isCountOnly) {
             asm.lload(filteredRowsSlot);
-            asm.invokeStatic(pool.helpersSegment);
-            asm.astore(s.outputSegSlot());
+            asm.lstore(s.outputSegSlot());
             // iota always uses Long species (row IDs are longs)
             asm.invokeStatic(pool.helpersLongSpecies);
             asm.invokeStatic(pool.helpersIotaVector);
@@ -702,14 +703,15 @@ public final class VectorBytecodeFilterCompiler {
         }
         asm.invokeVirtual(pool.longVecCompress);
 
-        // Write compressed row IDs to output segment
+        // Write compressed row IDs via UNIVERSE segment
         asm.iload(s.matchCountSlot());
-        asm.aload(s.outputSegSlot());
+        asm.lload(s.outputSegSlot());
         asm.lload(s.filteredCountSlot());
         asm.ldc2_w(pool.longEight);
         asm.lmul();
+        asm.ladd();
         asm.aload(s.nativeOrderSlot());
-        asm.invokeStatic(pool.writeCompressedRows);
+        asm.invokeStatic(pool.writeCompressedRowsAbs);
 
         // Increment filtered count
         asm.iload(s.matchCountSlot());
@@ -750,8 +752,23 @@ public final class VectorBytecodeFilterCompiler {
 
         // Build precise local type declarations for the full_frame.
         // Typed locals eliminate checkcast overhead in the hot loop.
+        // Count StackMapTable entries (each Long/Object/Integer = 1 entry,
+        // regardless of JVM slot width).
         int longParamCount = isCountOnly ? 6 : 7;
-        int totalLocals = 1 + longParamCount + 3 + s.objectLocalCount();
+        int totalLocals = 1 // this
+                + longParamCount // long params
+                + 3 // filteredCount, row, stride
+                + 3 // speciesSlot, nativeOrderSlot, activeMaskSlot
+                + (usesI4 ? 1 : 0)
+                + (shape.usesF4() ? 1 : 0)
+                + (shape.usesI1() ? 1 : 0)
+                + (shape.usesI2() ? 1 : 0)
+                + (needsNullVec ? 2 : 0)
+                + (!isCountOnly ? 4 : 0) // outputAddr(long) + iota + matchCount + fullMask
+                + (shape.maxColumnIndex() + 1) // colAddr(long) entries
+                + 1 // varsSegSlot
+                + (isCountOnly ? 2 : 0)
+                + tempCount;
 
         asm.putByte(0xff); // full_frame
         asm.putShort(loopBci);
@@ -787,13 +804,13 @@ public final class VectorBytecodeFilterCompiler {
             asm.putITEM_Object(pool.vectorMaskClass);  // nullMaskCacheSlot
         }
         if (!isCountOnly) {
-            asm.putITEM_Object(pool.memSegClass);      // outputSegSlot
+            asm.putITEM_Long();                         // outputAddrSlot (raw address)
             asm.putITEM_Object(pool.longVectorClass);  // iotaSlot
             asm.putITEM_Integer();                      // matchCountSlot
             asm.putITEM_Object(pool.vectorMaskClass);   // fullMaskSlot
         }
         for (int i = 0; i <= shape.maxColumnIndex(); i++) {
-            asm.putITEM_Object(pool.memSegClass); // colSegSlots[i]
+            asm.putITEM_Long(); // colAddrSlots[i] (raw address)
         }
         asm.putITEM_Object(pool.memSegClass); // varsSegSlot
         if (isCountOnly) {
@@ -1274,10 +1291,12 @@ public final class VectorBytecodeFilterCompiler {
         SlotLayout s = ctx.s();
         Pool.VecType vt = pool.vecType(lc.type());
         emitTypeSpecies(ctx, lc.type());
-        asm.aload(s.colSegSlots()[lc.columnIndex()]);
+        asm.getstatic(pool.helpersUniverse);
+        asm.lload(s.colSegSlots()[lc.columnIndex()]);
         asm.lload(s.rowSlot());
         asm.ldc2_w(pool.ensureLongPooled(elementBytes(lc.type())));
         asm.lmul();
+        asm.ladd();
         asm.aload(s.nativeOrderSlot());
         if (maskedLoads) {
             asm.aload(s.activeMaskSlot());
@@ -2093,8 +2112,10 @@ public final class VectorBytecodeFilterCompiler {
         final int helpersNativeByteOrder;
         final int helpersLongNullVector;
         final int helpersDoubleNanVector;
+        final int helpersColumnAddress;
         final int helpersColumnSegment;
         final int helpersSegment;
+        final int helpersUniverse;
         final int helpersIotaVector;
 
         // VectorSpecies interface methods
@@ -2163,6 +2184,7 @@ public final class VectorBytecodeFilterCompiler {
         final int longVecCompress;
         final int longVecReduceLanesToLong;
         final int writeCompressedRows;
+        final int writeCompressedRowsAbs;
 
         // VectorMask methods
         final int maskAnd;
@@ -2221,8 +2243,11 @@ public final class VectorBytecodeFilterCompiler {
             helpersByteSpeciesForLongRows = asm.poolMethod(helpersCls, "byteSpeciesForLongRows", "()" + sSpec);
             helpersShortSpeciesForLongRows = asm.poolMethod(helpersCls, "shortSpeciesForLongRows", "()" + sSpec);
             helpersNativeByteOrder = asm.poolMethod(helpersCls, "nativeByteOrder", "()Ljava/nio/ByteOrder;");
+            helpersColumnAddress = asm.poolMethod(helpersCls, "columnAddress", "(JI)J");
             helpersColumnSegment = asm.poolMethod(helpersCls, "columnSegment", "(JI)" + sMSeg);
             helpersSegment = asm.poolMethod(helpersCls, "segment", "(J)" + sMSeg);
+            helpersUniverse = asm.poolField(helpersCls,
+                    asm.poolNameAndType(asm.poolUtf8("UNIVERSE"), asm.poolUtf8(sMSeg)));
             helpersIotaVector = asm.poolMethod(helpersCls, "iotaVector",
                     "(" + sSpec + ")Ljdk/incubator/vector/LongVector;");
             helpersLongNullVector = asm.poolMethod(helpersCls, "longNullVector",
@@ -2407,6 +2432,9 @@ public final class VectorBytecodeFilterCompiler {
             writeCompressedRows = asm.poolMethod(asm.poolClass(FilterHelpers.class),
                     "writeCompressedRows",
                     "(" + sLVec + "I" + sMSeg + "J" + sBO + ")V");
+            writeCompressedRowsAbs = asm.poolMethod(asm.poolClass(FilterHelpers.class),
+                    "writeCompressedRowsAbs",
+                    "(" + sLVec + "IJ" + sBO + ")V");
 
             // --- VectorMask methods ---
             maskAnd = asm.poolMethod(vecMaskCls, "and", "(" + sMask + ")" + sMask);

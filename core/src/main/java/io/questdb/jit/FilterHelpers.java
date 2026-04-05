@@ -52,7 +52,24 @@ public final class FilterHelpers {
             48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
     };
 
+    /**
+     * A single MemorySegment covering the entire native address space.
+     * Used as the segment argument for all fromMemorySegment/intoMemorySegment
+     * calls, with raw addresses passed as offsets. Being a static final field,
+     * C2 constant-folds the segment metadata (length, scope), eliminating
+     * per-iteration scope/bounds checks from the hot loop.
+     */
+    public static final java.lang.foreign.MemorySegment UNIVERSE =
+            java.lang.foreign.MemorySegment.ofAddress(0).reinterpret(Long.MAX_VALUE);
+
     // --- Vector API helpers (called by generated vectorized filter classes) ---
+
+    /**
+     * Reads the raw column data address from the data pointer array.
+     */
+    public static long columnAddress(long dataAddress, int columnIndex) {
+        return UNSAFE.getLong(dataAddress + ((long) columnIndex << 3));
+    }
 
     /**
      * Creates a MemorySegment for a column's data, reading the column address
@@ -1069,6 +1086,21 @@ public final class FilterHelpers {
         jdk.incubator.vector.VectorMask<Long> storeMask =
                 compressed.species().indexInRange(0, matchCount);
         compressed.intoMemorySegment(output, byteOffset, order, storeMask);
+    }
+
+    /**
+     * Writes compressed row IDs to native memory via UNIVERSE segment.
+     * Uses absolute address (outputAddr + byteOffset) as the segment offset.
+     */
+    public static void writeCompressedRowsAbs(
+            jdk.incubator.vector.LongVector compressed,
+            int matchCount,
+            long absoluteByteOffset,
+            java.nio.ByteOrder order
+    ) {
+        jdk.incubator.vector.VectorMask<Long> storeMask =
+                compressed.species().indexInRange(0, matchCount);
+        compressed.intoMemorySegment(UNIVERSE, absoluteByteOffset, order, storeMask);
     }
 
     public static void writeRow(long filteredRowsAddress, long outputIndex, long row) {

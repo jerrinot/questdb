@@ -80,13 +80,63 @@ public class VectorBytecodeC2Driver extends AbstractCairoTest {
     }
 
     @Test
+    public void dumpLongEq42() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l = 42", true);
+    }
+
+    @Test
     public void dumpLongGt42() throws Exception {
         driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > 42", true);
     }
 
     @Test
+    public void dumpLongGt42OrDoubleLt100() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > 42 OR d < 100.0", true);
+    }
+
+    @Test
+    public void dumpLongIn10() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)", false);
+    }
+
+    @Test
+    public void dumpLongPlus10Gt42() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l + 10 > 42", true);
+    }
+
+    @Test
+    public void dumpLongRange() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > 42 AND l < 100", true);
+    }
+
+    @Test
+    public void dumpLongTriple() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > 42 AND l < 100 AND l != 77", true);
+    }
+
+    @Test
     public void dumpMixed() throws Exception {
         driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > 42 AND d < 100.0", true);
+    }
+
+    @Test
+    public void dumpMixedLongInt() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > 42 AND i < 100", true);
+    }
+
+    @Test
+    public void dumpNotLongGt42() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE NOT (l > 42)", true);
+    }
+
+    @Test
+    public void dumpPureDoubleEq() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE d = 42.5", true);
+    }
+
+    @Test
+    public void dumpPureDoubleRange() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE d > 42.0 AND d < 100.0", true);
     }
 
     private static final class SilentSqlExecutionContext extends SqlExecutionContextImpl {
