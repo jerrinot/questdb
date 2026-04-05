@@ -55,6 +55,11 @@ public class VectorBytecodeC2Driver extends AbstractCairoTest {
     private static final int WARMUP_ITERATIONS = 20_000;
 
     @Test
+    public void dumpCountLongGt42() throws Exception {
+        driveJavaVectorQuery("SELECT count(*) FROM jit_bench WHERE l > 42", true);
+    }
+
+    @Test
     public void dumpIn5() throws Exception {
         driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l IN (1, 2, 3, 4, 5)", true);
     }

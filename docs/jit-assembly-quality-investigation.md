@@ -33,9 +33,18 @@ Remaining C2 limitations (lower impact):
 
 1. **ZMM register underutilization** (only ~7 of 32 used). Forces constant
    re-broadcasting inside loops. More severe for 512-bit zmm than 256-bit ymm.
+   Root cause: C2 treats vector constants as cheap to rematerialize from memory
+   rather than keeping them in registers. No phantom TEMP declarations found
+   for ZMM (unlike the k-register case). The `8381149: C2: postaloc: deduplicate
+   vector constants` patch addresses the symptom.
 
-2. **K-register spills** despite available k1, k2. Conservative mask register
-   allocator.
+2. ~~**K-register spills**~~ **FIXED in custom JDK fork.** Two commits:
+   `75d3d2372d4` removes phantom `TEMP kscratch` from `mask_opers_evex` (the
+   scratch k-register was declared but never referenced in encoding, needlessly
+   reserving a k-register per mask AND/OR/XOR). `8a36bb8318e` marks
+   `AndVMask/OrVMask/XorVMask` as commutative in ADLC and removes duplicate
+   commuted mask_not rules with extra TEMPs. Verified: Phase 4 (5-element
+   IN-list) produces zero k-register spills with the custom JDK.
 
 See the [Consolidated Action List](#consolidated-action-list) for the full
 priority-ordered findings.
@@ -1614,9 +1623,44 @@ no iota vector, no compress, no output store. Instead, each iteration does
 
 ### Findings
 
-*Deferred — expected to follow established patterns from Phases 1-8/16.
-No new issues anticipated beyond the C2 limitations documented in the
-Consolidated Action List.*
+**Assembly captured**: non-OSR C2 compilation (compile ID 3518, 302 bytecodes,
+804 bytes native — very compact). Post-UNIVERSE optimization.
+
+#### A. Assembly transcript (complete hot loop — 16 instructions)
+
+```asm
+; --- loop-invariant hoists ---
+kmovd       k7, r11d                 ; fullMask (0xFF)
+vpbroadcastq zmm0, [rip - 0x122]    ; broadcast 42
+vpbroadcastq zmm1, [rip - 0x124]    ; broadcast LONG_NULL
+
+; --- hot loop (16 instructions, ~12 cycles) ---
+  jae       uncommon                 ; bounds check (pre-computed limit)
+  mov       r8, [r15 + 0x30]        ; safepoint page
+  lea       rcx, [r9 + 8]           ; next row
+  lea       rdx, [r9 + 0x10]        ; next + stride (pre-check)
+  vmovdqu32 zmm2, [r11]             ; load 8 longs
+  vpcmpnleq k6, zmm2, zmm0          ; GT 42 → k6
+  vpcmpeqq  k5, zmm2, zmm1          ; null mask → k5
+  kxorb     k5, k7, k5              ; NOT(null) → k5
+  kandb     k6, k6, k5              ; result AND NOT(null) → k6
+  kmovq     r11, k6                  ; mask → GPR
+  popcnt    rbx, r11                 ; trueCount
+  movsxd    r11, ebx                 ; sign extend (unnecessary)
+  add       rax, r11                 ; count += trueCount
+  test      [r8], eax               ; safepoint poll
+  cmp       rdx, r10                ; (row+16) > rowsCount?
+  jle       loop                     ; back to loop
+```
+
+This is the tightest hot loop achieved across all phases. No compress, no store,
+no iota, no output address computation. 16 instructions per iteration, ~12 cycles
+estimated. Core filter is 5 instructions (load + compare + null + NOT + AND).
+
+**Key answers**:
+- **`trueCount() + i2l + ladd` → `kmov + popcnt + add`?** Yes, confirmed.
+- **Tighter than filterRows?** Yes: 16 vs 21 instructions (-24%).
+- **`i2l`?** C2 emits `movsxd r11, ebx` — sign-extends. Unnecessary but harmless.
 
 ---
 
@@ -1770,9 +1814,11 @@ but has no practical workaround within the public Vector API.
    (int IN-list) hoists all 5 constants while Phase 4 (long IN-list) hoists
    only 3.
 
-3. **K-register spills** (Phases 2, 3, 4). C2 spills mask registers to stack
-   despite having unused k1, k2. Conservative k-register allocator. ~2
-   instructions per spill/reload.
+3. ~~**K-register spills**~~ **FIXED** in custom JDK fork (`75d3d2372d4` +
+   `8a36bb8318e`). Phantom `TEMP kscratch` in `mask_opers_evex` reserved an
+   unused k-register per mask operation. Commutativity for mask ops and removal
+   of duplicate rules with extra TEMPs freed additional registers. Verified:
+   zero k-register spills in Phase 4 with the custom JDK.
 
 4. **VectorMask.andNot decomposed to XOR+AND** (Phase 1). C2 doesn't pattern-
    match `AND(NOT(x), y)` → `KANDN(x, y)` on mask registers. +1 instruction
