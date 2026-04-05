@@ -90,6 +90,11 @@ public class VectorBytecodeC2Driver extends AbstractCairoTest {
     }
 
     @Test
+    public void dumpLongGtInt() throws Exception {
+        driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > i", true);
+    }
+
+    @Test
     public void dumpLongGt42() throws Exception {
         driveJavaVectorQuery("SELECT * FROM jit_bench WHERE l > 42", true);
     }

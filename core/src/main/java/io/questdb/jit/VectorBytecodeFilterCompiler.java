@@ -1395,13 +1395,27 @@ public final class VectorBytecodeFilterCompiler {
         ImmediateCompare immediateCompare = findImmediateCompare(ctx.block(), c);
 
         if (c.operandType() == F8_TYPE) {
-            // Double comparisons always use helpers (epsilon + NaN handling).
-            int helperMethod = pool.doubleCompareHelper(c.opcode());
-            asm.aload(tempSlots[c.lhs()]);
-            asm.checkcast(vt.vecClass);
-            asm.aload(tempSlots[c.rhs()]);
-            asm.checkcast(vt.vecClass);
-            asm.invokeStatic(helperMethod);
+            // Double comparisons use epsilon + NaN helpers.
+            // When the RHS is a non-NaN constant, use specialized helpers
+            // that skip the RHS NaN test (saves 3 dead mask ops per comparison).
+            boolean isRhsFinite = immediateCompare != null
+                    && immediateCompare.imm().type() == F8_TYPE
+                    && !Double.isNaN(Double.longBitsToDouble(immediateCompare.imm().lo()));
+            if (isRhsFinite) {
+                int helperMethod = pool.doubleCompareHelperRhsFinite(immediateCompare.opcode());
+                asm.aload(tempSlots[immediateCompare.vectorTemp()]);
+                asm.checkcast(vt.vecClass);
+                asm.aload(tempSlots[immediateCompare.imm().dst()]);
+                asm.checkcast(vt.vecClass);
+                asm.invokeStatic(helperMethod);
+            } else {
+                int helperMethod = pool.doubleCompareHelper(c.opcode());
+                asm.aload(tempSlots[c.lhs()]);
+                asm.checkcast(vt.vecClass);
+                asm.aload(tempSlots[c.rhs()]);
+                asm.checkcast(vt.vecClass);
+                asm.invokeStatic(helperMethod);
+            }
             if (!ctx.pureF8()) {
                 // Mixed I8+F8: cast VectorMask<Double> → VectorMask<Long> for uniform mask type
                 asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
@@ -1409,13 +1423,26 @@ public final class VectorBytecodeFilterCompiler {
             }
             asm.astore(tempSlots[c.dst()]);
         } else if (c.operandType() == F4_TYPE) {
-            // Float comparisons always use helpers (epsilon + NaN handling).
-            int helperMethod = pool.floatCompareHelper(c.opcode());
-            asm.aload(tempSlots[c.lhs()]);
-            asm.checkcast(vt.vecClass);
-            asm.aload(tempSlots[c.rhs()]);
-            asm.checkcast(vt.vecClass);
-            asm.invokeStatic(helperMethod);
+            // Float comparisons use epsilon + NaN helpers.
+            // When RHS is a non-NaN constant, use specialized helpers.
+            boolean isRhsFinite = immediateCompare != null
+                    && immediateCompare.imm().type() == F4_TYPE
+                    && !Float.isNaN(Float.intBitsToFloat((int) immediateCompare.imm().lo()));
+            if (isRhsFinite) {
+                int helperMethod = pool.floatCompareHelperRhsFinite(immediateCompare.opcode());
+                asm.aload(tempSlots[immediateCompare.vectorTemp()]);
+                asm.checkcast(vt.vecClass);
+                asm.aload(tempSlots[immediateCompare.imm().dst()]);
+                asm.checkcast(vt.vecClass);
+                asm.invokeStatic(helperMethod);
+            } else {
+                int helperMethod = pool.floatCompareHelper(c.opcode());
+                asm.aload(tempSlots[c.lhs()]);
+                asm.checkcast(vt.vecClass);
+                asm.aload(tempSlots[c.rhs()]);
+                asm.checkcast(vt.vecClass);
+                asm.invokeStatic(helperMethod);
+            }
             // Cast VectorMask<Float> → VectorMask<Long> for uniform mask type
             asm.getstatic(pool.vecType(I8_TYPE).speciesPreferred);
             asm.invokeVirtual(pool.maskCast);
@@ -2150,8 +2177,12 @@ public final class VectorBytecodeFilterCompiler {
         private final int intNullEq, intNullNe, intNullLt, intNullLe, intNullGt, intNullGe;
         // Double comparison helpers (epsilon + NaN)
         private final int doubleVecEq, doubleVecNe, doubleVecLt, doubleVecLe, doubleVecGt, doubleVecGe;
+        // Specialized: RHS is known non-NaN constant (skip RHS NaN test)
+        private final int doubleVecEqRF, doubleVecNeRF, doubleVecLtRF, doubleVecLeRF, doubleVecGtRF, doubleVecGeRF;
         // Float comparison helpers (epsilon + NaN)
         private final int floatVecEq, floatVecNe, floatVecLt, floatVecLe, floatVecGt, floatVecGe;
+        // Specialized: RHS is known non-NaN constant (skip RHS NaN test)
+        private final int floatVecEqRF, floatVecNeRF, floatVecLtRF, floatVecLeRF, floatVecGtRF, floatVecGeRF;
         // Arithmetic helpers
         // Per-operation arithmetic helpers (no runtime opcode switch)
         final int longVecAddNull, longVecSubNull, longVecMulNull, longVecDivNull;
@@ -2277,6 +2308,13 @@ public final class VectorBytecodeFilterCompiler {
             doubleVecLe = asm.poolMethod(helpersCls, "doubleVecLe", dblCmpSig);
             doubleVecGt = asm.poolMethod(helpersCls, "doubleVecGt", dblCmpSig);
             doubleVecGe = asm.poolMethod(helpersCls, "doubleVecGe", dblCmpSig);
+            // Specialized: RHS is known non-NaN constant
+            doubleVecEqRF = asm.poolMethod(helpersCls, "doubleVecEqRhsFinite", dblCmpSig);
+            doubleVecNeRF = asm.poolMethod(helpersCls, "doubleVecNeRhsFinite", dblCmpSig);
+            doubleVecLtRF = asm.poolMethod(helpersCls, "doubleVecLtRhsFinite", dblCmpSig);
+            doubleVecLeRF = asm.poolMethod(helpersCls, "doubleVecLeRhsFinite", dblCmpSig);
+            doubleVecGtRF = asm.poolMethod(helpersCls, "doubleVecGtRhsFinite", dblCmpSig);
+            doubleVecGeRF = asm.poolMethod(helpersCls, "doubleVecGeRhsFinite", dblCmpSig);
 
             // --- FilterHelpers: float comparison (epsilon + NaN) ---
             String fltCmpSig = "(Ljdk/incubator/vector/FloatVector;Ljdk/incubator/vector/FloatVector;)" + sMask;
@@ -2286,6 +2324,13 @@ public final class VectorBytecodeFilterCompiler {
             floatVecLe = asm.poolMethod(helpersCls, "floatVecLe", fltCmpSig);
             floatVecGt = asm.poolMethod(helpersCls, "floatVecGt", fltCmpSig);
             floatVecGe = asm.poolMethod(helpersCls, "floatVecGe", fltCmpSig);
+            // Specialized: RHS is known non-NaN constant
+            floatVecEqRF = asm.poolMethod(helpersCls, "floatVecEqRhsFinite", fltCmpSig);
+            floatVecNeRF = asm.poolMethod(helpersCls, "floatVecNeRhsFinite", fltCmpSig);
+            floatVecLtRF = asm.poolMethod(helpersCls, "floatVecLtRhsFinite", fltCmpSig);
+            floatVecLeRF = asm.poolMethod(helpersCls, "floatVecLeRhsFinite", fltCmpSig);
+            floatVecGtRF = asm.poolMethod(helpersCls, "floatVecGtRhsFinite", fltCmpSig);
+            floatVecGeRF = asm.poolMethod(helpersCls, "floatVecGeRhsFinite", fltCmpSig);
 
             // --- FilterHelpers: per-operation arithmetic helpers ---
             String sLV = "Ljdk/incubator/vector/LongVector;";
@@ -2482,6 +2527,18 @@ public final class VectorBytecodeFilterCompiler {
             };
         }
 
+        int doubleCompareHelperRhsFinite(int opcode) {
+            return switch (opcode) {
+                case EQ -> doubleVecEqRF;
+                case NE -> doubleVecNeRF;
+                case LT -> doubleVecLtRF;
+                case LE -> doubleVecLeRF;
+                case GT -> doubleVecGtRF;
+                case GE -> doubleVecGeRF;
+                default -> throw new UnsupportedOperationException("double cmp RhsFinite: " + opcode);
+            };
+        }
+
         int floatCompareHelper(int opcode) {
             return switch (opcode) {
                 case EQ -> floatVecEq;
@@ -2491,6 +2548,18 @@ public final class VectorBytecodeFilterCompiler {
                 case GT -> floatVecGt;
                 case GE -> floatVecGe;
                 default -> throw new UnsupportedOperationException("float cmp: " + opcode);
+            };
+        }
+
+        int floatCompareHelperRhsFinite(int opcode) {
+            return switch (opcode) {
+                case EQ -> floatVecEqRF;
+                case NE -> floatVecNeRF;
+                case LT -> floatVecLtRF;
+                case LE -> floatVecLeRF;
+                case GT -> floatVecGtRF;
+                case GE -> floatVecGeRF;
+                default -> throw new UnsupportedOperationException("float cmp RhsFinite: " + opcode);
             };
         }
 
