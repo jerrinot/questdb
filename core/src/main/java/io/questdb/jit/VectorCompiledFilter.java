@@ -24,12 +24,10 @@
 
 package io.questdb.jit;
 
-import io.questdb.cairo.JitBackend;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.SqlException;
 
 public class VectorCompiledFilter implements JitFilter {
-    private ScalarBytecodeFilterCompiler.ScalarFilterBody bytecodeFilter;
     private VectorFilterBody vectorBytecodeFilter;
 
     @Override
@@ -53,17 +51,6 @@ public class VectorCompiledFilter implements JitFilter {
                     rowsCount
             );
         }
-        if (bytecodeFilter != null) {
-            return bytecodeFilter.filterRows(
-                    dataAddress,
-                    dataSize,
-                    varSizeAuxAddress,
-                    varsAddress,
-                    varsSize,
-                    filteredRowsAddress,
-                    rowsCount
-            );
-        }
         throw new IllegalStateException("no compiled filter available");
     }
 
@@ -73,40 +60,13 @@ public class VectorCompiledFilter implements JitFilter {
 
     @Override
     public void compile(MemoryCARW filter, int options) throws SqlException {
-        compile(filter, options, JitBackend.AUTO);
-    }
-
-    public void compile(MemoryCARW filter, int options, int backend) throws SqlException {
-        compileBytecode(filter, options, backend);
-    }
-
-    public boolean usesBytecode() {
-        return bytecodeFilter != null || vectorBytecodeFilter != null;
+        IrDecoder decoder = new IrDecoder();
+        IrDecoder.Instruction[] instructions = decoder.decode(filter);
+        LoweredProgram program = IrLowering.lower(instructions, options);
+        vectorBytecodeFilter = VectorBytecodeFilterCompiler.compile(program);
     }
 
     public boolean usesVectorBytecode() {
         return vectorBytecodeFilter != null;
-    }
-
-    private void compileBytecode(MemoryCARW filter, int options, int backend) throws SqlException {
-        IrDecoder decoder = new IrDecoder();
-        IrDecoder.Instruction[] instructions = decoder.decode(filter);
-        LoweredProgram program = IrLowering.lower(instructions, options);
-
-        // Try vectorized bytecode first (unless forced to scalar-only).
-        // This generates SIMD code via Vector API — best performance for
-        // supported programs (I8/F8, straight-line, no var-size/UUID).
-        if (backend != JitBackend.JAVA_COMPILED) {
-            vectorBytecodeFilter = VectorBytecodeFilterCompiler.compile(program);
-            if (vectorBytecodeFilter != null) {
-                return;
-            }
-        }
-
-        // Fall back to scalar bytecode — handles all programs including
-        // control flow, all types, var-size columns, UUID.
-        if (backend != JitBackend.JAVA_VECTOR_COMPILED) {
-            bytecodeFilter = ScalarBytecodeFilterCompiler.compile(program);
-        }
     }
 }

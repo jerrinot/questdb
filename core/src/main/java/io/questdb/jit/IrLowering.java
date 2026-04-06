@@ -281,10 +281,22 @@ public final class IrLowering {
         /**
          * Coerce a temporary to the target type by inserting a Cast if needed.
          * Returns the (possibly new) temporary ID holding the value in the target type.
+         * <p>
+         * Narrow integer types (I1, I2) are always widened to I4 first. This
+         * ensures all casts reaching the vector compiler use supported patterns
+         * (I4→I8, I4→F4, I4→F8) rather than direct narrow-to-wide casts
+         * (I1→I8, I2→F8, etc.) that the vector compiler cannot handle.
          */
         private int coerceIfNeeded(int tempId, int fromType, int toType) {
             if (fromType == toType) {
                 return tempId;
+            }
+            // Decompose narrow→wide casts through I4: I1/I2→I4→target
+            if ((fromType == I1_TYPE || fromType == I2_TYPE) && toType != I4_TYPE) {
+                int widenDst = allocTemp();
+                currentBlock.addOp(new LoweredOp.Cast(widenDst, tempId, fromType, I4_TYPE));
+                tempId = widenDst;
+                fromType = I4_TYPE;
             }
             int castDst = allocTemp();
             currentBlock.addOp(new LoweredOp.Cast(castDst, tempId, fromType, toType));

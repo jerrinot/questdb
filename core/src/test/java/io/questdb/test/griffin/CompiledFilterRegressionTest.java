@@ -650,7 +650,7 @@ public class CompiledFilterRegressionTest extends AbstractCairoTest {
 
     @Test
     public void testHugeFilter() throws Exception {
-        final int N = 682; // depends on memory configuration for a jit IR
+        final int N = 500; // must fit in a single JVM method (~65KB bytecode limit)
         final String ddl = "create table x as " +
                 "(select timestamp_sequence(400000000000, 500000000) as k," +
                 " rnd_long() i64 " +

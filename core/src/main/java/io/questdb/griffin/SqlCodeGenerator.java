@@ -3245,12 +3245,9 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                             final boolean forceScalar = jitMode == SqlJitMode.JIT_MODE_FORCE_SCALAR;
                             // Short-circuit opcodes (AND_SC, OR_SC) introduce control flow that
                             // prevents Java vector-bytecode compilation. Only enable SC for
-                            // backends that never attempt vectorization: the native C++ backend
-                            // (which handles SC natively) and the Java scalar-only backend
-                            // (which benefits from early-exit evaluation). For AUTO and
-                            // JAVA_VECTOR_COMPILED, emit straight-line eager boolean IR so
-                            // the vector compiler gets a chance at mixed-size predicates.
-                            final boolean enableShortCircuit = jitBackend == JitBackend.CPP || jitBackend == JitBackend.JAVA_COMPILED;
+                            // the native C++ backend which handles SC natively. Java backends
+                            // use straight-line eager boolean IR for vector compilation.
+                            final boolean enableShortCircuit = jitBackend == JitBackend.CPP;
                             jitIRSerializer.of(jitIRMem, executionContext, factory.getMetadata(), cursor, bindVarFunctions);
                             jitOptions = jitIRSerializer.serialize(
                                     filterExpr,
@@ -3271,11 +3268,11 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                             compiledCountOnlyFilter = nativeCountOnly;
                         } else {
                             VectorCompiledFilter javaFilter = new VectorCompiledFilter();
-                            javaFilter.compile(jitIRMem, jitOptions, jitBackend);
+                            javaFilter.compile(jitIRMem, jitOptions);
                             compiledFilter = javaFilter;
 
                             VectorCompiledCountOnlyFilter javaCountOnly = new VectorCompiledCountOnlyFilter();
-                            javaCountOnly.compile(jitIRMem, jitOptions, jitBackend);
+                            javaCountOnly.compile(jitIRMem, jitOptions);
                             compiledCountOnlyFilter = javaCountOnly;
                         }
 
@@ -3320,6 +3317,13 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                         LOG.debug()
                                 .$("JIT cannot be applied to (sub)query [tableName=").$safe(model.getName())
                                 .$(", ex=").$safe(ex.getFlyweightMessage())
+                                .$(", fd=").$(executionContext.getRequestFd()).I$();
+                    } catch (io.questdb.std.ex.BytecodeException ex) {
+                        // bytecode generation failed (e.g. method too large) — fall back to Java filter
+                        Misc.free(compiledFilter);
+                        Misc.free(compiledCountOnlyFilter);
+                        LOG.debug()
+                                .$("JIT bytecode generation failed for (sub)query [tableName=").$safe(model.getName())
                                 .$(", fd=").$(executionContext.getRequestFd()).I$();
                     } catch (Throwable t) {
                         // other errors are fatal -> rethrow them

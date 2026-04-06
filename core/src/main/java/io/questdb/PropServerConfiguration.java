@@ -2278,7 +2278,7 @@ public class PropServerConfiguration implements ServerConfiguration {
             return JitBackend.JAVA_VECTOR_COMPILED;
         }
         if (Chars.equalsLowerCaseAscii(value, "java_scalar")) {
-            return JitBackend.JAVA_COMPILED;
+            return JitBackend.AUTO;
         }
         return JitBackend.AUTO;
     }

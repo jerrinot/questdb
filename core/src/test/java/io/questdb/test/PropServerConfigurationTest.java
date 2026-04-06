@@ -1649,7 +1649,7 @@ public class PropServerConfigurationTest {
 
         properties.setProperty("cairo.sql.jit.backend", "java_scalar");
         configuration = newPropServerConfiguration(properties);
-        Assert.assertEquals(JitBackend.JAVA_COMPILED, configuration.getCairoConfiguration().getSqlJitBackend());
+        Assert.assertEquals(JitBackend.AUTO, configuration.getCairoConfiguration().getSqlJitBackend());
 
         properties.setProperty("cairo.sql.jit.backend", "foobar");
         configuration = newPropServerConfiguration(properties);

@@ -39,6 +39,8 @@ import io.questdb.griffin.model.ExpressionNode;
 import io.questdb.jit.CompiledFilterIRSerializer;
 import io.questdb.jit.IrDecoder;
 import io.questdb.jit.IrLowering;
+import io.questdb.jit.LoweredBlock;
+import io.questdb.jit.LoweredOp;
 import io.questdb.jit.LoweredProgram;
 import io.questdb.jit.Terminator;
 import io.questdb.std.MemoryTag;
@@ -1463,6 +1465,92 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
             Terminator.Return ret = (Terminator.Return) block.getTerminator();
             Assert.assertNotEquals("zero IMM RET must NOT be ACCEPT",
                     Terminator.Return.ACCEPT, ret.src());
+        }
+    }
+
+    @Test
+    public void testLowerDecomposesNarrowToWideCasts() throws Exception {
+        // MEM I1 col0, IMM I8 42, GT → should decompose Cast(I1→I8) into
+        // Cast(I1→I4) + Cast(I4→I8), so the vector compiler can handle it.
+        try (MemoryCARW ir = Vm.getCARWInstance(256, 1, MemoryTag.NATIVE_JIT)) {
+            ir.putInt(MEM); ir.putInt(I1_TYPE); ir.putLong(0); ir.putLong(0); // col 0, I1
+            ir.putInt(IMM); ir.putInt(I8_TYPE); ir.putLong(42); ir.putLong(0); // 42L
+            ir.putInt(GT);  ir.putInt(0);       ir.putLong(0); ir.putLong(0);
+            ir.putInt(RET); ir.putInt(0);       ir.putLong(0); ir.putLong(0);
+
+            IrDecoder decoder = new IrDecoder();
+            int options = (2 << 1) | (1 << 4); // mixed-size, null checks
+            LoweredProgram program = IrLowering.lower(decoder.decode(ir), options);
+            LoweredBlock block = program.getBlock(program.getEntryBlockId());
+
+            // Find the Cast ops — there must be two for the I1 operand: I1→I4, then I4→I8
+            int castCount = 0;
+            boolean hasI1toI4 = false;
+            boolean hasI4toI8 = false;
+            for (int i = 0; i < block.getOpCount(); i++) {
+                if (block.getOp(i) instanceof LoweredOp.Cast c) {
+                    castCount++;
+                    if (c.fromType() == I1_TYPE && c.toType() == I4_TYPE) hasI1toI4 = true;
+                    if (c.fromType() == I4_TYPE && c.toType() == I8_TYPE) hasI4toI8 = true;
+                }
+            }
+            Assert.assertTrue("must have I1→I4 cast", hasI1toI4);
+            Assert.assertTrue("must have I4→I8 cast", hasI4toI8);
+            Assert.assertFalse("must NOT have direct I1→I8 cast", castCount == 1);
+        }
+    }
+
+    @Test
+    public void testLowerDecomposesShortToDoubleCast() throws Exception {
+        // MEM I2 col0, IMM F8 3.14, LT → should decompose Cast(I2→F8) into
+        // Cast(I2→I4) + Cast(I4→F8).
+        try (MemoryCARW ir = Vm.getCARWInstance(256, 1, MemoryTag.NATIVE_JIT)) {
+            ir.putInt(MEM); ir.putInt(I2_TYPE); ir.putLong(0); ir.putLong(0);
+            ir.putInt(IMM); ir.putInt(F8_TYPE); ir.putLong(Double.doubleToLongBits(3.14)); ir.putLong(0);
+            ir.putInt(LT);  ir.putInt(0);       ir.putLong(0); ir.putLong(0);
+            ir.putInt(RET); ir.putInt(0);       ir.putLong(0); ir.putLong(0);
+
+            IrDecoder decoder = new IrDecoder();
+            int options = (2 << 1) | (1 << 4);
+            LoweredProgram program = IrLowering.lower(decoder.decode(ir), options);
+            LoweredBlock block = program.getBlock(program.getEntryBlockId());
+
+            boolean hasI2toI4 = false;
+            boolean hasI4toF8 = false;
+            for (int i = 0; i < block.getOpCount(); i++) {
+                if (block.getOp(i) instanceof LoweredOp.Cast c) {
+                    if (c.fromType() == I2_TYPE && c.toType() == I4_TYPE) hasI2toI4 = true;
+                    if (c.fromType() == I4_TYPE && c.toType() == F8_TYPE) hasI4toF8 = true;
+                }
+            }
+            Assert.assertTrue("must have I2→I4 cast", hasI2toI4);
+            Assert.assertTrue("must have I4→F8 cast", hasI4toF8);
+        }
+    }
+
+    @Test
+    public void testLowerPreservesDirectI1toI4Cast() throws Exception {
+        // MEM I1 col0, IMM I4 10, GT → I1→I4 is direct, no decomposition needed.
+        try (MemoryCARW ir = Vm.getCARWInstance(256, 1, MemoryTag.NATIVE_JIT)) {
+            ir.putInt(MEM); ir.putInt(I1_TYPE); ir.putLong(0); ir.putLong(0);
+            ir.putInt(IMM); ir.putInt(I4_TYPE); ir.putLong(10); ir.putLong(0);
+            ir.putInt(GT);  ir.putInt(0);       ir.putLong(0); ir.putLong(0);
+            ir.putInt(RET); ir.putInt(0);       ir.putLong(0); ir.putLong(0);
+
+            IrDecoder decoder = new IrDecoder();
+            int options = (2 << 1) | (1 << 4);
+            LoweredProgram program = IrLowering.lower(decoder.decode(ir), options);
+            LoweredBlock block = program.getBlock(program.getEntryBlockId());
+
+            int castCount = 0;
+            for (int i = 0; i < block.getOpCount(); i++) {
+                if (block.getOp(i) instanceof LoweredOp.Cast c) {
+                    castCount++;
+                    Assert.assertEquals("single cast must be I1→I4", I1_TYPE, c.fromType());
+                    Assert.assertEquals("single cast must be I1→I4", I4_TYPE, c.toType());
+                }
+            }
+            Assert.assertEquals("exactly one cast for I1→I4", 1, castCount);
         }
     }
 

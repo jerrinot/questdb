@@ -24,12 +24,10 @@
 
 package io.questdb.jit;
 
-import io.questdb.cairo.JitBackend;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.SqlException;
 
 public class VectorCompiledCountOnlyFilter implements JitCountOnlyFilter {
-    private ScalarBytecodeFilterCompiler.ScalarFilterBody bytecodeFilter;
     private VectorFilterBody vectorBytecodeFilter;
 
     @Override
@@ -51,16 +49,6 @@ public class VectorCompiledCountOnlyFilter implements JitCountOnlyFilter {
                     rowsCount
             );
         }
-        if (bytecodeFilter != null) {
-            return bytecodeFilter.countRows(
-                    dataAddress,
-                    dataSize,
-                    varSizeAuxAddress,
-                    varsAddress,
-                    varsSize,
-                    rowsCount
-            );
-        }
         throw new IllegalStateException("no compiled filter available");
     }
 
@@ -70,35 +58,13 @@ public class VectorCompiledCountOnlyFilter implements JitCountOnlyFilter {
 
     @Override
     public void compile(MemoryCARW filter, int options) throws SqlException {
-        compile(filter, options, JitBackend.AUTO);
-    }
-
-    public void compile(MemoryCARW filter, int options, int backend) throws SqlException {
-        compileBytecode(filter, options, backend);
-    }
-
-    public boolean usesBytecode() {
-        return bytecodeFilter != null || vectorBytecodeFilter != null;
+        IrDecoder decoder = new IrDecoder();
+        IrDecoder.Instruction[] instructions = decoder.decode(filter);
+        LoweredProgram program = IrLowering.lower(instructions, options);
+        vectorBytecodeFilter = VectorBytecodeFilterCompiler.compile(program);
     }
 
     public boolean usesVectorBytecode() {
         return vectorBytecodeFilter != null;
-    }
-
-    private void compileBytecode(MemoryCARW filter, int options, int backend) throws SqlException {
-        IrDecoder decoder = new IrDecoder();
-        IrDecoder.Instruction[] instructions = decoder.decode(filter);
-        LoweredProgram program = IrLowering.lower(instructions, options);
-
-        if (backend != JitBackend.JAVA_COMPILED) {
-            vectorBytecodeFilter = VectorBytecodeFilterCompiler.compile(program);
-            if (vectorBytecodeFilter != null) {
-                return;
-            }
-        }
-
-        if (backend != JitBackend.JAVA_VECTOR_COMPILED) {
-            bytecodeFilter = ScalarBytecodeFilterCompiler.compile(program);
-        }
     }
 }

@@ -25,6 +25,7 @@
 package io.questdb.jit;
 
 import io.questdb.std.BytecodeAssembler;
+import java.util.Arrays;
 
 import java.util.HashMap;
 
@@ -113,13 +114,10 @@ public final class VectorBytecodeFilterCompiler {
         if (program.hasControlFlow()) {
             return false;
         }
-        if (program.getOptions().isScalarOnly()) {
-            return false;
-        }
         LoweredBlock block = program.getBlock(program.getEntryBlockId());
-        // Each vector op emits ~30-40 bytes of bytecode. JVM methods are
+        // Each vector op emits ~20-30 bytes of bytecode. JVM methods are
         // limited to 65535 bytes. Reject programs that would exceed this.
-        if (block.getOpCount() > 1500) {
+        if (block.getOpCount() > 3000) {
             return false;
         }
         for (int i = 0; i < block.getOpCount(); i++) {
@@ -233,8 +231,11 @@ public final class VectorBytecodeFilterCompiler {
                         int normalized = IrLowering.normalizeVarSizeType(vh.headerType());
                         if (normalized == I4_TYPE) usesI4 = true;
                         maxColIdx = Math.max(maxColIdx, vh.columnIndex());
-                    } else if (op instanceof LoweredOp.Cast) {
+                    } else if (op instanceof LoweredOp.Cast c) {
                         hasCast = true;
+                        if (c.toType() == I8_TYPE) hasI8 = true;
+                        if (c.toType() == I4_TYPE) usesI4 = true;
+                        if (c.toType() == F4_TYPE) usesF4 = true;
                     }
                 }
             }
@@ -279,11 +280,12 @@ public final class VectorBytecodeFilterCompiler {
             int[] colSegSlots,
             int varsSegSlot,
             int[] tempSlots,
+            int tempLocalCount,
             int maxLocals,
             int objectLocalCount
     ) {
 
-        static SlotLayout allocate(int firstFree, int tempCount, ProgramShape shape,
+        static SlotLayout allocate(int firstFree, LoweredBlock block, int tempCount, int[] useCounts, ProgramShape shape,
                                    boolean isCountOnly, boolean nullChecks) {
             boolean pureF8 = shape.pureF8();
             boolean usesI4 = shape.usesI4();
@@ -343,11 +345,10 @@ public final class VectorBytecodeFilterCompiler {
                 fullMaskSlot = nextSlot++;
             }
 
-            int[] tempSlots = new int[tempCount];
-            for (int i = 0; i < tempCount; i++) {
-                tempSlots[i] = nextSlot++;
-            }
-            int maxLocals = nextSlot;
+            TempSlotLayout tempLayout = allocateTempSlots(block, tempCount, useCounts, nextSlot);
+            int[] tempSlots = tempLayout.tempSlots();
+            int tempLocalCount = tempLayout.tempLocalCount();
+            int maxLocals = tempLayout.nextSlot();
             int objectLocalCount = maxLocals - (firstFree + 6);
 
             return new SlotLayout(
@@ -356,10 +357,13 @@ public final class VectorBytecodeFilterCompiler {
                     intSpeciesSlot, floatSpeciesSlot, byteSpeciesSlot, shortSpeciesSlot,
                     nullVecSlot, nullMaskCacheSlot,
                     outputSegSlot, iotaSlot, matchCountSlot, countAccSlot, fullMaskSlot,
-                    colSegSlots, varsSegSlot, tempSlots,
+                    colSegSlots, varsSegSlot, tempSlots, tempLocalCount,
                     maxLocals, objectLocalCount
             );
         }
+    }
+
+    private record TempSlotLayout(int[] tempSlots, int tempLocalCount, int nextSlot) {
     }
 
     /**
@@ -397,10 +401,10 @@ public final class VectorBytecodeFilterCompiler {
         boolean nullChecks = program.getOptions().isNullChecksEnabled();
         boolean needsNullVec = nullChecks && !pureF8;
 
-        SlotLayout s = SlotLayout.allocate(firstFree, tempCount, shape, isCountOnly, nullChecks);
         LoweredBlock block = program.getBlock(program.getEntryBlockId());
-        EmitContext ctx = new EmitContext(asm, pool, s, nullChecks, pureF8, block, new int[]{-1});
         int[] useCounts = computeUseCounts(block, tempCount);
+        SlotLayout s = SlotLayout.allocate(firstFree, block, tempCount, useCounts, shape, isCountOnly, nullChecks);
+        EmitContext ctx = new EmitContext(asm, pool, s, nullChecks, pureF8, block, new int[]{-1});
         Terminator.Return ret = (Terminator.Return) block.getTerminator();
 
         asm.startMethod(methodName, methodSig, 12, s.maxLocals());
@@ -426,7 +430,7 @@ public final class VectorBytecodeFilterCompiler {
         asm.lreturn();
 
         emitStackMaps(ctx, loop, stackMapAttr, isCountOnly,
-                usesI4, needsNullVec, tempCount, shape);
+                usesI4, needsNullVec, shape);
         asm.endMethod();
     }
 
@@ -732,7 +736,7 @@ public final class VectorBytecodeFilterCompiler {
     private static void emitStackMaps(
             EmitContext ctx, LoopEmission loop, int stackMapAttr,
             boolean isCountOnly, boolean usesI4, boolean needsNullVec,
-            int tempCount, ProgramShape shape
+            ProgramShape shape
     ) {
         BytecodeAssembler asm = ctx.asm();
         Pool pool = ctx.pool();
@@ -768,7 +772,7 @@ public final class VectorBytecodeFilterCompiler {
                 + (shape.maxColumnIndex() + 1) // colAddr(long) entries
                 + 1 // varsSegSlot
                 + (isCountOnly ? 2 : 0)
-                + tempCount;
+                + s.tempLocalCount();
 
         asm.putByte(0xff); // full_frame
         asm.putShort(loopBci);
@@ -817,7 +821,7 @@ public final class VectorBytecodeFilterCompiler {
             asm.putITEM_Object(pool.longVectorClass); // countAccSlot
             asm.putITEM_Object(pool.vectorMaskClass); // fullMaskSlot
         }
-        for (int i = 0; i < tempCount; i++) {
+        for (int i = 0; i < s.tempLocalCount(); i++) {
             asm.putITEM_Object(pool.objectClassIndex); // temp[i] — generic
         }
         // empty stack
@@ -882,6 +886,189 @@ public final class VectorBytecodeFilterCompiler {
         }
 
         return counts;
+    }
+
+    private static TempSlotLayout allocateTempSlots(LoweredBlock block, int tempCount, int[] useCounts, int firstTempSlot) {
+        boolean[] pinnedTemps = computePinnedTemps(block, tempCount);
+        int[] lastUses = computeTempLastUses(block, tempCount, useCounts);
+        int[] tempSlots = new int[tempCount];
+        int[] freeSlots = new int[tempCount];
+        int[] releaseHeads = new int[block.getOpCount() + 1];
+        int[] releaseNext = new int[tempCount];
+        Arrays.fill(releaseHeads, -1);
+        Arrays.fill(releaseNext, -1);
+
+        int freeSlotCount = 0;
+        int nextSlot = firstTempSlot;
+        for (int tempId = 0; tempId < tempCount; tempId++) {
+            if (pinnedTemps[tempId]) {
+                tempSlots[tempId] = nextSlot++;
+            }
+        }
+        for (int i = 0; i < block.getOpCount(); i++) {
+            for (int tempId = releaseHeads[i]; tempId >= 0; tempId = releaseNext[tempId]) {
+                freeSlots[freeSlotCount++] = tempSlots[tempId];
+            }
+
+            int dst = block.getOp(i).dst();
+            if (pinnedTemps[dst]) {
+                continue;
+            }
+            tempSlots[dst] = freeSlotCount > 0 ? freeSlots[--freeSlotCount] : nextSlot++;
+
+            int liveUntil = Math.max(lastUses[dst], i);
+            int releaseAt = liveUntil + 1;
+            if (releaseAt < releaseHeads.length) {
+                releaseNext[dst] = releaseHeads[releaseAt];
+                releaseHeads[releaseAt] = dst;
+            }
+        }
+
+        return new TempSlotLayout(tempSlots, nextSlot - firstTempSlot, nextSlot);
+    }
+
+    private static boolean[] computePinnedTemps(LoweredBlock block, int tempCount) {
+        boolean[] pinnedTemps = new boolean[tempCount];
+        for (int i = 0; i < block.getOpCount(); i++) {
+            LoweredOp op = block.getOp(i);
+            if (op instanceof LoweredOp.LoadImm li && li.type() != I16_TYPE) {
+                pinnedTemps[li.dst()] = true;
+            } else if (op instanceof LoweredOp.LoadVar lv && lv.type() != I16_TYPE) {
+                pinnedTemps[lv.dst()] = true;
+            }
+        }
+        return pinnedTemps;
+    }
+
+    private static int[] computeTempLastUses(LoweredBlock block, int tempCount, int[] useCounts) {
+        int[] lastUses = new int[tempCount];
+        Arrays.fill(lastUses, -1);
+        HashMap<Long, Integer> cachedLoads = new HashMap<>();
+
+        for (int i = 0; i < block.getOpCount(); i++) {
+            LoweredOp op = block.getOp(i);
+            switch (op) {
+                case LoweredOp.LoadColumn lc -> {
+                    if (lc.type() != I16_TYPE) {
+                        long cacheKey = (((long) lc.type()) << 32) | (lc.columnIndex() & 0xffff_ffffL);
+                        Integer cachedTemp = cachedLoads.putIfAbsent(cacheKey, lc.dst());
+                        if (cachedTemp != null) {
+                            markTempUse(lastUses, cachedTemp, i);
+                        }
+                    }
+                }
+                case LoweredOp.LoadVarSizeHeader ignored -> {
+                }
+                case LoweredOp.LoadVar ignored -> {
+                }
+                case LoweredOp.LoadImm ignored -> {
+                }
+                case LoweredOp.Cast c -> markTempUse(lastUses, c.src(), i);
+                case LoweredOp.Compare c -> {
+                    markTempUse(lastUses, c.lhs(), i);
+                    markTempUse(lastUses, c.rhs(), i);
+                }
+                case LoweredOp.CompareI128 c -> {
+                    markTempUse(lastUses, c.lhs(), i);
+                    markTempUse(lastUses, c.rhs(), i);
+                }
+                case LoweredOp.Arithmetic a -> {
+                    markTempUse(lastUses, a.lhs(), i);
+                    markTempUse(lastUses, a.rhs(), i);
+                }
+                case LoweredOp.BooleanOp bo -> {
+                    markTempUse(lastUses, bo.lhs(), i);
+                    markTempUse(lastUses, bo.rhs(), i);
+                }
+                case LoweredOp.Negate neg -> markTempUse(lastUses, neg.src(), i);
+                case LoweredOp.Not n -> markTempUse(lastUses, n.src(), i);
+                case LoweredOp.Move m -> markTempUse(lastUses, m.src(), i);
+            }
+        }
+
+        switch (block.getTerminator()) {
+            case Terminator.Branch branch -> markTempUse(lastUses, branch.src(), block.getOpCount());
+            case Terminator.Return ret -> {
+                if (ret.src() >= 0) {
+                    markTempUse(lastUses, ret.src(), block.getOpCount());
+                }
+            }
+            case Terminator.Goto ignored -> {
+            }
+        }
+
+        extendEqChainLastUses(block, useCounts, lastUses, I4_TYPE);
+        extendEqChainLastUses(block, useCounts, lastUses, I8_TYPE);
+
+        return lastUses;
+    }
+
+    private static void extendEqChainLastUses(LoweredBlock block, int[] useCounts, int[] lastUses, int type) {
+        for (int startIndex = 0; startIndex < block.getOpCount(); startIndex++) {
+            if (!(block.getOp(startIndex) instanceof LoweredOp.LoadColumn firstLoad) || firstLoad.type() != type) {
+                continue;
+            }
+            if (startIndex + 4 >= block.getOpCount()) {
+                continue;
+            }
+            if (useCounts[firstLoad.dst()] != 1) {
+                continue;
+            }
+
+            if (!(block.getOp(startIndex + 1) instanceof LoweredOp.Compare firstCompare)
+                    || firstCompare.opcode() != EQ
+                    || firstCompare.operandType() != type
+                    || eqOtherOperand(firstCompare, firstLoad.dst()) < 0) {
+                continue;
+            }
+
+            int accumTemp = firstCompare.dst();
+            int scan = startIndex + 2;
+            int chainLength = 1;
+
+            while (scan < block.getOpCount()) {
+                int s = scan;
+                while (s < block.getOpCount() && (block.getOp(s) instanceof LoweredOp.LoadImm
+                        || block.getOp(s) instanceof LoweredOp.LoadVar)) {
+                    s++;
+                }
+                if (s + 2 >= block.getOpCount()) {
+                    break;
+                }
+                if (!(block.getOp(s) instanceof LoweredOp.LoadColumn nextLoad)
+                        || nextLoad.type() != type
+                        || nextLoad.columnIndex() != firstLoad.columnIndex()) {
+                    break;
+                }
+                if (useCounts[nextLoad.dst()] != 1) {
+                    break;
+                }
+                if (!(block.getOp(s + 1) instanceof LoweredOp.Compare nextCompare)
+                        || nextCompare.opcode() != EQ
+                        || nextCompare.operandType() != type
+                        || eqOtherOperand(nextCompare, nextLoad.dst()) < 0) {
+                    break;
+                }
+                if (!(block.getOp(s + 2) instanceof LoweredOp.BooleanOp or)
+                        || or.opcode() != OR
+                        || !matchesBooleanInputs(or, accumTemp, nextCompare.dst())
+                        || useCounts[accumTemp] != 1
+                        || useCounts[nextCompare.dst()] != 1) {
+                    break;
+                }
+                accumTemp = or.dst();
+                scan = s + 3;
+                chainLength++;
+            }
+
+            if (chainLength >= 2) {
+                markTempUse(lastUses, firstLoad.dst(), scan - 1);
+            }
+        }
+    }
+
+    private static void markTempUse(int[] lastUses, int tempId, int useIndex) {
+        lastUses[tempId] = Math.max(lastUses[tempId], useIndex);
     }
 
     private static void emitSameFrame(BytecodeAssembler asm, int pos, int prevPos) {

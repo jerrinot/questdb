@@ -240,6 +240,80 @@ public class VectorCompiledFilterIntegrationTest extends AbstractCairoTest {
         });
     }
 
+    @Test
+    public void testByteColumnComparedToLongUsesVectorPath() throws Exception {
+        // Byte vs long triggers I1→I8 cast. After decomposition (I1→I4→I8),
+        // the vector compiler should accept it instead of falling back to scalar.
+        assertMemoryLeak(() -> {
+            execute(
+                    "CREATE TABLE narrow AS (" +
+                            "SELECT rnd_byte() b, rnd_long() l, timestamp_sequence(0, 1_000_000) ts " +
+                            "FROM long_sequence(1024)" +
+                            ") TIMESTAMP(ts)"
+            );
+
+            final String query = "SELECT count() FROM narrow WHERE b > 0 AND l < 100_000";
+
+            long expectedCount;
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_DISABLED);
+            try (RecordCursorFactory factory = select(query)) {
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Assert.assertTrue(cursor.hasNext());
+                    expectedCount = cursor.getRecord().getLong(0);
+                }
+            }
+
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_ENABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
+            try (RecordCursorFactory factory = select(query)) {
+                Assert.assertTrue("filter should be compiled", factory.usesCompiledFilter());
+                assertVectorCompiledFilter(factory);
+                assertVectorBytecodeUsed(factory);
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Assert.assertTrue(cursor.hasNext());
+                    Assert.assertEquals(expectedCount, cursor.getRecord().getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testShortColumnComparedToDoubleUsesVectorPath() throws Exception {
+        // Short vs double triggers I2→F8 cast. After decomposition (I2→I4→F8),
+        // the vector compiler should accept it.
+        assertMemoryLeak(() -> {
+            execute(
+                    "CREATE TABLE narrow2 AS (" +
+                            "SELECT rnd_short() s, rnd_double(0) d, timestamp_sequence(0, 1_000_000) ts " +
+                            "FROM long_sequence(1024)" +
+                            ") TIMESTAMP(ts)"
+            );
+
+            final String query = "SELECT count() FROM narrow2 WHERE s > 0 AND d < 0.5";
+
+            long expectedCount;
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_DISABLED);
+            try (RecordCursorFactory factory = select(query)) {
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Assert.assertTrue(cursor.hasNext());
+                    expectedCount = cursor.getRecord().getLong(0);
+                }
+            }
+
+            sqlExecutionContext.setJitMode(SqlJitMode.JIT_MODE_ENABLED);
+            sqlExecutionContext.setJitBackend(JitBackend.AUTO);
+            try (RecordCursorFactory factory = select(query)) {
+                Assert.assertTrue("filter should be compiled", factory.usesCompiledFilter());
+                assertVectorCompiledFilter(factory);
+                assertVectorBytecodeUsed(factory);
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Assert.assertTrue(cursor.hasNext());
+                    Assert.assertEquals(expectedCount, cursor.getRecord().getLong(0));
+                }
+            }
+        });
+    }
+
     private static void assertVectorBytecodeUsed(RecordCursorFactory factory) {
         RecordCursorFactory current = factory;
         while (current != null) {
