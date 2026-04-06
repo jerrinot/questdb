@@ -38,6 +38,9 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.model.ExpressionNode;
 import io.questdb.jit.CompiledFilterIRSerializer;
 import io.questdb.jit.IrDecoder;
+import io.questdb.jit.IrLowering;
+import io.questdb.jit.LoweredProgram;
+import io.questdb.jit.Terminator;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
@@ -1421,6 +1424,45 @@ public class CompiledFilterIRSerializerTest extends BaseFunctionFactoryTest {
 
         OptionsHint(int code) {
             this.code = code;
+        }
+    }
+
+    // --- IrLowering regression tests ---
+
+    @Test
+    public void testLowerRetCanonicalizesNonzeroImmToAccept() throws Exception {
+        // IMM 1, RET must lower to Return(ACCEPT), not Return(src=tempId).
+        // Without canonicalization, the vector filter compiler's terminator
+        // tries to checkcast an IntVector to VectorMask → ClassCastException.
+        try (MemoryCARW ir = Vm.getCARWInstance(256, 1, MemoryTag.NATIVE_JIT)) {
+            ir.putInt(IMM); ir.putInt(I4_TYPE); ir.putLong(1); ir.putLong(0);
+            ir.putInt(RET); ir.putInt(0); ir.putLong(0); ir.putLong(0);
+
+            IrDecoder decoder = new IrDecoder();
+            int options = (2 << 1) | (1 << 4); // I4 single-size
+            LoweredProgram program = IrLowering.lower(decoder.decode(ir), options);
+            var block = program.getBlock(program.getEntryBlockId());
+            Terminator term = block.getTerminator();
+            Assert.assertTrue("trivial accept must produce Return", term instanceof Terminator.Return);
+            Assert.assertEquals("nonzero IMM RET must canonicalize to ACCEPT",
+                    Terminator.Return.ACCEPT, ((Terminator.Return) term).src());
+        }
+    }
+
+    @Test
+    public void testLowerRetPreservesZeroImm() throws Exception {
+        // IMM 0, RET should NOT be canonicalized to ACCEPT (it's a reject).
+        try (MemoryCARW ir = Vm.getCARWInstance(256, 1, MemoryTag.NATIVE_JIT)) {
+            ir.putInt(IMM); ir.putInt(I4_TYPE); ir.putLong(0); ir.putLong(0);
+            ir.putInt(RET); ir.putInt(0); ir.putLong(0); ir.putLong(0);
+
+            IrDecoder decoder = new IrDecoder();
+            int options = (2 << 1) | (1 << 4);
+            LoweredProgram program = IrLowering.lower(decoder.decode(ir), options);
+            var block = program.getBlock(program.getEntryBlockId());
+            Terminator.Return ret = (Terminator.Return) block.getTerminator();
+            Assert.assertNotEquals("zero IMM RET must NOT be ACCEPT",
+                    Terminator.Return.ACCEPT, ret.src());
         }
     }
 

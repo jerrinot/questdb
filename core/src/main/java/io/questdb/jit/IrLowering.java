@@ -406,10 +406,29 @@ public final class IrLowering {
             if (tempIdStack.size() > 0) {
                 int src = tempIdStack.pop();
                 typeStack.pop();
-                currentBlock.setTerminator(new Terminator.Return(src));
+                // Canonicalize trivial accept: if the return source is a
+                // nonzero LoadImm, treat it as unconditional ACCEPT. This
+                // avoids producing a Return(src) where the temp holds a
+                // vector value instead of a VectorMask, which the vector
+                // bytecode compilers cannot consume.
+                if (isTruthyLoadImm(src)) {
+                    currentBlock.setTerminator(new Terminator.Return(Terminator.Return.ACCEPT));
+                } else {
+                    currentBlock.setTerminator(new Terminator.Return(src));
+                }
             } else {
                 currentBlock.setTerminator(new Terminator.Return(Terminator.Return.ACCEPT));
             }
+        }
+
+        private boolean isTruthyLoadImm(int tempId) {
+            for (int i = 0; i < currentBlock.getOpCount(); i++) {
+                LoweredOp op = currentBlock.getOp(i);
+                if (op.dst() == tempId && op instanceof LoweredOp.LoadImm li) {
+                    return li.lo() != 0;
+                }
+            }
+            return false;
         }
 
         private void lowerVar(IrDecoder.Instruction insn) {
