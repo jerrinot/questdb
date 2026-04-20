@@ -22,25 +22,40 @@
  *
  ******************************************************************************/
 
-open module io.questdb.test {
-    requires transitive io.questdb;
-    requires static junit;
-    requires transitive jdk.unsupported;
-    requires static org.jetbrains.annotations;
-    requires static java.sql;
-    requires static org.postgresql.jdbc;
-    requires static java.management;
-    requires io.questdb.client;
-    requires jdk.management;
-    requires java.net.http;
-    requires org.checkerframework.checker.qual;
-    requires io.netty.buffer;
-    requires io.netty.transport;
-    requires io.netty.codec.http2;
+package io.questdb.cutlass.http2;
 
-    uses io.questdb.griffin.FunctionFactory;
+/**
+ * HTTP/2 frame flag bits (RFC 7540 sec. 6). Flag semantics vary per frame type;
+ * a bit that is defined on one frame is "reserved, send 0" on another.
+ */
+public final class Http2Flags {
+    public static final byte ACK = 0x01;
+    public static final byte END_HEADERS = 0x04;
+    public static final byte END_STREAM = 0x01;
+    public static final byte NONE = 0x00;
+    public static final byte PADDED = 0x08;
+    public static final byte PRIORITY = 0x20;
 
-    exports io.questdb.test;
-    exports io.questdb.test.cairo;
-    exports io.questdb.test.cairo.parquet;
+    private Http2Flags() {
+    }
+
+    public static boolean hasAck(byte flags) {
+        return (flags & ACK) != 0;
+    }
+
+    public static boolean hasEndHeaders(byte flags) {
+        return (flags & END_HEADERS) != 0;
+    }
+
+    public static boolean hasEndStream(byte flags) {
+        return (flags & END_STREAM) != 0;
+    }
+
+    public static boolean hasPadded(byte flags) {
+        return (flags & PADDED) != 0;
+    }
+
+    public static boolean hasPriority(byte flags) {
+        return (flags & PRIORITY) != 0;
+    }
 }

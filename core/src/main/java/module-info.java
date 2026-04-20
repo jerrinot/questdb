@@ -44,6 +44,8 @@ open module io.questdb {
     exports io.questdb.cutlass.http;
     exports io.questdb.cutlass.http.processors;
     exports io.questdb.cutlass.http.ex;
+    exports io.questdb.cutlass.hpack;
+    exports io.questdb.cutlass.http2;
     exports io.questdb.cutlass.json;
     exports io.questdb.cutlass.line;
     exports io.questdb.cutlass.line.udp;

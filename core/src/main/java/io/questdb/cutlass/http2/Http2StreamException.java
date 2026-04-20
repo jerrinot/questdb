@@ -22,25 +22,40 @@
  *
  ******************************************************************************/
 
-open module io.questdb.test {
-    requires transitive io.questdb;
-    requires static junit;
-    requires transitive jdk.unsupported;
-    requires static org.jetbrains.annotations;
-    requires static java.sql;
-    requires static org.postgresql.jdbc;
-    requires static java.management;
-    requires io.questdb.client;
-    requires jdk.management;
-    requires java.net.http;
-    requires org.checkerframework.checker.qual;
-    requires io.netty.buffer;
-    requires io.netty.transport;
-    requires io.netty.codec.http2;
+package io.questdb.cutlass.http2;
 
-    uses io.questdb.griffin.FunctionFactory;
+/**
+ * Per-stream error. Handler emits {@code RST_STREAM} on the affected stream id
+ * and keeps the connection open (RFC 7540 sec. 5.4.2).
+ */
+public class Http2StreamException extends RuntimeException {
 
-    exports io.questdb.test;
-    exports io.questdb.test.cairo;
-    exports io.questdb.test.cairo.parquet;
+    private static final ThreadLocal<Http2StreamException> TL_INSTANCE = ThreadLocal.withInitial(Http2StreamException::new);
+
+    private int errorCode;
+    private int streamId;
+
+    private Http2StreamException() {
+        super(null, null, true, false);
+    }
+
+    public static Http2StreamException instance(int streamId, int errorCode) {
+        Http2StreamException e = TL_INSTANCE.get();
+        e.streamId = streamId;
+        e.errorCode = errorCode;
+        return e;
+    }
+
+    public int getErrorCode() {
+        return errorCode;
+    }
+
+    @Override
+    public String getMessage() {
+        return "stream=" + streamId + " " + Http2ErrorCode.nameOf(errorCode);
+    }
+
+    public int getStreamId() {
+        return streamId;
+    }
 }

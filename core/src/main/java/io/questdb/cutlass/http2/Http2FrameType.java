@@ -22,25 +22,23 @@
  *
  ******************************************************************************/
 
-open module io.questdb.test {
-    requires transitive io.questdb;
-    requires static junit;
-    requires transitive jdk.unsupported;
-    requires static org.jetbrains.annotations;
-    requires static java.sql;
-    requires static org.postgresql.jdbc;
-    requires static java.management;
-    requires io.questdb.client;
-    requires jdk.management;
-    requires java.net.http;
-    requires org.checkerframework.checker.qual;
-    requires io.netty.buffer;
-    requires io.netty.transport;
-    requires io.netty.codec.http2;
+package io.questdb.cutlass.http2;
 
-    uses io.questdb.griffin.FunctionFactory;
+/**
+ * HTTP/2 frame type codes (RFC 7540 sec. 6).
+ */
+public final class Http2FrameType {
+    public static final byte CONTINUATION = 0x09;
+    public static final byte DATA = 0x00;
+    public static final byte GOAWAY = 0x07;
+    public static final byte HEADERS = 0x01;
+    public static final byte PING = 0x06;
+    public static final byte PRIORITY = 0x02;
+    public static final byte PUSH_PROMISE = 0x05;
+    public static final byte RST_STREAM = 0x03;
+    public static final byte SETTINGS = 0x04;
+    public static final byte WINDOW_UPDATE = 0x08;
 
-    exports io.questdb.test;
-    exports io.questdb.test.cairo;
-    exports io.questdb.test.cairo.parquet;
+    private Http2FrameType() {
+    }
 }
