@@ -220,43 +220,61 @@ public class FlightSqlClientEndToEndTest extends AbstractBootstrapTest {
 
     @Test
     public void testScalarTypeSweep() throws Exception {
+        final int totalRows = 1_000_000;
         try (TestServerMain serverMain = startFlightSqlServer();
              FlightClient flightClient = openFlightClient(serverMain);
              FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
             FlightInfo info = sqlClient.execute(
                     "SELECT cast(x AS byte) b, cast(x AS short) s, cast(x AS int) i, x l, "
                             + "cast(x AS float) f, cast(x AS double) d, (x % 2 = 0) bo "
-                            + "FROM long_sequence(3)");
+                            + "FROM long_sequence(1_000_000)");
             try (FlightStream stream = sqlClient.getStream(info.getEndpoints().get(0).getTicket())) {
-                Assert.assertTrue(stream.next());
-                VectorSchemaRoot root = stream.getRoot();
-                Assert.assertEquals(3, root.getRowCount());
+                long observed = 0;
+                boolean hasSchemaChecked = false;
+                while (stream.next()) {
+                    VectorSchemaRoot root = stream.getRoot();
+                    int rows = root.getRowCount();
 
-                FieldVector b = root.getVector("b");
-                FieldVector s = root.getVector("s");
-                FieldVector i = root.getVector("i");
-                FieldVector l = root.getVector("l");
-                FieldVector f = root.getVector("f");
-                FieldVector d = root.getVector("d");
-                FieldVector bo = root.getVector("bo");
+                    FieldVector b = root.getVector("b");
+                    FieldVector s = root.getVector("s");
+                    FieldVector i = root.getVector("i");
+                    FieldVector l = root.getVector("l");
+                    FieldVector f = root.getVector("f");
+                    FieldVector d = root.getVector("d");
+                    FieldVector bo = root.getVector("bo");
 
-                Assert.assertTrue("b must be TinyIntVector, was " + b.getClass(), b instanceof TinyIntVector);
-                Assert.assertTrue("s must be SmallIntVector, was " + s.getClass(), s instanceof SmallIntVector);
-                Assert.assertTrue("i must be IntVector, was " + i.getClass(), i instanceof IntVector);
-                Assert.assertTrue("l must be BigIntVector, was " + l.getClass(), l instanceof BigIntVector);
-                Assert.assertTrue("f must be Float4Vector, was " + f.getClass(), f instanceof Float4Vector);
-                Assert.assertTrue("d must be Float8Vector, was " + d.getClass(), d instanceof Float8Vector);
-                Assert.assertTrue("bo must be BitVector, was " + bo.getClass(), bo instanceof BitVector);
+                    if (!hasSchemaChecked) {
+                        Assert.assertTrue("b must be TinyIntVector, was " + b.getClass(), b instanceof TinyIntVector);
+                        Assert.assertTrue("s must be SmallIntVector, was " + s.getClass(), s instanceof SmallIntVector);
+                        Assert.assertTrue("i must be IntVector, was " + i.getClass(), i instanceof IntVector);
+                        Assert.assertTrue("l must be BigIntVector, was " + l.getClass(), l instanceof BigIntVector);
+                        Assert.assertTrue("f must be Float4Vector, was " + f.getClass(), f instanceof Float4Vector);
+                        Assert.assertTrue("d must be Float8Vector, was " + d.getClass(), d instanceof Float8Vector);
+                        Assert.assertTrue("bo must be BitVector, was " + bo.getClass(), bo instanceof BitVector);
+                        hasSchemaChecked = true;
+                    }
 
-                Assert.assertEquals(1, ((TinyIntVector) b).get(0));
-                Assert.assertEquals(1, ((SmallIntVector) s).get(0));
-                Assert.assertEquals(1, ((IntVector) i).get(0));
-                Assert.assertEquals(1L, ((BigIntVector) l).get(0));
-                Assert.assertEquals(1.0f, ((Float4Vector) f).get(0), 0.0f);
-                Assert.assertEquals(1.0, ((Float8Vector) d).get(0), 0.0);
-                Assert.assertEquals(0, ((BitVector) bo).get(0));
+                    TinyIntVector bv = (TinyIntVector) b;
+                    SmallIntVector sv = (SmallIntVector) s;
+                    IntVector iv = (IntVector) i;
+                    BigIntVector lv = (BigIntVector) l;
+                    Float4Vector fv = (Float4Vector) f;
+                    Float8Vector dv = (Float8Vector) d;
+                    BitVector bov = (BitVector) bo;
 
-                Assert.assertFalse(stream.next());
+                    for (int row = 0; row < rows; row++) {
+                        long x = observed + row + 1;
+                        Assert.assertEquals("byte mismatch at x=" + x, (byte) x, bv.get(row));
+                        Assert.assertEquals("short mismatch at x=" + x, (short) x, sv.get(row));
+                        Assert.assertEquals("int mismatch at x=" + x, (int) x, iv.get(row));
+                        Assert.assertEquals("long mismatch at x=" + x, x, lv.get(row));
+                        Assert.assertEquals("float mismatch at x=" + x, (float) x, fv.get(row), 0.0f);
+                        Assert.assertEquals("double mismatch at x=" + x, (double) x, dv.get(row), 0.0);
+                        Assert.assertEquals("bool mismatch at x=" + x, (x % 2 == 0) ? 1 : 0, bov.get(row));
+                    }
+                    observed += rows;
+                }
+                Assert.assertEquals(totalRows, observed);
             }
         }
     }

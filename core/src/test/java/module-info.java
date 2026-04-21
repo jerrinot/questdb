@@ -36,6 +36,7 @@ open module io.questdb.test {
     requires org.checkerframework.checker.qual;
     requires io.netty.buffer;
     requires io.netty.transport;
+    requires io.netty.codec;
     requires io.netty.codec.http2;
     requires static org.apache.arrow.format;
     requires static org.apache.arrow.vector;
