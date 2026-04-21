@@ -30,8 +30,9 @@ import io.questdb.std.Unsafe;
 
 /**
  * Emits an Arrow IPC {@code Message} wrapping a {@code Schema} with one
- * or more scalar fields. Wave 7c covers LONG, DOUBLE, INT, FLOAT, BYTE,
- * SHORT, BOOLEAN, DATE and TIMESTAMP; any other type throws
+ * or more scalar fields. Wave 7d covers LONG, DOUBLE, INT, FLOAT, BYTE,
+ * SHORT, BOOLEAN, DATE, TIMESTAMP, STRING, VARCHAR and SYMBOL (the last
+ * three all mapped to Arrow {@code Utf8}); any other type throws
  * {@link UnsupportedColumnTypeException} which the Flight SQL handler
  * translates into {@code grpc-status: UNIMPLEMENTED}.
  * <p>
@@ -65,8 +66,9 @@ import io.questdb.std.Unsafe;
  *   <li>{@code MetadataVersion.V5 = 4}.</li>
  *   <li>{@code MessageHeader.Schema = 1} (union discriminator).</li>
  *   <li>{@code Type.Int = 2}, {@code Type.FloatingPoint = 3},
- *       {@code Type.Bool = 6}, {@code Type.Date = 8},
- *       {@code Type.Timestamp = 10} (union discriminators).</li>
+ *       {@code Type.Utf8 = 5}, {@code Type.Bool = 6},
+ *       {@code Type.Date = 8}, {@code Type.Timestamp = 10}
+ *       (union discriminators).</li>
  *   <li>{@code Precision.SINGLE = 1}, {@code Precision.DOUBLE = 2}.</li>
  *   <li>{@code DateUnit.DAY = 0}, {@code DateUnit.MILLISECOND = 1}.</li>
  *   <li>{@code TimeUnit.SECOND = 0}, {@code TimeUnit.MILLISECOND = 1},
@@ -90,6 +92,7 @@ public final class ArrowSchemaWriter {
     private static final int TYPE_FLOATING_POINT = 3;
     private static final int TYPE_INT = 2;
     private static final int TYPE_TIMESTAMP = 10;
+    private static final int TYPE_UTF8 = 5;
 
     private ArrowSchemaWriter() {
     }
@@ -184,6 +187,10 @@ public final class ArrowSchemaWriter {
                 return TYPE_DATE;
             case ColumnType.TIMESTAMP:
                 return TYPE_TIMESTAMP;
+            case ColumnType.STRING:
+            case ColumnType.VARCHAR:
+            case ColumnType.SYMBOL:
+                return TYPE_UTF8;
             default:
                 throw new UnsupportedColumnTypeException(columnType);
         }
@@ -281,8 +288,25 @@ public final class ArrowSchemaWriter {
                         ? TIME_UNIT_NANOSECOND
                         : TIME_UNIT_MICROSECOND;
                 return writeTimestampTable(writer, unit);
+            case ColumnType.STRING:
+            case ColumnType.VARCHAR:
+            case ColumnType.SYMBOL:
+                return writeUtf8Table(writer);
             default:
                 throw new UnsupportedColumnTypeException(columnType);
         }
+    }
+
+    /**
+     * STRING, VARCHAR and SYMBOL all map to Arrow {@code Utf8} on the
+     * wire. Utf8 is an empty flatbuffer table (just the discriminator);
+     * SYMBOL stays plain Utf8 rather than Arrow {@code DictionaryEncoded}
+     * because QuestDB's native symbol ids are scoped to a single reader,
+     * so resolving to strings server-side is correct and avoids an extra
+     * wire surface.
+     */
+    private static int writeUtf8Table(FbWriter writer) {
+        writer.startTable(0);
+        return writer.endTable();
     }
 }

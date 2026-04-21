@@ -65,6 +65,7 @@ import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.TinyIntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
@@ -202,11 +203,11 @@ public class FlightSqlQueryEndToEndTest extends AbstractBootstrapTest {
     }
 
     @Test
-    public void testStringColumnReturnsUnimplemented() throws Exception {
+    public void testUuidColumnReturnsUnimplemented() throws Exception {
         try (final TestServerMain serverMain = startFlightSqlServer()) {
             serverMain.start();
             try (Socket socket = openH2(serverMain)) {
-                QueryResult r = runGetFlightInfo(socket, "SELECT 'hello' AS greeting");
+                QueryResult r = runGetFlightInfo(socket, "SELECT rnd_uuid4() u FROM long_sequence(1)");
                 Assert.assertFalse("expected trailers-only unimplemented error", r.ok);
                 Assert.assertEquals("12", r.grpcStatus); // UNIMPLEMENTED
             }
@@ -400,6 +401,25 @@ public class FlightSqlQueryEndToEndTest extends AbstractBootstrapTest {
                 }
                 Assert.assertEquals(1L, batch.nullCountsPerBatch.get(0)[0]);
                 Assert.assertEquals(0L, batch.nullCountsPerBatch.get(1)[0]);
+                batch.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSelectVarcharColumnBaseline() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket,
+                        "SELECT cast('v' || x AS varchar) v FROM long_sequence(3)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                VarCharVector v = (VarCharVector) batch.root.getVector("v");
+                Assert.assertEquals(3, v.getValueCount());
+                Assert.assertEquals("v1", new String(v.get(0), StandardCharsets.UTF_8));
+                Assert.assertEquals("v2", new String(v.get(1), StandardCharsets.UTF_8));
+                Assert.assertEquals("v3", new String(v.get(2), StandardCharsets.UTF_8));
                 batch.close();
             }
         }

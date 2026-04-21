@@ -197,6 +197,11 @@ public final class TicketRegistry implements Closeable {
         int memoryTag;
         /** Per-column Arrow {@code null_count}. Reused across batches. */
         long[] nullCounts;
+        /**
+         * Per-column offsets buffer length for the current batch, in bytes.
+         * Zero for fixed-width columns; {@code 4 * (rowCount + 1)} for Utf8.
+         */
+        long[] offsetsLengths;
         /** Rows appended to {@link #scratches} but not yet flushed on the wire. */
         int rowsBuffered;
         ArrowColumnScratch[] scratches;
@@ -245,6 +250,10 @@ public final class TicketRegistry implements Closeable {
 
         public long[] getNullCounts() {
             return nullCounts;
+        }
+
+        public long[] getOffsetsLengths() {
+            return offsetsLengths;
         }
 
         public ArrowColumnScratch[] getScratches() {
@@ -330,6 +339,7 @@ public final class TicketRegistry implements Closeable {
             if (nullCounts == null || nullCounts.length != n) {
                 nullCounts = new long[n];
                 validityLengths = new long[n];
+                offsetsLengths = new long[n];
                 valuesLengths = new long[n];
             }
         }
@@ -421,6 +431,7 @@ public final class TicketRegistry implements Closeable {
             }
             nullCounts = null;
             validityLengths = null;
+            offsetsLengths = null;
             valuesLengths = null;
             columnTypes = null;
             if (batchScratchAddr != 0) {

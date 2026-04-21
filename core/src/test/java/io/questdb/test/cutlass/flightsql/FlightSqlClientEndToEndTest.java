@@ -46,7 +46,10 @@ import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.TinyIntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+
+import java.nio.charset.StandardCharsets;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Before;
@@ -300,6 +303,78 @@ public class FlightSqlClientEndToEndTest extends AbstractBootstrapTest {
     }
 
     @Test
+    public void testSelectMultiColumnMixed() throws Exception {
+        try (TestServerMain serverMain = startFlightSqlServer();
+             FlightClient flightClient = openFlightClient(serverMain);
+             FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
+            FlightInfo info = sqlClient.execute(
+                    "SELECT x l, cast('v' || x AS varchar) v, "
+                            + "x::double d, "
+                            + "cast('2024-01-01T12:00:00.000000Z' AS timestamp) t "
+                            + "FROM long_sequence(4)");
+            try (FlightStream stream = sqlClient.getStream(info.getEndpoints().get(0).getTicket())) {
+                Assert.assertTrue(stream.next());
+                VectorSchemaRoot root = stream.getRoot();
+                BigIntVector l = (BigIntVector) root.getVector("l");
+                VarCharVector v = (VarCharVector) root.getVector("v");
+                Float8Vector d = (Float8Vector) root.getVector("d");
+                TimeStampMicroVector t = (TimeStampMicroVector) root.getVector("t");
+                Assert.assertEquals(4, root.getRowCount());
+                for (int i = 0; i < 4; i++) {
+                    Assert.assertEquals(i + 1L, l.get(i));
+                    Assert.assertEquals("v" + (i + 1), new String(v.get(i), StandardCharsets.UTF_8));
+                    Assert.assertEquals((double) (i + 1), d.get(i), 0.0);
+                    Assert.assertEquals(1_704_110_400_000_000L, t.get(i));
+                }
+                Assert.assertFalse(stream.next());
+            }
+        }
+    }
+
+    @Test
+    public void testSelectString() throws Exception {
+        try (TestServerMain serverMain = startFlightSqlServer();
+             FlightClient flightClient = openFlightClient(serverMain);
+             FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
+            FlightInfo info = sqlClient.execute("SELECT 'hello' AS s FROM long_sequence(3)");
+            try (FlightStream stream = sqlClient.getStream(info.getEndpoints().get(0).getTicket())) {
+                Assert.assertTrue(stream.next());
+                VectorSchemaRoot root = stream.getRoot();
+                VarCharVector s = (VarCharVector) root.getVector("s");
+                Assert.assertEquals(3, root.getRowCount());
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertFalse("row " + i + " must be valid", s.isNull(i));
+                    Assert.assertEquals("hello", new String(s.get(i), StandardCharsets.UTF_8));
+                }
+                Assert.assertFalse(stream.next());
+            }
+        }
+    }
+
+    @Test
+    public void testSelectSymbol() throws Exception {
+        try (TestServerMain serverMain = startFlightSqlServer();
+             FlightClient flightClient = openFlightClient(serverMain);
+             FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
+            FlightInfo info = sqlClient.execute(
+                    "SELECT rnd_symbol('red','green','blue') sy FROM long_sequence(5)");
+            try (FlightStream stream = sqlClient.getStream(info.getEndpoints().get(0).getTicket())) {
+                Assert.assertTrue(stream.next());
+                VectorSchemaRoot root = stream.getRoot();
+                VarCharVector sy = (VarCharVector) root.getVector("sy");
+                Assert.assertEquals(5, root.getRowCount());
+                for (int i = 0; i < 5; i++) {
+                    Assert.assertFalse("row " + i + " must be valid", sy.isNull(i));
+                    String v = new String(sy.get(i), StandardCharsets.UTF_8);
+                    Assert.assertTrue("unexpected symbol: " + v,
+                            "red".equals(v) || "green".equals(v) || "blue".equals(v));
+                }
+                Assert.assertFalse(stream.next());
+            }
+        }
+    }
+
+    @Test
     public void testSelectTimestampMicro() throws Exception {
         try (TestServerMain serverMain = startFlightSqlServer();
              FlightClient flightClient = openFlightClient(serverMain);
@@ -322,17 +397,41 @@ public class FlightSqlClientEndToEndTest extends AbstractBootstrapTest {
     }
 
     @Test
+    public void testSelectVarcharFromTable() throws Exception {
+        try (TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.compile("CREATE TABLE t (v VARCHAR)");
+            serverMain.execute("INSERT INTO t VALUES ('abc'), (null), ('xyz')");
+            try (FlightClient flightClient = openFlightClient(serverMain);
+                 FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
+                FlightInfo info = sqlClient.execute("SELECT v FROM t");
+                try (FlightStream stream = sqlClient.getStream(info.getEndpoints().get(0).getTicket())) {
+                    Assert.assertTrue(stream.next());
+                    VectorSchemaRoot root = stream.getRoot();
+                    VarCharVector v = (VarCharVector) root.getVector("v");
+                    Assert.assertEquals(3, root.getRowCount());
+                    Assert.assertFalse(v.isNull(0));
+                    Assert.assertEquals("abc", new String(v.get(0), StandardCharsets.UTF_8));
+                    Assert.assertTrue("middle row must be null", v.isNull(1));
+                    Assert.assertFalse(v.isNull(2));
+                    Assert.assertEquals("xyz", new String(v.get(2), StandardCharsets.UTF_8));
+                    Assert.assertFalse(stream.next());
+                }
+            }
+        }
+    }
+
+    @Test
     public void testUnsupportedTypeRaisesUnimplemented() throws Exception {
         try (TestServerMain serverMain = startFlightSqlServer();
              FlightClient flightClient = openFlightClient(serverMain);
              FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
             FlightRuntimeException ex = null;
             try {
-                sqlClient.execute("SELECT 'hello' g");
+                sqlClient.execute("SELECT rnd_uuid4() u FROM long_sequence(1)");
             } catch (FlightRuntimeException e) {
                 ex = e;
             }
-            Assert.assertNotNull("expected FlightRuntimeException for STRING column", ex);
+            Assert.assertNotNull("expected FlightRuntimeException for UUID column", ex);
             Assert.assertEquals(FlightStatusCode.UNIMPLEMENTED, ex.status().code());
         }
     }

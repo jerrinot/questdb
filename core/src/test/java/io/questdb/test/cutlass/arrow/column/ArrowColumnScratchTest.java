@@ -30,6 +30,8 @@ import io.questdb.cutlass.arrow.column.ArrowColumnScratch;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Numbers;
 import io.questdb.std.Unsafe;
+import io.questdb.std.str.GcUtf8String;
+import io.questdb.std.str.Utf8String;
 import io.questdb.test.AbstractCairoTest;
 import org.junit.Assert;
 import org.junit.Test;
@@ -83,6 +85,153 @@ public class ArrowColumnScratchTest extends AbstractCairoTest {
                 Assert.assertEquals(0, s.getNullCount());
                 Assert.assertEquals(0, s.validityLengthBytes());
                 Assert.assertEquals(64, s.valuesLengthBytes());
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testAppendStringOrNullBasic() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.STRING, 4);
+                s.appendStringOrNull("hi");
+                s.appendStringOrNull("world");
+                s.appendStringOrNull("");
+                Assert.assertEquals(3, s.getRowCount());
+                Assert.assertEquals(0, s.getNullCount());
+                // 2 + 5 + 0 = 7 UTF-8 bytes total.
+                Assert.assertEquals(7, s.valuesLengthBytes());
+                // offsets buffer carries 4 * (rowCount + 1) = 16 bytes.
+                Assert.assertEquals(16, s.offsetsLengthBytes());
+                // all valid; no validity bytes emitted.
+                Assert.assertEquals(0, s.validityLengthBytes());
+
+                long offDst = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                long valDst = Unsafe.malloc(7, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushOffsetsTo(offDst);
+                    Assert.assertEquals(0, Unsafe.getUnsafe().getInt(offDst));
+                    Assert.assertEquals(2, Unsafe.getUnsafe().getInt(offDst + 4));
+                    Assert.assertEquals(7, Unsafe.getUnsafe().getInt(offDst + 8));
+                    Assert.assertEquals(7, Unsafe.getUnsafe().getInt(offDst + 12));
+                    s.flushValuesTo(valDst);
+                    byte[] expected = {'h', 'i', 'w', 'o', 'r', 'l', 'd'};
+                    for (int i = 0; i < expected.length; i++) {
+                        Assert.assertEquals("byte " + i, expected[i], Unsafe.getUnsafe().getByte(valDst + i));
+                    }
+                } finally {
+                    Unsafe.free(valDst, 7, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(offDst, 16, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testAppendStringOrNullWithNullInMiddle() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.STRING, 4);
+                s.appendStringOrNull("abc");
+                s.appendStringOrNull(null);
+                s.appendStringOrNull("de");
+                Assert.assertEquals(3, s.getRowCount());
+                Assert.assertEquals(1, s.getNullCount());
+                Assert.assertEquals(5, s.valuesLengthBytes()); // 3 + 0 + 2
+                Assert.assertEquals(16, s.offsetsLengthBytes());
+                // first null allocates the validity bitmap; validity covers row 0..2.
+                Assert.assertEquals(1, s.validityLengthBytes());
+
+                long offDst = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                long valDst = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+                long bitDst = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushOffsetsTo(offDst);
+                    Assert.assertEquals(0, Unsafe.getUnsafe().getInt(offDst));
+                    Assert.assertEquals(3, Unsafe.getUnsafe().getInt(offDst + 4));
+                    Assert.assertEquals(3, Unsafe.getUnsafe().getInt(offDst + 8));
+                    Assert.assertEquals(5, Unsafe.getUnsafe().getInt(offDst + 12));
+                    s.flushValuesTo(valDst);
+                    byte[] expected = {'a', 'b', 'c', 'd', 'e'};
+                    for (int i = 0; i < expected.length; i++) {
+                        Assert.assertEquals(expected[i], Unsafe.getUnsafe().getByte(valDst + i));
+                    }
+                    s.flushValidityTo(bitDst);
+                    // bit0 = valid, bit1 = null, bit2 = valid -> 0b0000_0101.
+                    Assert.assertEquals((byte) 0b0000_0101, Unsafe.getUnsafe().getByte(bitDst));
+                } finally {
+                    Unsafe.free(bitDst, 8, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(valDst, 8, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(offDst, 16, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testAppendVarcharOrNullDirect() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            GcUtf8String direct = new GcUtf8String("abc");
+            try {
+                // Sanity: direct-backed sequence must expose a valid ptr().
+                Assert.assertTrue("GcUtf8String must be direct-backed", direct.ptr() >= 0);
+                s.initFor(ColumnType.VARCHAR, 4);
+                s.appendVarcharOrNull(direct);
+                Assert.assertEquals(1, s.getRowCount());
+                Assert.assertEquals(0, s.getNullCount());
+                Assert.assertEquals(3, s.valuesLengthBytes());
+                Assert.assertEquals(8, s.offsetsLengthBytes()); // offsets[0..1]
+
+                long off = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+                long val = Unsafe.malloc(3, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushOffsetsTo(off);
+                    Assert.assertEquals(0, Unsafe.getUnsafe().getInt(off));
+                    Assert.assertEquals(3, Unsafe.getUnsafe().getInt(off + 4));
+                    s.flushValuesTo(val);
+                    Assert.assertEquals((byte) 'a', Unsafe.getUnsafe().getByte(val));
+                    Assert.assertEquals((byte) 'b', Unsafe.getUnsafe().getByte(val + 1));
+                    Assert.assertEquals((byte) 'c', Unsafe.getUnsafe().getByte(val + 2));
+                } finally {
+                    Unsafe.free(val, 3, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(off, 8, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testAppendVarcharOrNullOnHeap() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                Utf8String onHeap = new Utf8String("xyz");
+                // Sanity: plain Utf8String does not expose a native pointer.
+                Assert.assertEquals(-1L, onHeap.ptr());
+                s.initFor(ColumnType.VARCHAR, 4);
+                s.appendVarcharOrNull(onHeap);
+                Assert.assertEquals(1, s.getRowCount());
+                Assert.assertEquals(3, s.valuesLengthBytes());
+                long val = Unsafe.malloc(3, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushValuesTo(val);
+                    Assert.assertEquals((byte) 'x', Unsafe.getUnsafe().getByte(val));
+                    Assert.assertEquals((byte) 'y', Unsafe.getUnsafe().getByte(val + 1));
+                    Assert.assertEquals((byte) 'z', Unsafe.getUnsafe().getByte(val + 2));
+                } finally {
+                    Unsafe.free(val, 3, MemoryTag.NATIVE_DEFAULT);
+                }
             } finally {
                 s.close();
             }
@@ -429,6 +578,42 @@ public class ArrowColumnScratchTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testOffsetsMonotonic() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.STRING, 8);
+                String[] rows = {"a", "", "bc", null, "defg", ""};
+                for (String r : rows) {
+                    s.appendStringOrNull(r);
+                }
+                int rowCount = s.getRowCount();
+                Assert.assertEquals(rows.length, rowCount);
+                int offsetsLen = s.offsetsLengthBytes();
+                Assert.assertEquals(4 * (rowCount + 1), offsetsLen);
+                long off = Unsafe.malloc(offsetsLen, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushOffsetsTo(off);
+                    int prev = Unsafe.getUnsafe().getInt(off);
+                    Assert.assertEquals(0, prev);
+                    for (int i = 1; i <= rowCount; i++) {
+                        int cur = Unsafe.getUnsafe().getInt(off + 4L * i);
+                        Assert.assertTrue("offsets must be non-decreasing at " + i + ": " + prev + " -> " + cur,
+                                cur >= prev);
+                        prev = cur;
+                    }
+                    Assert.assertEquals("last offset must equal valuesPos",
+                            s.valuesLengthBytes(), Unsafe.getUnsafe().getInt(off + 4L * rowCount));
+                } finally {
+                    Unsafe.free(off, offsetsLen, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
     public void testResetAfterNullThenAllValidEmitsEmptyValidity() throws Exception {
         assertMemoryLeak(() -> {
             ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
@@ -487,6 +672,41 @@ public class ArrowColumnScratchTest extends AbstractCairoTest {
                     Assert.assertEquals(8L, Unsafe.getUnsafe().getLong(dst + 8));
                 } finally {
                     Unsafe.free(dst, 16, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testResetClearsOffsetsForReuse() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.STRING, 4);
+                s.appendStringOrNull("first");
+                s.appendStringOrNull("second");
+                Assert.assertEquals(2, s.getRowCount());
+
+                s.reset();
+                Assert.assertEquals(0, s.getRowCount());
+                Assert.assertEquals(0, s.getNullCount());
+                Assert.assertEquals(4, s.offsetsLengthBytes()); // 4 * (0 + 1) = 4
+                Assert.assertEquals(0, s.valuesLengthBytes());
+
+                s.appendStringOrNull("abc");
+                Assert.assertEquals(1, s.getRowCount());
+                Assert.assertEquals(3, s.valuesLengthBytes());
+                int offLen = s.offsetsLengthBytes();
+                long off = Unsafe.malloc(offLen, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushOffsetsTo(off);
+                    Assert.assertEquals("offsets[0] must be 0 after reset", 0, Unsafe.getUnsafe().getInt(off));
+                    Assert.assertEquals("offsets[1] must be byteLen of the first new row",
+                            3, Unsafe.getUnsafe().getInt(off + 4));
+                } finally {
+                    Unsafe.free(off, offLen, MemoryTag.NATIVE_DEFAULT);
                 }
             } finally {
                 s.close();

@@ -44,6 +44,7 @@ import org.apache.arrow.flatbuf.Schema;
 import org.apache.arrow.flatbuf.TimeUnit;
 import org.apache.arrow.flatbuf.Timestamp;
 import org.apache.arrow.flatbuf.Type;
+import org.apache.arrow.flatbuf.Utf8;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -138,9 +139,9 @@ public class ArrowSchemaWriterTest {
     }
 
     @Test(expected = UnsupportedColumnTypeException.class)
-    public void testSchemaMessageThrowsOnUnsupportedStringColumn() {
+    public void testSchemaMessageThrowsOnUnsupportedUuidColumn() {
         GenericRecordMetadata metadata = new GenericRecordMetadata();
-        metadata.add(new TableColumnMetadata("s", ColumnType.STRING));
+        metadata.add(new TableColumnMetadata("id", ColumnType.UUID));
         writeToBytes(metadata);
     }
 
@@ -174,6 +175,27 @@ public class ArrowSchemaWriterTest {
         Timestamp ts = (Timestamp) field.type(new Timestamp());
         Assert.assertEquals(TimeUnit.NANOSECOND, ts.unit());
         Assert.assertNull(ts.timezone());
+    }
+
+    @Test
+    public void testSchemaMessageVarcharColumn() {
+        // STRING, VARCHAR and SYMBOL all map to Arrow Utf8 on the wire; the
+        // covering unit test only needs to pin one of them. Using VARCHAR
+        // here is arbitrary -- the mapping lives in ArrowSchemaWriter and
+        // is shared across all three QuestDB tags.
+        GenericRecordMetadata metadata = new GenericRecordMetadata();
+        metadata.add(new TableColumnMetadata("v", ColumnType.VARCHAR));
+        byte[] bytes = writeToBytes(metadata);
+        Message msg = Message.getRootAsMessage(ByteBuffer.wrap(bytes));
+        Schema schema = (Schema) msg.header(new Schema());
+        Assert.assertEquals(1, schema.fieldsLength());
+        org.apache.arrow.flatbuf.Field field = schema.fields(0);
+        Assert.assertEquals("v", field.name());
+        Assert.assertTrue(field.nullable());
+        Assert.assertEquals(Type.Utf8, field.typeType());
+        // Utf8 is an empty flatbuffer table -- just assert the discriminator
+        // resolves.
+        Assert.assertNotNull(field.type(new Utf8()));
     }
 
     @Test
