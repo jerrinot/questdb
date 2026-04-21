@@ -610,8 +610,21 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
                             io.questdb.std.MemoryTag.NATIVE_HTTP_CONN);
             final io.questdb.cutlass.flightsql.server.HandshakeHandler handshake =
                     new io.questdb.cutlass.flightsql.server.HandshakeHandler();
+            final io.questdb.cutlass.flightsql.server.ArrowSchemaCache schemaCache =
+                    new io.questdb.cutlass.flightsql.server.ArrowSchemaCache("col1",
+                            io.questdb.std.MemoryTag.NATIVE_HTTP_CONN);
+            final io.questdb.cutlass.flightsql.server.TicketRegistry ticketRegistry =
+                    new io.questdb.cutlass.flightsql.server.TicketRegistry(
+                            io.questdb.cutlass.flightsql.server.TicketRegistry.DEFAULT_CAPACITY);
+            final io.questdb.cutlass.flightsql.server.GetFlightInfoHandler getFlightInfo =
+                    new io.questdb.cutlass.flightsql.server.GetFlightInfoHandler(schemaCache, ticketRegistry,
+                            io.questdb.std.MemoryTag.NATIVE_HTTP_CONN);
+            final io.questdb.cutlass.flightsql.server.DoGetHandler doGet =
+                    new io.questdb.cutlass.flightsql.server.DoGetHandler(ticketRegistry,
+                            io.questdb.std.MemoryTag.NATIVE_HTTP_CONN);
             final io.questdb.cutlass.flightsql.server.FlightSqlDispatchListener dispatcher =
-                    new io.questdb.cutlass.flightsql.server.FlightSqlDispatchListener(pool, handshake);
+                    new io.questdb.cutlass.flightsql.server.FlightSqlDispatchListener(pool, handshake,
+                            getFlightInfo, doGet, schemaCache, ticketRegistry);
             h2 = new Http2ConnectionContext(dispatcher, h2Config);
             dispatcher.bind(h2);
             h2Listener = dispatcher;

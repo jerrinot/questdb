@@ -322,6 +322,12 @@ a different output layout.
 `QwpResultBatchBuffer`. The per-column-type switch is ~20 cases, same as QWP
 egress. Reuse the native scratch-buffer pattern.
 
+**Status.** Wave 6a landed a narrow `Int64ColumnEmitter` behind a
+`ColumnEmitter` one-method interface (`emit(dstAddr, src, offset, count)`).
+The implementation is deliberately minimal — it serialises a caller-owned
+`long[]` as dense little-endian int64 bytes — and exists mainly to pin the
+abstraction for Wave 7's `Float64`, `Utf8`, and `Dictionary` variants.
+
 **Page-frame fast path.** When the factory produces columnar page frames
 (table scans, simple filters), fixed-width columns can be emitted with a
 single `Unsafe.copyMemory` from the page into the Arrow buffer — zero
@@ -360,6 +366,26 @@ are straight-line code. ~2k LOC for the full Arrow message surface.
   dictionaries. Start with replacement; consider deltas as an optimisation.
 - **Body buffer padding to 8-byte alignment** is mandatory. Arrow readers
   assert on it.
+
+**Status.** Wave 6a landed the minimum Flatbuffers subset needed to serve
+a single-Int64-column result:
+- `FbWriter` — caller-owned native buffer, bottom-up prepend cursor,
+  tables (no vtable sharing), vectors of scalars / offsets / structs,
+  UTF-8 strings with trailing NUL, alignment tracking, root-offset
+  finalisation.
+- `ArrowSchemaWriter` — emits an Arrow IPC `Message{Schema}` for one
+  `Int64` (signed, non-null) field with a caller-supplied name.
+- `ArrowRecordBatchWriter` — emits an Arrow IPC `Message{RecordBatch}`
+  for a single Int64 column with an empty validity buffer
+  (`null_count = 0`, zero-length validity entry). Body bytes are emitted
+  separately by the column emitter and referenced via the `Buffer`
+  struct's `(offset, length)`.
+
+Encapsulated-message framing (the `0xFFFFFFFF` continuation marker and
+4-byte metadata length prefix) is deliberately **not** implemented: in
+Flight, `FlightData.data_header` carries the raw Flatbuffers message
+bytes and `FlightData.data_body` carries the raw buffer bytes. The
+framing is only needed for the file / stream IPC format.
 
 ### 5.6 Flight RPC dispatcher
 
@@ -403,6 +429,23 @@ retrieves the entry and streams.
 Tickets must survive across a `GetFlightInfo` → `DoGet` pair. In the
 single-endpoint single-node case both RPCs ride the same gRPC connection, so
 the per-connection registry is sufficient.
+
+**Wave 6a status.** The per-connection `TicketRegistry` is live with a
+fixed-slot array (`DEFAULT_CAPACITY = 64`), monotonic 64-bit ids, and
+`acquire()` / `entryById()` / `release()` surface. Exhausted pools
+return `-1` from `acquire()`, which the handler converts to
+`grpc-status: RESOURCE_EXHAUSTED`. HMAC signing and ticket expiry are
+deferred to Wave 7; the 6a ticket is 8 raw big-endian bytes carrying
+the monotonic id.
+
+The dispatcher routes `GetFlightInfo` and `DoGet` alongside the
+existing `Handshake` route. Both handlers live in
+`io.questdb.cutlass.flightsql.server` (`GetFlightInfoHandler`,
+`DoGetHandler`) and share a dispatcher-scoped `ArrowSchemaCache` that
+holds the cached Int64 schema message bytes. DoGet emits two
+`FlightData` messages per ticket (schema + record batch) and closes
+with `grpc-status: 0`; an unknown ticket gets a trailers-only
+`INVALID_ARGUMENT`.
 
 ### 5.7 Flight SQL command handlers
 
@@ -627,12 +670,15 @@ Stage 5:  Flight RPC dispatcher skeleton
           +  CommandGetSqlInfo / CommandGetTableTypes stubs
           |
           v
-Stage 6:  Arrow IPC encoder (Schema + RecordBatch)
+Stage 6:  Arrow IPC encoder (Schema + RecordBatch)              [PARTIAL]
           +  Arrow column emitters (scalar types only)
           +  Type mapping for scalars
+          Wave 6a landed Int64-only encoders + a hardcoded
+          GetFlightInfo / DoGet roundtrip (no CairoEngine). Wave 6b
+          wires in CommandStatementQuery decoding + SQL compilation.
           |
           v
-Stage 7:  CommandStatementQuery end-to-end
+Stage 7:  CommandStatementQuery end-to-end                      [NEXT]
           (first real SELECT via Flight SQL JDBC)
           |
           v

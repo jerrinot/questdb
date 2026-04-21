@@ -39,6 +39,95 @@ public class ProtobufWriterTest {
     private static final int BUF_SIZE = 4096;
 
     @Test
+    public void testBeginEndNestedMessageRoundTripViaGoogle() throws IOException {
+        long buf = Unsafe.malloc(BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+        try {
+            ProtobufWriter w = new ProtobufWriter();
+            w.of(buf, buf + BUF_SIZE);
+            // outer message: field 7 as nested; inner message has a single
+            // varint field (fieldNumber=1) and a length-delimited bytes
+            // field (fieldNumber=2). Google decodes this as one bytes field
+            // at field 7, whose payload is the inner wire bytes.
+            long innerStart = w.beginNestedMessage(7);
+            Assert.assertTrue(innerStart > 0);
+            long c = w.writeVarint64Field(1, 42);
+            Assert.assertTrue(c > 0);
+            byte[] bytes = "blob".getBytes();
+            long bytesAddr = Unsafe.malloc(bytes.length, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < bytes.length; i++) {
+                    Unsafe.getUnsafe().putByte(bytesAddr + i, bytes[i]);
+                }
+                c = w.writeLengthDelimitedField(2, bytesAddr, bytes.length);
+                Assert.assertTrue(c > 0);
+                c = w.endNestedMessage(innerStart);
+                Assert.assertTrue(c > 0);
+                int encodedLen = (int) (w.cursor() - buf);
+                byte[] wire = new byte[encodedLen];
+                for (int i = 0; i < encodedLen; i++) {
+                    wire[i] = Unsafe.getUnsafe().getByte(buf + i);
+                }
+                CodedInputStream outer = CodedInputStream.newInstance(wire);
+                int outerTag = outer.readTag();
+                Assert.assertEquals(7, ProtobufWireFormat.fieldNumberOf(outerTag));
+                Assert.assertEquals(ProtobufWireFormat.WIRE_TYPE_LENGTH_DELIMITED,
+                        ProtobufWireFormat.wireTypeOf(outerTag));
+                byte[] inner = outer.readByteArray();
+                Assert.assertTrue(outer.isAtEnd());
+                CodedInputStream innerIn = CodedInputStream.newInstance(inner);
+                long gotVarint = -1;
+                byte[] gotBytes = null;
+                while (!innerIn.isAtEnd()) {
+                    int tag = innerIn.readTag();
+                    switch (ProtobufWireFormat.fieldNumberOf(tag)) {
+                        case 1:
+                            gotVarint = innerIn.readUInt64();
+                            break;
+                        case 2:
+                            gotBytes = innerIn.readByteArray();
+                            break;
+                        default:
+                            innerIn.skipField(tag);
+                    }
+                }
+                Assert.assertEquals(42L, gotVarint);
+                Assert.assertArrayEquals(bytes, gotBytes);
+            } finally {
+                Unsafe.free(bytesAddr, bytes.length, MemoryTag.NATIVE_DEFAULT);
+            }
+        } finally {
+            Unsafe.free(buf, BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testEmptyNestedMessage() throws IOException {
+        long buf = Unsafe.malloc(BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+        try {
+            ProtobufWriter w = new ProtobufWriter();
+            w.of(buf, buf + BUF_SIZE);
+            long innerStart = w.beginNestedMessage(3);
+            Assert.assertTrue(innerStart > 0);
+            w.endNestedMessage(innerStart);
+            int encodedLen = (int) (w.cursor() - buf);
+            byte[] wire = new byte[encodedLen];
+            for (int i = 0; i < encodedLen; i++) {
+                wire[i] = Unsafe.getUnsafe().getByte(buf + i);
+            }
+            CodedInputStream in = CodedInputStream.newInstance(wire);
+            int tag = in.readTag();
+            Assert.assertEquals(3, ProtobufWireFormat.fieldNumberOf(tag));
+            Assert.assertEquals(ProtobufWireFormat.WIRE_TYPE_LENGTH_DELIMITED,
+                    ProtobufWireFormat.wireTypeOf(tag));
+            byte[] empty = in.readByteArray();
+            Assert.assertEquals(0, empty.length);
+            Assert.assertTrue(in.isAtEnd());
+        } finally {
+            Unsafe.free(buf, BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
     public void testLengthDelimitedFieldOverflowAtomic() {
         long buf = Unsafe.malloc(BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -94,6 +183,79 @@ public class ProtobufWriterTest {
                 Assert.assertTrue(in.isAtEnd());
             } finally {
                 Unsafe.free(payloadAddr, payload.length, MemoryTag.NATIVE_DEFAULT);
+            }
+        } finally {
+            Unsafe.free(buf, BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testNestedMessageOverflow() {
+        long buf = Unsafe.malloc(BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+        try {
+            ProtobufWriter w = new ProtobufWriter();
+            // Limit budget tight: tag fits but length placeholder does not.
+            w.of(buf, buf + 4);
+            long start = w.beginNestedMessage(1);
+            Assert.assertEquals(-1L, start);
+        } finally {
+            Unsafe.free(buf, BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testRepeatedFieldSameTagMultipleTimes() throws IOException {
+        long buf = Unsafe.malloc(BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+        try {
+            ProtobufWriter w = new ProtobufWriter();
+            w.of(buf, buf + BUF_SIZE);
+            // Emit three repeated bytes entries at field 3, then a varint
+            // field at field 1.
+            byte[][] payloads = {"one".getBytes(), "two".getBytes(), "three".getBytes()};
+            long[] payloadAddrs = new long[payloads.length];
+            try {
+                for (int i = 0; i < payloads.length; i++) {
+                    payloadAddrs[i] = Unsafe.malloc(payloads[i].length, MemoryTag.NATIVE_DEFAULT);
+                    for (int j = 0; j < payloads[i].length; j++) {
+                        Unsafe.getUnsafe().putByte(payloadAddrs[i] + j, payloads[i][j]);
+                    }
+                    long c = w.writeLengthDelimitedField(3, payloadAddrs[i], payloads[i].length);
+                    Assert.assertTrue(c > 0);
+                }
+                long c = w.writeVarint64Field(1, 99);
+                Assert.assertTrue(c > 0);
+                int encodedLen = (int) (w.cursor() - buf);
+                byte[] wire = new byte[encodedLen];
+                for (int i = 0; i < encodedLen; i++) {
+                    wire[i] = Unsafe.getUnsafe().getByte(buf + i);
+                }
+                CodedInputStream in = CodedInputStream.newInstance(wire);
+                java.util.List<byte[]> collected = new java.util.ArrayList<>();
+                long varint = -1;
+                while (!in.isAtEnd()) {
+                    int tag = in.readTag();
+                    switch (ProtobufWireFormat.fieldNumberOf(tag)) {
+                        case 3:
+                            collected.add(in.readByteArray());
+                            break;
+                        case 1:
+                            varint = in.readUInt64();
+                            break;
+                        default:
+                            in.skipField(tag);
+                    }
+                }
+                Assert.assertEquals(payloads.length, collected.size());
+                for (int i = 0; i < payloads.length; i++) {
+                    Assert.assertArrayEquals("element " + i, payloads[i], collected.get(i));
+                }
+                Assert.assertEquals(99L, varint);
+            } finally {
+                for (int i = 0; i < payloadAddrs.length; i++) {
+                    if (payloadAddrs[i] != 0) {
+                        Unsafe.free(payloadAddrs[i], payloads[i].length, MemoryTag.NATIVE_DEFAULT);
+                    }
+                }
             }
         } finally {
             Unsafe.free(buf, BUF_SIZE, MemoryTag.NATIVE_DEFAULT);

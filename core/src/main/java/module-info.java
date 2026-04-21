@@ -44,6 +44,9 @@ open module io.questdb {
     exports io.questdb.cutlass.http;
     exports io.questdb.cutlass.http.processors;
     exports io.questdb.cutlass.http.ex;
+    exports io.questdb.cutlass.arrow.column;
+    exports io.questdb.cutlass.arrow.ipc;
+    exports io.questdb.cutlass.flightsql.proto;
     exports io.questdb.cutlass.flightsql.server;
     exports io.questdb.cutlass.grpc;
     exports io.questdb.cutlass.hpack;

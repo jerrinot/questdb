@@ -48,23 +48,38 @@ import java.io.Closeable;
 public final class FlightSqlDispatchListener implements Http2StreamListener, Closeable {
 
     public static final int DEFAULT_MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
+    public static final String DO_GET_PATH = "/arrow.flight.protocol.FlightService/DoGet";
+    public static final String GET_FLIGHT_INFO_PATH = "/arrow.flight.protocol.FlightService/GetFlightInfo";
     public static final String HANDSHAKE_PATH = "/arrow.flight.protocol.FlightService/Handshake";
     private static final byte[] CONTENT_TYPE_GRPC_PREFIX = "application/grpc".getBytes();
     private static final Log LOG = LogFactory.getLog(FlightSqlDispatchListener.class);
     private static final byte[] METHOD_POST = "POST".getBytes();
     private final FlightSqlCallContextPool contextPool;
-    private final HandshakeHandler handshakeHandler;
+    private final DoGetHandler doGetHandler;
+    // Route table is flat because Wave 6a has only three routes. When
+    // more land, promote to a hash-of-path keyed map.
+    private final byte[] doGetPathBytes = DO_GET_PATH.getBytes();
+    private final GetFlightInfoHandler getFlightInfoHandler;
+    private final byte[] getFlightInfoPathBytes = GET_FLIGHT_INFO_PATH.getBytes();
     private Http2ConnectionContext h2;
-    // Route table is flat because Wave 5 only has one route. When more
-    // routes land, promote to an IntObjHashMap keyed on a hash of the
-    // path bytes (prompt §3).
+    private final HandshakeHandler handshakeHandler;
     private final byte[] handshakePathBytes = HANDSHAKE_PATH.getBytes();
+    private final ArrowSchemaCache schemaCache;
+    private final TicketRegistry ticketRegistry;
     private boolean isClosed;
 
     public FlightSqlDispatchListener(FlightSqlCallContextPool contextPool,
-                                     HandshakeHandler handshakeHandler) {
+                                     HandshakeHandler handshakeHandler,
+                                     GetFlightInfoHandler getFlightInfoHandler,
+                                     DoGetHandler doGetHandler,
+                                     ArrowSchemaCache schemaCache,
+                                     TicketRegistry ticketRegistry) {
         this.contextPool = contextPool;
         this.handshakeHandler = handshakeHandler;
+        this.getFlightInfoHandler = getFlightInfoHandler;
+        this.doGetHandler = doGetHandler;
+        this.schemaCache = schemaCache;
+        this.ticketRegistry = ticketRegistry;
     }
 
     /**
@@ -87,6 +102,18 @@ public final class FlightSqlDispatchListener implements Http2StreamListener, Clo
         }
         isClosed = true;
         contextPool.close();
+        if (doGetHandler != null) {
+            doGetHandler.close();
+        }
+        if (getFlightInfoHandler != null) {
+            getFlightInfoHandler.close();
+        }
+        if (ticketRegistry != null) {
+            ticketRegistry.close();
+        }
+        if (schemaCache != null) {
+            schemaCache.close();
+        }
     }
 
     @Override
@@ -260,6 +287,12 @@ public final class FlightSqlDispatchListener implements Http2StreamListener, Clo
     private FlightSqlHandler routeByPath(long pathAddr, int pathLen) {
         if (bytesEqual(pathAddr, pathLen, handshakePathBytes)) {
             return handshakeHandler;
+        }
+        if (bytesEqual(pathAddr, pathLen, getFlightInfoPathBytes)) {
+            return getFlightInfoHandler;
+        }
+        if (bytesEqual(pathAddr, pathLen, doGetPathBytes)) {
+            return doGetHandler;
         }
         return null;
     }

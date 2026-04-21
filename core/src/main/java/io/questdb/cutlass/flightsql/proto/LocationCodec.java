@@ -22,28 +22,32 @@
  *
  ******************************************************************************/
 
-open module io.questdb.test {
-    requires transitive io.questdb;
-    requires static junit;
-    requires transitive jdk.unsupported;
-    requires static org.jetbrains.annotations;
-    requires static java.sql;
-    requires static org.postgresql.jdbc;
-    requires static java.management;
-    requires io.questdb.client;
-    requires jdk.management;
-    requires java.net.http;
-    requires org.checkerframework.checker.qual;
-    requires io.netty.buffer;
-    requires io.netty.transport;
-    requires io.netty.codec.http2;
-    requires static org.apache.arrow.format;
-    requires static org.apache.arrow.vector;
-    requires static org.apache.arrow.memory.core;
+package io.questdb.cutlass.flightsql.proto;
 
-    uses io.questdb.griffin.FunctionFactory;
+import io.questdb.cutlass.protobuf.ProtobufWriter;
 
-    exports io.questdb.test;
-    exports io.questdb.test.cairo;
-    exports io.questdb.test.cairo.parquet;
+/**
+ * Encoder for the Flight {@code Location} message.
+ * <pre>
+ *   message Location {
+ *     string uri = 1;
+ *   }
+ * </pre>
+ * Strings encode byte-identically to {@code bytes}: a length-delimited
+ * UTF-8 payload.
+ */
+public final class LocationCodec {
+
+    public static final int FIELD_URI = 1;
+
+    private LocationCodec() {
+    }
+
+    /**
+     * Encodes a {@code Location} body into {@code writer}. Returns the
+     * writer cursor on success, {@code -1} on overflow.
+     */
+    public static long encode(ProtobufWriter writer, long uriAddr, int uriLen) {
+        return writer.writeLengthDelimitedField(FIELD_URI, uriAddr, uriLen);
+    }
 }

@@ -233,7 +233,8 @@ public class FlightSqlDispatchListenerTest {
 
         Fixture() {
             pool = new FlightSqlCallContextPool(8, MAX_MESSAGE_BYTES, MemoryTag.NATIVE_DEFAULT);
-            dispatcher = new FlightSqlDispatchListener(pool, new HandshakeHandler());
+            dispatcher = new FlightSqlDispatchListener(pool, new HandshakeHandler(),
+                    null, null, null, null);
             ctx = new Http2ConnectionContext(dispatcher, Http2ConnectionConfig.defaults());
             dispatcher.bind(ctx);
             scratchBuf = Unsafe.malloc(SCRATCH * 4, MemoryTag.NATIVE_DEFAULT);

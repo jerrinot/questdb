@@ -68,11 +68,14 @@ public final class FlightSqlCallContext implements Closeable {
     public static final int EMIT_STALE_GENERATION = Http2ConnectionContext.ENQUEUE_STALE_GENERATION;
     public static final int EMIT_STREAM_CLOSED = Http2ConnectionContext.ENQUEUE_STREAM_CLOSED;
     /**
-     * Default scratch size for a handler's outgoing message body,
-     * sized for the empty Handshake response (4 bytes) with ample
-     * headroom for future small RPCs that land on this surface.
+     * Default scratch size for a handler's outgoing message body.
+     * Sized for Wave 6a's {@code FlightInfo} and {@code FlightData}
+     * messages (the RecordBatch header pushes toward the upper end of
+     * this budget); Wave 5's Handshake needed only a few bytes so the
+     * extra headroom is cheap. The response scratch is allocated once
+     * per pool slot, not per call.
      */
-    public static final int DEFAULT_RESPONSE_SCRATCH_BYTES = 1024;
+    public static final int DEFAULT_RESPONSE_SCRATCH_BYTES = 8192;
     private static final byte[] CONTENT_TYPE_BYTES = "application/grpc+proto".getBytes(StandardCharsets.US_ASCII);
     // HPACK static table index for ":status 200" (RFC 7541 Appendix A).
     private static final int HPACK_STATIC_CONTENT_TYPE_NAME = 31;

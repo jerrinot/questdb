@@ -160,7 +160,7 @@ public class HandshakeEndToEndTest extends AbstractBootstrapTest {
                 out.write(PREFACE);
                 out.write(buildEmptySettings());
                 out.write(buildHeadersFrame(1,
-                        "/arrow.flight.protocol.FlightService/DoGet",
+                        "/arrow.flight.protocol.FlightService/ListFlights",
                         "POST",
                         "application/grpc+proto",
                         /*endStream*/ true));

@@ -46,6 +46,15 @@ import io.questdb.std.Unsafe;
  */
 public final class ProtobufWriter {
 
+    /**
+     * Fixed width of the pre-reserved length varint emitted by
+     * {@link #beginNestedMessage(int)}. Always five bytes: the maximum
+     * number of bytes a protobuf varint needs to cover any length fitting
+     * in an {@code int32}. Keeping the width fixed lets the writer backfill
+     * the length at {@link #endNestedMessage(long)} without shifting bytes
+     * around.
+     */
+    public static final int NESTED_LENGTH_VARINT_BYTES = 5;
     private long cursor;
     private long limit;
 
@@ -121,7 +130,65 @@ public final class ProtobufWriter {
         return staticWriteVarint64Raw(c, limit, value);
     }
 
+    /**
+     * Opens a nested length-delimited field. Writes the tag followed by a
+     * five-byte placeholder for the length varint; the caller then writes
+     * the nested message body via the normal writer surface, and closes
+     * with {@link #endNestedMessage(long)} passing the {@code bodyStart}
+     * returned here. Returns {@code -1} on overflow (cursor unchanged,
+     * no partial bytes written).
+     * <p>
+     * Using a fixed five-byte length varint wastes 0-4 bytes per nested
+     * message (length varints normally collapse to 1-2 bytes for small
+     * bodies) but avoids the compact-and-shift step that a variable-width
+     * length would require. Flight SQL messages in Wave 6a are small
+     * enough that the trade is invisible on the wire.
+     */
+    public long beginNestedMessage(int fieldNumber) {
+        long tagCursor = staticWriteTag(cursor, limit, fieldNumber,
+                ProtobufWireFormat.WIRE_TYPE_LENGTH_DELIMITED);
+        if (tagCursor < 0) {
+            return -1;
+        }
+        if (tagCursor + NESTED_LENGTH_VARINT_BYTES > limit) {
+            return -1;
+        }
+        // Placeholder: five-byte varint encoding zero with every byte
+        // except the last carrying the continuation bit. endNestedMessage
+        // overwrites every byte with the real length.
+        Unsafe.getUnsafe().putByte(tagCursor, (byte) 0x80);
+        Unsafe.getUnsafe().putByte(tagCursor + 1, (byte) 0x80);
+        Unsafe.getUnsafe().putByte(tagCursor + 2, (byte) 0x80);
+        Unsafe.getUnsafe().putByte(tagCursor + 3, (byte) 0x80);
+        Unsafe.getUnsafe().putByte(tagCursor + 4, (byte) 0x00);
+        long bodyStart = tagCursor + NESTED_LENGTH_VARINT_BYTES;
+        cursor = bodyStart;
+        return bodyStart;
+    }
+
     public long cursor() {
+        return cursor;
+    }
+
+    /**
+     * Closes a nested length-delimited field opened by
+     * {@link #beginNestedMessage(int)}. Backfills the pre-reserved five
+     * byte length varint with the actual body length. Returns the writer
+     * cursor.
+     */
+    public long endNestedMessage(long bodyStart) {
+        if (bodyStart < 0) {
+            throw new IllegalArgumentException("bodyStart must be non-negative");
+        }
+        long bodyLen = cursor - bodyStart;
+        if (bodyLen < 0) {
+            throw new IllegalStateException("nested body length is negative");
+        }
+        if (bodyLen > Integer.MAX_VALUE) {
+            throw new IllegalStateException("nested body length exceeds int range");
+        }
+        long lenAddr = bodyStart - NESTED_LENGTH_VARINT_BYTES;
+        writeFixedFiveByteVarint(lenAddr, bodyLen);
         return cursor;
     }
 
@@ -196,5 +263,25 @@ public final class ProtobufWriter {
         }
         cursor = c;
         return c;
+    }
+
+    /**
+     * Writes {@code value} into a five-byte fixed-width varint at
+     * {@code dstAddr}. The encoding matches the canonical protobuf varint
+     * form for values that fit in 32 bits, with trailing zero continuation
+     * bytes as needed so the total is always exactly five bytes. The final
+     * byte has the continuation bit cleared.
+     */
+    private static void writeFixedFiveByteVarint(long dstAddr, long value) {
+        long v = value;
+        Unsafe.getUnsafe().putByte(dstAddr, (byte) ((v & 0x7FL) | 0x80L));
+        v >>>= 7;
+        Unsafe.getUnsafe().putByte(dstAddr + 1, (byte) ((v & 0x7FL) | 0x80L));
+        v >>>= 7;
+        Unsafe.getUnsafe().putByte(dstAddr + 2, (byte) ((v & 0x7FL) | 0x80L));
+        v >>>= 7;
+        Unsafe.getUnsafe().putByte(dstAddr + 3, (byte) ((v & 0x7FL) | 0x80L));
+        v >>>= 7;
+        Unsafe.getUnsafe().putByte(dstAddr + 4, (byte) (v & 0x7FL));
     }
 }
