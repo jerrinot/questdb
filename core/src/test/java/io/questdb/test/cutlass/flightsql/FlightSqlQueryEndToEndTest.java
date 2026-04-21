@@ -77,6 +77,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -846,10 +847,22 @@ public class FlightSqlQueryEndToEndTest extends AbstractBootstrapTest {
 
         byte[] schemaMsg = grpcMessages.get(0);
         FlightDataParts schemaPart = parseFlightData(schemaMsg);
-        Assert.assertArrayEquals(q.schemaBytes, schemaPart.header);
         Assert.assertNull(schemaPart.body);
+        // FlightInfo.schema is Arrow IPC encapsulated stream format
+        // ([0xFFFFFFFF][metadata_size LE][flatbuffer][pad-to-8]); DoGet's
+        // FlightData.data_header carries the raw flatbuffer only. Assert the
+        // raw flatbuffer embedded in FlightInfo.schema matches data_header.
+        Assert.assertEquals(0xFFFFFFFF, ByteBuffer.wrap(q.schemaBytes, 0, 4)
+                .order(ByteOrder.LITTLE_ENDIAN).getInt());
+        int metadataSize = ByteBuffer.wrap(q.schemaBytes, 4, 4)
+                .order(ByteOrder.LITTLE_ENDIAN).getInt();
+        Assert.assertEquals("FlightInfo.schema total length mismatch",
+                8 + metadataSize, q.schemaBytes.length);
+        byte[] rawSchemaFromInfo = new byte[schemaPart.header.length];
+        System.arraycopy(q.schemaBytes, 8, rawSchemaFromInfo, 0, rawSchemaFromInfo.length);
+        Assert.assertArrayEquals(rawSchemaFromInfo, schemaPart.header);
 
-        Schema schemaFb = (Schema) Message.getRootAsMessage(ByteBuffer.wrap(q.schemaBytes)).header(new Schema());
+        Schema schemaFb = (Schema) Message.getRootAsMessage(ByteBuffer.wrap(schemaPart.header)).header(new Schema());
         org.apache.arrow.vector.types.pojo.Schema pojoSchema =
                 org.apache.arrow.vector.types.pojo.Schema.convertSchema(schemaFb);
         BatchResult result = new BatchResult();

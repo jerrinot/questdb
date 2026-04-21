@@ -710,7 +710,13 @@
         <dependency>
             <groupId>com.google.protobuf</groupId>
             <artifactId>protobuf-java</artifactId>
-            <version>3.25.5</version>
+            <!-- Pinned to 3.25.1: later 3.25.x releases (3.25.5+) added
+                 Automatic-Module-Name: com.google.protobuf to the manifest,
+                 while Arrow Flight SQL 17.0.0 was compiled against a version
+                 that derived its module name from the JAR filename (protobuf.java).
+                 Keeping the filename-derived name matches flight-sql's
+                 `requires protobuf.java;` at runtime. -->
+            <version>3.25.1</version>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -722,6 +728,48 @@
         <dependency>
             <groupId>org.apache.arrow</groupId>
             <artifactId>arrow-memory-unsafe</artifactId>
+            <version>17.0.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>flight-core</artifactId>
+            <version>17.0.0</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
+                </exclusion>
+                <!-- arrow-memory-netty-buffer-patch defines the io.netty.buffer
+                     package as a separate module, causing a split-package
+                     conflict with netty-buffer on the modulepath. flight-core
+                     does not need the Netty allocator at test time; we use
+                     arrow-memory-unsafe instead. -->
+                <exclusion>
+                    <groupId>org.apache.arrow</groupId>
+                    <artifactId>arrow-memory-netty</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.arrow</groupId>
+                    <artifactId>arrow-memory-netty-buffer-patch</artifactId>
+                </exclusion>
+                <!-- jsr305 and javax.annotation-api both define javax.annotation.*,
+                     causing a split-package error under JPMS. They only carry
+                     annotations (compile-time), safe to drop. -->
+                <exclusion>
+                    <groupId>com.google.code.findbugs</groupId>
+                    <artifactId>jsr305</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>javax.annotation</groupId>
+                    <artifactId>javax.annotation-api</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>flight-sql</artifactId>
             <version>17.0.0</version>
             <scope>test</scope>
         </dependency>

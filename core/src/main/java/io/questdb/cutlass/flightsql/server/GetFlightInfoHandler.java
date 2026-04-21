@@ -80,7 +80,7 @@ import java.nio.charset.StandardCharsets;
 public final class GetFlightInfoHandler implements FlightSqlHandler, Closeable {
 
     private static final int NAME_SCRATCH_CAP = 256;
-    private static final byte[] REUSE_CONNECTION_URI = "arrow-flight-reuse-connection://"
+    private static final byte[] REUSE_CONNECTION_URI = "arrow-flight-reuse-connection://?"
             .getBytes(StandardCharsets.US_ASCII);
     private static final int SCHEMA_SCRATCH_CAP = 32 * 1024;
     private static final Log LOG = LogFactory.getLog(GetFlightInfoHandler.class);
@@ -255,19 +255,36 @@ public final class GetFlightInfoHandler implements FlightSqlHandler, Closeable {
             }
 
             // Build Arrow schema bytes into the handler's scratch, then copy
-            // into a per-ticket allocation that the entry owns.
+            // into a per-ticket allocation wrapped in the Arrow IPC
+            // encapsulated stream format so FlightInfo.schema parses with
+            // MessageSerializer.deserializeSchema(ReadChannel) on the
+            // client. Layout:
+            //   [0xFFFFFFFF continuation, 4B]
+            //   [metadata_size LE, 4B]
+            //   [raw flatbuffer Message, rawSchemaLen B]
+            //   [zero padding to 8-byte boundary]
+            // metadata_size includes padding per Arrow spec. DoGet reads
+            // (addr + 8, rawSchemaLen) to emit just the raw flatbuffer.
             fbWriter.of(schemaScratchAddr, schemaScratchAddr + SCHEMA_SCRATCH_CAP);
-            int schemaLen = ArrowSchemaWriter.writeSchemaMessage(fbWriter, nameScratchAddr,
+            int rawSchemaLen = ArrowSchemaWriter.writeSchemaMessage(fbWriter, nameScratchAddr,
                     NAME_SCRATCH_CAP, metadata);
-            if (schemaLen <= 0) {
+            if (rawSchemaLen <= 0) {
                 rejectWithStatus(ctx, GrpcStatus.INTERNAL, "schema scratch overflow");
                 Misc.free(factory);
                 ticketRegistry.release(ticketId);
                 return;
             }
+            int paddedMetaLen = (rawSchemaLen + 7) & ~7;
+            int framedLen = 8 + paddedMetaLen;
             long finishedAddr = fbWriter.finishedAddr();
-            long entrySchemaAddr = Unsafe.malloc(schemaLen, memoryTag);
-            Unsafe.getUnsafe().copyMemory(finishedAddr, entrySchemaAddr, schemaLen);
+            long entrySchemaAddr = Unsafe.malloc(framedLen, memoryTag);
+            Unsafe.getUnsafe().putInt(entrySchemaAddr, 0xFFFFFFFF);
+            Unsafe.getUnsafe().putInt(entrySchemaAddr + 4, paddedMetaLen);
+            Unsafe.getUnsafe().copyMemory(finishedAddr, entrySchemaAddr + 8, rawSchemaLen);
+            int padBytes = paddedMetaLen - rawSchemaLen;
+            if (padBytes > 0) {
+                Unsafe.getUnsafe().setMemory(entrySchemaAddr + 8 + rawSchemaLen, padBytes, (byte) 0);
+            }
 
             // Wire all the per-ticket state into the entry.
             entry.setFactory(factory);
@@ -281,7 +298,7 @@ public final class GetFlightInfoHandler implements FlightSqlHandler, Closeable {
                 scratches[i].initFor(columnTypes[i], 4096);
             }
             entry.setScratches(scratches);
-            entry.setSchema(entrySchemaAddr, schemaLen, schemaLen, memoryTag);
+            entry.setSchema(entrySchemaAddr, framedLen, framedLen, rawSchemaLen, memoryTag);
 
             // Encode ticket bytes: 8-byte big-endian ticket id.
             encodeTicketIdBigEndian(ticketBuf, ticketId);
@@ -299,6 +316,7 @@ public final class GetFlightInfoHandler implements FlightSqlHandler, Closeable {
             writer.of(bodyWriteAddr, bodyLimit);
             long end = FlightInfoCodec.encodeSingleEndpoint(writer,
                     entry.getSchemaAddr(), entry.getSchemaLen(),
+                    0, 0,
                     ticketBuf, 8,
                     uriAddr, REUSE_CONNECTION_URI.length);
             if (end < 0) {

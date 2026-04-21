@@ -32,7 +32,7 @@ import io.questdb.cutlass.protobuf.ProtobufWriter;
  * <pre>
  *   message FlightInfo {
  *     bytes                schema            = 1;
- *     FlightDescriptor     flight_descriptor = 2;  // skipped
+ *     FlightDescriptor     flight_descriptor = 2;
  *     repeated FlightEndpoint endpoint       = 3;
  *     int64                total_records     = 4;
  *     int64                total_bytes       = 5;
@@ -42,11 +42,12 @@ import io.questdb.cutlass.protobuf.ProtobufWriter;
  * </pre>
  * Wave 6a emits {@code total_records = -1} and {@code total_bytes = -1}
  * (unknown), a single {@code FlightEndpoint} with a locally-minted ticket,
- * and a hardcoded {@code arrow-flight-reuse-connection://} URI.
+ * and a hardcoded {@code arrow-flight-reuse-connection://?} URI.
  */
 public final class FlightInfoCodec {
 
     public static final int FIELD_ENDPOINT = 3;
+    public static final int FIELD_FLIGHT_DESCRIPTOR = 2;
     public static final int FIELD_SCHEMA = 1;
     public static final int FIELD_TOTAL_BYTES = 5;
     public static final int FIELD_TOTAL_RECORDS = 4;
@@ -62,10 +63,22 @@ public final class FlightInfoCodec {
      */
     public static long encodeSingleEndpoint(ProtobufWriter writer,
                                             long schemaAddr, int schemaLen,
+                                            long descriptorCmdAddr, int descriptorCmdLen,
                                             long ticketAddr, int ticketLen,
                                             long uriAddr, int uriLen) {
         // schema bytes
         if (writer.writeLengthDelimitedField(FIELD_SCHEMA, schemaAddr, schemaLen) < 0) {
+            return -1;
+        }
+        // flight_descriptor (CMD)
+        long descriptorBodyStart = writer.beginNestedMessage(FIELD_FLIGHT_DESCRIPTOR);
+        if (descriptorBodyStart < 0) {
+            return -1;
+        }
+        if (FlightDescriptorCodec.encodeCmd(writer, descriptorCmdAddr, descriptorCmdLen) < 0) {
+            return -1;
+        }
+        if (writer.endNestedMessage(descriptorBodyStart) < 0) {
             return -1;
         }
         // endpoint (single)
@@ -94,6 +107,9 @@ public final class FlightInfoCodec {
     public static int upperBoundEncodedLen(int schemaLen, int ticketLen, int uriLen) {
         // schema field: tag (2) + length varint (5) + body
         int total = 2 + 5 + schemaLen;
+        // flight_descriptor field: tag (1) + length varint (5) + body
+        // body = type enum: tag (1) + one-byte varint value
+        total += 1 + 5 + (1 + 1);
         // endpoint field: tag (1) + length varint (5) + body
         // body = ticket sub-msg + location sub-msg
         //   ticket sub-msg: tag (1) + length varint (5) + (tag (1) + varint (5) + ticketLen)

@@ -323,7 +323,7 @@ public class FlightMessageCodecTest {
     public void testFlightInfoEncodeRoundTripViaGoogle() throws IOException {
         byte[] schema = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00};
         byte[] ticket = {1, 2, 3, 4, 5, 6, 7, 8};
-        byte[] uri = "arrow-flight-reuse-connection://".getBytes();
+        byte[] uri = "arrow-flight-reuse-connection://?".getBytes();
 
         long buf = Unsafe.malloc(BUF, MemoryTag.NATIVE_DEFAULT);
         long schemaAddr = Unsafe.malloc(schema.length, MemoryTag.NATIVE_DEFAULT);
@@ -343,6 +343,7 @@ public class FlightMessageCodecTest {
             w.of(buf, buf + BUF);
             long c = FlightInfoCodec.encodeSingleEndpoint(w,
                     schemaAddr, schema.length,
+                    0, 0,
                     ticketAddr, ticket.length,
                     uriAddr, uri.length);
             Assert.assertTrue(c > 0);

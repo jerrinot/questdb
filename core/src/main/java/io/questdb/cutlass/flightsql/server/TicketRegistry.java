@@ -200,6 +200,7 @@ public final class TicketRegistry implements Closeable {
         /** Rows appended to {@link #scratches} but not yet flushed on the wire. */
         int rowsBuffered;
         ArrowColumnScratch[] scratches;
+        int rawSchemaLen;
         long schemaAddr;
         int schemaCap;
         int schemaLen;
@@ -248,6 +249,10 @@ public final class TicketRegistry implements Closeable {
 
         public ArrowColumnScratch[] getScratches() {
             return scratches;
+        }
+
+        public int getRawSchemaLen() {
+            return rawSchemaLen;
         }
 
         public long getSchemaAddr() {
@@ -330,23 +335,32 @@ public final class TicketRegistry implements Closeable {
         }
 
         /**
-         * Attaches a schema payload. Ownership of {@code addr} transfers
-         * to the entry: {@link #release()} and {@link #close()} free it
-         * under the supplied {@code memoryTag}. If {@code cap} is
-         * greater than {@code len} the extra bytes are tracked so the
-         * free call is symmetric with the original {@code Unsafe.malloc}.
+         * Attaches a schema payload in Arrow IPC encapsulated stream format:
+         * {@code [0xFFFFFFFF continuation, 4B][metadata_size LE, 4B]
+         * [raw flatbuffer Message, rawSchemaLen B][zero padding to 8B]}.
+         * The {@code (addr, len)} pair is what {@code FlightInfo.schema}
+         * sends on the wire; DoGet's {@code FlightData.data_header} uses
+         * {@code (addr + 8, rawSchemaLen)} to emit just the raw flatbuffer.
+         * Ownership of {@code addr} transfers to the entry:
+         * {@link #release()} and {@link #close()} free it under the supplied
+         * {@code memoryTag}. {@code cap} may exceed {@code len} to make the
+         * free call symmetric with the original {@code Unsafe.malloc}.
          */
-        public void setSchema(long addr, int len, int cap, int memoryTag) {
+        public void setSchema(long addr, int len, int cap, int rawSchemaLen, int memoryTag) {
             if (addr == 0 && (len != 0 || cap != 0)) {
                 throw new IllegalArgumentException("addr must be non-zero when len/cap non-zero");
             }
             if (len < 0 || cap < len) {
                 throw new IllegalArgumentException("len/cap out of range");
             }
+            if (rawSchemaLen < 0 || rawSchemaLen + 8 > len) {
+                throw new IllegalArgumentException("rawSchemaLen out of range");
+            }
             freeSchema();
             this.schemaAddr = addr;
             this.schemaLen = len;
             this.schemaCap = cap;
+            this.rawSchemaLen = rawSchemaLen;
             this.memoryTag = memoryTag;
         }
 
@@ -380,6 +394,7 @@ public final class TicketRegistry implements Closeable {
             this.schemaAddr = 0;
             this.schemaLen = 0;
             this.schemaCap = 0;
+            this.rawSchemaLen = 0;
             this.doGetState = DoGetState.SETUP;
             this.rowsBuffered = 0;
             this.batchScratchLen = 0;
@@ -429,6 +444,7 @@ public final class TicketRegistry implements Closeable {
             schemaAddr = 0;
             schemaLen = 0;
             schemaCap = 0;
+            rawSchemaLen = 0;
         }
     }
 }

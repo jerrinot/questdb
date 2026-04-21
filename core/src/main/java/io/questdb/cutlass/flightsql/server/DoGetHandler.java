@@ -249,9 +249,11 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
                 }
                 case EMIT_SCHEMA: {
                     // If nothing is pending (fresh entry), build the schema FlightData now.
+                    // FlightData.data_header carries the raw flatbuffer only -- skip the
+                    // 8-byte IPC stream prefix stored on the ticket for FlightInfo.schema.
                     if (ticket.getBatchScratchLen() == 0) {
                         int encoded = writeFlightDataBytes(ticket,
-                                ticket.getSchemaAddr(), ticket.getSchemaLen(), 0, 0);
+                                ticket.getSchemaAddr() + 8, ticket.getRawSchemaLen(), 0, 0);
                         if (encoded < 0) {
                             rejectAfterHeaders(ctx, GrpcStatus.INTERNAL, "schema FlightData scratch overflow");
                             releaseTicketAndDone(ctx, ticket);

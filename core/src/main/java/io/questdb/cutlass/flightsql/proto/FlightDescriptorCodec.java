@@ -27,6 +27,7 @@ package io.questdb.cutlass.flightsql.proto;
 import io.questdb.cutlass.protobuf.ProtobufException;
 import io.questdb.cutlass.protobuf.ProtobufReader;
 import io.questdb.cutlass.protobuf.ProtobufWireFormat;
+import io.questdb.cutlass.protobuf.ProtobufWriter;
 
 /**
  * Decoder for the Flight {@code FlightDescriptor} message.
@@ -101,6 +102,24 @@ public final class FlightDescriptorCodec {
                     break;
             }
         }
+    }
+
+    /**
+     * Writes a {@code FlightDescriptor} body with {@code type = CMD} and
+     * optional {@code cmd} bytes. Returns the writer cursor on success,
+     * {@code -1} on overflow.
+     */
+    public static long encodeCmd(ProtobufWriter writer, long cmdAddr, int cmdLen) {
+        if (cmdLen < 0) {
+            throw new IllegalArgumentException("cmdLen must be non-negative");
+        }
+        if (writer.writeVarint64Field(FIELD_TYPE, TYPE_CMD) < 0) {
+            return -1;
+        }
+        if (cmdLen == 0) {
+            return writer.cursor();
+        }
+        return writer.writeLengthDelimitedField(FIELD_CMD, cmdAddr, cmdLen);
     }
 
     /**

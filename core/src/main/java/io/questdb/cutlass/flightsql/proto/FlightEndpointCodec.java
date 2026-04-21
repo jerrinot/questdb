@@ -37,7 +37,7 @@ import io.questdb.cutlass.protobuf.ProtobufWriter;
  *   }
  * </pre>
  * Wave 6a always writes a single location pointing at
- * {@code arrow-flight-reuse-connection://} so the client reuses the
+ * {@code arrow-flight-reuse-connection://?} so the client reuses the
  * existing gRPC channel for {@code DoGet}.
  */
 public final class FlightEndpointCodec {

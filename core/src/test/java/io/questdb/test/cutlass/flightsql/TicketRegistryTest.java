@@ -91,9 +91,10 @@ public class TicketRegistryTest {
             long t = r.acquire();
             TicketRegistry.TicketEntry e = r.entryById(t);
             Assert.assertNotNull(e);
-            e.setSchema(schemaAddr, 32, 32, MemoryTag.NATIVE_DEFAULT);
+            e.setSchema(schemaAddr, 32, 32, 24, MemoryTag.NATIVE_DEFAULT);
             Assert.assertEquals(schemaAddr, e.getSchemaAddr());
             Assert.assertEquals(32, e.getSchemaLen());
+            Assert.assertEquals(24, e.getRawSchemaLen());
             // release must free the schema memory
             r.release(t);
             Assert.assertNull(r.entryById(t));
