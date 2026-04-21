@@ -39,6 +39,11 @@ import io.questdb.cutlass.http.ex.RetryFailedOperationException;
 import io.questdb.cutlass.http.ex.RetryOperationException;
 import io.questdb.cutlass.http.ex.TooFewBytesReceivedException;
 import io.questdb.cutlass.http.processors.RejectProcessor;
+import io.questdb.cutlass.http2.Http2ConnectionConfig;
+import io.questdb.cutlass.http2.Http2ConnectionContext;
+import io.questdb.cutlass.http2.Http2Preface;
+import io.questdb.cutlass.http2.Http2RequestHeadersView;
+import io.questdb.cutlass.http2.Http2StreamListener;
 import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
@@ -76,10 +81,22 @@ import static io.questdb.cutlass.http.HttpResponseSink.HTTP_TOO_MANY_REQUESTS;
 import static io.questdb.network.IODispatcher.*;
 import static java.net.HttpURLConnection.*;
 
-public class HttpConnectionContext extends IOContext<HttpConnectionContext> implements Locality, Retry {
+public class HttpConnectionContext extends IOContext<HttpConnectionContext>
+        implements Locality, Retry, HttpRequestContext {
     private static final String FALSE = "false";
     private static final Log LOG = LogFactory.getLog(HttpConnectionContext.class);
+    private static final byte MODE_H1 = 1;
+    private static final byte MODE_H2 = 3;
+    private static final byte MODE_H2_PREFACE_PENDING = 2;
+    private static final byte MODE_SNIFFING = 0;
+    // 64 KiB covers one max-size DATA frame (peer default MAX_FRAME_SIZE is
+    // 16 KiB, ours is 16 KiB too) plus several control frames in the same
+    // tick. When the engine is wired to real responses in B.6 this may need
+    // to grow to accommodate HEADERS + CONTINUATION + DATA combined; for
+    // Wave 2 only control frames flow.
+    private static final int H2_SEND_BUFFER_CAP = 64 * 1024;
     private static final int NO_RESUME_PROCESSOR = Integer.MIN_VALUE;
+    private static final int PEEK_SCRATCH_SIZE = Http2Preface.LENGTH;
     private static final String TRUE = "true";
     private final ActiveConnectionTracker activeConnectionTracker;
     private final HttpAuthenticator authenticator;
@@ -114,12 +131,28 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     private boolean connectionCounted;
     private int currentHandlerId = HttpRequestProcessorSelector.REJECT_PROCESSOR_ID;
     private boolean forceDisconnectOnComplete;
+    private Http2ConnectionContext h2;
+    private Http2StreamListener h2Listener;
+    private int h2PrefaceBytesDrained;
+    private long h2SendBuffer;
+    private int h2SendBufferCap;
+    // Bytes already written into h2SendBuffer but not yet handed to
+    // socket.send — preserved across ticks so a short-write on WRITE
+    // drains the remainder without replaying the engine.
+    private int h2SendBufferPos;
+    private int h2SendBufferLimit;
     private NetworkSqlExecutionCircuitBreaker httpCircuitBreaker;
     private SqlExecutionContextImpl httpSqlExecutionContext;
     private boolean isProtocolSwitched = false;  // WebSocket protocol switch flag
     private int nCompletedRequests;
+    private long peekScratchAddr;
     private boolean pendingRetry = false;
     private String processorName;
+    // MODE_SNIFFING until the first READ classifies the connection. The
+    // H1 / WebSocket paths live at MODE_H1; MODE_H2_PREFACE_PENDING is a
+    // transient state between a positive sniff match and the preface
+    // drain in a later wave (§6.1 / §6.2 of HTTP2_INTEGRATION.md).
+    private byte protocolMode = MODE_SNIFFING;
     private int receivedBytes;
     private long recvBuffer;
     private int recvBufferReadSize;
@@ -169,6 +202,9 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         this.preAllocateBuffers = configuration.preAllocateBuffers();
         if (preAllocateBuffers) {
             recvBuffer = Unsafe.malloc(recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+            peekScratchAddr = Unsafe.malloc(PEEK_SCRATCH_SIZE, MemoryTag.NATIVE_HTTP_CONN);
+            h2SendBuffer = Unsafe.malloc(H2_SEND_BUFFER_CAP, MemoryTag.NATIVE_HTTP_CONN);
+            h2SendBufferCap = H2_SEND_BUFFER_CAP;
             this.responseSink.open(configuration.getSendBufferSize());
         }
         this.multipartIdleSpinCount = contextConfiguration.getMultipartIdleSpinCount();
@@ -194,8 +230,15 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             LOG.error().$("reused context with retry pending").$();
         }
         this.pendingRetry = false;
+        if (h2 != null) {
+            h2.close();
+            h2 = null;
+        }
         if (!preAllocateBuffers) {
             this.recvBuffer = Unsafe.free(recvBuffer, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+            this.peekScratchAddr = Unsafe.free(peekScratchAddr, PEEK_SCRATCH_SIZE, MemoryTag.NATIVE_HTTP_CONN);
+            this.h2SendBuffer = Unsafe.free(h2SendBuffer, h2SendBufferCap, MemoryTag.NATIVE_HTTP_CONN);
+            this.h2SendBufferCap = 0;
             this.responseSink.close();
             this.headerParser.close();
             this.multipartContentHeaderParser.close();
@@ -208,6 +251,11 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         // connections. Do not make these conditional.
         this.isProtocolSwitched = false;
         this.securityContext = DenyAllSecurityContext.INSTANCE;
+        this.protocolMode = MODE_SNIFFING;
+        this.h2PrefaceBytesDrained = 0;
+        this.h2SendBufferPos = 0;
+        this.h2SendBufferLimit = 0;
+        this.h2Listener = null;
     }
 
     @Override
@@ -229,7 +277,14 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         this.localValueMap.close();
         this.httpCircuitBreaker = Misc.free(httpCircuitBreaker);
         this.httpSqlExecutionContext = Misc.free(httpSqlExecutionContext);
+        if (h2 != null) {
+            h2.close();
+            h2 = null;
+        }
         this.recvBuffer = Unsafe.free(recvBuffer, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+        this.peekScratchAddr = Unsafe.free(peekScratchAddr, PEEK_SCRATCH_SIZE, MemoryTag.NATIVE_HTTP_CONN);
+        this.h2SendBuffer = Unsafe.free(h2SendBuffer, h2SendBufferCap, MemoryTag.NATIVE_HTTP_CONN);
+        this.h2SendBufferCap = 0;
         this.responseSink.close();
         this.receivedBytes = 0;
         this.securityContext = DenyAllSecurityContext.INSTANCE;
@@ -367,8 +422,28 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return totalReceived;
     }
 
+    @TestOnly
+    public String getProtocolModeForTests() {
+        return switch (protocolMode) {
+            case MODE_SNIFFING -> "sniffing";
+            case MODE_H1 -> "h1";
+            case MODE_H2_PREFACE_PENDING -> "h2_preface_pending";
+            case MODE_H2 -> "h2";
+            default -> throw new IllegalStateException("unknown mode " + protocolMode);
+        };
+    }
+
     public boolean handleClientOperation(int operation, HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext)
             throws HeartBeatException, PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
+        if (protocolMode == MODE_SNIFFING) {
+            sniffAndSelectMode();
+        }
+        if (protocolMode == MODE_H2_PREFACE_PENDING) {
+            drainH2Preface();
+        }
+        if (protocolMode == MODE_H2) {
+            return handleH2Operation(operation);
+        }
         boolean keepGoing = switch (operation) {
             case IOOperation.READ -> handleClientRecv(selector, rescheduleContext);
             case IOOperation.WRITE -> handleClientSend(selector);
@@ -377,7 +452,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         };
 
         boolean useful = keepGoing;
-        if (keepGoing) {
+        if (keepGoing && protocolMode == MODE_H1) {
             if (keepConnectionAlive()) {
                 do {
                     keepGoing = handleClientRecv(selector, rescheduleContext);
@@ -454,6 +529,11 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return responseSink.simpleResponse();
     }
 
+    @TestOnly
+    public void sniffAndSelectModeForTests() throws PeerIsSlowToWriteException, ServerDisconnectException {
+        sniffAndSelectMode();
+    }
+
     /**
      * Switches the connection to a different protocol (e.g., WebSocket).
      * After calling this, normal HTTP parsing is bypassed and the processor
@@ -511,6 +591,15 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     }
 
     @SuppressWarnings("StatementWithEmptyBody")
+    private void allocateH2EngineIfNeeded() {
+        if (h2 != null) {
+            return;
+        }
+        final Http2ConnectionConfig h2Config = Http2ConnectionConfig.defaults();
+        h2Listener = new NoopH2Listener();
+        h2 = new Http2ConnectionContext(h2Listener, h2Config);
+    }
+
     private void busyRcvLoop(HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext)
             throws PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
         reset();
@@ -920,6 +1009,36 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         throw registerDispatcherDisconnect(reason);
     }
 
+    private void drainH2Preface() throws PeerIsSlowToWriteException, ServerDisconnectException, PeerIsSlowToReadException {
+        // Cursor h2PrefaceBytesDrained persists across ticks: when recv short-reads
+        // and we throw registerDispatcherRead, the next READ resumes at the same
+        // offset without replaying bytes we already validated. Bytes land in
+        // peekScratchAddr — the 24-byte buffer doubles as the drain window and is
+        // discarded once the preface finishes.
+        while (h2PrefaceBytesDrained < Http2Preface.LENGTH) {
+            final int toRead = Http2Preface.LENGTH - h2PrefaceBytesDrained;
+            final int n = socket.recv(peekScratchAddr + h2PrefaceBytesDrained, toRead);
+            if (n < 0) {
+                throw registerDispatcherDisconnect(DISCONNECT_REASON_PEER_DISCONNECT_AT_HEADER_RECV);
+            }
+            if (n == 0) {
+                throw registerDispatcherRead();
+            }
+            if (!Http2Preface.matches(peekScratchAddr, h2PrefaceBytesDrained, h2PrefaceBytesDrained + n)) {
+                LOG.error().$("h2 preface mismatch [fd=").$(getFd()).I$();
+                throw registerDispatcherDisconnect(DISCONNECT_REASON_PROTOCOL_VIOLATION);
+            }
+            h2PrefaceBytesDrained += n;
+        }
+        allocateH2EngineIfNeeded();
+        final long written = h2.emitInitialSettings(h2SendBuffer, h2SendBuffer + h2SendBufferCap);
+        h2SendBufferPos = 0;
+        h2SendBufferLimit = (int) (written - h2SendBuffer);
+        flushH2Send();
+        protocolMode = MODE_H2;
+        LOG.info().$("h2 upgrade complete [fd=").$(getFd()).I$();
+    }
+
     private void dumpBuffer(long buffer, int size) {
         if (dumpNetworkTraffic && size > 0) {
             StdoutSink.INSTANCE.put('>');
@@ -951,6 +1070,25 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                 reset();
             }
         }
+    }
+
+    private void flushH2Send() throws PeerIsSlowToReadException {
+        while (h2SendBufferPos < h2SendBufferLimit) {
+            final int remaining = h2SendBufferLimit - h2SendBufferPos;
+            final int sent = socket.send(h2SendBuffer + h2SendBufferPos, remaining);
+            if (sent < 0) {
+                LOG.info().$("h2 peer disconnected on send [fd=").$(getFd()).I$();
+                // Promote to ServerDisconnectException at the caller; for Wave 2
+                // signal via slow-to-read re-register so WRITE tick picks it up.
+                throw registerDispatcherWrite();
+            }
+            if (sent == 0) {
+                throw registerDispatcherWrite();
+            }
+            h2SendBufferPos += sent;
+        }
+        h2SendBufferPos = 0;
+        h2SendBufferLimit = 0;
     }
 
     private HttpRequestProcessor getHttpRequestProcessor(HttpRequestProcessorSelector selector) {
@@ -1128,6 +1266,47 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return false;
     }
 
+    private boolean handleH2Operation(int operation) throws HeartBeatException, PeerIsSlowToReadException, PeerIsSlowToWriteException, ServerDisconnectException {
+        // Flush any deferred send bytes first. A prior tick may have short-written
+        // on a slow-reader peer; draining here keeps the outbound order intact
+        // before the engine emits anything new.
+        if (h2SendBufferPos < h2SendBufferLimit) {
+            flushH2Send();
+        }
+        boolean useful = false;
+        if (operation == IOOperation.READ || operation == IOOperation.WRITE) {
+            if (operation == IOOperation.READ) {
+                final int read = socket.recv(recvBuffer, recvBufferSize);
+                if (read < 0) {
+                    throw registerDispatcherDisconnect(DISCONNECT_REASON_PEER_DISCONNECT_AT_RECV);
+                }
+                if (read > 0) {
+                    h2.processReceivedBytes(recvBuffer, recvBuffer + read);
+                    useful = true;
+                }
+            }
+            final long written = h2.writePending(h2SendBuffer, h2SendBuffer + h2SendBufferCap);
+            final int drainedBytes = (int) (written - h2SendBuffer);
+            if (drainedBytes > 0) {
+                h2SendBufferPos = 0;
+                h2SendBufferLimit = drainedBytes;
+                flushH2Send();
+                useful = true;
+            }
+            if (h2.getState() == Http2ConnectionContext.STATE_CLOSED && h2SendBufferLimit == h2SendBufferPos) {
+                throw registerDispatcherDisconnect(DISCONNECT_REASON_UNKNOWN_OPERATION);
+            }
+            if (operation == IOOperation.READ) {
+                throw registerDispatcherRead();
+            }
+            return useful;
+        }
+        if (operation == IOOperation.HEARTBEAT) {
+            throw registerDispatcherHeartBeat();
+        }
+        throw registerDispatcherDisconnect(DISCONNECT_REASON_UNKNOWN_OPERATION);
+    }
+
     /**
      * Handles receive for protocol-switched connections (e.g., WebSocket).
      * Instead of parsing HTTP, delegates to the processor's resumeRecv.
@@ -1199,6 +1378,31 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         LOG.debug().$("peer is slow, waiting for bigger part to parse [multipart]").$();
     }
 
+    private void sniffAndSelectMode() throws PeerIsSlowToWriteException, ServerDisconnectException {
+        if (!configuration.getHttpContextConfiguration().isH2Enabled()) {
+            protocolMode = MODE_H1;
+            return;
+        }
+        final int peeked = nf.peekRaw(socket.getFd(), peekScratchAddr, PEEK_SCRATCH_SIZE);
+        if (peeked < 0) {
+            throw registerDispatcherDisconnect(DISCONNECT_REASON_PEER_DISCONNECT_AT_HEADER_RECV);
+        }
+        if (peeked == 0) {
+            throw registerDispatcherRead();
+        }
+        final int classification = Http2Preface.detect(peekScratchAddr, peeked);
+        if (classification == Http2Preface.MATCH) {
+            protocolMode = MODE_H2_PREFACE_PENDING;
+            return;
+        }
+        if (classification == Http2Preface.INCOMPLETE) {
+            throw registerDispatcherRead();
+        }
+        // NO_MATCH: peeked bytes are non-H2 request bytes. MSG_PEEK left
+        // them in the kernel buffer; the H1 parser's first recv consumes them.
+        protocolMode = MODE_H1;
+    }
+
     @Override
     protected void doInit() throws TlsSessionInitFailedException {
         // the context is obtained from the pool, so we should initialize the memory
@@ -1207,6 +1411,13 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             recvBufferSize = configuration.getRecvBufferSize();
             recvBufferReadSize = Math.min(forceFragmentationReceiveChunkSize, recvBufferSize);
             recvBuffer = Unsafe.malloc(recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+        }
+        if (peekScratchAddr == 0) {
+            peekScratchAddr = Unsafe.malloc(PEEK_SCRATCH_SIZE, MemoryTag.NATIVE_HTTP_CONN);
+        }
+        if (h2SendBuffer == 0) {
+            h2SendBuffer = Unsafe.malloc(H2_SEND_BUFFER_CAP, MemoryTag.NATIVE_HTTP_CONN);
+            h2SendBufferCap = H2_SEND_BUFFER_CAP;
         }
         // re-read buffer sizes in case the config was reloaded
         responseSink.of(socket, configuration.getSendBufferSize());
@@ -1217,5 +1428,49 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             socket.startTlsSession(null);
         }
         connectionCounted = false;
+    }
+
+    /**
+     * Logging no-op {@link Http2StreamListener}. Installed on every new
+     * {@link Http2ConnectionContext} so the H2 engine has a valid listener
+     * to call; the Flight SQL handler surface (M2) substitutes its own
+     * listener at bind time. No response bytes ever leave the connection
+     * under this listener — the point is to let the engine accept
+     * connections, drain the preface, parse HEADERS / DATA / trailers, and
+     * observe the callback traffic without wiring a dispatch path that
+     * Wave 4 has explicitly retired.
+     */
+    private final class NoopH2Listener implements Http2StreamListener {
+        @Override
+        public boolean onData(int streamId, long addr, int dataLen, boolean endStream, int generationToken) {
+            LOG.debug().$("h2 onData [sid=").$(streamId)
+                    .$(", len=").$(dataLen)
+                    .$(", endStream=").$(endStream).I$();
+            return true;
+        }
+
+        @Override
+        public void onRequestHeader(int streamId, long nameAddr, int nameLen, long valueAddr, int valueLen, boolean neverIndexed) {
+        }
+
+        @Override
+        public void onRequestHeaders(int streamId, Http2RequestHeadersView view, boolean endStream) {
+            LOG.debug().$("h2 onRequestHeaders [sid=").$(streamId)
+                    .$(", endStream=").$(endStream).I$();
+        }
+
+        @Override
+        public void onStreamClosed(int streamId, int cause) {
+            LOG.debug().$("h2 onStreamClosed [sid=").$(streamId)
+                    .$(", cause=").$(cause).I$();
+        }
+
+        @Override
+        public void onStreamWritable(int streamId) {
+        }
+
+        @Override
+        public void onTrailers(int streamId, boolean endStream) {
+        }
     }
 }

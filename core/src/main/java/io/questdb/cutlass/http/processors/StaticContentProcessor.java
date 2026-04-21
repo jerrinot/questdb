@@ -35,6 +35,7 @@ import io.questdb.cutlass.http.HttpRangeParser;
 import io.questdb.cutlass.http.HttpRawSocket;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.cutlass.http.HttpResponseHeader;
 import io.questdb.cutlass.http.LocalValue;
@@ -117,12 +118,12 @@ public class StaticContentProcessor implements HttpRequestProcessor, HttpRequest
         return true;
     }
 
-    public LogRecord logInfoWithFd(HttpConnectionContext context) {
+    public LogRecord logInfoWithFd(HttpRequestContext context) {
         return LOG.info().$('[').$(context.getFd()).$("] ");
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         final HttpRequestHeader headers = context.getRequestHeader();
         final Utf8Sequence url = headers.getUrl();
         logInfoWithFd(context).$("incoming [url=").$(url).$(']').$();
@@ -169,7 +170,7 @@ public class StaticContentProcessor implements HttpRequestProcessor, HttpRequest
     }
 
     @Override
-    public void resumeSend(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void resumeSend(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         LOG.debug().$("resumeSend").$();
         StaticContentProcessorState state = LV.get(context);
 
@@ -194,11 +195,11 @@ public class StaticContentProcessor implements HttpRequestProcessor, HttpRequest
         }
     }
 
-    private static void sendStatusTextContent(HttpConnectionContext context, int code) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    private static void sendStatusTextContent(HttpRequestContext context, int code) throws PeerDisconnectedException, PeerIsSlowToReadException {
         context.simpleResponse().sendStatusTextContent(code);
     }
 
-    private void send(HttpConnectionContext context, LPSZ path, boolean asAttachment) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    private void send(HttpRequestContext context, LPSZ path, boolean asAttachment) throws PeerDisconnectedException, PeerIsSlowToReadException {
         TelemetryTask.store(telemetry, TelemetryOrigin.HTTP, TelemetryEvent.HTTP_STATIC_CONTENT);
         int n = Utf8s.lastIndexOfAscii(path, '.');
         if (n == -1) {
@@ -241,7 +242,7 @@ public class StaticContentProcessor implements HttpRequestProcessor, HttpRequest
     }
 
     private void sendRange(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             DirectUtf8Sequence range,
             LPSZ path,
             CharSequence contentType,
@@ -292,7 +293,7 @@ public class StaticContentProcessor implements HttpRequestProcessor, HttpRequest
     }
 
     private void sendVanilla(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             LPSZ path,
             CharSequence contentType,
             boolean asAttachment

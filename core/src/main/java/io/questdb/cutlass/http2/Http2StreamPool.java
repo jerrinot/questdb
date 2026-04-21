@@ -25,6 +25,9 @@
 package io.questdb.cutlass.http2;
 
 import io.questdb.std.IntIntHashMap;
+import io.questdb.std.Misc;
+
+import java.io.Closeable;
 
 /**
  * Fixed-size pool of HTTP/2 stream slots (see {@code STREAM_STATE_MACHINE.md} §4
@@ -48,7 +51,7 @@ import io.questdb.std.IntIntHashMap;
  * assumes every {@link #allocateLive} and {@link #allocateDiscardingBlock}
  * call carries a fresh id.
  */
-public final class Http2StreamPool {
+public final class Http2StreamPool implements Closeable {
 
     public static final byte CLOSE_CLEAN = 0;
     public static final byte CLOSE_LOCAL_RESET = 1;
@@ -72,6 +75,7 @@ public final class Http2StreamPool {
     private final int slotCount;
     private final int tombstoneCap;
     private int activeStreamCount;
+    private boolean closed;
     // Monotonic counter used to pick the oldest tombstone on roll-off.
     // Incremented on every tombstone install so ordering survives even
     // though slot indices are handed out from a free-list in arbitrary
@@ -82,10 +86,41 @@ public final class Http2StreamPool {
     private int tombstoneCount;
 
     public Http2StreamPool(int maxConcurrentStreams, int tombstoneCap) {
-        this(maxConcurrentStreams, tombstoneCap, DEFAULT_DISCARDING_RESERVE);
+        this(maxConcurrentStreams, tombstoneCap, DEFAULT_DISCARDING_RESERVE, 0, 0, 0);
     }
 
     public Http2StreamPool(int maxConcurrentStreams, int tombstoneCap, int discardingReserve) {
+        this(maxConcurrentStreams, tombstoneCap, discardingReserve, 0, 0, 0);
+    }
+
+    public Http2StreamPool(int maxConcurrentStreams, int tombstoneCap, int discardingReserve,
+                           int outboundArenaBytesPerStream, int outboundTupleQueueCap) {
+        this(maxConcurrentStreams, tombstoneCap, discardingReserve,
+                outboundArenaBytesPerStream, outboundTupleQueueCap, 0);
+    }
+
+    /**
+     * @param maxConcurrentStreams         {@code SETTINGS_MAX_CONCURRENT_STREAMS}
+     *                                     policy ceiling (§8).
+     * @param tombstoneCap                 recently-closed-stream grace window
+     *                                     bound (§5 closed rules).
+     * @param discardingReserve            extra slots reserved for
+     *                                     {@link #SLOT_DISCARDING_BLOCK} promotions.
+     * @param outboundArenaBytesPerStream  native copy-on-enqueue arena size
+     *                                     on each {@link Http2Stream}. {@code 0}
+     *                                     disables outbound staging.
+     * @param outboundTupleQueueCap        per-stream outbound tuple ring
+     *                                     capacity; must be {@code 0} iff
+     *                                     {@code outboundArenaBytesPerStream}
+     *                                     is {@code 0}.
+     * @param headerStagingBytesPerStream  native pseudo-header staging buffer
+     *                                     size on each {@link Http2Stream}.
+     *                                     {@code 0} disables pseudo-header
+     *                                     capture.
+     */
+    public Http2StreamPool(int maxConcurrentStreams, int tombstoneCap, int discardingReserve,
+                           int outboundArenaBytesPerStream, int outboundTupleQueueCap,
+                           int headerStagingBytesPerStream) {
         if (maxConcurrentStreams < 1) {
             throw new IllegalArgumentException("maxConcurrentStreams must be >= 1: " + maxConcurrentStreams);
         }
@@ -105,9 +140,25 @@ public final class Http2StreamPool {
         this.slotCloseTick = new long[slotCount];
         this.slotCloseKind = new byte[slotCount];
         this.slotStream = new Http2Stream[slotCount];
-        for (int i = 0; i < slotCount; i++) {
-            this.slotStream[i] = new Http2Stream();
-            this.slotStreamId[i] = -1;
+        // Allocate each per-slot Http2Stream up-front so the hot path never
+        // allocates. If one allocation throws (native OOM), roll back all
+        // prior slots so the partially-constructed pool doesn't leak the
+        // native arenas.
+        int allocated = 0;
+        try {
+            for (int i = 0; i < slotCount; i++) {
+                this.slotStream[i] = new Http2Stream(
+                        outboundArenaBytesPerStream,
+                        outboundTupleQueueCap,
+                        headerStagingBytesPerStream);
+                this.slotStreamId[i] = -1;
+                allocated++;
+            }
+        } catch (Throwable t) {
+            for (int i = 0; i < allocated; i++) {
+                Misc.free(slotStream[i]);
+            }
+            throw t;
         }
         this.freeList = new int[slotCount];
         for (int i = 0; i < slotCount; i++) {
@@ -258,6 +309,25 @@ public final class Http2StreamPool {
     }
 
     /**
+     * Releases the per-stream native arenas held by every pool slot.
+     * Idempotent. Called by {@link Http2ConnectionContext#close} at
+     * connection teardown. A subsequent {@link #allocateLive} or
+     * {@link #allocateDiscardingBlock} call after {@link #close} is a
+     * programming error — the stream objects have given their native
+     * memory back to the allocator.
+     */
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        for (int i = 0; i < slotCount; i++) {
+            Misc.free(slotStream[i]);
+        }
+    }
+
+    /**
      * Transitions the LIVE slot at {@code slotIndex} to
      * {@link #SLOT_TOMBSTONE}. Bumps the stream's
      * {@link Http2Stream#getGeneration} so any deferred-credit ack the
@@ -276,6 +346,15 @@ public final class Http2StreamPool {
             throw new IllegalArgumentException("closeKind must be CLEAN or LOCAL_RESET: " + closeKind);
         }
         activeStreamCount--;
+        // LIVE → TOMBSTONE should not carry response bytes the peer can no
+        // longer act on (RST races, local reset, unclean connection
+        // teardown). A clean close via send-END_STREAM already drained the
+        // queue during the final emission; this is a defensive idempotent
+        // reset for the RST / abort paths where the queue might still
+        // contain tuples. Catches the "arena bytes leak into a recycled
+        // slot" ownership bug that HTTP2_INTEGRATION.md §15.4 A.7 test 9
+        // is designed to surface.
+        slotStream[slotIndex].clearOutboundQueue();
         if (tombstoneCap == 0) {
             // Grace window disabled; skip TOMBSTONE entirely and return the
             // slot to the free-list so subsequent LIVE allocations see it

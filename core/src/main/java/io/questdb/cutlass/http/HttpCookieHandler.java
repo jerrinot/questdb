@@ -31,7 +31,7 @@ public interface HttpCookieHandler {
         return true;
     }
 
-    default boolean processServiceAccountCookie(HttpConnectionContext context, SecurityContext securityContext) {
+    default boolean processServiceAccountCookie(HttpRequestContext context, SecurityContext securityContext) {
         return true;
     }
 

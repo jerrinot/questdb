@@ -54,6 +54,7 @@ public class HttpServerConfigurationBuilder {
     private FactoryProvider factoryProvider;
     private int forceRecvFragmentationChunkSize = Integer.MAX_VALUE;
     private int forceSendFragmentationChunkSize = Integer.MAX_VALUE;
+    private boolean h2Enabled;
     private byte httpHealthCheckAuthType = SecurityContext.AUTH_TYPE_NONE;
     private String httpProtocolVersion = "HTTP/1.1 ";
     private byte httpStaticContentAuthType = SecurityContext.AUTH_TYPE_NONE;
@@ -179,6 +180,11 @@ public class HttpServerConfigurationBuilder {
                     @Override
                     public String getHttpVersion() {
                         return httpProtocolVersion;
+                    }
+
+                    @Override
+                    public boolean isH2Enabled() {
+                        return h2Enabled;
                     }
 
                     @Override
@@ -317,6 +323,11 @@ public class HttpServerConfigurationBuilder {
 
     public HttpServerConfigurationBuilder withForceSendFragmentationChunkSize(int forceSendFragmentationChunkSize) {
         this.forceSendFragmentationChunkSize = forceSendFragmentationChunkSize;
+        return this;
+    }
+
+    public HttpServerConfigurationBuilder withH2Enabled(boolean h2Enabled) {
+        this.h2Enabled = h2Enabled;
         return this;
     }
 

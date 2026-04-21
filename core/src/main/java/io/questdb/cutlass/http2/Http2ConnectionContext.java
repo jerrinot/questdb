@@ -54,27 +54,69 @@ import java.io.Closeable;
  * WINDOW_UPDATE, RST_STREAM, GOAWAY) plus PRIORITY discard. HEADERS /
  * CONTINUATION / DATA routing with the HPACK listener and §11 validator
  * surface land in a follow-up per §14.3 steps 7 and 9.
+ * <p>
+ * <b>Error-style split.</b> The class uses two distinct error-handling
+ * styles for two distinct concerns. Inbound frame parsing and
+ * control-path errors throw {@link Http2ConnectionException} or
+ * {@link Http2StreamException} — the connection-level vs. stream-level
+ * discrimination is encoded in the exception type, and these errors are
+ * rare enough that per-call allocation is not a hot-path concern. The
+ * response-emit surface ({@link #enqueueData}, {@link #emitResponseHeaders})
+ * uses {@code int} sentinels ({@link #ENQUEUE_OK},
+ * {@link #ENQUEUE_PARK}, {@link #ENQUEUE_STALE_GENERATION},
+ * {@link #ENQUEUE_STREAM_CLOSED},
+ * {@link #ENQUEUE_HEADER_LIST_TOO_LARGE}) because those methods run on
+ * the hottest per-response path under sustained load; per-call exception
+ * allocation there would violate the zero-GC discipline. The trade-off
+ * is intentional — do not "normalise" one style to the other without
+ * first measuring the allocation cost on the response-emit path.
  */
 public final class Http2ConnectionContext implements Closeable {
 
+    /**
+     * {@link #emitResponseHeaders} only — the encoded block overflows the
+     * engine's response-headers scratch. Caller treats as a programming
+     * error (likely exceeds the peer's
+     * {@code SETTINGS_MAX_HEADER_LIST_SIZE} advertisement or the per-stream
+     * arena cap).
+     */
+    public static final int ENQUEUE_HEADER_LIST_TOO_LARGE = -4;
+    /** Success; the tuple(s) have been copied into the stream's arena. */
+    public static final int ENQUEUE_OK = 0;
+    /**
+     * Per-stream outbound cap would be exceeded. The engine flags the
+     * stream as parked; the caller must suspend response production until
+     * {@link Http2StreamListener#onStreamWritable} fires for this stream.
+     */
+    public static final int ENQUEUE_PARK = -3;
+    /**
+     * Generation mismatch — the stream referenced by
+     * {@code (streamId, generation)} has been reset / recycled since the
+     * handler captured the pair. The call no-ops; no state changes.
+     */
+    public static final int ENQUEUE_STALE_GENERATION = -1;
+    /**
+     * Outbound direction is closed for this stream (state machine moved
+     * past {@code OPEN} / {@code HALF_CLOSED_REMOTE} on the send side, or
+     * a prior enqueue staged {@code END_STREAM}). Caller has a
+     * programming error or raced the stream's lifecycle; no state changes.
+     */
+    public static final int ENQUEUE_STREAM_CLOSED = -2;
     public static final byte STATE_ACTIVE = 0;
     public static final byte STATE_CLOSED = 2;
     public static final byte STATE_DRAINING = 1;
 
-    // M1 listener that drives the HPACK decoder to END_HEADERS without
-    // surfacing fields. The §11 validator surface (pseudo-header rules,
-    // staging, policy counter, forbidden-header / content-length checks)
-    // lands in a follow-up commit; for now the decoder still must run so
-    // the shared dynamic table stays coherent.
-    private static final HpackListener NOOP_HPACK_LISTENER =
-            (nameAddr, nameLen, valueAddr, valueLen, neverIndexed) -> {
-            };
-    // Placeholder view handed to {@link Http2StreamListener#onRequestHeaders}
-    // until pseudo-header capture lands. Every accessor returns the absent
-    // sentinel {@code (0, 0)}; handler code should not rely on slot
-    // presence in M1.
-    private static final Http2RequestHeadersView EMPTY_REQUEST_HEADERS =
-            new EmptyRequestHeadersView();
+    // Pseudo-header name addresses in the HPACK static table. The HPACK
+    // decoder surfaces indexed names by reference into that table, so a
+    // pseudo-header captured via an indexed representation lands here with
+    // the same native address each time. Byte-literal compare against these
+    // addresses would be brittle, so {@link #matchPseudoName} does a value
+    // compare, but caching them lets the hot path short-circuit.
+    private static final byte[] HEADER_AUTHORITY = asciiBytes(":authority");
+    private static final byte[] HEADER_CONTENT_TYPE = asciiBytes("content-type");
+    private static final byte[] HEADER_METHOD = asciiBytes(":method");
+    private static final byte[] HEADER_PATH = asciiBytes(":path");
+    private static final byte[] HEADER_SCHEME = asciiBytes(":scheme");
 
     private static final byte PENDING_GOAWAY = 3;
     private static final int PENDING_QUEUE_CAP = 16;
@@ -86,12 +128,24 @@ public final class Http2ConnectionContext implements Closeable {
     // (HEADER_TABLE_SIZE..MAX_HEADER_LIST_SIZE). A flat array keyed by wire
     // id lets the SETTINGS dispatcher read-modify-write without a mapping
     // table, while reserving slot 0 keeps index arithmetic safe.
+    // Emit sentinels for emitOneFrame. Every positive return is a cursor
+    // address inside the caller's send buffer; negative returns discriminate
+    // the two non-success outcomes.
+    private static final long EMIT_BUFFER_FULL = -1L;
+    private static final long EMIT_WINDOW_BLOCKED = -2L;
     private static final int SETTINGS_COUNT = 7;
 
     private final long blockAssemblyScratchAddr;
     private final int blockAssemblyScratchCap;
     private final Http2ConnectionConfig config;
     private final Http2FrameHeader frameHeader = new Http2FrameHeader();
+    // Engine-owned scratch for emitResponseHeaders: the writer callback
+    // encodes into this buffer, the engine measures the result, and only
+    // then commits tuples into the target stream's arena. Sized to the
+    // per-stream arena cap so any block that will fit the arena also fits
+    // the scratch. Allocated once at construction; freed on close.
+    private final long headersScratchAddr;
+    private final int headersScratchCap;
     private final HpackDecoder hpackDecoder;
     private final HpackEncoder hpackEncoder;
     private final Http2StreamListener listener;
@@ -114,11 +168,30 @@ public final class Http2ConnectionContext implements Closeable {
     private int blockAssemblyLen;
     private int blockAssemblySlot = -1;
     private int blockAssemblyStreamId = -1;
+    // Per-stream capture target for the HPACK listener. Non-null only
+    // during {@link #completeHeaderBlock} for an initial LIVE HEADERS
+    // block; the captured pseudo-header slots belong to this stream and
+    // live on until the next request on the same slot rebinds them.
+    private Http2Stream captureTargetStream;
+    private final Http2StreamHeaderCapturingListener capturingListener = new Http2StreamHeaderCapturingListener();
+    private final Http2StreamHeadersView requestHeadersView = new Http2StreamHeadersView();
     private boolean closed;
+    // Reentrancy guard for emitResponseHeaders. Set while the writer
+    // callback runs; any nested emitResponseHeaders / enqueueData call
+    // would corrupt the shared HPACK encoder's block state and throws
+    // IllegalStateException instead.
+    private boolean headersEncoderInUse;
     private int highestPeerStreamIdSeen;
     private long inboundConnectionWindow;
     private boolean initialSettingsEmitted;
     private int lastAcceptedPeerStreamId;
+    // Connection-scoped round-robin cursor over stream-pool slots. Persists
+    // across writePending calls so when a buffer-full early exit interrupts
+    // mid-sweep the next call resumes where we left off — preserves fairness
+    // under sustained backpressure. The cursor names the next slot to try;
+    // advanced after each successful emission attempt (whether the slot
+    // had a tuple or not).
+    private int nextStreamCursor;
     private long outboundConnectionWindow;
     private int pendingCount;
     // Bitset of SETTINGS identifier ids carried on our most-recent emitted
@@ -139,7 +212,13 @@ public final class Http2ConnectionContext implements Closeable {
         }
         this.listener = listener;
         this.config = config;
-        this.streamPool = new Http2StreamPool(config.ourMaxConcurrentStreams, config.tombstoneCap);
+        this.streamPool = new Http2StreamPool(
+                config.ourMaxConcurrentStreams,
+                config.tombstoneCap,
+                2, // DEFAULT_DISCARDING_RESERVE — tests cover the wider overload.
+                config.outboundArenaBytesPerStream,
+                config.outboundTupleQueueCap,
+                config.headerStagingBytesPerStream);
         // Pool capacity must cover every cap we might advertise via
         // SETTINGS_HEADER_TABLE_SIZE plus the HTTP/2 default (peer's pre-ACK
         // encoder operates at the default 4 KiB regardless of our config).
@@ -160,6 +239,26 @@ public final class Http2ConnectionContext implements Closeable {
         );
         this.blockAssemblyScratchCap = config.blockAssemblyScratchBytes;
         this.blockAssemblyScratchAddr = Unsafe.malloc(config.blockAssemblyScratchBytes, MemoryTag.NATIVE_DEFAULT);
+        // Response-headers scratch matches the per-stream arena cap so the
+        // engine can always trial-encode a block that would fit the arena
+        // into the scratch first. outboundArenaBytesPerStream may be 0 if
+        // the config disables outbound staging (tests); in that case we
+        // still allocate at least the HPACK encoder's buffer floor so
+        // beginBlock / encode have working space, because
+        // emitResponseHeaders is still callable and will reject with
+        // ENQUEUE_STREAM_CLOSED downstream.
+        int headersScratchSize = Math.max(
+                config.outboundArenaBytesPerStream,
+                config.hpackEncoderBufferBytes);
+        long headersScratch;
+        try {
+            headersScratch = Unsafe.malloc(headersScratchSize, MemoryTag.NATIVE_DEFAULT);
+        } catch (Throwable t) {
+            Unsafe.free(blockAssemblyScratchAddr, blockAssemblyScratchCap, MemoryTag.NATIVE_DEFAULT);
+            throw t;
+        }
+        this.headersScratchAddr = headersScratch;
+        this.headersScratchCap = headersScratchSize;
 
         initSettings();
     }
@@ -171,9 +270,11 @@ public final class Http2ConnectionContext implements Closeable {
         }
         closed = true;
         streamPool.clear();
+        streamPool.close();
         hpackDecoder.close();
         hpackEncoder.close();
         Unsafe.free(blockAssemblyScratchAddr, blockAssemblyScratchCap, MemoryTag.NATIVE_DEFAULT);
+        Unsafe.free(headersScratchAddr, headersScratchCap, MemoryTag.NATIVE_DEFAULT);
         state = STATE_CLOSED;
     }
 
@@ -238,6 +339,261 @@ public final class Http2ConnectionContext implements Closeable {
         settingsFrameOutstanding = true;
         initialSettingsEmitted = true;
         return written;
+    }
+
+    /**
+     * Encodes a response HEADERS block for {@code streamId} with the
+     * connection's shared {@link HpackEncoder} and commits the encoded
+     * bytes as one HEADERS frame plus zero-or-more CONTINUATION frames
+     * on the stream's outbound tuple queue. All-or-nothing: if the
+     * encoded block would push the stream's arena or tuple ring past
+     * its cap the method returns {@link #ENQUEUE_PARK} without appending
+     * any tuples.
+     * <p>
+     * Return values:
+     * <ul>
+     *   <li>{@link #ENQUEUE_OK} — one HEADERS + N CONTINUATION tuples
+     *       are queued; the scheduler will emit them in order.</li>
+     *   <li>{@link #ENQUEUE_STALE_GENERATION} — {@code generation} does
+     *       not match the current {@link Http2Stream#getGeneration} on
+     *       the stream id. No state changes.</li>
+     *   <li>{@link #ENQUEUE_STREAM_CLOSED} — the stream's outbound
+     *       direction is closed (FSM past {@code OPEN} /
+     *       {@code HALF_CLOSED_REMOTE}), or a prior call staged
+     *       {@code END_STREAM}. No state changes; the HPACK encoder's
+     *       block is not opened.</li>
+     *   <li>{@link #ENQUEUE_PARK} — the encoded block would exceed the
+     *       stream's {@code outboundArenaBytesPerStream} or
+     *       {@code outboundTupleQueueCap}. The stream's park flag is
+     *       set so the engine fires
+     *       {@link Http2StreamListener#onStreamWritable} once the queue
+     *       drains enough to admit the block. The HPACK encoder's
+     *       block state is clean (any queued size updates that were
+     *       flushed into scratch are discarded along with the scratch
+     *       bytes, but the encoder's dynamic-table state is unchanged
+     *       — Milestone 1 pins {@code selectedMax} at 0 per
+     *       {@code HPACK_CODEC.md} §16.1).</li>
+     *   <li>{@link #ENQUEUE_HEADER_LIST_TOO_LARGE} — the writer could
+     *       not finish encoding before the engine's response-headers
+     *       scratch overflowed. The block is discarded; the caller
+     *       must trim headers or reject the request.</li>
+     * </ul>
+     * <p>
+     * Concurrency: the engine serialises access to the shared HPACK
+     * encoder. A nested {@link #emitResponseHeaders} or
+     * {@link #enqueueData} call from inside the writer throws
+     * {@link IllegalStateException} — the contract on
+     * {@link Http2HeadersWriter} forbids it, and the engine enforces it
+     * with a reentrancy guard.
+     */
+    public int emitResponseHeaders(int streamId, int generation,
+                                   Http2HeadersWriter writer, boolean endStream) {
+        return emitHeaderBlock(streamId, generation, writer, endStream, Http2Stream.TUPLE_KIND_HEADERS);
+    }
+
+    /**
+     * Encodes a trailer HEADERS block for {@code streamId} via the
+     * shared {@link HpackEncoder} and commits it as one HEADERS-kind
+     * frame plus zero-or-more CONTINUATION frames on the stream's
+     * outbound tuple queue. Wire-frame-identical to
+     * {@link #emitResponseHeaders}: the scheduler encodes the tuple as
+     * a HEADERS frame on the wire (RFC 9113 §8.1 — trailers are a second
+     * HEADERS block in the stream, not a distinct frame type). The tuple
+     * is tagged {@link Http2Stream#TUPLE_KIND_TRAILERS} so the scheduler
+     * can distinguish it for diagnostics; the first tuple always carries
+     * {@code END_STREAM}.
+     * <p>
+     * Return values match {@link #emitResponseHeaders}:
+     * {@link #ENQUEUE_OK}, {@link #ENQUEUE_STALE_GENERATION},
+     * {@link #ENQUEUE_STREAM_CLOSED}, {@link #ENQUEUE_PARK},
+     * {@link #ENQUEUE_HEADER_LIST_TOO_LARGE}. HPACK snapshot / restore
+     * rolls the shared encoder back on every non-committing return —
+     * the peer's decoder never sees a size-update that didn't make it
+     * to the wire.
+     *
+     * @throws IllegalArgumentException if {@code endStream} is {@code
+     *         false}. RFC 9113 §8.1 mandates {@code END_STREAM} on the
+     *         terminating HEADERS of a trailer block; an omit here is a
+     *         programming error, not a protocol variant.
+     */
+    public int emitTrailers(int streamId, int generation,
+                            Http2HeadersWriter writer, boolean endStream) {
+        if (!endStream) {
+            throw new IllegalArgumentException(
+                    "trailer HEADERS must carry END_STREAM per RFC 9113 sec. 8.1");
+        }
+        return emitHeaderBlock(streamId, generation, writer, true, Http2Stream.TUPLE_KIND_TRAILERS);
+    }
+
+    private int emitHeaderBlock(int streamId, int generation,
+                                Http2HeadersWriter writer, boolean endStream,
+                                byte leadTupleKind) {
+        if (writer == null) {
+            throw new IllegalArgumentException("writer must be non-null");
+        }
+        if (headersEncoderInUse) {
+            throw new IllegalStateException("emitResponseHeaders re-entered from within a writer callback");
+        }
+        int validation = validateOutboundTarget(streamId, generation);
+        if (validation != ENQUEUE_OK) {
+            return validation;
+        }
+        int slot = streamPool.lookup(streamId);
+        Http2Stream s = streamPool.getLiveStream(slot);
+
+        int peerMaxFrameSize = (int) peerAdvertised[Http2Settings.MAX_FRAME_SIZE];
+        if (peerMaxFrameSize < Http2Settings.MAX_FRAME_SIZE_LOWER) {
+            peerMaxFrameSize = Http2Settings.MAX_FRAME_SIZE_LOWER;
+        }
+
+        // Snapshot the encoder's mutable state so any non-committing
+        // return path below can roll it back. Without this a PARK'd emit
+        // would drop a queued Dynamic Table Size Update (RFC 7541 sec.
+        // 4.2) or (M2) incremental-indexing admission on the floor —
+        // the peer's decoder would then observe an inconsistent dynamic
+        // table on the next successful block. `committed` flips to true
+        // only on the single ENQUEUE_OK return; every other exit path
+        // (PARK, HEADER_LIST_TOO_LARGE, propagated exceptions) goes
+        // through the finally's restore.
+        long encoderSnapshot = hpackEncoder.snapshot();
+        boolean committed = false;
+        headersEncoderInUse = true;
+        try {
+            long scratchStart = hpackEncoder.beginBlock(headersScratchAddr, headersScratchAddr + headersScratchCap);
+            if (scratchStart < 0) {
+                return ENQUEUE_HEADER_LIST_TOO_LARGE;
+            }
+            long finalCursor;
+            try {
+                finalCursor = writer.write(hpackEncoder, scratchStart, headersScratchAddr + headersScratchCap);
+            } catch (RuntimeException e) {
+                // Ensure the encoder block state is cleared before the
+                // exception propagates so the connection isn't left with
+                // a half-open block; the outer finally then calls
+                // restore() because committed is still false.
+                hpackEncoder.endBlock();
+                throw e;
+            }
+            hpackEncoder.endBlock();
+            if (finalCursor < 0 || finalCursor < scratchStart
+                    || finalCursor > headersScratchAddr + headersScratchCap) {
+                return ENQUEUE_HEADER_LIST_TOO_LARGE;
+            }
+            long encodedLen = finalCursor - headersScratchAddr;
+
+            // Cap check #1: per-stream arena can hold the encoded bytes.
+            int remainingArena = s.getOutboundArenaCap() - s.getOutboundQueuedPayloadBytes();
+            if (encodedLen > remainingArena) {
+                s.setOutboundParked(true);
+                return ENQUEUE_PARK;
+            }
+            // Cap check #2: per-stream tuple ring has room for 1 HEADERS
+            // + (N-1) CONTINUATIONs. A zero-length encoded block still
+            // needs exactly one HEADERS frame to carry END_HEADERS and
+            // (if set) END_STREAM — the all-or-nothing reservation must
+            // account for that floor.
+            int frames = (int) ((encodedLen + peerMaxFrameSize - 1) / peerMaxFrameSize);
+            if (frames == 0) {
+                frames = 1;
+            }
+            if (frames > s.getOutboundTupleCap() - s.getOutboundTupleCount()) {
+                s.setOutboundParked(true);
+                return ENQUEUE_PARK;
+            }
+
+            // Commit. Each tryEnqueueOutbound below must succeed given
+            // the two pre-checks above — any false return here would
+            // mean the accounting invariants drifted.
+            long emit = headersScratchAddr;
+            long scratchEnd = headersScratchAddr + encodedLen;
+            for (int i = 0; i < frames; i++) {
+                long remaining = scratchEnd - emit;
+                int chunk = (int) Math.min(remaining, (long) peerMaxFrameSize);
+                boolean isLast = (i == frames - 1);
+                byte kind = (i == 0) ? leadTupleKind : Http2Stream.TUPLE_KIND_CONTINUATION;
+                // RFC 9113 sec. 6.2: END_STREAM lives on the HEADERS
+                // frame (not CONTINUATION). END_HEADERS rides the last
+                // frame of the sequence.
+                byte tupleFlags = 0;
+                if (isLast) {
+                    tupleFlags |= Http2Stream.TUPLE_FLAG_END_HEADERS;
+                }
+                if (i == 0 && endStream) {
+                    tupleFlags |= Http2Stream.TUPLE_FLAG_END_STREAM;
+                }
+                if (!s.tryEnqueueOutbound(kind, tupleFlags, emit, chunk)) {
+                    // Pre-checks above should make this unreachable;
+                    // defend anyway by surfacing PARK so the caller can
+                    // retry. The partial appends that already happened
+                    // in this loop are rolled back by clearing the ring
+                    // entries we just wrote — but since tryEnqueueOutbound
+                    // on a tuple only appends (no shared state with
+                    // earlier tuples), dropping via clearOutboundQueue
+                    // here would also wipe pre-existing tuples the caller
+                    // legitimately owns. Leave the partial append in
+                    // place and restore only the HPACK encoder state —
+                    // the per-stream outbound queue is caller-owned and
+                    // the caller is expected to retry the same block on
+                    // the next onStreamWritable. Pre-checks ensure this
+                    // branch is unreachable in practice.
+                    s.setOutboundParked(true);
+                    return ENQUEUE_PARK;
+                }
+                emit += chunk;
+            }
+            committed = true;
+            return ENQUEUE_OK;
+        } finally {
+            headersEncoderInUse = false;
+            if (!committed) {
+                hpackEncoder.restore(encoderSnapshot);
+            }
+        }
+    }
+
+    /**
+     * Appends a DATA frame tuple carrying {@code payloadLen} bytes copied
+     * from {@code payloadAddr} to the outbound queue of {@code streamId}.
+     * The caller's buffer is free to be reused immediately on return —
+     * the bytes are memcpy'd into the stream's arena per §4.4
+     * copy-on-enqueue ownership.
+     * <p>
+     * Return values:
+     * <ul>
+     *   <li>{@link #ENQUEUE_OK} — tuple queued.</li>
+     *   <li>{@link #ENQUEUE_STALE_GENERATION} — generation mismatch;
+     *       silent no-op.</li>
+     *   <li>{@link #ENQUEUE_STREAM_CLOSED} — the stream's outbound
+     *       direction is closed or a prior call staged
+     *       {@code END_STREAM}.</li>
+     *   <li>{@link #ENQUEUE_PARK} — per-stream arena or tuple ring cap
+     *       would be exceeded. The stream's park flag is set; the
+     *       engine will fire
+     *       {@link Http2StreamListener#onStreamWritable} once the queue
+     *       drains.</li>
+     * </ul>
+     * <p>
+     * Zero-length payloads are legal: a {@code payloadLen == 0} call with
+     * {@code endStream == true} queues an empty terminator DATA frame
+     * that the scheduler emits even under a zero flow-control window
+     * (RFC 9113 §6.9.1).
+     */
+    public int enqueueData(int streamId, int generation, long payloadAddr, int payloadLen, boolean endStream) {
+        if (payloadLen < 0) {
+            throw new IllegalArgumentException("payloadLen must be non-negative: " + payloadLen);
+        }
+        int validation = validateOutboundTarget(streamId, generation);
+        if (validation != ENQUEUE_OK) {
+            return validation;
+        }
+        int slot = streamPool.lookup(streamId);
+        Http2Stream s = streamPool.getLiveStream(slot);
+        byte flags = endStream ? Http2Stream.TUPLE_FLAG_END_STREAM : (byte) 0;
+        if (!s.tryEnqueueOutbound(Http2Stream.TUPLE_KIND_DATA, flags, payloadAddr, payloadLen)) {
+            s.setOutboundParked(true);
+            return ENQUEUE_PARK;
+        }
+        return ENQUEUE_OK;
     }
 
     public int getActiveStreamCount() {
@@ -391,14 +747,36 @@ public final class Http2ConnectionContext implements Closeable {
     }
 
     /**
-     * Drains the pending outbound control-frame queue into the caller-owned
-     * send buffer {@code [addr, limit)}. Stops at the first frame that
-     * cannot fit (buffer too small); the caller retries after the socket
-     * write drains. Returns the new write pointer; unwritten frames remain
-     * queued in FIFO order.
+     * Drains outbound frames into the caller-owned send buffer
+     * {@code [addr, limit)}. Two phases:
+     * <ol>
+     *   <li>Flush the control-frame FIFO (SETTINGS_ACK, PING_ACK, GOAWAY,
+     *       RST_STREAM, WINDOW_UPDATE). Stops at the first frame that
+     *       cannot fit.</li>
+     *   <li>Round-robin over {@link Http2StreamPool} slots with queued
+     *       outbound tuples. Each sweep emits at most one frame per
+     *       eligible LIVE stream (HEADERS / CONTINUATION / DATA); DATA
+     *       emission is gated on stream + connection outbound windows and
+     *       capped at peer {@code MAX_FRAME_SIZE}. Sweeps repeat while any
+     *       slot made progress; the loop exits when the send buffer fills
+     *       or no slot is eligible. The next-slot cursor persists across
+     *       {@link #writePending} calls so an interrupted sweep resumes
+     *       fairly on the next call.</li>
+     * </ol>
+     * A parked stream (see {@link #ENQUEUE_PARK}) whose successful emission
+     * frees arena / ring headroom triggers
+     * {@link Http2StreamListener#onStreamWritable} synchronously from
+     * inside this call.
+     * <p>
+     * A stream that reaches {@link Http2StreamState#CLOSED} as a result of
+     * a send-side {@code END_STREAM} emission has its pool slot promoted
+     * to a clean tombstone and
+     * {@link Http2StreamListener#onStreamClosed} fired before
+     * {@code writePending} returns.
      */
     public long writePending(long addr, long limit) {
         long cursor = addr;
+        // Phase 1: drain control-frame FIFO in FIFO order.
         int written = 0;
         for (int i = 0; i < pendingCount; i++) {
             long next = writeOne(cursor, limit, i);
@@ -418,7 +796,122 @@ public final class Http2ConnectionContext implements Closeable {
             }
             pendingCount = remaining;
         }
+        if (pendingCount > 0) {
+            // Control FIFO did not fully drain — buffer is full. No room
+            // for stream frames either; return and let the caller drain.
+            return cursor;
+        }
+
+        // Phase 2: round-robin stream scheduler. Skip on closed connection.
+        if (state == STATE_CLOSED) {
+            return cursor;
+        }
+        int slotCount = streamPool.getSlotCount();
+        if (slotCount == 0) {
+            return cursor;
+        }
+
+        boolean sweptAnything;
+        do {
+            sweptAnything = false;
+            int attempted = 0;
+            while (attempted < slotCount) {
+                int slot = nextStreamCursor;
+                if (streamPool.getSlotKind(slot) != Http2StreamPool.SLOT_LIVE) {
+                    nextStreamCursor = (nextStreamCursor + 1) % slotCount;
+                    attempted++;
+                    continue;
+                }
+                Http2Stream s = streamPool.getLiveStream(slot);
+                if (s.getOutboundTupleCount() == 0) {
+                    nextStreamCursor = (nextStreamCursor + 1) % slotCount;
+                    attempted++;
+                    continue;
+                }
+                long next = emitOneFrame(cursor, limit, s);
+                if (next == EMIT_BUFFER_FULL) {
+                    // Leave nextStreamCursor on this slot so the next
+                    // writePending resumes here — round-robin fairness
+                    // after buffer-full interruption demands we retry
+                    // the same slot rather than skip it.
+                    return cursor;
+                }
+                if (next == EMIT_WINDOW_BLOCKED) {
+                    // Window-blocked stream: advance past it and try other
+                    // streams in this sweep; a subsequent WINDOW_UPDATE
+                    // will re-enable it.
+                    nextStreamCursor = (nextStreamCursor + 1) % slotCount;
+                    attempted++;
+                    continue;
+                }
+                cursor = next;
+                sweptAnything = true;
+                // Check if this emission unblocked a parked stream.
+                maybeFireWritableAfterEmission(s);
+                nextStreamCursor = (nextStreamCursor + 1) % slotCount;
+                attempted++;
+            }
+        } while (sweptAnything);
+
         return cursor;
+    }
+
+    private static byte[] asciiBytes(String s) {
+        byte[] out = new byte[s.length()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) s.charAt(i);
+        }
+        return out;
+    }
+
+    private static boolean equalsAsciiIgnoreCase(long addr, int len, byte[] expected) {
+        if (len != expected.length) {
+            return false;
+        }
+        for (int i = 0; i < len; i++) {
+            byte a = Unsafe.getUnsafe().getByte(addr + i);
+            byte b = expected[i];
+            if (a != b) {
+                if ((a >= 'A' && a <= 'Z' ? (byte) (a + 32) : a)
+                        != (b >= 'A' && b <= 'Z' ? (byte) (b + 32) : b)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static int matchPseudoName(long nameAddr, int nameLen) {
+        // Byte-literal match on the decoder-produced name. The HPACK decoder
+        // already lowercased regular-header names per RFC 9113 §8.2.1, but we
+        // still guard Host with a case-insensitive compare for indexed-literal
+        // paths that surface mixed case. Pseudo-headers (:method, :path,
+        // :scheme, :authority) are always lowercase on the wire per RFC 9113
+        // §8.3 so the equalsAsciiIgnoreCase helper is overkill for them but
+        // free — the four ASCII bytes compare in a tight loop.
+        if (nameLen <= 0) {
+            return -1;
+        }
+        byte first = Unsafe.getUnsafe().getByte(nameAddr);
+        if (first == (byte) ':') {
+            if (equalsAsciiIgnoreCase(nameAddr, nameLen, HEADER_METHOD)) {
+                return Http2Stream.STAGING_SLOT_METHOD;
+            }
+            if (equalsAsciiIgnoreCase(nameAddr, nameLen, HEADER_PATH)) {
+                return Http2Stream.STAGING_SLOT_PATH;
+            }
+            if (equalsAsciiIgnoreCase(nameAddr, nameLen, HEADER_SCHEME)) {
+                return Http2Stream.STAGING_SLOT_SCHEME;
+            }
+            if (equalsAsciiIgnoreCase(nameAddr, nameLen, HEADER_AUTHORITY)) {
+                return Http2Stream.STAGING_SLOT_AUTHORITY;
+            }
+            return -1;
+        }
+        if (equalsAsciiIgnoreCase(nameAddr, nameLen, HEADER_CONTENT_TYPE)) {
+            return Http2Stream.STAGING_SLOT_CONTENT_TYPE;
+        }
+        return -1;
     }
 
     private int admitNewStream(int streamId) {
@@ -534,6 +1027,11 @@ public final class Http2ConnectionContext implements Closeable {
             Http2Stream s = pool.getLiveStream(i);
             s.onOutboundInitialWindowDelta(delta);
         }
+        // Trigger 3: a positive delta unparks every outbound-active
+        // parked stream. No-op for negative / zero deltas.
+        if (delta > 0) {
+            fanOutWritableAfterSettingsWindowIncrease();
+        }
     }
 
     private void applyPeerSetting(short id, long value) {
@@ -565,12 +1063,20 @@ public final class Http2ConnectionContext implements Closeable {
         blockAssemblySlot = slot;
         blockAssemblyEndStream = endStream;
         blockAssemblyLen = 0;
+        captureTargetStream = null;
         if (streamPool.getSlotKind(slot) == Http2StreamPool.SLOT_LIVE) {
             Http2Stream s = streamPool.getLiveStream(slot);
             // beginHeaderBlock() clears refusingCurrentBlock. A trailer
             // HEADERS sets that flag via markCurrentBlockRefused() AFTER
             // this call.
             s.beginHeaderBlock();
+            if (!s.isInitialHeadersSeen()) {
+                // §11 capture scope: only the initial HEADERS block carries
+                // pseudo-headers. Trailer blocks land on §8 M1 refusal above
+                // and never need a staging reset.
+                s.beginInitialHeaders();
+                captureTargetStream = s;
+            }
         }
     }
 
@@ -605,14 +1111,20 @@ public final class Http2ConnectionContext implements Closeable {
 
         // HPACK decode always runs so the shared dynamic table stays
         // coherent even when the block is refused / discarded (§11
-        // sticky-error rationale). A structural HPACK failure escalates
-        // to a connection COMPRESSION_ERROR.
+        // sticky-error rationale). The capturing listener writes target
+        // pseudo-header / content-type bytes into captureTargetStream's
+        // staging buffer; all other fields are consumed and dropped. A
+        // structural HPACK failure escalates to a connection
+        // COMPRESSION_ERROR.
+        Http2Stream captureTargetSnapshot = captureTargetStream;
         try {
-            hpackDecoder.decodeBlock(blockAddr, blockLimit, NOOP_HPACK_LISTENER);
+            hpackDecoder.decodeBlock(blockAddr, blockLimit, capturingListener);
         } catch (HpackException e) {
+            captureTargetStream = null;
             throw Http2ConnectionException.instance(
                     Http2ErrorCode.COMPRESSION_ERROR, e.getMessage());
         }
+        captureTargetStream = null;
 
         byte kind = streamPool.getSlotKind(slot);
         if (kind == Http2StreamPool.SLOT_DISCARDING_BLOCK) {
@@ -636,12 +1148,21 @@ public final class Http2ConnectionContext implements Closeable {
             resetStreamLocally(streamId, Http2ErrorCode.PROTOCOL_ERROR);
             return;
         }
+        if (captureTargetSnapshot == s && s.isStagingOverflow()) {
+            // §15.5 step 2 capture-overflow rule. A pseudo-header or
+            // content-type value is too large to fit the per-stream
+            // staging budget; reset with PROTOCOL_ERROR and do not fire
+            // onRequestHeaders so the listener never observes a
+            // half-populated view.
+            resetStreamLocally(streamId, Http2ErrorCode.PROTOCOL_ERROR);
+            return;
+        }
         if (!s.onRecvHeaders(endStream)) {
             // Malformed trailer (no END_STREAM) or bad state transition.
             resetStreamLocally(streamId, Http2ErrorCode.PROTOCOL_ERROR);
             return;
         }
-        listener.onRequestHeaders(streamId, EMPTY_REQUEST_HEADERS, endStream);
+        listener.onRequestHeaders(streamId, requestHeadersView.of(s), endStream);
         if (s.isClosed()) {
             // HEADERS+END_STREAM on HALF_CLOSED_LOCAL closes the stream
             // immediately. Settle any deferred credit (none expected on
@@ -947,7 +1468,10 @@ public final class Http2ConnectionContext implements Closeable {
             return;
         }
         // §9: echo the 8-byte opaque payload back with the ACK flag set.
-        long opaque = Unsafe.getUnsafe().getLong(header.getPayloadAddr());
+        // Must use big-endian read (readU64) symmetric with writePing's
+        // big-endian putU64 so the wire-octet sequence round-trips exactly
+        // as RFC 9113 sec. 6.7 requires.
+        long opaque = Http2FrameReader.readU64(header.getPayloadAddr());
         enqueuePingAck(opaque);
     }
 
@@ -1056,6 +1580,9 @@ public final class Http2ConnectionContext implements Closeable {
                         "connection outbound window overflow");
             }
             outboundConnectionWindow = credited;
+            // Trigger 2: connection window credit fans out to every
+            // parked stream whose own outbound window is non-zero.
+            fanOutWritableAfterConnectionWindowUpdate();
             return;
         }
         int slot = streamPool.lookup(streamId);
@@ -1079,6 +1606,111 @@ public final class Http2ConnectionContext implements Closeable {
             throw Http2StreamException.instance(streamId, Http2ErrorCode.FLOW_CONTROL_ERROR);
         }
         s.setOutboundStreamWindow(credited);
+        // Trigger 1: per-stream window credit unparks this stream.
+        maybeFireWritableAfterStreamWindowUpdate(slot);
+    }
+
+    /**
+     * Emits at most one wire frame from {@code s}'s head outbound tuple
+     * into {@code [addr, limit)}. Returns the new cursor on success, or
+     * one of {@link #EMIT_BUFFER_FULL} / {@link #EMIT_WINDOW_BLOCKED} on
+     * failure. HEADERS and CONTINUATION ignore flow control per RFC 9113
+     * sec. 5.2.1; DATA debits both the stream and connection outbound
+     * windows by the emitted payload length. Zero-length DATA with
+     * {@code END_STREAM} is emitted even under a zero flow-control window
+     * per RFC 9113 sec. 6.9.1.
+     * <p>
+     * On {@code END_STREAM} emission the stream's FSM advances per §5;
+     * a transition to {@link Http2StreamState#CLOSED} causes the slot to
+     * close-clean and fires {@link Http2StreamListener#onStreamClosed}.
+     */
+    private long emitOneFrame(long addr, long limit, Http2Stream s) {
+        byte kind = s.peekOutboundKind();
+        byte flags = s.peekOutboundFlags();
+        long tupleAddr = s.peekOutboundPayloadAddr();
+        int remaining = s.peekOutboundPayloadLen();
+        boolean tupleEndStream = (flags & Http2Stream.TUPLE_FLAG_END_STREAM) != 0;
+        boolean tupleEndHeaders = (flags & Http2Stream.TUPLE_FLAG_END_HEADERS) != 0;
+        int peerMaxFrame = peerMaxFrameSize();
+        int streamId = s.getStreamId();
+
+        if (kind == Http2Stream.TUPLE_KIND_HEADERS || kind == Http2Stream.TUPLE_KIND_TRAILERS) {
+            // §15.5 step 3: trailers ride the wire as HEADERS frames (RFC
+            // 9113 §8.1 — a trailer block is a second HEADERS block, not
+            // a distinct frame type). Only the tuple kind tracks the
+            // distinction for diagnostics.
+            int frameSize = Math.min(remaining, peerMaxFrame);
+            boolean frameEndStream = tupleEndStream && frameSize == remaining;
+            boolean frameEndHeaders = tupleEndHeaders && frameSize == remaining;
+            long next = Http2FrameWriter.writeHeaders(addr, limit, streamId,
+                    frameEndStream, frameEndHeaders, tupleAddr, frameSize);
+            if (next < 0) {
+                return EMIT_BUFFER_FULL;
+            }
+            s.advanceOutboundHead(frameSize);
+            if (frameEndStream) {
+                s.onSendHeaders(true);
+                maybeCloseStream(s);
+            }
+            return next;
+        }
+
+        if (kind == Http2Stream.TUPLE_KIND_CONTINUATION) {
+            int frameSize = Math.min(remaining, peerMaxFrame);
+            boolean frameEndHeaders = tupleEndHeaders && frameSize == remaining;
+            long next = Http2FrameWriter.writeContinuation(addr, limit, streamId,
+                    frameEndHeaders, tupleAddr, frameSize);
+            if (next < 0) {
+                return EMIT_BUFFER_FULL;
+            }
+            s.advanceOutboundHead(frameSize);
+            return next;
+        }
+
+        // DATA
+        if (remaining == 0) {
+            if (!tupleEndStream) {
+                // Zero-length non-END_STREAM DATA is not a useful tuple;
+                // enqueueData should have rejected or skipped it. Defensive.
+                throw new IllegalStateException(
+                        "zero-length DATA without END_STREAM on stream=" + streamId);
+            }
+            // RFC 9113 sec. 6.9.1: zero-length DATA with END_STREAM is not
+            // flow-controlled and emits even under a zero window.
+            long next = Http2FrameWriter.writeData(addr, limit, streamId, true, 0L, 0);
+            if (next < 0) {
+                return EMIT_BUFFER_FULL;
+            }
+            s.advanceOutboundHead(0);
+            s.onSendDataEndStream();
+            maybeCloseStream(s);
+            return next;
+        }
+        long streamWindow = s.getOutboundStreamWindow();
+        long connWindow = outboundConnectionWindow;
+        if (streamWindow <= 0 || connWindow <= 0) {
+            return EMIT_WINDOW_BLOCKED;
+        }
+        long budget = Math.min(Math.min(streamWindow, connWindow), (long) peerMaxFrame);
+        int frameSize = (int) Math.min((long) remaining, budget);
+        if (frameSize <= 0) {
+            return EMIT_WINDOW_BLOCKED;
+        }
+        boolean frameEndStream = tupleEndStream && frameSize == remaining;
+        long next = Http2FrameWriter.writeData(addr, limit, streamId,
+                frameEndStream, tupleAddr, frameSize);
+        if (next < 0) {
+            return EMIT_BUFFER_FULL;
+        }
+        // RFC 9113 sec. 5.2.1: only DATA consumes outbound windows.
+        outboundConnectionWindow -= frameSize;
+        s.setOutboundStreamWindow(streamWindow - frameSize);
+        s.advanceOutboundHead(frameSize);
+        if (frameEndStream) {
+            s.onSendDataEndStream();
+            maybeCloseStream(s);
+        }
+        return next;
     }
 
     private void enqueueGoAway(int errorCode) {
@@ -1146,6 +1778,55 @@ public final class Http2ConnectionContext implements Closeable {
         pendingOpaque[idx] = 0L;
     }
 
+    /**
+     * Trigger 2 fan-out: after a peer {@code WINDOW_UPDATE(0)} credits
+     * the connection outbound window, every parked stream whose own
+     * outbound window is non-zero becomes potentially writable.
+     */
+    private void fanOutWritableAfterConnectionWindowUpdate() {
+        Http2StreamPool pool = streamPool;
+        int slotCount = pool.getSlotCount();
+        for (int i = 0; i < slotCount; i++) {
+            if (pool.getSlotKind(i) != Http2StreamPool.SLOT_LIVE) {
+                continue;
+            }
+            Http2Stream s = pool.getLiveStream(i);
+            if (!s.isOutboundParked()) {
+                continue;
+            }
+            if (s.getOutboundStreamWindow() <= 0) {
+                continue;
+            }
+            s.setOutboundParked(false);
+            listener.onStreamWritable(s.getStreamId());
+        }
+    }
+
+    /**
+     * Trigger 3 fan-out: a peer
+     * {@code SETTINGS_INITIAL_WINDOW_SIZE} increase has bumped every
+     * outbound-direction-active stream's window. Every parked stream
+     * whose direction is still active becomes writable.
+     */
+    private void fanOutWritableAfterSettingsWindowIncrease() {
+        Http2StreamPool pool = streamPool;
+        int slotCount = pool.getSlotCount();
+        for (int i = 0; i < slotCount; i++) {
+            if (pool.getSlotKind(i) != Http2StreamPool.SLOT_LIVE) {
+                continue;
+            }
+            Http2Stream s = pool.getLiveStream(i);
+            if (!s.isOutboundParked()) {
+                continue;
+            }
+            if (!s.isOutboundDirectionActive()) {
+                continue;
+            }
+            s.setOutboundParked(false);
+            listener.onStreamWritable(s.getStreamId());
+        }
+    }
+
     private void initSettings() {
         // RFC 9113 sec. 6.5.2 defaults populate both ourApplied and
         // peerAdvertised before any SETTINGS exchange. ourAdvertised stays
@@ -1161,6 +1842,88 @@ public final class Http2ConnectionContext implements Closeable {
         }
         inboundConnectionWindow = Http2Settings.DEFAULT_INITIAL_WINDOW_SIZE;
         outboundConnectionWindow = Http2Settings.DEFAULT_INITIAL_WINDOW_SIZE;
+    }
+
+    /**
+     * Called after a scheduler emission that may have driven the stream
+     * into {@link Http2StreamState#CLOSED}. Promotes the LIVE slot to a
+     * clean tombstone and fires {@link Http2StreamListener#onStreamClosed}.
+     */
+    private void maybeCloseStream(Http2Stream s) {
+        if (!s.isClosed()) {
+            return;
+        }
+        int streamId = s.getStreamId();
+        int slot = streamPool.lookup(streamId);
+        if (slot == Http2StreamPool.SLOT_NOT_FOUND
+                || streamPool.getSlotKind(slot) != Http2StreamPool.SLOT_LIVE) {
+            return;
+        }
+        streamPool.closeLiveSlot(slot, Http2StreamPool.CLOSE_CLEAN);
+        listener.onStreamClosed(streamId, Http2ErrorCode.NO_ERROR);
+    }
+
+    /**
+     * Trigger 4: a scheduler emission drained some of {@code s}'s queue.
+     * If the stream was parked and now has arena + ring headroom for a
+     * hypothetical next enqueue, clear the park flag and fire
+     * {@link Http2StreamListener#onStreamWritable}. Stream-window
+     * secondary condition is deliberately left out here — the integration
+     * layer's next enqueue only cares about cap headroom, and the
+     * scheduler drain is evidence that the stream's windows are at least
+     * non-blocking for the bytes we just sent.
+     * <p>
+     * M2 tech debt: under sustained zero-window traffic this can produce
+     * a spurious {@code resumeSend} cycle when the cap-freeing emission
+     * did not actually unblock forward progress (stream window dropped
+     * to zero on the same emission). Measure under a deferred-body-heavy
+     * workload; if it shows up in profiles, tighten the precondition to
+     * {@code capFree && outboundStreamWindow > 0}.
+     */
+    private void maybeFireWritableAfterEmission(Http2Stream s) {
+        if (!s.isOutboundParked()) {
+            return;
+        }
+        if (s.getOutboundQueuedPayloadBytes() >= s.getOutboundArenaCap()) {
+            return;
+        }
+        if (s.getOutboundTupleCount() >= s.getOutboundTupleCap()) {
+            return;
+        }
+        s.setOutboundParked(false);
+        listener.onStreamWritable(s.getStreamId());
+    }
+
+    /**
+     * Trigger 1: a peer {@code WINDOW_UPDATE(streamId>0)} credited this
+     * stream's outbound window. If the stream was parked, it is now
+     * writable.
+     */
+    private void maybeFireWritableAfterStreamWindowUpdate(int slot) {
+        Http2Stream s = streamPool.getLiveStream(slot);
+        if (!s.isOutboundParked()) {
+            return;
+        }
+        s.setOutboundParked(false);
+        listener.onStreamWritable(s.getStreamId());
+    }
+
+    /**
+     * Returns the peer's current advertised {@code MAX_FRAME_SIZE}
+     * clamped to {@link Http2Settings#MAX_FRAME_SIZE_LOWER}. The peer
+     * setting is tracked as an unsigned 32-bit long; the cap never rises
+     * above {@link Http2Settings#MAX_FRAME_SIZE_UPPER} (2^24 - 1), so
+     * the int narrow is safe.
+     */
+    private int peerMaxFrameSize() {
+        long peer = peerAdvertised[Http2Settings.MAX_FRAME_SIZE];
+        if (peer < Http2Settings.MAX_FRAME_SIZE_LOWER) {
+            return Http2Settings.MAX_FRAME_SIZE_LOWER;
+        }
+        if (peer > Http2Settings.MAX_FRAME_SIZE_UPPER) {
+            return Http2Settings.MAX_FRAME_SIZE_UPPER;
+        }
+        return (int) peer;
     }
 
     private void resetStreamLocally(int streamId, int errorCode) {
@@ -1208,56 +1971,128 @@ public final class Http2ConnectionContext implements Closeable {
         pendingCount--;
     }
 
-    private static final class EmptyRequestHeadersView implements Http2RequestHeadersView {
+    /**
+     * Shared preflight for {@link #enqueueData} and
+     * {@link #emitResponseHeaders}: classifies the target stream against
+     * the engine's pool state + the handler's captured generation token.
+     * Returns {@link #ENQUEUE_OK} if the stream is LIVE, the generation
+     * matches, the outbound direction is still active, and no prior
+     * call has staged {@code END_STREAM}; otherwise the appropriate
+     * sentinel.
+     */
+    private int validateOutboundTarget(int streamId, int generation) {
+        int slot = streamPool.lookup(streamId);
+        if (slot == Http2StreamPool.SLOT_NOT_FOUND) {
+            return ENQUEUE_STALE_GENERATION;
+        }
+        if (streamPool.getSlotKind(slot) != Http2StreamPool.SLOT_LIVE) {
+            // DISCARDING_BLOCK / TOMBSTONE / FREE slot for this id: the
+            // handler's token is stale by definition.
+            return ENQUEUE_STALE_GENERATION;
+        }
+        Http2Stream s = streamPool.getLiveStream(slot);
+        if (s.getGeneration() != generation) {
+            return ENQUEUE_STALE_GENERATION;
+        }
+        if (!s.isOutboundDirectionActive()) {
+            return ENQUEUE_STREAM_CLOSED;
+        }
+        if (s.isOutboundEndStreamStaged()) {
+            return ENQUEUE_STREAM_CLOSED;
+        }
+        return ENQUEUE_OK;
+    }
+
+    /**
+     * HPACK listener that captures the five pseudo-header / Host slots
+     * into the current {@link #captureTargetStream}'s per-stream staging
+     * buffer. Other fields are consumed and dropped so the shared HPACK
+     * dynamic table stays coherent. Name matching is byte-literal over
+     * the decoder-produced {@code (nameAddr, nameLen)} pair; the hot path
+     * is a single {@code nameLen} compare plus one memory compare per
+     * short name and no allocation.
+     */
+    private final class Http2StreamHeaderCapturingListener implements HpackListener {
+
+        @Override
+        public void onHeader(long nameAddr, int nameLen, long valueAddr, int valueLen, boolean neverIndexed) {
+            Http2Stream target = captureTargetStream;
+            if (target == null) {
+                return;
+            }
+            int slot = matchPseudoName(nameAddr, nameLen);
+            if (slot < 0) {
+                return;
+            }
+            target.captureHeaderSlot(slot, valueAddr, valueLen);
+        }
+    }
+
+    /**
+     * Read-only view over a {@link Http2Stream}'s staged pseudo-header
+     * slots plus the captured {@code content-type}. A single instance per
+     * connection is rebound via {@link #of} immediately before each
+     * {@link Http2StreamListener#onRequestHeaders} dispatch; the returned
+     * addresses live in the stream's staging buffer and remain valid
+     * until the next request's {@link Http2Stream#beginInitialHeaders}
+     * clears them.
+     */
+    private static final class Http2StreamHeadersView implements Http2RequestHeadersView {
+        private Http2Stream target;
 
         @Override
         public long getAuthorityAddr() {
-            return 0;
+            return target == null ? 0L : target.getStagingSlotAddr(Http2Stream.STAGING_SLOT_AUTHORITY);
         }
 
         @Override
         public int getAuthorityLen() {
-            return 0;
+            return target == null ? 0 : target.getStagingSlotLen(Http2Stream.STAGING_SLOT_AUTHORITY);
         }
 
         @Override
-        public long getHostAddr() {
-            return 0;
+        public long getContentTypeAddr() {
+            return target == null ? 0L : target.getStagingSlotAddr(Http2Stream.STAGING_SLOT_CONTENT_TYPE);
         }
 
         @Override
-        public int getHostLen() {
-            return 0;
+        public int getContentTypeLen() {
+            return target == null ? 0 : target.getStagingSlotLen(Http2Stream.STAGING_SLOT_CONTENT_TYPE);
         }
 
         @Override
         public long getMethodAddr() {
-            return 0;
+            return target == null ? 0L : target.getStagingSlotAddr(Http2Stream.STAGING_SLOT_METHOD);
         }
 
         @Override
         public int getMethodLen() {
-            return 0;
+            return target == null ? 0 : target.getStagingSlotLen(Http2Stream.STAGING_SLOT_METHOD);
         }
 
         @Override
         public long getPathAddr() {
-            return 0;
+            return target == null ? 0L : target.getStagingSlotAddr(Http2Stream.STAGING_SLOT_PATH);
         }
 
         @Override
         public int getPathLen() {
-            return 0;
+            return target == null ? 0 : target.getStagingSlotLen(Http2Stream.STAGING_SLOT_PATH);
         }
 
         @Override
         public long getSchemeAddr() {
-            return 0;
+            return target == null ? 0L : target.getStagingSlotAddr(Http2Stream.STAGING_SLOT_SCHEME);
         }
 
         @Override
         public int getSchemeLen() {
-            return 0;
+            return target == null ? 0 : target.getStagingSlotLen(Http2Stream.STAGING_SLOT_SCHEME);
+        }
+
+        Http2StreamHeadersView of(Http2Stream stream) {
+            this.target = stream;
+            return this;
         }
     }
 

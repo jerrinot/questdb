@@ -39,6 +39,7 @@ import io.questdb.cutlass.http.HttpException;
 import io.questdb.cutlass.http.HttpFullFatServerConfiguration;
 import io.questdb.cutlass.http.HttpRawSocket;
 import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.cutlass.http.LocalValue;
 import io.questdb.cutlass.qwp.codec.QwpEgressColumnDef;
@@ -199,7 +200,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
     }
 
     @Override
-    public void onConnectionClosed(HttpConnectionContext context) {
+    public void onConnectionClosed(HttpRequestContext context) {
         LOG.info().$("Egress WebSocket connection closed [fd=").$(context.getFd()).I$();
         QwpEgressProcessorState state = LV.get(context);
         if (state == null) {
@@ -213,7 +214,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
     }
 
     @Override
-    public void onHeadersReady(HttpConnectionContext context) throws PeerDisconnectedException {
+    public void onHeadersReady(HttpRequestContext context) throws PeerDisconnectedException {
         HttpRawSocket rawSocket = context.getRawResponseSocket();
         long bufferAddr = rawSocket.getBufferAddress();
         int bufferSize = rawSocket.getBufferSize();
@@ -298,7 +299,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context)
+    public void onRequestComplete(HttpRequestContext context)
             throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         QwpEgressProcessorState state = LV.get(context);
         if (state == null || !state.isHandshakeFlushPending()) {
@@ -321,7 +322,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
     }
 
     @Override
-    public void resumeRecv(HttpConnectionContext context)
+    public void resumeRecv(HttpRequestContext context)
             throws PeerIsSlowToWriteException, ServerDisconnectException, PeerIsSlowToReadException {
         QwpEgressProcessorState state = LV.get(context);
         if (state == null) {
@@ -329,9 +330,11 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
             throw ServerDisconnectException.INSTANCE;
         }
 
-        Socket socket = context.getSocket();
-        long recvBuffer = context.getRecvBuffer();
-        int recvBufferSize = context.getRecvBufferSize();
+        // H1-only: direct socket and recv-buffer access lives on HttpConnectionContext.
+        HttpConnectionContext h1 = (HttpConnectionContext) context;
+        Socket socket = h1.getSocket();
+        long recvBuffer = h1.getRecvBuffer();
+        int recvBufferSize = h1.getRecvBufferSize();
 
         try {
             int recvBufferLen = state.getRecvBufferLen();
@@ -382,7 +385,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
      * </ul>
      */
     @Override
-    public void resumeSend(HttpConnectionContext context)
+    public void resumeSend(HttpRequestContext context)
             throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         QwpEgressProcessorState state = LV.get(context);
 
@@ -502,7 +505,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
     }
 
     private void dispatchEgressMessage(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             QwpEgressProcessorState state,
             long payload,
             int length
@@ -533,7 +536,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
      * {@code QUERY_ERROR}.
      */
     private void executeNonSelect(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             QwpEgressProcessorState state,
             SqlExecutionContextImpl sqlCtx,
             CompiledQuery cq,
@@ -597,13 +600,14 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
         sendExecDone(context, state, requestId, type, rowsAffected);
     }
 
-    private void finalizeHandshake(HttpConnectionContext context, QwpEgressProcessorState state) {
+    private void finalizeHandshake(HttpRequestContext context, QwpEgressProcessorState state) {
         state.setWsHandshakeSent(true);
         state.setHandshakeFlushPending(false);
         state.setPendingHandshakeBytes(0);
         LOG.info().$("Egress WebSocket handshake sent [fd=").$(context.getFd())
                 .$(", qwpVersion=").$(state.getNegotiatedVersion() & 0xFF).I$();
-        context.switchProtocol();
+        // H1-only: WebSocket upgrade requires HttpConnectionContext-specific switchProtocol.
+        ((HttpConnectionContext) context).switchProtocol();
     }
 
     // Egress message dispatch and query execution
@@ -625,7 +629,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
      * The in-place plumbing (flag + streamResults check + STATUS_CANCELLED
      * mapping) is ready for that fix.
      */
-    private void handleCancel(HttpConnectionContext context, QwpEgressProcessorState state, long payload, int length) {
+    private void handleCancel(HttpRequestContext context, QwpEgressProcessorState state, long payload, int length) {
         try {
             long targetRequestId = state.getDecoder().decodeCancel(payload, length);
             if (state.isStreamingActive() && state.getStreamingRequestId() == targetRequestId) {
@@ -644,7 +648,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
         }
     }
 
-    private void handleClose(HttpConnectionContext context, long payload, int length) {
+    private void handleClose(HttpRequestContext context, long payload, int length) {
         int closeCode = -1;
         if (length >= 2) {
             int high = Unsafe.getUnsafe().getByte(payload) & 0xFF;
@@ -676,7 +680,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
      * is safe: the suspended state left nothing mid-batch -- it exited cleanly
      * at the top of the loop.
      */
-    private void handleCredit(HttpConnectionContext context, QwpEgressProcessorState state, long payload, int length)
+    private void handleCredit(HttpRequestContext context, QwpEgressProcessorState state, long payload, int length)
             throws PeerDisconnectedException, PeerIsSlowToReadException {
         try {
             long targetRequestId = Unsafe.getUnsafe().getLong(payload + 1);
@@ -722,7 +726,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
         }
     }
 
-    private void handlePing(HttpConnectionContext context, long payload, int length) {
+    private void handlePing(HttpRequestContext context, long payload, int length) {
         try {
             HttpRawSocket rawSocket = context.getRawResponseSocket();
             int frameSize = WebSocketFrameWriter.headerSize(length, false) + length;
@@ -736,7 +740,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
     }
 
     private void handleQueryRequest(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             QwpEgressProcessorState state,
             long payload,
             int length
@@ -918,7 +922,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
     }
 
     private void handleWebSocketFrame(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             QwpEgressProcessorState state,
             int opcode,
             boolean fin,
@@ -968,7 +972,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
         return negotiated;
     }
 
-    private void processWebSocketFrames(HttpConnectionContext context, QwpEgressProcessorState state, long buffer, int bufferLen)
+    private void processWebSocketFrames(HttpRequestContext context, QwpEgressProcessorState state, long buffer, int bufferLen)
             throws ServerDisconnectException, PeerDisconnectedException, PeerIsSlowToReadException {
         long bufferEnd = buffer + bufferLen;
         long pos = buffer;
@@ -1022,7 +1026,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
      * so this is a one-shot send -- no chunking.
      */
     private void sendExecDone(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             QwpEgressProcessorState state,
             long requestId,
             short opType,
@@ -1041,7 +1045,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
     }
 
     private void sendQueryError(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             QwpEgressProcessorState state,
             long requestId,
             byte status,
@@ -1080,7 +1084,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
      * credit bookkeeping to debit the stream's remaining budget.
      */
     private int sendResultBatch(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             QwpEgressProcessorState state,
             long requestId,
             long batchSeq,
@@ -1289,7 +1293,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
     }
 
     private void sendResultEnd(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             QwpEgressProcessorState state,
             long requestId,
             long finalSeq,
@@ -1312,7 +1316,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
      * lives on {@link QwpEgressProcessorState} so that a parked send can be resumed in
      * {@link #resumeSend} without losing the iteration position.
      */
-    private void streamResults(HttpConnectionContext context, QwpEgressProcessorState state)
+    private void streamResults(HttpRequestContext context, QwpEgressProcessorState state)
             throws PeerDisconnectedException, PeerIsSlowToReadException {
         QwpResultBatchBuffer batchBuffer = state.getBatchBuffer();
         ObjList<QwpEgressColumnDef> columnDefs = state.borrowColumnDefs(state.getStreamingColumnCount());

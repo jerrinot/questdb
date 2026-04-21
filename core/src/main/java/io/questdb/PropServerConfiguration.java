@@ -1226,6 +1226,8 @@ public class PropServerConfiguration implements ServerConfiguration {
                 httpExportConnectionLimit = getInt(properties, env, PropertyKey.HTTP_EXPORT_CONNECTION_LIMIT, httpExportConnectionLimitDefault);
             }
 
+            boolean httpH2Enabled = getBoolean(properties, env, PropertyKey.HTTP_H2_ENABLED, false);
+
             httpContextConfiguration = new PropHttpContextConfiguration(
                     connectionPoolInitialCapacity,
                     connectionStringPoolCapacity,
@@ -1245,7 +1247,8 @@ public class PropServerConfiguration implements ServerConfiguration {
                     requestHeaderBufferSize,
                     httpJsonQueryConnectionLimit,
                     httpIlpConnectionLimit,
-                    httpExportConnectionLimit
+                    httpExportConnectionLimit,
+                    httpH2Enabled
             );
 
             // Use a separate configuration for min server. It does not make sense for the min server to grow the buffer sizes together with the main http server

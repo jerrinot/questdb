@@ -28,6 +28,7 @@ import io.questdb.cutlass.http.HttpChunkedResponse;
 import io.questdb.cutlass.http.HttpConnectionContext;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.cutlass.http.HttpServerConfiguration;
 import io.questdb.metrics.HealthMetricsImpl;
@@ -60,7 +61,7 @@ public class HealthCheckProcessor implements HttpRequestProcessor, HttpRequestHa
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         HttpChunkedResponse response = context.getChunkedResponse();
 
         if (pessimisticMode) {

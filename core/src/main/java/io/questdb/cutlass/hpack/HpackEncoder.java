@@ -84,6 +84,20 @@ public final class HpackEncoder implements Closeable {
     private int queuedInterimMin = NO_QUEUED_UPDATE;
     private int queuedSizeUpdate = NO_QUEUED_UPDATE;
     private int selectedMax;
+    // Single-slot snapshot of encoder-side mutable state (block-open flag
+    // + the two queued-size-update slots). Paired with the dynamic table's
+    // own snapshot. Exercised by {@link HpackEncoder#snapshot} /
+    // {@link HpackEncoder#restore} so the stream-layer emit path can
+    // preflight a block into scratch and roll back on a non-committing
+    // return without desynchronising the peer's decoder.
+    private boolean snapshotBlockOpen;
+    private int snapshotQueuedInterimMin;
+    private int snapshotQueuedSizeUpdate;
+    private boolean snapshotValid;
+    // Monotonically-increasing token returned by {@link #snapshot} so a
+    // restore with a stale token fails loudly rather than silently
+    // applying the wrong rollback.
+    private long snapshotVersion;
 
     /**
      * @param initialPeerAdvertisedCap the peer's SETTINGS_HEADER_TABLE_SIZE as of
@@ -329,10 +343,71 @@ public final class HpackEncoder implements Closeable {
         this.queuedInterimMin = NO_QUEUED_UPDATE;
         this.queuedSizeUpdate = 0;
         this.blockOpen = false;
+        this.snapshotValid = false;
+    }
+
+    /**
+     * Reverts encoder state (queued size updates, {@link #blockOpen}, and
+     * the dynamic-table pointers captured by the paired
+     * {@link HpackDynamicTable#snapshot}) to the most recent
+     * {@link #snapshot} call. Called by the stream-layer emit path when
+     * an all-or-nothing header block commit fails — either the encoded
+     * block would overflow the per-stream arena / tuple ring
+     * ({@link io.questdb.cutlass.http2.Http2ConnectionContext#ENQUEUE_PARK}),
+     * the writer callback returned {@code -1}
+     * ({@link io.questdb.cutlass.http2.Http2ConnectionContext#ENQUEUE_HEADER_LIST_TOO_LARGE}),
+     * or the callback threw. Without this rollback a PARK'd emit would
+     * swallow a queued Dynamic Table Size Update (RFC 7541 sec. 4.2) or
+     * an M2 incremental-indexing admission, desynchronising the peer's
+     * decoder on the next successful block.
+     *
+     * @param snapshot the token returned by the matching {@link #snapshot}
+     *                 call; stale tokens throw
+     *                 {@link IllegalStateException} to catch snapshot /
+     *                 restore pairing bugs
+     */
+    public void restore(long snapshot) {
+        if (!snapshotValid || snapshot != snapshotVersion) {
+            throw new IllegalStateException(
+                    "restore called with stale snapshot token=" + snapshot
+                            + " current=" + snapshotVersion + " valid=" + snapshotValid);
+        }
+        blockOpen = snapshotBlockOpen;
+        queuedInterimMin = snapshotQueuedInterimMin;
+        queuedSizeUpdate = snapshotQueuedSizeUpdate;
+        dynamicTable.restore();
+        snapshotValid = false;
     }
 
     public int selectedMax() {
         return selectedMax;
+    }
+
+    /**
+     * Captures encoder state so a subsequent {@link #restore} can revert
+     * the side effects of a {@link #beginBlock} / {@link #encode}* /
+     * {@link #endBlock} cycle. Specifically captures:
+     * <ul>
+     *   <li>{@link #blockOpen} — reversed on restore;</li>
+     *   <li>the two queued Dynamic Table Size Update slots
+     *       ({@code queuedInterimMin}, {@code queuedSizeUpdate}) that
+     *       {@link #beginBlock} drains on success;</li>
+     *   <li>the dynamic table's mutable pointers via
+     *       {@link HpackDynamicTable#snapshot} — forward-looking for M2
+     *       incremental-indexing; a no-op rollback under M1 because
+     *       {@code selectedMax == 0} prevents admissions.</li>
+     * </ul>
+     * Single-slot: calling {@link #snapshot} again before
+     * {@link #restore} overwrites the prior capture. Returns an opaque
+     * token that {@link #restore} validates; mismatched tokens throw.
+     */
+    public long snapshot() {
+        snapshotBlockOpen = blockOpen;
+        snapshotQueuedInterimMin = queuedInterimMin;
+        snapshotQueuedSizeUpdate = queuedSizeUpdate;
+        dynamicTable.snapshot();
+        snapshotValid = true;
+        return ++snapshotVersion;
     }
 
     private static int computeBufferFloor(int localPreferredCap, int maxOutboundFieldBytes) {

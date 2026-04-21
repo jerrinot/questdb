@@ -34,11 +34,12 @@ public final class Http2ConnectionConfig {
 
     public final int blockAssemblyScratchBytes;
     public final int headerListPolicyCap;
-    public final int headerStagingBytes;
-    public final int headerStagingTuples;
+    public final int headerStagingBytesPerStream;
     public final int hpackDecoderScratchBytes;
     public final int hpackEncoderBufferBytes;
     public final int hpackPoolCapacityBytes;
+    public final int outboundArenaBytesPerStream;
+    public final int outboundTupleQueueCap;
     public final int ourHeaderTableSize;
     public final int ourInitialWindowSize;
     public final int ourMaxConcurrentStreams;
@@ -48,11 +49,12 @@ public final class Http2ConnectionConfig {
     private Http2ConnectionConfig(Builder b) {
         this.blockAssemblyScratchBytes = b.blockAssemblyScratchBytes;
         this.headerListPolicyCap = b.headerListPolicyCap;
-        this.headerStagingBytes = b.headerStagingBytes;
-        this.headerStagingTuples = b.headerStagingTuples;
+        this.headerStagingBytesPerStream = b.headerStagingBytesPerStream;
         this.hpackDecoderScratchBytes = b.hpackDecoderScratchBytes;
         this.hpackEncoderBufferBytes = b.hpackEncoderBufferBytes;
         this.hpackPoolCapacityBytes = b.hpackPoolCapacityBytes;
+        this.outboundArenaBytesPerStream = b.outboundArenaBytesPerStream;
+        this.outboundTupleQueueCap = b.outboundTupleQueueCap;
         this.ourHeaderTableSize = b.ourHeaderTableSize;
         this.ourInitialWindowSize = b.ourInitialWindowSize;
         this.ourMaxConcurrentStreams = b.ourMaxConcurrentStreams;
@@ -71,8 +73,13 @@ public final class Http2ConnectionConfig {
     public static final class Builder {
         private int blockAssemblyScratchBytes = 16 * 1024;
         private int headerListPolicyCap = 16 * 1024;
-        private int headerStagingBytes = 16 * 1024;
-        private int headerStagingTuples = 600;
+        // HTTP2_INTEGRATION.md §15.5 step 2 default. The buffer sizes one
+        // stream's five captured slots (:method, :path, :scheme,
+        // :authority, content-type); 8 KiB is comfortably above every
+        // realistic gRPC path / authority / content-type the router will
+        // see, yet small enough that a multi-stream connection stays
+        // well under budget at MAX_CONCURRENT_STREAMS.
+        private int headerStagingBytesPerStream = 8 * 1024;
         // Strictly greater than headerListPolicyCap per §11 sizing discipline
         // so the stream-error path always fires before the HPACK scratch cap.
         private int hpackDecoderScratchBytes = 24 * 1024;
@@ -83,6 +90,17 @@ public final class Http2ConnectionConfig {
         // one complete HEADERS block fragment.
         private int hpackEncoderBufferBytes = 64 * 1024;
         private int hpackPoolCapacityBytes = 4096;
+        // HTTP2_INTEGRATION.md §10 and §16 Q7: the per-stream outbound arena
+        // bounds how many queued response bytes one parked stream can tie up
+        // before PeerIsSlowToReadException fires. 256 KiB is the doc's
+        // starting point; needs measurement against realistic response-size
+        // distributions once PR3 and the integration layer are in place.
+        // TODO: re-evaluate once M2 workloads are wired up.
+        private int outboundArenaBytesPerStream = 256 * 1024;
+        // HTTP2_INTEGRATION.md §16 Q7 and the PR feedback on tuple-count
+        // bounding: cap the tuple ring at 128 so a burst of small writes
+        // can't silently inflate per-stream memory.
+        private int outboundTupleQueueCap = 128;
         private int ourHeaderTableSize = 4096;
         // RFC 9113 default per-stream initial window.
         private int ourInitialWindowSize = 65_535;
@@ -110,13 +128,8 @@ public final class Http2ConnectionConfig {
             return this;
         }
 
-        public Builder withHeaderStagingBytes(int v) {
-            this.headerStagingBytes = v;
-            return this;
-        }
-
-        public Builder withHeaderStagingTuples(int v) {
-            this.headerStagingTuples = v;
+        public Builder withHeaderStagingBytesPerStream(int v) {
+            this.headerStagingBytesPerStream = v;
             return this;
         }
 
@@ -132,6 +145,16 @@ public final class Http2ConnectionConfig {
 
         public Builder withHpackPoolCapacityBytes(int v) {
             this.hpackPoolCapacityBytes = v;
+            return this;
+        }
+
+        public Builder withOutboundArenaBytesPerStream(int v) {
+            this.outboundArenaBytesPerStream = v;
+            return this;
+        }
+
+        public Builder withOutboundTupleQueueCap(int v) {
+            this.outboundTupleQueueCap = v;
             return this;
         }
 

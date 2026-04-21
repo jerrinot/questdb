@@ -41,6 +41,7 @@ import io.questdb.cutlass.http.HttpKeywords;
 import io.questdb.cutlass.http.HttpMultipartContentProcessor;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.cutlass.http.LocalValue;
 import io.questdb.cutlass.http.ex.RetryOperationException;
@@ -100,7 +101,7 @@ public class TextImportProcessor implements HttpMultipartContentProcessor, HttpR
     }
 
     @Override
-    public void failRequest(HttpConnectionContext context, HttpException e) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
+    public void failRequest(HttpRequestContext context, HttpException e) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         sendErrorAndThrowDisconnect(e.getFlyweightMessage());
     }
 
@@ -173,7 +174,7 @@ public class TextImportProcessor implements HttpMultipartContentProcessor, HttpR
     // valid during multipart events.
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) {
+    public void onRequestComplete(HttpRequestContext context) {
         if (transientState != null) {
             transientState.clear();
         }
@@ -181,27 +182,29 @@ public class TextImportProcessor implements HttpMultipartContentProcessor, HttpR
 
     @Override
     public void onRequestRetry(
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
-        this.transientContext = context;
+        // H1-only: transientContext field drives multipart/body bookkeeping keyed to HttpConnectionContext.
+        this.transientContext = (HttpConnectionContext) context;
         this.transientState = LV.get(context);
         onChunk(transientState.lo, transientState.hi);
     }
 
     @Override
-    public void resumeRecv(HttpConnectionContext context) {
-        this.transientContext = context;
+    public void resumeRecv(HttpRequestContext context) {
+        // H1-only: transientContext field drives multipart/body bookkeeping keyed to HttpConnectionContext.
+        this.transientContext = (HttpConnectionContext) context;
         this.transientState = LV.get(context);
         if (transientState == null) {
             LOG.debug().$("new text state").$();
             LV.set(context, this.transientState = new TextImportProcessorState(engine));
         }
-        transientState.json = isJson(context);
+        transientState.json = isJson(transientContext);
     }
 
     @Override
     public void resumeSend(
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         context.resumeResponseSend();
         doResumeSend(LV.get(context), context.getChunkedResponse());
@@ -419,7 +422,7 @@ public class TextImportProcessor implements HttpMultipartContentProcessor, HttpR
         }
     }
 
-    private static void sendErr(HttpConnectionContext context, CharSequence message) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
+    private static void sendErr(HttpRequestContext context, CharSequence message) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         final TextImportProcessorState state = LV.get(context);
         state.responseState = RESPONSE_ERROR;
         state.errorMessage = message;
@@ -474,7 +477,7 @@ public class TextImportProcessor implements HttpMultipartContentProcessor, HttpR
         sendErrorAndThrowDisconnect(message, transientContext, transientState);
     }
 
-    private void sendResponse(HttpConnectionContext context)
+    private void sendResponse(HttpRequestContext context)
             throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         final TextImportProcessorState state = LV.get(context);
         final HttpChunkedResponse response = context.getChunkedResponse();

@@ -28,6 +28,7 @@ import io.questdb.DefaultFactoryProvider;
 import io.questdb.DefaultHttpClientConfiguration;
 import io.questdb.cutlass.http.DefaultHttpServerConfiguration;
 import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHandlerFactory;
 import io.questdb.cutlass.http.HttpRequestProcessor;
@@ -66,12 +67,12 @@ public class HttpServerTest extends AbstractTest {
         try (HttpServerMock httpServer = new HttpServerMock(1, 9001)) {
             httpServer.registerEndpoint(requestHeader -> new HttpRequestProcessor() {
                 @Override
-                public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+                public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
                     context.simpleResponse().sendStatusTextContent(HTTP_OK, SUCCESS_UTF8, null);
                 }
 
                 @Override
-                public void resumeSend(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+                public void resumeSend(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
                     context.simpleResponse().sendStatusTextContent(HTTP_OK, SUCCESS_UTF8, null);
                 }
             });

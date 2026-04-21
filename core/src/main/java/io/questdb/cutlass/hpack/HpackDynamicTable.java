@@ -99,6 +99,19 @@ public final class HpackDynamicTable implements Closeable {
     private int newestSlot = EMPTY_SLOT;
     private int oldestSlot = EMPTY_SLOT;
     private int poolCursor;
+    // Single-slot snapshot of the mutable table pointers + counters. Used
+    // by {@link HpackEncoder#snapshot} to make emit-time block attempts
+    // reversible (e.g. all-or-nothing response-header commits at the
+    // stream layer). The pool bytes themselves are not captured — future
+    // inserts will overwrite any "dead" bytes the rollback leaves behind,
+    // and the ring's invariants treat space beyond the pointers as
+    // free-for-reuse.
+    private int snapshotCurrentSize;
+    private int snapshotDynamicCount;
+    private int snapshotNewestSlot;
+    private int snapshotOldestSlot;
+    private int snapshotPoolCursor;
+    private boolean snapshotValid;
 
     /**
      * @param initialOperatingCap initial {@code currentOperatingCap}, bounded by
@@ -304,7 +317,27 @@ public final class HpackDynamicTable implements Closeable {
                     + ") exceeds poolCapacityBytes (" + poolCapacityBytes + ")");
         }
         clear();
+        this.snapshotValid = false;
         this.currentOperatingCap = initialOperatingCap;
+    }
+
+    /**
+     * Reverts table state to the most recent {@link #snapshot} call. Only
+     * restores the mutable pointers / counters — the pool bytes themselves
+     * are not rolled back, which is safe under the ring-buffer contract
+     * because any bytes beyond the restored pointers are free for reuse.
+     * Throws {@link IllegalStateException} if no snapshot is available.
+     */
+    public void restore() {
+        if (!snapshotValid) {
+            throw new IllegalStateException("restore called without a prior snapshot");
+        }
+        currentSize = snapshotCurrentSize;
+        dynamicCount = snapshotDynamicCount;
+        newestSlot = snapshotNewestSlot;
+        oldestSlot = snapshotOldestSlot;
+        poolCursor = snapshotPoolCursor;
+        snapshotValid = false;
     }
 
     /**
@@ -326,6 +359,21 @@ public final class HpackDynamicTable implements Closeable {
         while (currentSize > newCap && dynamicCount > 0) {
             evictOldest();
         }
+    }
+
+    /**
+     * Captures the current mutable pointers / counters so a subsequent
+     * {@link #restore} call can revert insert-driven state. Overwrites any
+     * prior unresolved snapshot — the single-owner-thread contract on the
+     * encoder means there is never more than one snapshot outstanding.
+     */
+    public void snapshot() {
+        snapshotCurrentSize = currentSize;
+        snapshotDynamicCount = dynamicCount;
+        snapshotNewestSlot = newestSlot;
+        snapshotOldestSlot = oldestSlot;
+        snapshotPoolCursor = poolCursor;
+        snapshotValid = true;
     }
 
     private void clear() {

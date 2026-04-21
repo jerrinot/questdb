@@ -35,6 +35,7 @@ import io.questdb.cutlass.http.HttpConnectionContext;
 import io.questdb.cutlass.http.HttpPostPutProcessor;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.cutlass.http.LocalValue;
 import io.questdb.log.Log;
@@ -94,7 +95,7 @@ public class SettingsProcessor implements HttpRequestHandler {
         }
 
         @Override
-        public void onHeadersReady(HttpConnectionContext context) {
+        public void onHeadersReady(HttpRequestContext context) {
             final Utf8StringSink settings = LV_GET_SINK.get(context);
             if (settings == null) {
                 LOG.debug().$("new settings sink").$();
@@ -103,7 +104,7 @@ public class SettingsProcessor implements HttpRequestHandler {
         }
 
         @Override
-        public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
             TelemetryTask.store(telemetry, TelemetryOrigin.HTTP, TelemetryEvent.HTTP_SETTINGS_READ);
             final Utf8StringSink settings = LV_GET_SINK.get(context);
             settings.clear();
@@ -117,7 +118,7 @@ public class SettingsProcessor implements HttpRequestHandler {
         }
 
         @Override
-        public void resumeSend(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
+        public void resumeSend(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
             final Utf8StringSink settings = LV_GET_SINK.get(context);
             context.simpleResponse().sendStatusJsonContent(HTTP_OK, settings, false);
         }
@@ -140,7 +141,7 @@ public class SettingsProcessor implements HttpRequestHandler {
         }
 
         @Override
-        public void onHeadersReady(HttpConnectionContext context) {
+        public void onHeadersReady(HttpRequestContext context) {
             transientState = LV_POST_STATE.get(context);
             if (transientState == null) {
                 LOG.debug().$("new settings state").$();
@@ -150,7 +151,7 @@ public class SettingsProcessor implements HttpRequestHandler {
         }
 
         @Override
-        public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
+        public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
             try {
                 context.getSecurityContext().authorizeSettings();
 
@@ -170,12 +171,12 @@ public class SettingsProcessor implements HttpRequestHandler {
         }
 
         @Override
-        public void resumeRecv(HttpConnectionContext context) {
+        public void resumeRecv(HttpRequestContext context) {
             transientState = LV_POST_STATE.get(context);
         }
 
         @Override
-        public void resumeSend(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
+        public void resumeSend(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
             transientState.send(context);
         }
 
@@ -188,7 +189,7 @@ public class SettingsProcessor implements HttpRequestHandler {
             }
         }
 
-        private void sendErr(HttpConnectionContext context, Throwable e) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        private void sendErr(HttpRequestContext context, Throwable e) throws PeerDisconnectedException, PeerIsSlowToReadException {
             transientState.clear();
             transientState.setStatusCode(HTTP_BAD_REQUEST);
             final DirectUtf8Sink utf8Sink = transientState.getUtf8Sink();
@@ -196,7 +197,7 @@ public class SettingsProcessor implements HttpRequestHandler {
             transientState.send(context);
         }
 
-        private void sendErr(HttpConnectionContext context, CairoException e) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        private void sendErr(HttpRequestContext context, CairoException e) throws PeerDisconnectedException, PeerIsSlowToReadException {
             transientState.clear();
             transientState.setStatusCode(
                     e.isPreferencesOutOfDateError() ? HTTP_CONFLICT
@@ -208,7 +209,7 @@ public class SettingsProcessor implements HttpRequestHandler {
             transientState.send(context);
         }
 
-        private void sendOk(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        private void sendOk(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
             TelemetryTask.store(telemetry, TelemetryOrigin.HTTP, TelemetryEvent.HTTP_SETTINGS_WRITE);
             transientState.clear();
             transientState.setStatusCode(HTTP_OK);

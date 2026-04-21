@@ -53,6 +53,7 @@ import io.questdb.cutlass.Services;
 import io.questdb.cutlass.http.DefaultHttpContextConfiguration;
 import io.questdb.cutlass.http.DefaultHttpServerConfiguration;
 import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpFullFatServerConfiguration;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHandlerFactory;
@@ -5798,7 +5799,7 @@ public class IODispatcherTest extends AbstractTest {
                     public HttpRequestProcessor select(HttpRequestHeader requestHeader) {
                         return new HttpRequestProcessor() {
                             @Override
-                            public void onHeadersReady(HttpConnectionContext context) {
+                            public void onHeadersReady(HttpRequestContext context) {
                                 HttpRequestHeader headers = context.getRequestHeader();
                                 sink.put(headers.getMethodLine());
                                 sink.put("\r\n");
@@ -5970,7 +5971,7 @@ public class IODispatcherTest extends AbstractTest {
                     public HttpRequestProcessor select(HttpRequestHeader requestHeader) {
                         return new HttpRequestProcessor() {
                             @Override
-                            public void onHeadersReady(HttpConnectionContext context) {
+                            public void onHeadersReady(HttpRequestContext context) {
                                 HttpRequestHeader headers = context.getRequestHeader();
                                 sink.put(headers.getMethodLine());
                                 sink.put("\r\n");
@@ -5984,7 +5985,7 @@ public class IODispatcherTest extends AbstractTest {
                             }
 
                             @Override
-                            public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+                            public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
                                 context.simpleResponse().sendStatusTextContent(200);
                             }
                         };
@@ -6128,7 +6129,7 @@ public class IODispatcherTest extends AbstractTest {
                     public HttpRequestProcessor select(HttpRequestHeader requestHeader) {
                         return new HttpRequestProcessor() {
                             @Override
-                            public void onHeadersReady(HttpConnectionContext connectionContext) {
+                            public void onHeadersReady(HttpRequestContext connectionContext) {
                                 HttpRequestHeader headers = connectionContext.getRequestHeader();
                                 sink.put(headers.getMethodLine());
                                 sink.put("\r\n");
@@ -6789,7 +6790,7 @@ public class IODispatcherTest extends AbstractTest {
 
                             final HttpRequestProcessor processor = new HttpRequestProcessor() {
                                 @Override
-                                public void onHeadersReady(HttpConnectionContext context) {
+                                public void onHeadersReady(HttpRequestContext context) {
                                     HttpRequestHeader headers = context.getRequestHeader();
                                     sink.clear();
                                     sink.put(headers.getMethodLine());

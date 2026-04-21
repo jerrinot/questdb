@@ -84,7 +84,7 @@ public interface HttpRequestProcessor {
     // if a processor desires to write a goodbye letter to the client,
     // it must also send TCP FIN by invoking socket.shutdownWrite()
     default void failRequest(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             HttpException exception
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
     }
@@ -105,27 +105,27 @@ public interface HttpRequestProcessor {
         return false;
     }
 
-    default void onConnectionClosed(HttpConnectionContext context) {
+    default void onConnectionClosed(HttpRequestContext context) {
     }
 
-    default void onHeadersReady(HttpConnectionContext context) throws PeerDisconnectedException {
+    default void onHeadersReady(HttpRequestContext context) throws PeerDisconnectedException {
     }
 
     default void onRequestComplete(
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
     }
 
     default void onRequestRetry(
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
     }
 
-    default void parkRequest(HttpConnectionContext context, boolean pausedQuery) {
+    default void parkRequest(HttpRequestContext context, boolean pausedQuery) {
     }
 
     default boolean processServiceAccountCookie(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             SecurityContext securityContext
     ) throws PeerIsSlowToReadException, PeerDisconnectedException {
         return true;
@@ -139,11 +139,11 @@ public interface HttpRequestProcessor {
         return false;
     }
 
-    default void resumeRecv(HttpConnectionContext context) throws PeerIsSlowToWriteException, ServerDisconnectException, PeerIsSlowToReadException {
+    default void resumeRecv(HttpRequestContext context) throws PeerIsSlowToWriteException, ServerDisconnectException, PeerIsSlowToReadException {
     }
 
     default void resumeSend(
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
     }
 }

@@ -29,6 +29,7 @@ import io.questdb.cutlass.http.ActiveConnectionTracker;
 import io.questdb.cutlass.http.HttpConnectionContext;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.network.PeerDisconnectedException;
 import io.questdb.network.PeerIsSlowToReadException;
@@ -58,13 +59,13 @@ public class LineHttpPingProcessor implements HttpRequestProcessor, HttpRequestH
 
     @Override
     public void onRequestComplete(
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException {
         context.simpleResponse().sendStatusNoContent(204, header);
     }
 
     @Override
-    public void resumeSend(HttpConnectionContext context) throws PeerIsSlowToReadException, PeerDisconnectedException {
+    public void resumeSend(HttpRequestContext context) throws PeerIsSlowToReadException, PeerDisconnectedException {
         context.simpleResponse().sendStatusNoContent(204, header);
     }
 }

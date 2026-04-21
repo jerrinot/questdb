@@ -33,6 +33,7 @@ import io.questdb.cutlass.http.HttpFullFatServerConfiguration;
 import io.questdb.cutlass.http.HttpMultipartContentProcessor;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.cutlass.http.LocalValue;
 import io.questdb.log.Log;
@@ -95,7 +96,7 @@ public class LineHttpProcessorImpl implements HttpMultipartContentProcessor, Htt
     }
 
     @Override
-    public void onConnectionClosed(HttpConnectionContext context) {
+    public void onConnectionClosed(HttpRequestContext context) {
         state = LV.get(context);
         if (state != null) {
             state.onDisconnected();
@@ -103,7 +104,7 @@ public class LineHttpProcessorImpl implements HttpMultipartContentProcessor, Htt
     }
 
     @Override
-    public void onHeadersReady(HttpConnectionContext context) {
+    public void onHeadersReady(HttpRequestContext context) {
         state = LV.get(context);
         if (state == null) {
             state = new LineHttpProcessorState(recvBufferSize, maxResponseContentLength, engine, lineConfiguration);
@@ -173,7 +174,7 @@ public class LineHttpProcessorImpl implements HttpMultipartContentProcessor, Htt
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         state.onMessageComplete();
         if (state.isOk()) {
             state.commit();
@@ -193,13 +194,13 @@ public class LineHttpProcessorImpl implements HttpMultipartContentProcessor, Htt
     }
 
     @Override
-    public void resumeRecv(HttpConnectionContext context) {
+    public void resumeRecv(HttpRequestContext context) {
         state = LV.get(context);
     }
 
     @Override
     public void resumeSend(
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException {
         state = LV.get(context);
         assert state != null;
@@ -222,13 +223,13 @@ public class LineHttpProcessorImpl implements HttpMultipartContentProcessor, Htt
         }
     }
 
-    private void sendErrorContent(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    private void sendErrorContent(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         HttpChunkedResponse response = context.getChunkedResponse();
         state.formatError(response);
         response.sendChunk(true);
     }
 
-    private void sendErrorHeader(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    private void sendErrorHeader(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         HttpChunkedResponse response = context.getChunkedResponse();
         response.status(state.getHttpResponseCode(), CONTENT_TYPE_JSON);
         response.sendHeader();

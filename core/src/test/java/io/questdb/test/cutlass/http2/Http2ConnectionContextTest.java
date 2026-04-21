@@ -248,7 +248,7 @@ public class Http2ConnectionContextTest {
             Assert.assertEquals(Http2FrameType.PING, h.getType());
             Assert.assertTrue(Http2Flags.hasAck(h.getFlags()));
             Assert.assertEquals(8, h.getPayloadLength());
-            Assert.assertEquals(opaque, Unsafe.getUnsafe().getLong(h.getPayloadAddr()));
+            Assert.assertEquals(opaque, Http2FrameReader.readU64(h.getPayloadAddr()));
             Assert.assertEquals(Http2FrameHeader.SIZE + 8, n);
         } finally {
             Unsafe.free(recv, BUF, MemoryTag.NATIVE_DEFAULT);
@@ -691,7 +691,7 @@ public class Http2ConnectionContextTest {
             int n2 = r.tryReadNext(send + n1, written, h, 16_384);
             Assert.assertEquals(Http2FrameType.PING, h.getType());
             Assert.assertTrue(Http2Flags.hasAck(h.getFlags()));
-            Assert.assertEquals(0xABCDL, Unsafe.getUnsafe().getLong(h.getPayloadAddr()));
+            Assert.assertEquals(0xABCDL, Http2FrameReader.readU64(h.getPayloadAddr()));
             Assert.assertEquals(written - send, n1 + n2);
         } finally {
             Unsafe.free(recv, BUF, MemoryTag.NATIVE_DEFAULT);
@@ -729,6 +729,11 @@ public class Http2ConnectionContextTest {
         @Override
         public void onStreamClosed(int streamId, int cause) {
             events.add("closed:" + streamId + ":" + cause);
+        }
+
+        @Override
+        public void onStreamWritable(int streamId) {
+            events.add("writable:" + streamId);
         }
 
         @Override

@@ -14,9 +14,9 @@ boundary to build against.
 1. [Scope](#1-scope)
 2. [Non-Goals](#2-non-goals)
 3. [References](#3-references)
-4. [Layered Architecture](#4-layered-architecture)
+4. [Architecture](#4-architecture)
 5. [Threading Model](#5-threading-model)
-6. [IO Dispatcher and Preface Branching](#6-io-dispatcher-and-preface-branching)
+6. [Preface Detection and Mode Selection](#6-preface-detection-and-mode-selection)
 7. [HttpRequestContext Interface Extraction](#7-httprequestcontext-interface-extraction)
 8. [Per-Stream Request Context](#8-per-stream-request-context)
 9. [Request Reading Path](#9-request-reading-path)
@@ -32,37 +32,64 @@ boundary to build against.
 
 ## 1. Scope
 
-This document specifies how the HTTP/2 stack — the frame codec,
-HPACK codec, and stream state machine — integrates with the rest
-of the QuestDB HTTP server so that existing request processors
-(`HttpRequestProcessor` implementations such as `JsonQueryProcessor`,
-`ExportQueryProcessor`, `TextImportProcessor`, etc.) run unmodified
-over HTTP/2 streams.
+**Pivot note (2026-04-20):** earlier revisions of this doc aimed
+to run the existing `HttpRequestProcessor` surface
+(`JsonQueryProcessor`, `ExportQueryProcessor`,
+`TextImportProcessor`, `HealthCheckProcessor`, ...) unmodified
+over H2. That goal was retired once it became clear that the
+only near-term consumer of H2 is Arrow Flight SQL, which does
+not reuse any of the H1 processor plumbing — gRPC has its own
+framing, its own auth model, its own routing, and its own
+streaming semantics. The H1-mimicry layer
+(`Http2StreamRequestContext`, `Http2ResponseSink`,
+`Http2ChunkedResponse`, `Http2SimpleResponse`,
+`HttpRequestContext` interface extraction, `SimpleResponse`
+interface extraction, `LocalValueMap.release`,
+`HttpRequestProcessorSelector` wiring on H2) is dead weight
+under the new framing and is removed in Wave 4. §7 and §8 of
+this doc describe that layer for historical context only; §15
+reflects the current milestone shape.
+
+The rest of the H2 engine work — frame codec, HPACK codec,
+stream state machine, outbound arena, scheduler, park / resume,
+preface detection — remains load-bearing. It's exactly the
+subset gRPC needs.
+
+This document now specifies how the HTTP/2 stack integrates
+with the rest of the QuestDB HTTP server as the transport
+substrate for gRPC / Arrow Flight SQL handlers. The gRPC
+framing, Flight SQL RPC surface, and handler dispatch are
+described in `FLIGHT_SQL_DESIGN.md`.
 
 Covered:
 
-- The IO layer split: `Http2ConnectionContext` as a pure
-  byte-in / byte-out protocol engine, wrapped by
-  `Http2ServerContext extends IOContext<Http2ServerContext>` that
-  owns the socket, buffers, and dispatcher integration.
-- Preface detection at accept time; how the same `IODispatcher`
-  queue services both HTTP/1.x and HTTP/2 connections.
-- Extracting `HttpRequestContext` as the minimal interface that
-  `HttpRequestProcessor` needs, implemented by both the existing
-  `HttpConnectionContext` and the new per-stream adapter.
-- Per-stream request-context adapter `Http2StreamRequestContext`
-  that presents one HTTP/2 stream to a processor as if it were a
-  dedicated connection.
-- Response writing: `Http2ChunkedResponse` + `Http2ResponseSink`
-  that translate the same processor-facing API shape as
-  `HttpChunkedResponse` into HEADERS / DATA frames subject to
-  per-stream and connection-level flow control.
-- `LocalValue` semantics under multiplexing; park / resume at
-  stream scope rather than connection scope.
+- Extending `HttpConnectionContext` with an H2 mode selected at
+  the first READ event. No new `IOContext` subclass, no dispatcher
+  changes, no accept-time context swap.
+- The preface sniff on the existing HTTP listen socket, gated by
+  a config toggle; lazy allocation of the H2 engine on a positive
+  match. The stream-adapter pool, response sink, and chunked-
+  response adapter are gone — the Flight SQL handler surface
+  binds directly to `Http2StreamListener` / `Http2ConnectionContext`.
+- Pseudo-header capture for `:method`, `:scheme`, `:path`,
+  `:authority`, and `content-type` into per-stream staging so a
+  router can dispatch without touching the H1 request-header
+  type. Full §11 validator work deferred — only the rules the
+  HPACK decoder + stream state machine already enforce hold in
+  this layer.
+- Response writing: direct use of
+  `Http2ConnectionContext.emitResponseHeaders` /
+  `enqueueData` / trailer HEADERS emission by the Flight SQL
+  handler. No adapter layer.
+- Park / resume at stream scope driven by
+  `Http2StreamListener.onStreamWritable` — required for DoGet
+  result-set streaming.
 - Error-class translation (`PeerIsSlowToReadException`,
   `PeerDisconnectedException`, `ServerDisconnectException`) into
   the RST_STREAM / GOAWAY vocabulary from
   `STREAM_STATE_MACHINE.md` §12.
+- TLS + ALPN wiring so Flight SQL clients negotiate `h2` at the
+  TLS layer and skip the preface sniff (Milestone 2).
 
 Not covered here: gRPC framing, Arrow Flight SQL semantics, or
 any Stage 3 dispatch logic. Those live on top of this layer and
@@ -86,6 +113,9 @@ are described in `FLIGHT_SQL_DESIGN.md`.
   that negotiate via ALPN). The 101-Switching-Protocols upgrade
   dance is not supported in M1; may be added in M3 once ALPN is
   wired.
+- **No new `IOContext` subclass for HTTP/2.** `HttpConnectionContext`
+  remains the only HTTP-facing `IOContext`, extended with a mode
+  bit. Rationale in §4.
 
 ## 3. References
 
@@ -96,15 +126,62 @@ are described in `FLIGHT_SQL_DESIGN.md`.
 - `FLIGHT_SQL_DESIGN.md` — Stage boundaries and the Stage 3
   handoff.
 - `core/src/main/java/io/questdb/cutlass/http/HttpConnectionContext.java`
-  — the existing HTTP/1.x IOContext; reference surface that the
-  per-stream adapter must present.
+  — the HTTP/1.x + WebSocket `IOContext`; gains H2 as a third mode.
 - `core/src/main/java/io/questdb/cutlass/http/HttpRequestProcessor.java`
   — the processor interface that becomes
   `HttpRequestContext`-keyed.
+- `core/src/main/java/io/questdb/cutlass/http2/Http2ConnectionContext.java`
+  — the socket-free H2 protocol engine; held by composition on
+  `HttpConnectionContext`.
 
-## 4. Layered Architecture
+## 4. Architecture
 
-Three layers, strictly separated:
+**One `IOContext` per fd; protocol mode selected inline.**
+`HttpConnectionContext` stays the single HTTP-facing `IOContext`
+subclass. It gains a `protocolMode` field with three values
+(`SNIFFING`, `H1`, `H2`) and dispatches inside its
+`handleClientOperation` to either the existing H1 code path, the
+existing WebSocket code path, or a new H2 code path that drives
+the socket-free `Http2ConnectionContext` engine.
+
+No new `IOContext` subclass, no changes to `IODispatcher` /
+`IOContextFactory` / `HttpContextFactory`, no dispatcher context
+swap. The H2 engine and stream-adapter pool live as composed
+fields on `HttpConnectionContext` and are lazy-allocated on a
+successful preface match.
+
+### 4.1 Why this shape
+
+Two in-tree precedents establish the pattern:
+
+1. **pgwire TLS upgrade** — `PGConnectionContext.handleClientOperation`
+   (`PGConnectionContext.java:382-398`) runs `handleTlsRequest()`
+   inline, flips `tlsSessionStarting`, calls
+   `socket.startTlsSession(null)` on the same fd, and keeps going.
+   One class, no IOContext swap, mode bit tracks the phase.
+2. **HTTP WebSocket upgrade** — `HttpConnectionContext.switchProtocol`
+   (`HttpConnectionContext.java:463-466`) flips
+   `isProtocolSwitched` and stores the resume handler id;
+   `handleClientRecv` branches on the bit at the top
+   (`HttpConnectionContext.java:962-966`). One class, no new
+   `IOContext`.
+
+Every cutlass `IOContext` subclass is a fat class that owns its
+fd's full protocol state (HTTP 1221 lines, pgwire 1899 lines, ILP
+444 lines). None of them splits a dispatcher-facing shell from a
+protocol engine via composition. Option A follows that pattern;
+it is both the lowest-friction path and the idiomatic one.
+
+The alternative considered — a shell class owning two engines via
+composition — was rejected because (a) it has no in-tree
+precedent, (b) the dispatcher's self-typed
+`IODispatcher<C extends IOContext<C>>` generic forbids hosting
+two distinct `IOContext` subclasses under a common supertype
+without a refactor, and (c) the `FLIGHT_SQL_DESIGN.md` §2
+requirement "one port, one I/O stack" forces shared-port anyway,
+which is exactly what in-class mode switching is for.
+
+### 4.2 Layering
 
 ```
 +----------------------------------------------------------+
@@ -115,67 +192,175 @@ Three layers, strictly separated:
                           |  HttpRequestContext interface
                           v
 +----------------------------------------------------------+
-| Per-stream adapter layer (new)                           |
+| Per-stream adapter layer (new; H2 only)                  |
 | Http2StreamRequestContext                                |
 |  - implements HttpRequestContext                         |
-|  - owns per-stream request header view, body buffer,     |
-|    response sink, LocalValueMap, park/resume slot        |
+|  - per-stream header view, LocalValueMap,                |
+|    SecurityContext, response sink, handlerId,            |
+|    park/resume slot                                      |
 +----------------------------------------------------------+
-                          |  Http2StreamListener
+                          |  Http2StreamListener (in-class impl)
                           v
 +----------------------------------------------------------+
 | Protocol core (STREAM_STATE_MACHINE.md)                  |
-| Http2ConnectionContext                                   |
-|  - byte-in / byte-out                                    |
+| Http2ConnectionContext (io.questdb.cutlass.http2)        |
+|  - socket-free, byte-in / byte-out                       |
 |  - drives Http2StreamListener per frame                  |
-|  - NO socket, NO dispatcher reference                    |
 +----------------------------------------------------------+
-                          |  processReceivedBytes(addr,len)
-                          |  writePending(addr,cap)
+                          |  processReceivedBytes / writePending
+                          |  / onBytesConsumed
                           v
 +----------------------------------------------------------+
-| IO wrapper (new)                                         |
-| Http2ServerContext extends IOContext<Http2ServerContext> |
-|  - owns socket, native receive/send buffers              |
-|  - owns the Http2ConnectionContext + stream adapters     |
-|  - handleClientOperation(READ/WRITE/HEARTBEAT)           |
+| IOContext (existing, extended)                           |
+| HttpConnectionContext                                    |
+|  - owns socket, recv/send buffers                        |
+|  - protocolMode: SNIFFING | H1 | H2 (+ isProtocolSwitched|
+|    for WebSocket, preserved)                             |
+|  - H1: existing parsers, response sink, dispatch         |
+|  - H2: Http2ConnectionContext, adapter pool,             |
+|    parked-streams set, pending-ops queue, H2 send buffer |
 +----------------------------------------------------------+
                           |
                           v
-                  IODispatcher, HttpServer
+                  IODispatcher (unchanged), HttpServer (unchanged)
 ```
 
-**Why the protocol core stays socket-less.** HTTP/2 has a dense
-set of edge cases around flow-control accounting, HPACK dynamic-
-table coherence after malformed blocks, per-stream state machine
-transitions, content-length pre-dispatch suppression, and
+**Why `Http2ConnectionContext` stays socket-free.** HTTP/2 has a
+dense set of edge cases around flow-control accounting, HPACK
+dynamic-table coherence after malformed blocks, per-stream state
+machine transitions, content-length pre-dispatch suppression, and
 deferred-credit settlement. `STREAM_STATE_MACHINE.md` §13 lists
 dozens of regression tests that craft exact byte sequences and
-assert on internal state at frame granularity. Running those tests
-through real sockets adds TCP buffering, worker scheduling, and
-flake risk for no benefit. Keeping `Http2ConnectionContext`
-socket-free makes the tests deterministic and single-threaded.
+assert on internal state at frame granularity. Running those
+tests through real sockets adds TCP buffering, worker scheduling,
+and flake risk for no benefit. Keeping the engine socket-free
+makes the tests deterministic and single-threaded, and the
+`HttpConnectionContext` shell is thin enough that the boundary
+between "holds the fd" and "drives the protocol" stays clean by
+structure, not by discipline alone.
 
-**Why the wrapper is real code, not a convention.** If
-`Http2ConnectionContext` directly extended `IOContext`, the
-socket-free property would rely on "don't call socket APIs from
-inside the protocol engine" — a discipline, not a constraint.
-Splitting the class physically makes the boundary a compile-time
-check: `Http2ConnectionContext` has no socket field, so it cannot
-touch one.
+### 4.3 Class inventory
 
-**Class inventory** (all new unless noted):
+| File                             | Status          | Purpose                                                                                                                                                                                                                                                                                                                                               |
+|----------------------------------|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `HttpConnectionContext.java`     | extended        | Adds `protocolMode` state, preface sniff, lazy H2 engine + adapter pool + H2 send buffer, H2 listener implementation, parked-streams set, pending-ops queue.                                                                                                                                                                                          |
+| `Http2ConnectionContext.java`    | extended        | Gains the response-emission / outbound scheduling surface listed in §4.4. The M1 engine covers inbound framing + HPACK + stream state + WINDOW_UPDATE accounting; response HEADERS encoding, outbound DATA tuple queuing, the per-connection round-robin scheduler, and the `onStreamWritable` listener callback are net-new work for this milestone. |
+| `Http2StreamRequestContext.java` | new             | Per-stream adapter implementing `HttpRequestContext`. Pooled on `HttpConnectionContext`, sized to `SETTINGS_MAX_CONCURRENT_STREAMS` (§8).                                                                                                                                                                                                             |
+| `Http2RequestHeader.java`        | new             | Implements `HttpRequestHeader` on top of the pseudo-header slots from `Http2RequestHeadersView` plus the per-stream staged regular-header tuple table. Parses `:path` into URL + query, maps `:method` to `isGetRequest`/`isPostRequest`/`isPutRequest`, resolves `content-length` / `content-type` / `host` / arbitrary header lookup. See §8.       |
+| `Http2ResponseSink.java`         | new             | Buffered response-header + body emitter. Converts the `HttpResponseSink`-shaped API into HEADERS (via `HpackEncoder`) + DATA frames bounded by per-stream / connection windows.                                                                                                                                                                       |
+| `Http2ChunkedResponse.java`      | new             | Thin wrapper over `Http2ResponseSink` presenting the `HttpChunkedResponse` surface processors already use.                                                                                                                                                                                                                                            |
+| `Http2RequestHeadersView.java`   | existing        | Exposes captured pseudo-headers (address / length). Remains the stream-listener-facing view; `Http2RequestHeader` above wraps it for processor consumption.                                                                                                                                                                                           |
+| `Http2StreamListener.java`       | extended        | Gains `onStreamWritable(int streamId)` so the adapter can resume streams whose outbound window cleared (§10).                                                                                                                                                                                                                                         |
+| `HttpRequestContext.java`        | new (interface) | Extracted from `HttpConnectionContext`; §7 below.                                                                                                                                                                                                                                                                                                     |
 
-| File                                         | Purpose                                                                                             |
-|----------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `Http2ServerContext.java`                    | `IOContext<Http2ServerContext>`. Owns socket + receive/send buffers + `Http2ConnectionContext`. Its `handleClientOperation` is the boundary between network and protocol. |
-| `Http2ServerConnectionFactory.java`          | Creates `Http2ServerContext` instances, sized per configuration. Registered with `IODispatcher` via the branch in §6. |
-| `Http2StreamRequestContext.java`             | Per-stream adapter implementing `HttpRequestContext`. Pooled inside `Http2ServerContext`, sized exactly to the configured inbound `SETTINGS_MAX_CONCURRENT_STREAMS` so every LIVE stream slot in `Http2StreamPool` has a paired adapter (§8 below). |
-| `Http2StreamRequestContextListener.java`     | Implementation of `Http2StreamListener` that the server context hands to `Http2ConnectionContext`. Maps stream events to adapter lifecycle. |
-| `Http2ResponseSink.java`                     | Buffered response-header + body emitter. Converts the `HttpResponseSink`-shaped API into HEADERS (via `HpackEncoder`) + DATA frames bounded by per-stream / connection windows. |
-| `Http2ChunkedResponse.java`                  | Thin wrapper over `Http2ResponseSink` presenting the `HttpChunkedResponse` surface processors already use. |
-| `Http2RequestHeaderView.java` (existing)     | Already in the tree — exposes captured pseudo-headers plus staged regular headers as `HttpRequestHeader`-shaped lookups. |
-| `HttpRequestContext.java` (refactor)         | Extracted interface that was `HttpConnectionContext`; §7 below. |
+No `Http2ServerContext`, no `Http2ServerConnectionFactory`, no
+`HttpServerContext` common supertype. The `IODispatcher` and
+`HttpContextFactory` wiring at `HttpServer.java:104, 409` is
+untouched.
+
+### 4.4 New `Http2ConnectionContext` APIs
+
+The engine today
+(`Http2ConnectionContext.java:346, 400, 310, 193`) exposes
+`processReceivedBytes` / `writePending` / `onBytesConsumed` /
+`emitInitialSettings` and drains a small queue of control frames
+(SETTINGS_ACK, PING_ACK, GOAWAY, RST_STREAM, WINDOW_UPDATE)
+through `writePending`. There is no public response path yet.
+M1 adds:
+
+- **Response HEADERS emit.** A method with this shape (names
+  indicative):
+
+  ```java
+  // Returns 0 on success, a negative error code on generation
+  // mismatch, stream-closed, or header-list-size overrun.
+  int emitResponseHeaders(
+          int streamId,
+          int generation,
+          Http2HeadersWriter writer,  // callback with HpackEncoder
+          boolean endStream);
+
+  @FunctionalInterface
+  interface Http2HeadersWriter {
+      // Called once with the encoder already inside an open
+      // block on engine-owned scratch. The writer appends the
+      // response's headers (status pseudo-header first, then
+      // regular headers) by calling HpackEncoder.encode(...),
+      // threading the returned cursor through each put, and
+      // returning the final cursor (or -1 on scratch overflow).
+      // Must not retain the encoder reference past the callback
+      // and must not call beginBlock / endBlock.
+      long write(HpackEncoder encoder, long cursor, long limit);
+  }
+  ```
+
+  `HpackEncoder.encode(...)` is cursor-stateless by design (see
+  `HPACK_CODEC.md`), so the writer threads `cursor` and `limit`
+  through each `encode` call and returns the final cursor rather
+  than relying on encoder-internal position state.
+
+  The engine serialises access to the shared `HpackEncoder`
+  (one instance per connection; its dynamic table must advance
+  in a deterministic order — see §10), encodes the block into
+  engine-owned storage (not the caller's buffer), splits the
+  encoded bytes across HEADERS + CONTINUATION by peer
+  `MAX_FRAME_SIZE`, and hands the framed bytes to the outbound
+  scheduler on `streamId`.
+- **Outbound DATA tuple enqueue.** A method
+  `enqueueData(streamId, generation, payloadAddr, payloadLen,
+  endStream)` that appends a tuple to the stream's outbound
+  queue inside the existing `Http2Stream`. Fails on window
+  overflow beyond the per-stream queue cap (§10).
+
+  **Ownership on enqueue.** Tuples point at bytes the engine
+  must keep valid until the scheduler frames them. Caller-owned
+  sink buffers are about to be reused by the next write, so one
+  of the following must hold:
+
+    1. **Engine copies on enqueue** into a per-stream outbound
+       arena owned by `Http2Stream`. Simplest; pays one memcpy
+       per enqueue. Under zero-window conditions the arena is
+       bounded by the per-stream queue cap (§10), so memory is
+       predictable.
+    2. **Sink hand-off with ownership transfer.**
+       `Http2ResponseSink` holds a small ring of output chunks
+       (two or three chunk-sized native buffers); each `flush`
+       passes the current chunk's `(addr, len)` to `enqueueData`
+       and rotates to the next free ring slot. The engine
+       releases the chunk back to the sink's ring when the
+       scheduler has emitted the last DATA frame that referenced
+       it. No copy, but needs explicit "release" callback and
+       ring-slot accounting.
+
+  **M1 picks option 1** (copy-on-enqueue). It keeps the engine
+  self-contained, avoids a new release path on the sink, and
+  the extra memcpy is small vs. the socket write that follows.
+  M2 may revisit once real throughput numbers are in. The
+  same rule applies to HEADERS / CONTINUATION bytes emitted
+  below: `emitResponseHeaders` copies the encoded block into
+  engine-owned storage before returning, so the caller's
+  encoder buffer is free to re-use.
+- **Round-robin outbound scheduler.** `writePending` grows to
+  drain the control-frame queue first, then walk the set of
+  streams with queued outbound tuples + non-zero stream and
+  connection windows in round-robin order, emitting DATA frames
+  up to `peerMaxFrameSize` and up to available windows, until
+  either the send buffer fills or no stream is eligible. The
+  scheduler's "which stream is next" cursor is connection-
+  scoped per `STREAM_STATE_MACHINE.md` §7.
+- **`onStreamWritable` callback.** After a WINDOW_UPDATE applies
+  (connection- or stream-scoped), streams whose outbound queue
+  was parked above the per-stream cap and is now below fire the
+  new listener callback exactly once per transition. Firing
+  condition is specified in the open question in §16.
+- **Preface consumption hook.** The engine assumes frames from
+  the first byte; the connection-layer preface drain stays
+  outside it (§6.2 below).
+
+These additions are **not optional shims** — the integration
+can't proceed past M1 step 6 without them. They are scoped into
+M1's build order as step 4 (lazy H2 engine) and step 6
+(response sink) in §15.4.
 
 ## 5. Threading Model
 
@@ -189,8 +374,9 @@ integration layer has to preserve.
 
 1. **One owner worker per connection at any instant.** The
    `IODispatcher` guarantees that only one worker ever calls
-   `Http2ServerContext.handleClientOperation(...)` for a given
-   context at the same time.
+   `HttpConnectionContext.handleClientOperation(...)` for a given
+   context at the same time. Same invariant as today; nothing in
+   the H2 mode weakens it.
 2. **`Http2ConnectionContext` is single-threaded by contract**
    (`STREAM_STATE_MACHINE.md` §4, §10). Every mutation — frame
    read, frame emit, SETTINGS apply, stream-pool slot change,
@@ -213,11 +399,11 @@ integration layer has to preserve.
 **Worker migration.** When a stream parks on
 `PeerIsSlowToReadException`, the dispatcher re-queues the
 connection for WRITE; a different worker may pick up the next
-event. The `Http2ServerContext` travels with the connection as a
-unit — the adapter pool, the parked-streams map, the HPACK
-codecs, everything — because it's one `IOContext` object that the
-dispatcher hands around. The new worker resolves the right
-processor instance via
+event. The `HttpConnectionContext` travels with the connection
+as a unit — the adapter pool, the parked-streams map, the HPACK
+codecs, the pending-ops queue — because it's one `IOContext`
+object that the dispatcher hands around. The new worker resolves
+the right processor instance via
 `HttpRequestProcessorSelector.resolveProcessorById`, exactly like
 HTTP/1.x (§12). The adapter must hold **only** the processor's
 handler id (an `int`), not a reference to any one worker's
@@ -228,11 +414,11 @@ instance after migration.
 may process events for many streams in arbitrary order (DATA on
 stream 3, HEADERS on stream 5, WINDOW_UPDATE on stream 1, etc.
 — the frame reader's output). The adapter must therefore treat
-every stream as independent state: its `LocalValueMap` is per-
-stream (§11), its `SecurityContext` is per-stream (§13), its
+every stream as independent state: its `LocalValueMap` is
+per-stream (§11), its `SecurityContext` is per-stream (§13), its
 deferred-credit counter (`Http2Stream.outstandingInboundCredit`)
-is per-stream, and its generation-token identity-guard is per-
-stream (§7 step 6 of the state-machine doc).
+is per-stream, and its generation-token identity-guard is
+per-stream (§7 step 6 of the state-machine doc).
 
 **Foreign-thread marshalling — the critical case.** A processor
 that returns `false` from the adapter's body-consumption callback
@@ -244,18 +430,19 @@ directly — that would mutate context state from outside the
 owner worker, corrupting the flow-control windows, the coalescing
 credit counter, and the outbound frame queue. Instead:
 
-- `Http2ServerContext` exposes a thread-safe
-  `MPSC`-style **pending-ops queue**. Each stream may contribute
-  multiple entries over its lifetime — `outstandingInboundCredit`
-  accumulates across successive `onData` calls that return `false`,
-  so a handler may produce one ack per offloaded chunk rather
-  than one per stream. The queue is bounded (say, 4 ×
-  `MAX_CONCURRENT_STREAMS` slots — open question §16 on the exact
-  bound); if a foreign thread finds the queue full it falls back
-  to a blocking enqueue until the owner worker drains, which
-  naturally backpressures the offload pipeline. The worker-thread
-  ack pushes an entry `{streamId, generationToken, n}` and signals
-  the dispatcher to wake the connection.
+- `HttpConnectionContext` exposes a thread-safe `MPSC`-style
+  **pending-ops queue**. Each stream may contribute multiple
+  entries over its lifetime — `outstandingInboundCredit`
+  accumulates across successive `onData` calls that return
+  `false`, so a handler may produce one ack per offloaded chunk
+  rather than one per stream. The queue is bounded (say,
+  4 × `MAX_CONCURRENT_STREAMS` slots — open question on the
+  exact bound); if a foreign thread finds the queue full it
+  falls back to a blocking enqueue until the owner worker
+  drains, which naturally backpressures the offload pipeline.
+  The worker-thread ack pushes an entry
+  `{streamId, generationToken, n}` and signals the dispatcher
+  to wake the connection.
 - On the next owner-worker tick, `handleClientOperation` drains
   the pending-ops queue **before** reading bytes; each entry
   turns into a `Http2ConnectionContext.onBytesConsumed(streamId,
@@ -268,12 +455,12 @@ credit counter, and the outbound frame queue. Instead:
 
 The same marshalling rule applies to any async response-write
 path: a processor that asynchronously produces response bytes
-must push them (or a "please call resumeSend") onto the pending-
-ops queue, not write them directly from the producing thread.
-In practice, M1 and M2 processors are all synchronous inside the
-IO tick (they may block on CairoEngine work, but they do so on
-the owner worker), and the only foreign-thread case is deferred
-body consumption.
+must push them (or a "please call resumeSend") onto the
+pending-ops queue, not write them directly from the producing
+thread. In practice, M1 and M2 processors are all synchronous
+inside the IO tick (they may block on CairoEngine work, but they
+do so on the owner worker), and the only foreign-thread case is
+deferred body consumption.
 
 **Race-free stream close.** `onStreamClosed` fires on the owner
 worker as part of state-machine transition processing. The
@@ -283,75 +470,222 @@ longer matches the (now-bumped) `Http2Stream.generation` is
 silently dropped on drain — the same guard as §7 step 6 of the
 state-machine doc.
 
-## 6. IO Dispatcher and Preface Branching
+## 6. Preface Detection and Mode Selection
 
-One TCP listen socket, one `IODispatcher`, two IOContext types
-behind a common supertype.
+One TCP listen socket, one `IODispatcher`, one `IOContext`
+subclass. Protocol mode is decided on first READ, inside
+`HttpConnectionContext.handleClientOperation`.
 
 RFC 9113 sec. 3.4: an HTTP/2 client with prior knowledge opens
 the TCP connection and sends the 24-byte preface
-`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` as its first bytes, before any
-frames. An HTTP/1.x client sends `METHOD path HTTP/1.x\r\n...`.
-These are disjoint on the first byte range.
+`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` as its first bytes, before
+any frames. An HTTP/1.x client sends
+`METHOD path HTTP/1.x\r\n...`. The first four bytes (`PRI ` vs
+any H1 method token) are disjoint; the 24-byte full match rules
+out accidental matches from pathological H1 requests.
 
-**Branch point.** Define `HttpServerContext` as the common
-supertype for both:
+### 6.1 State
 
-```java
-public abstract class HttpServerContext<C extends HttpServerContext<C>>
-        extends IOContext<C> {
-    // shared: peer address, auth state, metrics bindings
-}
+A new `byte protocolMode` field on `HttpConnectionContext`:
 
-public class HttpConnectionContext
-        extends HttpServerContext<HttpConnectionContext> { ... }
-
-public final class Http2ServerContext
-        extends HttpServerContext<Http2ServerContext> { ... }
+```
+MODE_SNIFFING           = 0  // initial — peek on next READ decides
+MODE_H1                 = 1  // HTTP/1.x (covers the WebSocket upgrade
+                             //   path via the existing `isProtocolSwitched`)
+MODE_H2_PREFACE_PENDING = 2  // H2 selected (sniff match, dedicated port,
+                             //   or ALPN); 24-byte client preface not yet
+                             //   drained
+MODE_H2                 = 3  // H2 active, preface drained, frames only
 ```
 
-The accept flow:
+`MODE_H2_PREFACE_PENDING` is required because **every HTTP/2
+connection sends the 24-byte client preface regardless of how
+the protocol was selected** (RFC 9113 §3.4: "The client MUST send
+the client connection preface as the first application data
+octets of a connection"). Skipping the sniff on a dedicated H2
+port or under ALPN skips *detection*, not the preface itself;
+the engine still cannot be handed bytes until those 24 octets
+are consumed.
 
-1. `IODispatcher` accepts, hands the socket to a
-   **preface-sniffing IOContext** (`HttpServerStartContext`,
-   short-lived).
-2. First READ event: `Net.peek(fd, scratch, 24)` — QuestDB's
-   socket layer wraps `MSG_PEEK`, so this reads up to 24 bytes
-   without consuming them from the socket buffer. Three outcomes:
-   - Fewer than 24 bytes available and what arrived is a proper
-     prefix of the preface (`PRI`, `PRI `, …): return to the
-     dispatcher and wait for the next READ event; try peek
-     again.
-   - 24 bytes available, full match against the preface: swap
-     the context for `Http2ServerContext`. The preface bytes
-     stay in the socket buffer and the H2 context's first
-     `recv` consumes them naturally — no handoff required.
-   - Anything else: swap for `HttpConnectionContext`. The H1
-     parser's first `recv` picks up the bytes from the socket
-     buffer, also without a handoff.
-3. Both successor contexts are `IOContext` subtypes, so
-   `IODispatcher<HttpServerContext>` routes `handleClientOperation`
-   events uniformly.
+Transitions:
 
-The swap requires an `IOContext` handle that the dispatcher can
-replace in place. The existing dispatcher supports this via
-`context.reshuffle(...)` or similar (confirm when wiring — open
-question §16); if not, the alternative is to have a single
-`HttpServerContext` that internally holds either an HTTP/1.x
-parser or an H2 engine, with the choice made on first-byte
-inspection and sticky thereafter. Both shapes work; pick whichever
-fits the existing dispatcher API with the least disruption.
+```
+SNIFFING --peek match--> H2_PREFACE_PENDING --24 bytes drained--> H2
+SNIFFING --peek miss--->  H1
+doInit() (dedicated H2 port / ALPN=h2) --> H2_PREFACE_PENDING
+doInit() (ALPN=http/1.1)               --> H1
+```
 
-**No 101 Upgrade in M1.** Pure HTTP/2 prior-knowledge only, which
-is what `curl --http2-prior-knowledge` and every gRPC client use.
-M3 may add the `Upgrade: h2c` handshake if a real caller needs
-it.
+All H2 code paths flow through `H2_PREFACE_PENDING` once; it is
+not a shared-port-only optimisation. The existing
+`isProtocolSwitched` bit stays and continues to be orthogonal to
+`protocolMode`; WebSocket can only activate from `MODE_H1`.
 
-**TLS / ALPN** (M3). The TLS layer selects `h2` or `http/1.1` via
-ALPN before any bytes reach this branch; the dispatcher's socket
-wrapper exposes the negotiated protocol, and the branch uses that
-directly instead of the preface sniff. For M1 / M2 we stay on
-cleartext.
+A small (24-byte) native scratch buffer `peekScratchAddr` is
+allocated in `doInit()` alongside the existing buffers. Freed in
+`close()`.
+
+### 6.2 Sniff logic
+
+At the top of `handleClientOperation`:
+
+```java
+if(protocolMode ==MODE_SNIFFING){
+
+sniffAndSelectMode();               // may throw to re-register for READ
+}
+        if(protocolMode ==MODE_H2_PREFACE_PENDING){
+
+drainH2Preface();                   // may throw to re-register for READ
+// drainH2Preface transitions to MODE_H2 once 24 bytes are consumed;
+// also lazy-allocates the H2 engine + adapter pool + H2 send buffer
+// and emits the initial SETTINGS.
+}
+        return switch(protocolMode){
+        case MODE_H1 ->
+
+handleH1Operation(op, selector, resched);  // existing body
+    case MODE_H2 ->
+
+handleH2Operation(op, selector, resched);  // new
+
+default      ->throw
+
+registerDispatcherDisconnect(DISCONNECT_REASON_UNKNOWN_OPERATION);
+};
+```
+
+`sniffAndSelectMode()` uses
+`NetworkFacade.peekRaw(socket.getFd(), peekScratchAddr, 24)`
+(`NetworkFacadeImpl.java:183` — wraps `MSG_PEEK`). Outcomes:
+
+| Peek result                       | Action                                                                                                                                                               |
+|-----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `< 0` (error / disconnect)        | `throw registerDispatcherDisconnect(DISCONNECT_REASON_PEER_DISCONNECT_AT_HEADER_RECV)`.                                                                              |
+| `0` (no bytes yet)                | `throw registerDispatcherRead()` — identical idiom to `HttpConnectionContext.java:991`.                                                                              |
+| `1..23`, proper prefix of preface | `throw registerDispatcherRead()` — wait for more bytes; next READ re-runs the sniff.                                                                                 |
+| `>= 24`, full preface match       | `protocolMode = MODE_H2_PREFACE_PENDING`; return to `handleClientOperation`, which proceeds to `drainH2Preface()` below.                                             |
+| anything else                     | `protocolMode = MODE_H1`; fall through to the existing H1 path. Peeked bytes stay in the kernel socket buffer and the H1 parser's first `socket.recv` consumes them. |
+
+`sniffAndSelectMode` does not itself drain the preface or
+allocate the H2 engine. It only classifies the connection.
+All H2 setup — drain, engine allocation, initial SETTINGS —
+lives in `drainH2Preface`, which also runs unmodified on
+dedicated-port and ALPN paths that never see the sniff.
+
+**Preface drain (`drainH2Preface`).**
+`Http2ConnectionContext.processReceivedBytes` starts frame
+parsing from the first byte; it does not recognise the 24-byte
+preface (`HTTP2_FRAME_CODEC.md` §7 explicitly says to consume
+it before handing bytes off).
+`drainH2Preface` is the single chokepoint where this happens,
+reached from three distinct entry conditions:
+
+- **Shared-port sniff.** `sniffAndSelectMode` set
+  `MODE_H2_PREFACE_PENDING` after matching the preface bytes
+  via `MSG_PEEK`.
+- **Dedicated H2 port.** `doInit()` set
+  `MODE_H2_PREFACE_PENDING` eagerly based on the listener's
+  configured protocol; no peek ran. The client still sends the
+  preface as its first bytes.
+- **TLS + ALPN (M3).** `doInit()` after `startTlsSession`
+  completes and ALPN returns `h2` sets
+  `MODE_H2_PREFACE_PENDING`; the TLS layer has handed the
+  connection off without peeking. Again, the client's first
+  plaintext bytes are the preface.
+
+The drain itself:
+
+```java
+// Consume exactly 24 bytes from the socket, matching each byte
+// against the fixed preface. Mismatch on any byte is a protocol
+// error (someone opened H2 port / negotiated ALPN=h2 but then
+// sent non-preface bytes).
+int drained = h2PrefaceBytesDrained;  // persisted across ticks
+while(drained< 24){
+int n = socket.recv(peekScratchAddr + drained, 24 - drained);
+    if(n< 0)throw
+
+registerDispatcherDisconnect(DISCONNECT_REASON_PEER_DISCONNECT_AT_HEADER_RECV);
+    if(n ==0){
+// Not enough bytes yet. Persist progress, wait for READ.
+h2PrefaceBytesDrained =drained;
+        throw
+
+registerDispatcherRead();
+    }
+            // Validate each byte against PREFACE[drained .. drained+n).
+            if(!
+
+matchesPreface(peekScratchAddr +drained, n, drained)){
+        throw
+
+registerDispatcherDisconnect(DISCONNECT_REASON_PROTOCOL_VIOLATION);
+    }
+drained +=n;
+}
+h2PrefaceBytesDrained =24;
+
+allocateH2EngineIfNeeded();      // lazy: h2, adapter pool, send buffer
+h2.
+
+emitInitialSettings(sendBuffer, sendBufferLimit);
+
+protocolMode =MODE_H2;
+```
+
+The validation step on every recv byte catches cases where the
+peek is absent (dedicated port / ALPN) and the client
+misbehaves, as well as partial-preface failures where the sniff
+saw fewer than 24 bytes. `peekScratchAddr` doubles as the drain
+buffer; the bytes are discarded once consumed.
+
+The H1 path needs no equivalent drain — its parser reads from
+the first byte, and the peek was non-consuming, so the bytes
+are still in the kernel buffer waiting for the H1 parser's
+first `socket.recv`.
+
+**TLS caveat verified.** `Socket` (`Socket.java:85-96`) exposes
+`recv`/`send` only; `peek` is raw-fd via `Net.peek`. Under TLS
+the peek would return encrypted bytes, so preface sniffing is
+plaintext-only. M3 replaces the sniff with ALPN-driven mode
+selection: after `socket.startTlsSession` completes, the
+negotiated protocol is read off the socket and `protocolMode` is
+set directly, bypassing the peek.
+
+### 6.3 Config gate
+
+The sniff costs one `peek` syscall on the first READ of every
+connection. A new `http.h2.enabled` config key (default `false`
+until M2 stabilises) short-circuits the sniff to `MODE_H1` when
+false. This also serves as the kill-switch for deployments that
+do not want H2 enabled.
+
+A dedicated H2 port (optional per `FLIGHT_SQL_DESIGN.md` §9 Q1)
+does **not** require a new class. The shared-port deployment
+uses the preface sniff as above; a strict-isolation deployment
+that runs a second `HttpServer` on a dedicated port can set
+`protocolMode = MODE_H2_PREFACE_PENDING` eagerly in `doInit()`
+(gated by the port's configuration), skipping the sniff but
+**not** skipping `drainH2Preface` — the client still sends the
+24-byte preface first. Same class, same code, different
+trigger. This is also how ALPN is wired in M3.
+
+### 6.4 What stays unchanged
+
+- `IODispatcher`, `AbstractIODispatcher`, `IODispatcherLinux/Osx/Windows`.
+- `IOContext`, `IOContextFactory`, `IOContextFactoryImpl`.
+- `HttpContextFactory` at `HttpServer.java:409`.
+- `IORequestProcessor` wiring at `HttpServer.java:115-117`.
+- `HttpRequestProcessorSelector`.
+- The H1 / WebSocket code paths inside `handleClientRecv` /
+  `handleClientSend` (`HttpConnectionContext.java:962-1129`) —
+  they become the `MODE_H1` branch.
+
+No 101 Upgrade in M1 / M2. Pure HTTP/2 prior-knowledge only,
+which is what `curl --http2-prior-knowledge` and every gRPC
+client use. M3 may add the `Upgrade: h2c` handshake if a real
+caller needs it.
 
 ## 7. HttpRequestContext Interface Extraction
 
@@ -359,89 +693,267 @@ Currently `HttpRequestProcessor` takes `HttpConnectionContext`:
 
 ```java
 void onHeadersReady(HttpConnectionContext context);
+
 void onRequestComplete(HttpConnectionContext context);
+
 void resumeSend(HttpConnectionContext context);
 // ... etc
 ```
 
-This ties every processor to the HTTP/1.x context type. For
+This ties every processor to the outer IOContext. For
 multiplexed HTTP/2 we need processors to operate on a per-stream
 handle. The refactor extracts the surface that processors
 actually use into `HttpRequestContext`:
 
 ```java
-// Retry already extends Closeable; Locality is the LocalValue anchor
-public interface HttpRequestContext extends Locality, Retry {
+// Locality is the LocalValue anchor. Retry is NOT on this
+// interface — see "Retries and WaitProcessor" below.
+public interface HttpRequestContext extends Locality {
     HttpRequestHeader getRequestHeader();
+
     HttpResponseHeader getResponseHeader();
+
     HttpChunkedResponse getChunkedResponse();
-    HttpRawSocket getRawResponseSocket();
+
+    SimpleResponse simpleResponse();                          // new interface — see below
+
+    HttpRawSocket getRawResponseSocket();                     // null in H2 mode; see §10
+
+    void resumeResponseSend() throws PeerIsSlowToReadException, PeerDisconnectedException;
 
     LocalValueMap getMap();             // LocalValue storage
+
     SecurityContext getSecurityContext();
+
     NetworkSqlExecutionCircuitBreaker getCircuitBreaker();
+
+    NetworkSqlExecutionCircuitBreaker getOrCreateCircuitBreaker(CairoEngine engine);
+
     HttpCookieHandler getCookieHandler();
+
     CharSequenceObjHashMap<CharSequence> getParsedCookiesMap();
+
     Metrics getMetrics();
+
     RejectProcessor getRejectProcessor();
 
     // SqlExecutionContext accessors used by query processors
     SqlExecutionContextImpl getOrCreateSqlExecutionContext(
             CairoEngine engine, int workerCount);
+
     SqlExecutionContextImpl getSqlExecutionContext();
+
     AssociativeCache<RecordCursorFactory> getSelectCache();
 
-    // Connection-scope bookkeeping that the processors read
+    // Connection / request bookkeeping the processors read
     long getFd();                       // for log correlation
+
     long getTotalBytesSent();
+
     long getTotalReceived();
-    RetryAttemptAttributes getAttemptDetails();
+
+    long getLastRequestBytesSent();     // per-request counter, used by metrics
+
+    int getNCompletedRequests();        // per-connection counter, used by metrics
+
+    // Per-request counters consumed by query processors for timing / trace
+    long getAuthenticationNanos();      // JsonQueryProcessorState.java:1271
+
+    @NotNull
+    StringSink getSessionIdSink();  // JsonQueryProcessor.java:865
 }
 ```
 
-Both `HttpConnectionContext` and `Http2StreamRequestContext`
-implement this interface. The processor interface becomes:
+The surface is wider than a minimal "protocol-adaptation"
+interface because real processors reach into connection and
+response state beyond the request / response header pair.
+Verified callers that drive the method list:
+
+- `LineHttpPingProcessor.java:63` calls `context.simpleResponse()`.
+- `SqlValidationProcessor.java:164` calls `resumeResponseSend()`
+  and `getOrCreateCircuitBreaker()`.
+- `SqlValidationProcessor.java:477` reads
+  `getLastRequestBytesSent()` and `getNCompletedRequests()` for
+  metrics.
+- `StaticContentProcessor.java:180, 182` calls
+  `resumeResponseSend()` and `getRawResponseSocket()`.
+- `JsonQueryProcessor.java:865` reads `getSessionIdSink()`.
+- `JsonQueryProcessorState.java:1271` reads
+  `getAuthenticationNanos()`.
+
+Every additional method on the interface is a real call-site in
+the existing processor tree, not speculative breadth.
+
+**`SimpleResponse` extraction.** Today the simple-response path
+returns `HttpResponseSink.SimpleResponseImpl`
+(`HttpResponseSink.java:712`), a **non-static inner class** on
+the H1 sink that emits `HTTP/1.1 ` status lines directly through
+H1 internals (`headerImpl.status("HTTP/1.1 ", ...)` at line 708).
+An H2 adapter cannot return that concrete type. The refactor
+extracts a `SimpleResponse` interface with exactly the methods
+the processors call (`sendStatusJsonContent` variants,
+`sendStatusNoContent`, `sendStatusTextContent`, `clear()`, plus
+the small-body variants used by `LineHttpPingProcessor` and the
+reject path). The H1 sink's `SimpleResponseImpl` implements it
+unchanged; `Http2ResponseSink` ships a parallel implementation
+that emits via the H2 HEADERS + DATA path.
+
+**Cookie handler signature.**
+`HttpCookieHandler.processServiceAccountCookie(HttpConnectionContext,
+SecurityContext)` (`HttpCookieHandler.java:34`) takes the
+concrete H1 context today. Retype its first argument to
+`HttpRequestContext` as part of step 2 of the refactor; the
+only implementation in-tree (`DefaultHttpCookieHandler`) needs
+the same-shape edit, and the call sites on
+`HttpConnectionContext` / `Http2StreamRequestContext` both have
+the requisite accessors on the interface. Without this change,
+step 2's "every processor compiles unchanged" claim fails at
+the cookie path.
+
+**Processor-state classes that store `HttpConnectionContext`
+directly.** Grep picked up several state-holder classes in
+`io.questdb.cutlass.http.processors.*` that keep a strongly-
+typed `HttpConnectionContext` field (e.g.
+`JsonQueryProcessorState` holding `httpConnectionContext`).
+These are not processor classes — they are per-request state
+attached via `LocalValue` — but they must be retyped to
+`HttpRequestContext` in the same PR that retypes the processor
+signatures, otherwise the constructor calls stop compiling.
+The change is mechanical (field type + constructor arg type),
+but it expands the refactor footprint beyond the
+`HttpRequestProcessor` interface itself.
+
+**Refactor is largely mechanical but its footprint is wider
+than "processor signatures only".** Step 2 lands the
+`HttpRequestProcessor` retype, the `HttpCookieHandler`
+signature change, the state-holder retypes, and the
+`SimpleResponse` interface extraction together — they share a
+single compile-unit of churn. Processors that reach into
+HTTP/1.x-concrete state (`HttpHeaderParser`, chunked-encoding
+state, keep-alive bookkeeping, `switchProtocol`, request-line
+byte range) keep their `HttpConnectionContext` references and
+are flagged as HTTP/1.x-only until M3. Grep the tree before
+step 2 to classify each processor.
+
+**Scope for "all read-path processors over H2" in M2.** The M2
+target (§15.2) lists `JsonQueryProcessor` and
+`ExportQueryProcessor`. Both rely on `JsonQueryProcessorState`
+and related state classes that currently pin to
+`HttpConnectionContext`; the M2 work must include the state-
+class retype described above, not just processor-side imports.
+If a state class proves too tangled to retype in one pass, M2
+ships the retypeable processors first and defers the rest
+rather than rushing.
+
+**Retries and `WaitProcessor`.** The existing retry path
+(`WaitProcessor.java:205-223`) casts any `Retry` back to
+`HttpConnectionContext` on all three slow / disconnect
+branches. If an H2 stream adapter implements `Retry` itself,
+those casts break. The integration keeps retries owned by the
+outer `HttpConnectionContext` — `HttpRequestContext` does
+**not** extend `Retry` and `Http2StreamRequestContext` is
+**not** a `Retry`. Under H2, stream-scoped errors either fail
+fast (`RST_STREAM(INTERNAL_ERROR)`, no retry) or are retried
+via a new adapter-aware path.
+
+**This is a hard prerequisite for M2, not background work.**
+`JsonQueryProcessor` — named in §15.2 as a target of the M2
+"all read-path processors over H2" goal — actively uses the
+retry machinery:
+`JsonQueryProcessor.java:214` catches `EntryUnavailableException`
+and throws `RetryOperationException.INSTANCE`;
+`JsonQueryProcessor.java:295` implements
+`onRequestRetry(HttpConnectionContext)`. Additional retry sites
+at lines 551, 585, 688, 824 cover ALTER / UPDATE paths that
+also flow through read-path processors. Any of these firing on
+an H2 stream under the current `WaitProcessor` cast would
+corrupt the dispatcher's view of the context on rerun.
+
+M2 cannot enable `JsonQueryProcessor` over H2 without one of:
+
+1. **`WaitProcessor` retype.** Parametrise the retry path on
+   `Retry` + a `RetryContext` abstraction, drop the cast to
+   `HttpConnectionContext`. `HttpConnectionContext` and
+   `Http2StreamRequestContext` both implement `Retry`; the
+   per-stream retry state rides on the adapter.
+2. **Dedicated H2 retry path.** Park the adapter in a
+   per-stream retry queue; the owner worker reruns on the
+   next tick without going through `WaitProcessor`. Avoids
+   the shared retry queue but duplicates some bookkeeping.
+
+Option 1 is cleaner; option 2 is smaller scope. Either way,
+the retry refactor lands before the M2 JsonQueryProcessor /
+ExportQueryProcessor enablement, not after. Tracked as
+prerequisite in §15.2.
+
+Both `HttpConnectionContext` (H1 mode, where the outer context
+itself is the request handle) and `Http2StreamRequestContext`
+(H2 mode, where each stream gets its own handle) implement this
+interface. The processor interface becomes:
 
 ```java
 public interface HttpRequestProcessor {
     void onHeadersReady(HttpRequestContext ctx);
+
     void onRequestComplete(HttpRequestContext ctx);
+
     void resumeSend(HttpRequestContext ctx);
     // ...
 }
 ```
 
-**Refactor plan.** This is a large-scoped, mechanical rename that
-touches every processor. To keep reviewable diffs:
+**Refactor plan.** Three PRs. Only step 1 is purely mechanical;
+steps 2 and 3 carry the real scope discussed above.
 
-1. Introduce `HttpRequestContext` as an interface with exactly
-   the methods above, implemented only by `HttpConnectionContext`.
-   No processor signature changes yet. Lands as one PR.
-2. Change `HttpRequestProcessor` parameter types from
-   `HttpConnectionContext` to `HttpRequestContext`. Every
-   processor compiles unchanged because
-   `HttpConnectionContext` implements the new interface. Lands
-   as a second PR; diff is mostly import changes.
-3. Any processor that reached into HTTP/1.x-specific state
-   (e.g. `context.getRequestHeader()` casting the
-   `HttpRequestHeader` to a concrete type) gets cleaned up in
-   the same PR. Expected to be zero cases, but Grep first.
+1. **Introduce `HttpRequestContext` interface** with the method
+   set above, implemented only by `HttpConnectionContext`. No
+   processor or cookie / selector / state-class signature
+   changes yet. Tests unchanged. Mechanical.
+2. **Surface changes and processor retype (one PR).** Bundle
+   together because they share a single compile unit:
+    - Extract `SimpleResponse` interface; `HttpResponseSink.SimpleResponseImpl`
+      implements it unchanged.
+    - Retype `HttpCookieHandler.processServiceAccountCookie`'s
+      first parameter from `HttpConnectionContext` to
+      `HttpRequestContext` (`HttpCookieHandler.java:34`).
+    - Retype every `HttpRequestProcessor` method parameter from
+      `HttpConnectionContext` to `HttpRequestContext`.
+    - Retype processor-state classes that hold a concrete
+      `HttpConnectionContext` field (e.g.
+      `JsonQueryProcessorState.httpConnectionContext` at
+      `JsonQueryProcessorState.java:1271`).
+    - Classify each processor: mostly-H1-only (keeps
+      `HttpConnectionContext` where it reaches into H1 framing
+      state) versus interface-only (runs over H2). Grep first;
+      the concrete known cases are the state-class retypes
+      just above and the processors that touch
+      `HttpHeaderParser`, chunked-encoding state, keep-alive
+      bookkeeping, `switchProtocol`, or the request-line byte
+      range.
+3. **Add `Http2StreamRequestContext`** as a second implementor
+   of `HttpRequestContext`. Touches no processors, no
+   state-holders — only the adapter plus the H2 listener
+   implementation on `HttpConnectionContext`.
 
-After step 2, `Http2StreamRequestContext` can be added as a
-second implementor without touching any processor.
+After step 2, each processor file is either compiled against
+the interface only (H2-eligible) or still imports
+`HttpConnectionContext` (H1-only until retyped or reworked in a
+later PR). The expected split is biased toward H1-only in M1 —
+M2 migrates the read-path processors off the H1 concretes via
+incremental state-class retypes.
 
 **Methods that do NOT belong on `HttpRequestContext`.** Anything
 that exposes HTTP/1.x framing state: the `HttpHeaderParser`
 instance, chunked-encoding state, keep-alive bookkeeping, the
-request-line byte range. Those live on `HttpConnectionContext`
-only. A processor that needs them is HTTP/1.x-only by
-definition.
+request-line byte range, the `switchProtocol` WebSocket hook.
+Those live on `HttpConnectionContext` only. A processor that
+needs them is HTTP/1.x-only by definition.
 
 ## 8. Per-Stream Request Context
 
 `Http2StreamRequestContext` presents one HTTP/2 stream to a
 processor as if it were a dedicated connection. Pooled by
-`Http2ServerContext`; the pool is sized to exactly
+`HttpConnectionContext`; the pool is sized to exactly
 `SETTINGS_MAX_CONCURRENT_STREAMS` (the same number as the
 LIVE-slot budget of the `Http2StreamPool` inside
 `Http2ConnectionContext` — `STREAM_STATE_MACHINE.md` §4). The
@@ -450,11 +962,11 @@ and DISCARDING_BLOCK / TOMBSTONE slots do not consume adapter
 capacity, so the adapter pool cannot be exhausted while the
 state machine still admits streams.
 
-The adapter pool lives on `Http2ServerContext` and migrates with
-the connection across workers (§5). Neither the pool itself nor
-any adapter is ever shared across connections or across workers
-— all adapter access is single-threaded on the current owner
-worker.
+The adapter pool lives on `HttpConnectionContext` and migrates
+with the connection across workers (§5). Neither the pool itself
+nor any adapter is ever shared across connections or across
+workers — all adapter access is single-threaded on the current
+owner worker.
 
 **Fields.** Every field is pre-allocated once and reused across
 requests — the "zero-GC on the hot path" rule applies here too.
@@ -466,11 +978,53 @@ requests — the "zero-GC on the hot path" rule applies here too.
   generation goes into `context.onBytesConsumed(streamId,
   generationToken, n)` verbatim (see
   `STREAM_STATE_MACHINE.md` §7 step 6).
-- `Http2RequestHeaderView headerView` — an `HttpRequestHeader`
-  implementation that reads from the captured pseudo-header
-  slots plus the staged regular-header tuple table
-  (`HEADER_STAGING_BYTES` / `HEADER_STAGING_TUPLES`). Already
-  in the tree.
+- `Http2RequestHeader header` — the adapter's
+  `HttpRequestHeader` implementation. This is a new class, not
+  the existing `Http2RequestHeadersView`: the view
+  (`Http2RequestHeadersView.java:45-66`) exposes only pseudo-
+  header address/length slots, whereas `HttpRequestHeader`
+  (`HttpRequestHeader.java:33-70`) requires URL + query
+  resolution, method helpers (`isGetRequest`, `isPostRequest`,
+  `isPutRequest`), content-length / content-type lookups, and
+  a general `getHeader(Utf8Sequence)` over arbitrary regular
+  headers.
+
+  **Header lifetime — copy on bind.** The view's javadoc
+  (`Http2RequestHeadersView.java:35-40`) states that
+  `(addr, len)` pairs are stable only for the duration of
+  `onRequestHeaders`, but processors read
+  `ctx.getRequestHeader()` on every later callback
+  (`onData`, `resumeSend`, `onRequestComplete`,
+  `onConnectionClosed`). To bridge the two lifetimes, the
+  adapter **copies** pseudo-header slots and regular-header
+  tuples into adapter-owned native storage inside the
+  `onRequestHeaders` dispatch, before the processor is called.
+  Storage is a fixed-size per-adapter native buffer sized to
+  the H2 `MAX_HEADER_LIST_SIZE` policy cap (a single allocation
+  at adapter construction, reused across requests — zero-GC on
+  the hot path). `Http2RequestHeader` then reads from that
+  adapter-owned copy, not from the view, for the rest of the
+  stream's lifetime.
+
+  The state-machine contract is unchanged; the copy is a
+  layer concern. Alternative — extending the state machine's
+  stream-close lifetime contract to keep staging alive until
+  `onStreamClosed` — was considered but rejected: it would
+  couple `Http2ConnectionContext`'s stream-pool reuse rules
+  to the adapter's read pattern and complicate §11 of the
+  state-machine doc.
+
+  The `Http2RequestHeader` then computes:
+    - `:path` → `getUrl()` + `getQuery()` (split on the first `?`).
+    - `:method` → `isGetRequest` / `isPostRequest` / `isPutRequest`.
+    - regular-header tuple table → `getHeader(name)`,
+      `getHeaderNames()`, `getContentLength()`, `getContentType()`,
+      `getBoundary()`, `getCharset()`, `getContentDisposition*`,
+      `getStatementTimeout()`.
+    - `getMethodLine()` is synthesised from `:method` + `:path` +
+      a fixed `HTTP/2.0` tail only where log correlation needs it;
+      processors that care about the exact method line are
+      HTTP/1.x-only.
 - `LocalValueMap localValueMap` — per-stream, not per-connection
   (see §11).
 - `SecurityContext securityContext` — set by the auth path (§13)
@@ -479,6 +1033,11 @@ requests — the "zero-GC on the hot path" rule applies here too.
   frame emitter.
 - `Http2ChunkedResponse chunkedResponse` — processor-facing
   response API; wraps `responseSink`.
+- `int handlerId` — the id returned by
+  `HttpRequestProcessorSelector.getLastSelectedHandlerId()`
+  immediately after `selector.select(...)` at request-dispatch
+  time (`HttpRequestProcessorSelector.java:35-42`). Used for
+  park/resume across worker migration (§12).
 - Deferred-body-ack bookkeeping: the existing HTTP/1.x body
   dispatch tests the processor's type at request-dispatch time
   (`instanceof HttpPostPutProcessor`) and routes body chunks
@@ -499,45 +1058,72 @@ requests — the "zero-GC on the hot path" rule applies here too.
 **Lifecycle.**
 
 1. `onRequestHeaders(streamId, view, endStream)` on the
-   `Http2StreamListener` implementation:
-   - Acquire a pooled `Http2StreamRequestContext`; bind to
-     `(streamId, streamGeneration)`.
-   - Populate `headerView` from the captured pseudo-header slots.
-   - Run the authentication pipeline (§13); populate
-     `securityContext`.
-   - Select the processor via
-     `HttpRequestProcessorSelector.select(headerView)` (the
-     selector already operates on `HttpRequestHeader`, so no
-     changes needed).
-   - Call `processor.onHeadersReady(ctx)`.
-   - If `endStream == true`, follow up with
-     `processor.onRequestComplete(ctx)` immediately — no body
-     will arrive.
+   `Http2StreamListener` implementation (hosted by
+   `HttpConnectionContext`):
+    - Acquire a pooled `Http2StreamRequestContext`; bind to
+      `(streamId, streamGeneration)`.
+    - Populate the adapter's `Http2RequestHeader` from `view` +
+      the per-stream staged regular-header tuple table.
+    - Run the authentication pipeline (§13); populate
+      `securityContext`.
+    - Select the processor:
+      ```java
+      HttpRequestProcessor processor = selector.select(adapter.getRequestHeader());
+      adapter.handlerId = selector.getLastSelectedHandlerId();
+      ```
+      `select` returns the processor instance; the id is read via
+      `selector.getLastSelectedHandlerId()` afterwards
+      (`HttpRequestProcessorSelector.java:35, 41`,
+      `HttpServer.java:466-476`). The selector already operates
+      on `HttpRequestHeader`, so no selector changes needed.
+    - Call `processor.onHeadersReady(ctx)`.
+    - If `endStream == true`, follow up with
+      `processor.onRequestComplete(ctx)` immediately — no body
+      will arrive.
 2. `onRequestHeader(...)` fires before `onRequestHeaders` per
    `STREAM_STATE_MACHINE.md` §11. The adapter does not need to
-   observe these individually; the `headerView` reads the staged
-   tuple table at lookup time.
+   observe these individually; the per-field callbacks exist
+   so that other (non-adapter) listeners can stream headers if
+   they wish. Once `onRequestHeaders` fires, the adapter copies
+   every staged field into its own native storage as described
+   above, so header reads during later callbacks go through the
+   copy, not the staging table.
 3. `onData(streamId, addr, dataLen, endStream, genToken)`:
-   - Route body bytes to the processor's `onChunk`-equivalent
-     entry point. For a POST / PUT processor, this is where
-     `HttpMultipartContentProcessor` / `HttpPostPutProcessor`
-     consume bytes.
-   - Return `true` if synchronously consumed, `false` if the
-     processor needs to defer. On deferral, the adapter stashes
-     `genToken` and produces it on the later
-     `onBytesConsumed` call.
-   - If `endStream == true`, call
-     `processor.onRequestComplete(ctx)`.
+    - Route body bytes to the processor's `onChunk`-equivalent
+      entry point. For a POST / PUT processor, this is where
+      `HttpMultipartContentProcessor` / `HttpPostPutProcessor`
+      consume bytes.
+    - Return `true` if synchronously consumed, `false` if the
+      processor needs to defer. On deferral, the adapter stashes
+      `genToken` and produces it on the later
+      `onBytesConsumed` call.
+    - **Terminal callback timing.** If `endStream == true` and
+      the body consumer returned `true` (synchronous), call
+      `processor.onRequestComplete(ctx)` right away. If
+      `endStream == true` and the consumer returned `false`
+      (deferred), the adapter **must not** call
+      `onRequestComplete` yet — firing it would tell the
+      processor "request done" before the final DATA bytes have
+      actually been processed, which matters for POST / PUT
+      paths (e.g. `TextImportProcessor` commits only after the
+      last chunk lands in the `TableWriter`). The adapter sets
+      a sticky `pendingTerminalComplete` flag and the
+      pending-ops drain (§5, §9) calls
+      `processor.onRequestComplete(ctx)` when the final
+      `onBytesConsumed` ack for the terminal frame arrives and
+      the flag is clear-to-fire. A stream reset before the ack
+      lands drops the flag silently — `onStreamClosed` takes
+      over via `processor.onConnectionClosed(ctx)`.
 4. `onTrailers(streamId, endStream)` (M2): trailers not currently
    consumed by any HTTP/1.x-legacy processor, so the M2 path
    delivers them through a new optional
    `processor.onTrailers(ctx, trailerView)` hook that defaults to
    no-op.
 5. `onStreamClosed(streamId, cause)`:
-   - Call `processor.onConnectionClosed(ctx)` (rename pending
-     — see §16 open question; the semantics match per-stream
-     close).
-   - Release the adapter back to the pool.
+    - Call `processor.onConnectionClosed(ctx)` (rename pending
+      — see §16 open question; the semantics match per-stream
+      close).
+    - Release the adapter back to the pool.
 
 **Binding rules.**
 
@@ -552,12 +1138,13 @@ requests — the "zero-GC on the hot path" rule applies here too.
 
 ## 9. Request Reading Path
 
-Concrete flow for an inbound POST with a body:
+Concrete flow for an inbound POST with a body, in `MODE_H2`:
 
 ```
 peer bytes
-  -> Http2ServerContext.handleClientOperation(READ)
-    -> read socket into receiveBuffer
+  -> HttpConnectionContext.handleClientOperation(READ)
+    -> drain pending-ops queue (foreign-thread inbound acks)
+    -> read socket into recvBuffer
     -> Http2ConnectionContext.processReceivedBytes(addr, len)
       -> Http2FrameReader splits frames
       -> HEADERS + CONTINUATION sequence assembled in block scratch
@@ -569,15 +1156,27 @@ peer bytes
          Http2StreamListener.onRequestHeader(...) per field
          Http2StreamListener.onRequestHeaders(streamId, view,
                                               endStream)
-      -> context adapter selects processor, calls
+      -> adapter selects processor, calls
          processor.onHeadersReady(ctx)
       -> subsequent DATA frames:
          Http2StreamListener.onData(streamId, addr, dataLen,
                                      endStream, genToken)
          -> adapter delivers to processor's body-consumer
          -> on endStream=true:
-            processor.onRequestComplete(ctx)
+            if body-consumer returned true (sync):
+              processor.onRequestComplete(ctx)
+            if body-consumer returned false (deferred):
+              set pendingTerminalComplete on adapter; fire
+              onRequestComplete from the pending-ops drain
+              after the final onBytesConsumed ack lands
+              (see §8 lifecycle step 3)
+    -> Http2ConnectionContext.writePending(sendBuffer, cap)
+    -> socket.send(sendBuffer, n)
 ```
+
+The listener implementation is an inner class (or a package-
+private helper) on `HttpConnectionContext` — same owner worker,
+same heap, no cross-component marshalling.
 
 The response path is interleaved (not physically concurrent)
 with any remaining inbound DATA — HTTP/2 is logically
@@ -602,9 +1201,9 @@ begin emitting response headers + DATA via
   foreign thread finishes, it **MUST NOT** call
   `Http2ConnectionContext.onBytesConsumed(...)` directly — that
   violates the single-owner-thread invariant (§5). Instead it
-  pushes the ack entry onto the `Http2ServerContext`'s pending-
-  ops queue and signals the dispatcher. The next tick on the
-  owner worker drains the queue and invokes
+  pushes the ack entry onto the `HttpConnectionContext`'s
+  pending-ops queue and signals the dispatcher. The next tick on
+  the owner worker drains the queue and invokes
   `Http2ConnectionContext.onBytesConsumed(streamId, genToken,
   n)` on the owner thread. Generation mismatch on drain is a
   silent no-op per `STREAM_STATE_MACHINE.md` §7 step 6 —
@@ -622,7 +1221,8 @@ declared length — the state machine rejects before dispatching.
 The existing `HttpChunkedResponse` / `HttpResponseSink` pair
 streams response bytes through HTTP/1.1 chunked encoding. The
 H2 replacement pair exposes the same processor-facing API
-surface.
+surface and lives on the per-stream adapter, not on
+`HttpConnectionContext` directly.
 
 **Processor-facing contract.** Unchanged. A processor writes to
 `ctx.getChunkedResponse()`; the sink buffers, flushes, and
@@ -665,17 +1265,18 @@ Its emit path:
    outbound tuple queue (inside `Http2ConnectionContext`,
    `STREAM_STATE_MACHINE.md` §7 "Outbound accounting on send").
    A write fills the sink buffer; on flush, the sink hands a
-   tuple to the state machine, which queues it until the
-   scheduler emits a DATA frame under available window. When
-   the outbound window is zero the tuple simply sits in the
-   state-machine queue — the sink buffer is free to accept more
-   writes. `PeerIsSlowToReadException` fires only when
-   **both** buffers are at their configured bound:
-   - The sink's buffer has no room for another write, AND
-   - The state-machine's per-stream outbound tuple queue has
-     already absorbed a configurable maximum (a new per-stream
-     cap, e.g. 256 KiB worth of queued tuple payload, to bound
-     memory per stream under zero-window).
+   `(payloadAddr, payloadLen)` tuple to `enqueueData`, which
+   copies the bytes into engine-owned per-stream storage (see
+   §4.4) so the sink buffer is immediately free to accept more
+   writes. The tuple then sits in the state-machine queue until
+   the scheduler emits a DATA frame under available window.
+   `PeerIsSlowToReadException` fires only when **both** buffers
+   are at their configured bound:
+    - The sink's buffer has no room for another write, AND
+    - The state-machine's per-stream outbound tuple queue has
+      already absorbed a configurable maximum (a new per-stream
+      cap, e.g. 256 KiB worth of queued tuple payload, to bound
+      memory per stream under zero-window).
 
    At that point the adapter calls the existing `parkRequest`
    path (see §12). When `WINDOW_UPDATE` arrives and the
@@ -684,18 +1285,44 @@ Its emit path:
    callback `Http2StreamListener.onStreamWritable(streamId)`
    (not in the current listener interface — see open question
    §16) which schedules resume for this stream.
-4. **End of response.** On the final `flush()` call carrying the
-   last bytes, the tuple's `endStream=true` flag fires;
-   `Http2ConnectionContext` emits DATA with `END_STREAM` and
-   transitions the stream per §5 of the state-machine doc.
-   `onStreamClosed` fires on the listener after the frame is
-   flushed to the socket.
+4. **End of response.** The processor signals end-of-body via
+   an explicit `done()` call on the sink, mirroring the H1
+   `HttpChunkedResponse.done()` shape. Three variants:
+    - **Body only.** `done()` flushes any buffered bytes; the
+      last `enqueueData` call carries `endStream=true`, and the
+      scheduler emits DATA with `END_STREAM` set.
+    - **No body.** A processor that returns an empty-body
+      response calls `done()` without any prior body writes.
+      The sink emits the HEADERS frame with `END_STREAM` set
+      and no DATA frame at all.
+    - **Body + trailers** (gRPC shape — M2). `sendTrailers(...)`
+      replaces `done()`. The final DATA frame does **not**
+      carry `END_STREAM`; instead a second HEADERS frame (built
+      via `emitResponseHeaders` with `endStream=true`) carries
+      the trailer fields. A processor that calls `sendTrailers`
+      after `done()` has already fired the end-of-stream marker
+      is a programming error — the M2 sink asserts on it.
 
-**Trailers** (M2): a handler that wants to emit trailers (gRPC
-pattern — `grpc-status` + `grpc-message` after the body)
-invokes `ctx.getChunkedResponse().sendTrailers(...)`. The sink
-builds a second HEADERS frame via the encoder and emits it with
-`END_STREAM` set.
+   `onStreamClosed` fires on the listener after the final
+   END_STREAM-carrying frame flushes to the socket, regardless
+   of which variant closed the response.
+
+**H2 send buffer.** `HttpResponseSink` is H1-chunked-encoding-
+specific (`HttpConnectionContext.java:167`). M1 allocates a
+separate native send buffer on `HttpConnectionContext` for H2
+mode, sized to peer `SETTINGS_MAX_FRAME_SIZE` plus control-frame
+headroom. Sharing the existing response-sink buffer would
+require `HttpResponseSink` to become protocol-aware; not worth
+it.
+
+**Trailers** (M2). M1 does not ship the trailer path; the
+`sendTrailers` method is defined on the `Http2ChunkedResponse`
+surface but throws `UnsupportedOperationException` until M2
+wires it up. M2 builds the trailing HEADERS frame via the
+engine's `emitResponseHeaders(streamId, generation, writer,
+endStream=true)` call (§4.4); the trailer-specific validation
+(no pseudo-headers allowed in trailers per RFC 9113 sec. 8.1)
+lives in the writer callback, not in the engine.
 
 **Raw socket access.** `HttpRequestContext.getRawResponseSocket()`
 does not make sense for H2 — there is no single byte stream
@@ -704,8 +1331,8 @@ returns `null` (and processors that use it are H2-incompatible
 and must guard on the protocol type) or returns a thin adapter
 that converts raw byte writes into DATA frames with the same
 flow-control contract. Pick the latter if any production
-processor depends on it; M1 can return `null` and treat raw-
-socket processors as HTTP/1.x-only.
+processor depends on it; M1 can return `null` and treat
+raw-socket processors as HTTP/1.x-only.
 
 ## 11. LocalValue and Per-Stream State
 
@@ -720,22 +1347,54 @@ have independent maps. This is the only behaviour consistent
 with multiplexing — per-connection state would leak between
 concurrent requests.
 
-**Pool reuse.** When a stream closes and the adapter returns to
-the `Http2ServerContext`'s adapter pool, its `LocalValueMap` is
-cleared through the same teardown path `HttpConnectionContext`
-uses for HTTP/1.x request end (`LocalValue` entries get their
-close hook invoked for `Closeable` values, then the map resets
-to empty). A subsequent request reuses the adapter and starts
-with an empty map, matching the post-`onConnectionClosed`
-lifecycle on the HTTP/1.x side.
+**Pool reuse and close semantics.** The adapter pool reuses
+each adapter across many streams on the same connection, so the
+cleanup cadence must match *H1 connection end*, not *H1 request
+end*. Verified against source:
 
-**Connection-scope state.** If a processor truly needs state that
-spans all streams on one TCP connection (no current processor
-does, but it's conceivable — e.g. a connection-wide auth cache),
-it attaches via a `LocalValue` on `Http2ServerContext` directly.
-This requires a second `LocalValueMap` on the server context;
-M1 omits it since no processor needs it. The §16 open question
-tracks when to add it.
+- `LocalValueMap.clear()` (`LocalValueMap.java:45-53`) only
+  calls `.clear()` on values that implement `Mutable`. It does
+  **not** invoke `close()` on `Closeable` values.
+- `LocalValueMap.close()` (`LocalValueMap.java:55-65`) is the
+  method that calls `Misc.freeIfCloseable` on every entry.
+- H1 `HttpConnectionContext.reset()` (called per request,
+  `HttpConnectionContext.java:411`) uses `clear()`. Closeable
+  LocalValue entries on H1 therefore survive across requests
+  on the same connection and are freed only on
+  `HttpConnectionContext.close()` at connection end
+  (`HttpConnectionContext.java:229`).
+
+H2 stream reuse is not an H1 request boundary; it's an adapter
+re-binding to a new logical request. Closeable per-request
+state attached via `LocalValue` on the adapter MUST be released
+at stream close, otherwise it leaks across stream reuses within
+one TCP connection. The adapter therefore calls
+`localValueMap.close()` (not `clear()`) inside `onStreamClosed`,
+followed by a fresh `LocalValueMap` allocation on next bind OR
+a reusable map implementation with an explicit
+"release-closeables-and-empty" method added to
+`LocalValueMap`. M1 picks the second option — add
+`LocalValueMap.release()` that iterates entries, calls
+`Misc.freeIfCloseable` on the value, nulls the slot, and keeps
+the backing table for reuse. H1 paths keep calling `clear()`
+(unchanged behaviour).
+
+**Adapter pool teardown.** On connection close
+(`HttpConnectionContext.close`), every adapter in the pool —
+whether bound or free — has `localValueMap.close()` called,
+followed by native buffer frees for the per-adapter header
+copy, response sink, and HPACK encoder buffer.
+
+**Connection-scope state falls out of the design.** The
+`localValueMap` field already on `HttpConnectionContext`
+(`HttpConnectionContext.java:93`) continues to exist in H2 mode,
+but nothing in the per-stream dispatch path writes to it. A
+processor that needs state that spans all streams on one TCP
+connection (none do today — e.g. a connection-wide auth cache)
+attaches via a `LocalValue` keyed on the outer
+`HttpConnectionContext.getMap()`. This resolves the
+connection-scope-LocalValue question that used to be open: no
+second map is needed; the existing one plays the role.
 
 ## 12. Park / Resume
 
@@ -749,18 +1408,39 @@ connection context.
 servicing other streams even while one stream is parked on its
 own outbound window.
 
-The adapter keeps a **parked-streams set** on `Http2ServerContext`:
+The per-stream state lives on a **parked-streams set** on
+`HttpConnectionContext`:
 `IntObjHashMap<Http2StreamRequestContext>` keyed by stream id,
 populated when a stream throws `PeerIsSlowToReadException` out
-of its sink. Resume triggers:
+of its sink. The set exists because the state machine only
+knows "this stream has a non-empty outbound queue"; it does not
+know which streams have an adapter currently parked and waiting
+for a resume callback. The set is the adapter layer's view on
+top of the engine's outbound accounting.
 
-- Inbound `WINDOW_UPDATE` on the stream id → the state machine
-  raises `onStreamWritable(streamId)` → the wrapper wakes that
-  one stream's adapter and calls
-  `processor.resumeSend(adapter)`.
-- Inbound `WINDOW_UPDATE(0)` on the connection + any parked
-  stream with `outboundStreamWindow > 0` → wake the stream(s)
-  and call resume on each.
+Resume fires on any event that grows a parked stream's
+outbound-eligible window back under the per-stream queue cap:
+
+- Inbound `WINDOW_UPDATE` on the stream id.
+- Inbound `WINDOW_UPDATE(0)` on the connection, combined with
+  any parked stream that has non-zero `outboundStreamWindow`.
+- Inbound `SETTINGS` that raises `SETTINGS_INITIAL_WINDOW_SIZE`
+  (the state machine sweeps every outbound-active stream and
+  adjusts windows — `Http2ConnectionContext.java:504-537`),
+  potentially unparking streams that were blocked on
+  per-stream (not connection) window.
+
+In all three cases the state machine raises
+`onStreamWritable(streamId)` on the listener; the listener
+looks the adapter up in the parked-streams set and calls
+`processor.resumeSend(adapter)`.
+
+Even when one or more streams parked in a given tick,
+`HttpConnectionContext` re-registers the connection for WRITE
+exactly once at the dispatcher level — the connection's
+readiness is a single bit as far as `IODispatcher` is concerned;
+the per-stream resume fan-out happens on the next tick when the
+state machine applies the incoming `WINDOW_UPDATE`(s).
 
 **Processor id correlation across worker migration.** Each
 worker has its own `HttpRequestProcessor` instance
@@ -774,14 +1454,28 @@ otherwise resume on worker B would call into worker A's
 processor, violating the "one worker at a time" invariant on
 that instance.
 
-Call-site shape:
+Call-site shape (verified against
+`HttpRequestProcessorSelector.java:35-42` and
+`HttpServer.java:466-476`):
 
 - At `select` time in `onRequestHeaders`:
-  `int handlerId = selector.select(headerView).getHandlerId();`
-  stored on the adapter.
+  ```java
+  HttpRequestProcessor p = selector.select(adapter.getRequestHeader());
+  adapter.handlerId = selector.getLastSelectedHandlerId();
+  ```
+  `select` returns the processor instance; the handler id is
+  published as side-effect state on the selector and read
+  afterwards via `getLastSelectedHandlerId()`.
 - At resume time, whether this tick is on worker A or B:
-  `HttpRequestProcessor p = selector.resolveProcessorById(
-  handlerId);` then `p.resumeSend(adapter)`.
+  ```java
+  HttpRequestProcessor p = selector.resolveProcessorById(
+          adapter.handlerId, adapter.getRequestHeader());
+  p.resumeSend(adapter);
+  ```
+  `resolveProcessorById` takes the request header as its second
+  argument so the handler can pick the right processor variant
+  based on request state (the H1 path at
+  `HttpConnectionContext.java:956-960` does the same).
 
 This matches HTTP/1.x's park / resume discipline exactly; H2
 differs only in that the resume target is a *stream-scoped*
@@ -828,21 +1522,53 @@ already, so the adapter calls it identically to HTTP/1.x.
 
 **Connection-scope auth caching** (optional, deferred): a
 connection-scope auth-token-to-`SecurityContext` cache on
-`Http2ServerContext` would skip re-evaluating the same bearer
+`HttpConnectionContext` would skip re-evaluating the same bearer
 token on every stream. Worth measuring before implementing —
 the per-stream path is already fast.
+
+**Per-stream circuit breakers.** H1 has a single
+`NetworkSqlExecutionCircuitBreaker` per connection
+(`HttpConnectionContext.java:117`, lazy-allocated via
+`getOrCreateCircuitBreaker`). Under H2, cancelling one stream
+via `RST_STREAM(CANCEL)` must not abort SQL executing for other
+streams on the same connection, so each adapter owns its own
+circuit breaker.
+
+- `Http2StreamRequestContext.getOrCreateCircuitBreaker(engine)`
+  lazily builds an adapter-scoped
+  `NetworkSqlExecutionCircuitBreaker` on first call, reusing it
+  across streams bound to the same adapter (cleared on stream
+  close via the `clear()` on the breaker).
+- Native memory owned by each breaker is freed when the adapter
+  itself is closed during connection teardown (§11 adapter pool
+  teardown), not at stream end — the breaker object is reusable
+  across bindings.
+- `RST_STREAM(CANCEL)` inbound trips the breaker for that
+  adapter only, leaving other streams' breakers untouched.
+- H1's single-breaker shape is preserved for H1 mode; the
+  interface method `getOrCreateCircuitBreaker(engine)` is the
+  same call site on both contexts, just with different scoping
+  semantics.
+
+**Per-stream reject processor.** `RejectProcessor` is a stateful
+per-request object (`HttpConnectionContext.java:102`, reset in
+`reset()`). Each H2 adapter owns its own RejectProcessor
+instance, built during adapter construction from the same
+factory `HttpContextConfiguration.getRejectProcessorFactory()`
+uses on H1. Sharing a single RejectProcessor across concurrent
+streams would corrupt its per-request state.
 
 ## 14. Error Mapping
 
 The processor pipeline throws a small set of checked exceptions:
 
-| Exception                    | HTTP/1.x meaning                                        | HTTP/2 meaning                                                                                      |
-|------------------------------|---------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `PeerDisconnectedException`  | Socket closed / reset                                   | Maps to connection-level socket close. Entire `Http2ServerContext` tears down (all streams lost). |
-| `PeerIsSlowToReadException`  | Send buffer full, park for WRITE                        | Stream-scope park (see §12). The connection stays up; other streams proceed.                        |
-| `PeerIsSlowToWriteException` | Receive buffer empty, park for READ                     | Effectively never fires on H2. HTTP/1.x throws this when the processor is parsing headers / body and needs more bytes that haven't arrived. Under H2, headers are fully assembled by `Http2ConnectionContext` before the processor is invoked, and body bytes are surfaced one DATA frame at a time through `onData`; a processor that needs more body simply waits for the next `onData` invocation. The adapter should treat `PeerIsSlowToWriteException` as a programming error (log and `RST_STREAM(INTERNAL_ERROR)`) in M1; the state machine's flow-control buffering subsumes its semantics. |
-| `ServerDisconnectException`  | Server-initiated shutdown                               | For a stream-scope error: `RST_STREAM(INTERNAL_ERROR)` on the stream, connection survives. For a server-wide shutdown: `GOAWAY(NO_ERROR)` followed by drain per `STREAM_STATE_MACHINE.md` §12. |
-| `HttpException` (processor)  | Response reset mid-body, close connection              | `RST_STREAM(INTERNAL_ERROR)` on the stream. Connection survives so other streams are unaffected.   |
+| Exception                    | HTTP/1.x meaning                          | HTTP/2 meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+|------------------------------|-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `PeerDisconnectedException`  | Socket closed / reset                     | Connection-level socket close. `HttpConnectionContext` tears down (all streams lost).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `PeerIsSlowToReadException`  | Send buffer full, park for WRITE          | Stream-scope park (see §12). The connection stays up; other streams proceed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `PeerIsSlowToWriteException` | Receive buffer empty, park for READ       | Effectively never fires on H2. HTTP/1.x throws this when the processor is parsing headers / body and needs more bytes that haven't arrived. Under H2, headers are fully assembled by `Http2ConnectionContext` before the processor is invoked, and body bytes are surfaced one DATA frame at a time through `onData`; a processor that needs more body simply waits for the next `onData` invocation. The adapter should treat `PeerIsSlowToWriteException` as a programming error (log and `RST_STREAM(INTERNAL_ERROR)`) in M1; the state machine's flow-control buffering subsumes its semantics. |
+| `ServerDisconnectException`  | Server-initiated shutdown                 | For a stream-scope error: `RST_STREAM(INTERNAL_ERROR)` on the stream, connection survives. For a server-wide shutdown: `GOAWAY(NO_ERROR)` followed by drain per `STREAM_STATE_MACHINE.md` §12.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `HttpException` (processor)  | Response reset mid-body, close connection | `RST_STREAM(INTERNAL_ERROR)` on the stream. Connection survives so other streams are unaffected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 The adapter catches these at the `processor.*` call sites and
 translates. An uncaught `RuntimeException` from a processor is
@@ -853,131 +1579,417 @@ failure, flow-control overrun, etc.) handled inside
 `Http2ConnectionContext` per §12 of the state-machine doc;
 processors do not surface those.
 
+**Connection idle-timeout under H2.** `invalid()`
+(`HttpConnectionContext.java:393`) is **not** a "connection
+still has useful work" signal — it's read by the dispatcher's
+`doDisconnect` (`AbstractIODispatcher.java:454-457`) as "do not
+tear down this context now", and the Linux idle scan at
+`IODispatcherLinux.java:146-153` calls `doDisconnect` directly
+without consulting it for idle reaping. Overloading `invalid()`
+with `h2.getActiveStreamCount() > 0` would skip legitimate
+cleanup paths (disconnect-on-error, shutdown) while still
+allowing the idle scan to reap a mid-stream connection — the
+worst of both.
+
+M1 keeps `invalid()` unchanged and introduces a dedicated H2
+idle policy instead:
+
+- Every successful `handleH2Operation` tick refreshes the
+  connection's idle-timer anchor whenever a frame is read or a
+  byte is written, so a connection with healthy stream traffic
+  never ages into the idle scan.
+- A `HEARTBEAT` operation from the dispatcher
+  (`HttpConnectionContext.handleClientOperation`'s
+  `IOOperation.HEARTBEAT` case at line 375) gets a new H2
+  branch: if `protocolMode == MODE_H2` and any stream has
+  made progress since the previous heartbeat, re-register for
+  READ to keep the timer fresh; otherwise fall through to the
+  existing heartbeat behaviour (which lets the dispatcher apply
+  its idle-timeout).
+- Long-running streams with no traffic (gRPC long-polls, Flight
+  SQL blocked on a slow query) need the heartbeat-anchor reset
+  from the *processor* side via an explicit "stream alive"
+  signal. Deferred to M2 alongside the dispatcher wake-up
+  primitive (§16); M1 processors all complete within one tick.
+
+This keeps `invalid()` semantically consistent with how the
+dispatcher uses it today and isolates the "active streams"
+concern to the heartbeat / idle-refresh path where it belongs.
+
+**Pipelined inner recv loop.** The existing
+`handleClientOperation` body (`HttpConnectionContext.java:379-388`)
+re-enters `handleClientRecv` in a loop while
+`keepConnectionAlive()` — an H1-pipelining optimisation. For H2
+the single-tick `handleH2Operation` already drains what it can;
+gate the loop with `if (protocolMode == MODE_H1 &&
+keepConnectionAlive())`.
+
 ## 15. Milestone Scoping
 
-### 15.1 Milestone 1 — single processor end-to-end
+The milestone shape reflects the Flight-SQL-only framing from
+§1. The earlier three-milestone plan (M1 HealthCheck end-to-end,
+M2 full REST-over-H2, M3 TLS + Flight SQL) is superseded.
 
-- `HttpRequestContext` interface extraction (§7 steps 1 + 2).
-- `Http2ServerContext` + preface-sniffing accept branch.
-- `Http2StreamRequestContext` adapter + listener
-  implementation, wired to exactly one processor:
-  `StaticContentProcessor` or a hello-world handler (easier to
-  exercise end-to-end than the real query pipeline).
-- `Http2ResponseSink` / `Http2ChunkedResponse` covering status
-  line + headers + a single-frame body.
-- Per-stream `LocalValueMap`, per-stream auth evaluation.
-- Park / resume at stream scope (§12) wired for
-  `PeerIsSlowToReadException`.
-- Tier 4 smoke: `curl --http2-prior-knowledge http://host/health`
-  round-trips a 200 OK with a small body.
-- No trailers, no chunked response beyond one DATA frame's
-  worth, no GOAWAY-driven graceful shutdown, no raw-socket
-  processor support.
+### 15.1 Milestone 1 — H2 engine fit for gRPC
 
-### 15.2 Milestone 2 — production shape
+**Already landed (Waves 1–2):**
 
-- All read-path processors (`JsonQueryProcessor`,
-  `ExportQueryProcessor`) run over H2.
-- Streaming response bodies with real flow-control backpressure
-  (multi-frame bodies, `PeerIsSlowToReadException` park /
-  resume under load).
-- POST / PUT processors (`TextImportProcessor`,
-  `HttpPostPutProcessor`) — deferred body-ack path, per-stream
-  circuit-breaker integration.
-- Trailers on both sides (optional per-processor hook).
-- GOAWAY graceful-shutdown flow — server shutdown triggers
-  `Http2ConnectionContext` to emit GOAWAY; adapter drains
-  active streams per §12 of the state-machine doc.
-- h2spec full conformance via the harness already sketched in
+- Frame codec, HPACK codec, stream state machine, outbound
+  arena with copy-on-enqueue ownership, per-stream tuple queue,
+  round-robin scheduler, park machinery, `onStreamWritable`
+  listener, HPACK snapshot / restore for PARK rollback.
+- `protocolMode` on `HttpConnectionContext`,
+  `sniffAndSelectMode`, `drainH2Preface`,
+  `allocateH2EngineIfNeeded`, `handleH2Operation` skeleton.
+  `http.h2.enabled` config gate (default off).
+
+**Landed but slated for removal (Wave 4):** the H1-mimicry
+layer from Wave 3 — `Http2StreamRequestContext`,
+`Http2StreamRequestContextPool`, `Http2ResponseSink`,
+`Http2ChunkedResponse`, `Http2SimpleResponse`,
+`Http2RequestHeader`, `Http2StreamRequestContextListener`,
+`HttpRequestContext` interface extraction, `SimpleResponse`
+interface extraction, `LocalValueMap.release`. Built on the
+assumption that existing H1 processors would run over H2;
+Flight SQL does not reuse any of it.
+
+**Remaining (Wave 4):**
+
+- Remove the H1-mimicry layer listed above. Replace the in-
+  class listener with a slim no-op placeholder that the
+  Flight SQL handler surface (M2) will substitute at bind
+  time.
+- Pseudo-header capture for `:method`, `:scheme`, `:path`,
+  `:authority`, and `content-type` only. Per-stream header
+  staging buffer on `Http2Stream`, real `HpackListener`
+  replacing `NOOP_HPACK_LISTENER`, concrete
+  `Http2RequestHeadersView` backed by the staging buffer.
+  Scope is deliberately narrow: just enough for a gRPC router
+  to see the RPC path and content-type. Full §11 validator
+  (ordering, forbidden-headers, content-length, uppercase-
+  name, TE restrictions, connection ban) deferred to M2.
+- Trailer emission. `Http2ConnectionContext.emitTrailers(
+  streamId, generation, writer, endStream=true)` as a peer of
+  `emitResponseHeaders`, sharing the same HPACK-snapshot-and-
+  restore discipline for PARK rollback. gRPC requires trailers
+  for every RPC — this moves up from the old M2.
+- Park / resume wired end-to-end at the engine level — the
+  listener callback is already in place; Wave 4 adds a
+  generic test-only consumer that drives PARK via tiny
+  `SETTINGS_INITIAL_WINDOW_SIZE` + `WINDOW_UPDATE` + tuple-
+  ring saturation and asserts resume actually drains.
+
+**M1 exit criterion:** a synthetic HEADERS + DATA + trailers
+round-trip test at the engine level — no HTTP processor, no
+gRPC framer yet — proves the engine can carry a gRPC-shaped
+request and response including trailers and park / resume.
+
+### 15.2 Milestone 2 — TLS, ALPN, gRPC framing, Flight SQL handlers
+
+- ALPN in the TLS layer. `socket.startTlsSession` negotiates
+  `h2`; the TLS code path pre-sets
+  `protocolMode = MODE_H2_PREFACE_PENDING` in `doInit()` and
+  skips the MSG_PEEK sniff. The 24-byte preface drain still
+  runs — RFC 9113 §3.4 requires every H2 client to send the
+  preface regardless of negotiation path.
+- gRPC framing layer. 5-byte prefix (`compressed` flag +
+  4-byte length) over DATA frames; message reassembly across
+  frame boundaries; `grpc-timeout`, `grpc-encoding`,
+  `grpc-accept-encoding` header handling.
+- Flight SQL handler surface. A narrow `FlightSqlHandler`
+  interface bound to the engine via a custom
+  `Http2StreamListener` that routes on `:path` — one RPC per
+  path per `arrow.flight.protocol.FlightService/{Method}`.
+  Initial handlers: `Handshake`, `GetFlightInfo`, `DoGet`,
+  `DoPut`, `DoAction`. Result-set streaming in `DoGet`
+  exercises Wave 4's park / resume for real.
+- §11 validator subset required for gRPC correctness:
+  reject requests missing required pseudo-headers, reject
+  non-POST, reject bad `content-type`, reject uppercase header
+  names. The full RFC 9113 §8.1.2 set is not needed — what's
+  on the wire is a closed set of known-good clients.
+- Error mapping. RPC-level failure maps to HTTP 200 with a
+  trailer `grpc-status` and optional `grpc-message`. Transport
+  failure emits `RST_STREAM` / `GOAWAY` per §14.
+
+### 15.3 Milestone 3 — Production polish
+
+Deferred until after Flight SQL is working end-to-end:
+
+- GOAWAY graceful-shutdown. Server shutdown emits
+  `GOAWAY(NO_ERROR)` with `lastProcessedStreamId`; new streams
+  refused, existing streams allowed to drain per
+  `STREAM_STATE_MACHINE.md` §12.
+- h2spec full conformance via the harness in
   `HTTP2_FRAME_CODEC.md` §12.5.
+- Full §11 validator (content-length reconciliation, TE
+  restrictions, connection ban).
+- Extended CONNECT (RFC 8441) if any Flight client ends up
+  needing bidirectional streaming over a single long-lived
+  stream.
 
-### 15.3 Milestone 3 — TLS and Flight SQL
+### 15.4 Deliberately out of scope
 
-- ALPN negotiation in the TLS layer; drop the preface sniff.
-- Extended CONNECT (RFC 8441) carve-out in the state machine;
-  gRPC-specific processor surface.
-- Arrow Flight SQL `DoGet` / `DoPut` handlers emitting
-  length-prefixed protobuf over DATA frames.
+The following pre-pivot items are retired and will not land
+unless a future non-Flight-SQL consumer re-raises the need:
 
-### 15.4 Build order within Milestone 1
+- `JsonQueryProcessor` / `ExportQueryProcessor` /
+  `HealthCheckProcessor` / any existing REST processor running
+  over H2. The existing H1 listen socket keeps serving them.
+- `WaitProcessor` retry-path refactor for H2.
+- Foreign-thread dispatcher wake-up primitive for H2 body
+  consumption (Flight SQL body consumption happens on the
+  same worker that drives the H2 engine).
+- `HttpCookieHandler.parseCookies` retype.
+- `RejectProcessorFactory` retype.
+- Cookie parsing over H2.
+- `HttpRequestContext` as a processor-facing abstraction for
+  H2 (Wave 4 rips out the H2 side; the H1 path keeps the
+  interface it already has, or reverts to the concrete type —
+  see Wave 4 §15.5 step 1).
+- `Http2StreamRequestContext` adapter layer, response sink,
+  chunked / simple response adapters, `LocalValueMap.release`.
 
+### 15.5 Build order for Wave 4
+
+Single PR, or split at the reviewer's discretion. The ordering
+inside is:
+
+1. **Rip out the H1-mimicry layer.** Delete
+   `Http2StreamRequestContext`,
+   `Http2StreamRequestContextPool`, `Http2ResponseSink`,
+   `Http2ChunkedResponse`, `Http2SimpleResponse`,
+   `Http2RequestHeader`. Delete
+   `Http2StreamRequestContextListener` from
+   `HttpConnectionContext` and the `h2AdapterPool`
+   field / lifecycle. Delete `LocalValueMap.release`. Revert
+   the `HttpRequestContext` interface extraction if no
+   current caller still needs it — check H1 first; if H1 now
+   takes `HttpRequestContext` everywhere, leaving the
+   interface in place is harmless and pure refactoring churn
+   to revert, so leave it. Revert the `SimpleResponse`
+   interface extraction on the same principle. Delete the
+   Wave 3 tests
+   (`Http2StreamAdapterPoolTest`,
+   `Http2RequestHeaderCopyOnBindTest`,
+   `Http2ResponseSinkSingleFrameTest`,
+   `LocalValueMapReleaseTest`).
+2. **Pseudo-header capture.** Per-stream staging buffer on
+   `Http2Stream` (8 KiB default,
+   `Http2ConnectionConfig.headerStagingBytesPerStream`); real
+   `HpackListener` replacing `NOOP_HPACK_LISTENER`; concrete
+   `Http2RequestHeadersView`; overflow → `PROTOCOL_ERROR`
+   reset. Slots: `:method`, `:scheme`, `:path`, `:authority`,
+   `content-type`. No `Host` capture — H1-ism that Flight SQL
+   doesn't use. All other headers consumed and dropped.
+3. **Trailer emission.**
+   `emitTrailers(streamId, generation, writer, endStream=true)`
+   on `Http2ConnectionContext` with the same HPACK snapshot /
+   restore discipline as `emitResponseHeaders`. Tuple kind
+   `TUPLE_KIND_TRAILERS` on `Http2Stream`; scheduler treats
+   trailer HEADERS identically to response HEADERS except
+   that trailers always carry `END_STREAM` and the state
+   machine transitions accordingly. State-machine update per
+   `STREAM_STATE_MACHINE.md` §5.
+4. **Park / resume end-to-end test.** Test-only listener that
+   emits a multi-DATA-frame response, drives PARK via tiny
+   `SETTINGS_INITIAL_WINDOW_SIZE`, asserts resume on
+   `WINDOW_UPDATE`. Same shape for tuple-ring saturation and
+   `WINDOW_UPDATE(0)`. Multi-park cases.
+5. **Slim listener placeholder.** Replace the deleted
+   `Http2StreamRequestContextListener` with a tiny logging no-
+   op listener inside `HttpConnectionContext` that just
+   records callbacks. M2 replaces this with the Flight SQL
+   listener proper.
+
+### 15.6 Pre-pivot build order (historical)
+
+Two phases, with Phase A and Phase B steps 1–2 runnable in
+parallel. Phase B steps 3 onwards depend on Phase A landing.
 Each step lands with its unit tests and is independently
 reviewable.
 
-1. **`HttpRequestContext` interface.** Extract from
-   `HttpConnectionContext`. No processor signature changes.
-   Tests unchanged.
-2. **`HttpRequestProcessor` parameter retype.** Change every
-   processor method signature from `HttpConnectionContext` to
-   `HttpRequestContext`. Mechanical diff, every compile-error
-   is an import fix.
-3. **`Http2ServerContext` skeleton.** Socket ownership,
-   receive/send buffers, `handleClientOperation` routing to
-   `Http2ConnectionContext` already under test. No listener
-   yet — listener is a no-op that just logs callbacks.
-4. **Preface-branch in the dispatcher.** Accept flow picks
-   between `Http2ServerContext` and `HttpConnectionContext` on
-   first bytes.
-5. **`Http2StreamRequestContext` pool + `Http2RequestHeaderView`
-   population.** Adapter construction / teardown tested in
-   isolation via a mock `Http2StreamListener` feeding the
-   adapter synthetic events.
-6. **`Http2ResponseSink` sending a single HEADERS + DATA
-   frame.** No flow-control backpressure path yet — the M1
-   response bodies fit in one frame.
-7. **Wire to `StaticContentProcessor`** (or a hello-world
-   stub); `curl --http2-prior-knowledge` smoke.
-8. **Park / resume** wired for the response sink's
-   `PeerIsSlowToReadException` path, then re-test with a
-   response large enough to drain the initial window.
+#### Phase A — Response core in `Http2ConnectionContext`
+
+Pure engine work. Socket-free, driven by native `(addr, limit)`
+buffers per `Http2ConnectionContext`'s existing contract (§4.2).
+Tests live under `core/src/test/java/io/questdb/test/cutlass/http2/`
+and drive the engine directly without touching the HTTP
+integration layer. The reason this phase goes first: without the
+response-side primitives, the integration layer would have to
+fake them or bake ownership / backpressure decisions into the
+adapter, where they don't belong.
+
+**A.1 — Outbound state on `Http2Stream`.** Extend
+`Http2Stream.java` (385 LOC today) with the per-stream outbound
+queue, the copy-on-enqueue arena (native, sized to the per-stream
+outbound tuple-queue cap — §16 Q7), per-stream-cap accounting,
+and the END_STREAM-carrying flag on the final tuple. `Http2StreamPool`
+teardown frees the arena when a slot moves to TOMBSTONE.
+
+**A.2 — `enqueueData` with copy-on-enqueue ownership.** Add the
+engine API shape from §4.4: `enqueueData(streamId, generation,
+payloadAddr, payloadLen, endStream)` copies bytes into the
+stream's outbound arena, rejects on generation mismatch or
+stream-closed, rejects when the per-stream cap is exceeded
+(returns the sentinel that tells the caller to park).
+
+**A.3 — `emitResponseHeaders` with the shared `HpackEncoder`.**
+Add the `Http2HeadersWriter` callback interface and the
+`emitResponseHeaders(streamId, generation, writer, endStream)`
+method. Encoder serialisation per §10 rule 1; copied encoded
+block handed to the outbound scheduler on `streamId`.
+
+**A.4 — Round-robin outbound scheduler in `writePending`.**
+Extend `writePending` to drain the control-frame queue first,
+then walk ready streams in round-robin order, emitting DATA
+frames up to `peerMaxFrameSize` and up to available stream +
+connection windows, stopping when the send buffer fills or no
+stream is eligible. Connection-scoped "next stream" cursor per
+`STREAM_STATE_MACHINE.md` §7.
+
+**A.5 — `Http2StreamListener.onStreamWritable(streamId)`.**
+New listener method. Fires after any event that grows a parked
+stream's outbound-eligible window below the per-stream queue
+cap — `WINDOW_UPDATE` on the stream id, `WINDOW_UPDATE(0)` on
+the connection, and `SETTINGS_INITIAL_WINDOW_SIZE` increases
+(`Http2ConnectionContext.java:504-537`). Decide synchronously-
+during-`processReceivedBytes` vs. end-of-tick batching (§16
+Q6); pick synchronous for simplicity unless profiling says
+otherwise.
+
+**A.6 — Response-side END_STREAM transitions.** Wire
+`emitResponseHeaders(..., endStream=true)` and DATA-with-
+END_STREAM through the state-machine transitions per
+`STREAM_STATE_MACHINE.md` §5. Ensure `onStreamClosed` fires on
+the listener after the frame flushes.
+
+**A.7 — Focused tests.** Land alongside the implementation
+PRs. The set:
+
+- HEADERS-only response (status + empty body, END_STREAM on
+  HEADERS).
+- HEADERS + DATA + END_STREAM (happy path).
+- DATA payload split across multiple DATA frames by peer
+  `MAX_FRAME_SIZE`.
+- Zero stream outbound window → DATA queued, no emission;
+  `WINDOW_UPDATE` unparks and DATA flows.
+- Zero connection outbound window with stream window > 0 →
+  DATA queued; `WINDOW_UPDATE(0)` unparks.
+- `SETTINGS_INITIAL_WINDOW_SIZE` increase unparks streams
+  blocked only on per-stream window.
+- Per-stream cap overrun on `enqueueData` returns the park
+  sentinel and does not accept more bytes.
+- `enqueueData` / `onBytesConsumed` / `emitResponseHeaders`
+  with stale generation reject the call silently (per §7 step
+  6 of the state-machine doc).
+- Peer `RST_STREAM(CANCEL)` lands while HEADERS / DATA are
+  queued for that stream → scheduler drops queued tuples, the
+  per-stream arena is freed, no further frames emit on that
+  stream. **This test catches ownership bugs at the cheapest
+  point.**
+- Round-robin fairness: two streams with queued DATA, both
+  under their windows, alternate DATA emissions tick by tick.
+
+#### Phase B — Integration
+
+**B.1 — `HttpRequestContext` interface extraction.** Parallel
+with Phase A. Pure mechanical — extracts the interface from
+`HttpConnectionContext`; no processor signature changes yet.
+Tests unchanged. (§7 refactor plan step 1.)
+
+**B.2 — Surface changes + processor retype.** Parallel with
+Phase A. Per §7 refactor plan step 2 — **not** a pure
+import-fix pass. Bundle: `SimpleResponse` interface extraction,
+`HttpCookieHandler.processServiceAccountCookie` first-arg
+retype, `HttpRequestProcessor` parameter retype across every
+implementation, and processor-state-class retypes (e.g.
+`JsonQueryProcessorState.httpConnectionContext`). Classify
+each processor as H2-eligible vs. H1-only and leave H1-only
+processors importing the concrete context. Grep before
+starting to size the change.
+
+**B.3 — `protocolMode` + sniff path.** Depends on nothing;
+could land any time after B.1. Adds the mode bit, the
+peek-scratch allocation in `doInit()`, `sniffAndSelectMode`,
+and the `MODE_H1` / `MODE_H2_PREFACE_PENDING` branches at the
+top of `handleClientOperation`.
+`MODE_H2_PREFACE_PENDING` initially short-circuits to
+`registerDispatcherDisconnect` with a not-implemented reason.
+Validates that the sniff doesn't regress H1 under the full
+HTTP test suite.
+
+**B.4 — Lazy H2 engine + preface drain + handleH2Operation
+skeleton.** Depends on Phase A (the engine must already have
+the response-emit surface) and B.3 (the mode bit). On entry
+to `MODE_H2_PREFACE_PENDING`, run `drainH2Preface` (§6.2),
+allocate `Http2ConnectionContext`, H2 send buffer, and emit
+the initial SETTINGS; transition to `MODE_H2`.
+`handleH2Operation` drains recv → `processReceivedBytes` →
+`writePending` → `socket.send` with a no-op
+`Http2StreamListener` that just logs callbacks.
+`curl --http2-prior-knowledge` completes the preface exchange
+cleanly; no actual responses yet.
+
+**B.5 — Adapter pool + `Http2RequestHeader` population.**
+Depends on B.4 (the engine is actually driving the listener
+now). Adapter construction / teardown tested in isolation via
+a mock `Http2StreamListener` feeding the adapter synthetic
+events. Exercises the copy-on-bind path (§8) and the
+per-stream `LocalValueMap` release-on-close semantics (§11).
+
+**B.6 — `Http2ResponseSink` + `Http2ChunkedResponse` sending
+a single HEADERS + DATA frame.** Depends on B.5 + Phase A.
+Uses `emitResponseHeaders` and `enqueueData` directly — the
+engine already has them tested. No flow-control backpressure
+path yet — the M1 response bodies fit in one frame.
+
+**B.7 — Wire to `HealthCheckProcessor`** (or a hello-world
+stub). Depends on B.2 + B.6. `curl --http2-prior-knowledge`
+smoke returns 200 OK. Avoid `StaticContentProcessor` until
+the raw-socket DATA-frame adapter lands (§16 Q1).
+
+**B.8 — Park / resume.** Depends on B.7. Wire the response
+sink's `PeerIsSlowToReadException` path through the
+parked-streams set on `HttpConnectionContext`, driven by
+`onStreamWritable` from Phase A.5. Re-test with a response
+large enough to drain the initial window.
 
 ## 16. Open Questions
 
-1. **Dispatcher context swap.** §6 step 2 swaps the short-lived
-   `HttpServerStartContext` for either `HttpConnectionContext`
-   or `Http2ServerContext` after `Net.peek` decides the
-   protocol. Does `IODispatcher` currently support replacing the
-   `IOContext` bound to a socket in place, or does the API force
-   one type for the whole connection lifetime? If the latter,
-   fold both parsers under a single `HttpServerContext` whose
-   `handleClientOperation` internally dispatches to an H1 or H2
-   engine selected at first peek. Verify when wiring.
-2. **Connection-scope `LocalValue`.** No current processor needs
-   state that spans all streams on a TCP connection. Add the
-   facility (a second `LocalValueMap` on `Http2ServerContext`)
-   only when a real caller asks for it.
-3. **Raw-socket processor support.** Does any M1 / M2 processor
+1. **Raw-socket processor support.** Does any M1 / M2 processor
    depend on `HttpRawSocket` access? If yes, build the
    DATA-frame-wrapping adapter (§10); if no, return `null` from
    `Http2StreamRequestContext.getRawResponseSocket()` and
    document raw-socket processors as HTTP/1.x-only until M3.
    Grep the processor tree to close this.
-4. **Trailers for existing processors.** HTTP/1.x processors
+2. **Trailers for existing processors.** HTTP/1.x processors
    never see trailers. Is the M2 trailer hook worth the
    interface churn, or is the gRPC-only pathway the right home
    for it? Defer pending the Stage 3 design.
-5. **Per-connection auth cache.** Measure whether re-running
+3. **Per-connection auth cache.** Measure whether re-running
    the authenticator per stream is a meaningful overhead under
    the expected H2 workload (browser-driven query bursts, gRPC
-   long-lived channels). If yes, add the cache on
-   `Http2ServerContext`; if no, skip.
-6. **`onConnectionClosed` rename.** The processor hook
+   long-lived channels). If yes, add the cache via a
+   `LocalValue` on the outer `HttpConnectionContext.getMap()`
+   (§11); if no, skip.
+4. **`onConnectionClosed` rename.** The processor hook
    `onConnectionClosed(ctx)` fires on stream close under H2,
    not connection close. Rename to `onRequestClosed(ctx)` in
    the refactor PR, or keep the historical name and document
    the semantics. Minor but touches every processor.
-7. **Dispatcher wake-up for pending-ops queue.** §5 specifies
+5. **Dispatcher wake-up for pending-ops queue.** §5 specifies
    that foreign threads (e.g. a `TextImportProcessor` worker
    finishing deferred body consumption) push entries onto a
    per-connection MPSC pending-ops queue and signal the
    `IODispatcher` to wake the connection. The exact wake-up
    primitive depends on what QuestDB's dispatcher exposes —
    `eventfd`-style wake, re-queue via `heartbeat`, or a
-   dedicated signal channel. Confirm when wiring §5; if no
-   primitive exists, adding one is a prerequisite for M2
+   dedicated signal channel. No such primitive exists on
+   `IODispatcher` today; adding one is a prerequisite for M2
    (M1 can get away without it since the hello-world fixture
    is fully synchronous).
-8. **`Http2StreamListener.onStreamWritable(streamId)`.** §10
+6. **`Http2StreamListener.onStreamWritable(streamId)`.** §10
    introduces this new callback so the adapter layer can resume
    a stream that parked on its outbound window. It is **not**
    in the current `Http2StreamListener` Java interface; adding
@@ -988,7 +2000,7 @@ reviewable.
    implementing, and decide whether the callback is raised
    synchronously during `processReceivedBytes` (simplest) or
    deferred to the end of the tick (batches multiple wakes).
-9. **Per-stream outbound tuple-queue cap.** §10 references a
+7. **Per-stream outbound tuple-queue cap.** §10 references a
    "configurable maximum, e.g. 256 KiB worth of queued tuple
    payload" as the threshold above which
    `PeerIsSlowToReadException` fires. Pick the number after
@@ -996,14 +2008,22 @@ reviewable.
    `INITIAL_WINDOW_SIZE`. Too low and long-poll / streaming
    responses bounce into park/resume under moderate load; too
    high and a single stalled peer can tie up unbounded memory.
-10. **Pending-ops queue bound and overflow policy.** §5 proposes
-    `4 × MAX_CONCURRENT_STREAMS` entries with a blocking
-    enqueue as the overflow fallback. Blocking inside the
-    foreign thread feeds backpressure into the offload pipeline
-    (e.g. the `TextImportProcessor` writer slows its reads),
-    which is probably right; alternatively, a bounded queue
-    with a non-blocking "drop and let the state machine settle
-    on stream close" policy would avoid any risk of deadlocking
-    the offload pipeline at the cost of re-crediting more
-    bytes via the settlement path. Measure under a deferred-
-    body-heavy workload to pick.
+8. **Pending-ops queue bound and overflow policy.** §5 proposes
+   `4 × MAX_CONCURRENT_STREAMS` entries with a blocking
+   enqueue as the overflow fallback. Blocking inside the
+   foreign thread feeds backpressure into the offload pipeline
+   (e.g. the `TextImportProcessor` writer slows its reads),
+   which is probably right; alternatively, a bounded queue
+   with a non-blocking "drop and let the state machine settle
+   on stream close" policy would avoid any risk of deadlocking
+   the offload pipeline at the cost of re-crediting more
+   bytes via the settlement path. Measure under a deferred-
+   body-heavy workload to pick.
+9. **Lazy H1 buffer allocation on H2-only connections.** When
+   `preAllocateBuffers = true` (`HttpConnectionContext.java:169`),
+   the H1 `recvBuffer`, `responseSink` send buffer,
+   `headerParser` etc. are allocated in the constructor and
+   sit unused on H2-only connections. For de/cployments that run
+   H2 heavily (Flight SQL, gRPC), either flip the default off
+   or split pre-allocation by mode. M1 defers; M2 worth
+   measuring.

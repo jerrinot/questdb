@@ -43,6 +43,7 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
     private final int httpForceRecvFragmentationChunkSize;
     private final int httpForceSendFragmentationChunkSize;
     private final boolean httpFrozenClock;
+    private final boolean httpH2Enabled;
     private final int httpIlpConnectionLimit;
     private final int httpJsonQueryConnectionLimit;
     private final boolean httpReadOnlySecurityContext;
@@ -93,7 +94,8 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
                 requestHeaderBufferSize,
                 -1,
                 -1,
-                -1
+                -1,
+                false
         );
     }
 
@@ -116,7 +118,8 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
             int requestHeaderBufferSize,
             int httpJsonQueryConnectionLimit,
             int httpIlpConnectionLimit,
-            int exportConnectionLimit
+            int exportConnectionLimit,
+            boolean httpH2Enabled
     ) {
         this.connectionPoolInitialCapacity = connectionPoolInitialCapacity;
         this.connectionStringPoolCapacity = connectionStringPoolCapacity;
@@ -125,6 +128,7 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
         this.httpForceRecvFragmentationChunkSize = httpForceRecvFragmentationChunkSize;
         this.httpForceSendFragmentationChunkSize = httpForceSendFragmentationChunkSize;
         this.httpFrozenClock = httpFrozenClock;
+        this.httpH2Enabled = httpH2Enabled;
         this.httpReadOnlySecurityContext = httpReadOnlySecurityContext;
         this.httpServerCookiesEnabled = httpServerCookiesEnabled;
         this.httpSessionTimeout = httpSessionTimeout;
@@ -242,6 +246,11 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
     @Override
     public long getSessionTimeout() {
         return httpSessionTimeout;
+    }
+
+    @Override
+    public boolean isH2Enabled() {
+        return httpH2Enabled;
     }
 
     @Override

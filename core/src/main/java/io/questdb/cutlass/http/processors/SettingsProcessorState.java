@@ -25,6 +25,7 @@
 package io.questdb.cutlass.http.processors;
 
 import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.network.PeerDisconnectedException;
 import io.questdb.network.PeerIsSlowToReadException;
 import io.questdb.std.Mutable;
@@ -55,7 +56,7 @@ class SettingsProcessorState implements Mutable, Closeable {
         return utf8Sink;
     }
 
-    void send(HttpConnectionContext context) throws PeerIsSlowToReadException, PeerDisconnectedException {
+    void send(HttpRequestContext context) throws PeerIsSlowToReadException, PeerDisconnectedException {
         assert statusCode > 0;
         if (utf8Sink.size() > 0) {
             context.simpleResponse().sendStatusJsonContent(statusCode, utf8Sink);

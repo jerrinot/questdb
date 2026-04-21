@@ -149,7 +149,20 @@ public final class Http2FrameReader {
         return total;
     }
 
-    private static int readU32(long addr) {
+    /**
+     * Big-endian 64-bit read. Symmetric with {@code Http2FrameWriter.putU64}.
+     * Use this when echoing wire-octet sequences back to the peer
+     * byte-for-byte (e.g. PING opaque), since {@link Unsafe#getLong} reads
+     * in platform byte order and would corrupt big-endian wire data on
+     * little-endian hosts.
+     */
+    public static long readU64(long addr) {
+        long hi = readU32(addr) & 0xFFFF_FFFFL;
+        long lo = readU32(addr + 4) & 0xFFFF_FFFFL;
+        return (hi << 32) | lo;
+    }
+
+    static int readU32(long addr) {
         int b0 = Unsafe.getUnsafe().getByte(addr) & 0xFF;
         int b1 = Unsafe.getUnsafe().getByte(addr + 1) & 0xFF;
         int b2 = Unsafe.getUnsafe().getByte(addr + 2) & 0xFF;

@@ -287,6 +287,7 @@ public enum PropertyKey implements ConfigPropertyKey {
     HTTP_MIN_NET_CONNECTION_RCVBUF("http.min.net.connection.rcvbuf"),
     HTTP_MIN_NET_CONNECTION_HINT("http.min.net.connection.hint"),
     HTTP_ENABLED("http.enabled"),
+    HTTP_H2_ENABLED("http.h2.enabled"),
     HTTP_MULTIPART_HEADER_BUFFER_SIZE("http.multipart.header.buffer.size"),
     HTTP_MULTIPART_IDLE_SPIN_COUNT("http.multipart.idle.spin.count"),
     HTTP_REQUEST_HEADER_BUFFER_SIZE("http.request.header.buffer.size"),

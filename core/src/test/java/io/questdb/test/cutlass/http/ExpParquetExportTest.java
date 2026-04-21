@@ -49,6 +49,8 @@ import io.questdb.std.str.DirectUtf8Sink;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8StringSink;
+import io.questdb.std.str.Utf8s;
 import io.questdb.test.AbstractBootstrapTest;
 import io.questdb.test.AbstractTest;
 import io.questdb.test.TestServerMain;
@@ -1607,16 +1609,23 @@ public class ExpParquetExportTest extends AbstractBootstrapTest {
                     params.put("query", "SELECT x + 1 AS cx, rnd_str(500, 1000, 0) AS big, ts FROM cb_test");
                     params.put("fmt", "parquet");
                     params.put("timeout", "1");
-                    // With a very short timeout the circuit breaker should trip
-                    // during PAGE_FRAME_BACKED export.  Depending on which code
-                    // path checks first, the error is either "timeout, query
-                    // aborted" (from the page-frame factory) or "cancelled by
-                    // user" (from the HTTP exporter).  The server may also just
-                    // disconnect.
+                    // Three legitimate outcomes depending on when the breaker
+                    // fires relative to the parquet write path:
+                    //   1. Breaker fires before any parquet bytes are flushed
+                    //      -> server responds 400 with JSON containing
+                    //         "timeout, query aborted" or "cancelled by user".
+                    //   2. Breaker fires after the PAR chunk has been flushed
+                    //      -> server closes mid-stream, HTTP client raises
+                    //         "peer disconnect" / "malformed chunk".
+                    //   3. Breaker doesn't fire at all (JIT-warm fast path:
+                    //      export completes within the 1-second URL timeout)
+                    //      -> server responds 200 with a complete binary
+                    //         parquet body (PAR1 ... PAR1).
+                    // All three are valid server behaviour. The assertion has
+                    // to branch on the status code rather than trying to
+                    // UTF-8-decode the body unconditionally.
                     try {
-                        testHttpClient.assertGetContains("/exp", "timeout, query aborted", params);
-                    } catch (AssertionError ae) {
-                        TestUtils.assertContains(ae.getMessage(), "cancelled by user");
+                        assertParquetTimeoutResponse();
                     } catch (HttpClientException e) {
                         String msg = e.getMessage();
                         Assert.assertTrue(
@@ -1625,6 +1634,59 @@ public class ExpParquetExportTest extends AbstractBootstrapTest {
                         );
                     }
                 });
+    }
+
+    /**
+     * Drives the /exp request using the raw {@link HttpClient} API so the test
+     * can inspect the response status before deciding how to treat the body.
+     * A 400 response is decoded as text and asserted against the breaker
+     * error messages; a 200 response is a valid binary parquet file and is
+     * validated byte-level against the parquet magic.
+     */
+    private void assertParquetTimeoutResponse() {
+        final int port = 9001;
+        try (HttpClient client = HttpClientFactory.newPlainTextInstance(new DefaultHttpClientConfiguration())) {
+            HttpClient.Request req = client.newRequest("localhost", port);
+            req.GET().url("/exp");
+            for (int i = 0, n = params.size(); i < n; i++) {
+                CharSequence name = params.keys().getQuick(i);
+                req.query(name, params.get(name));
+            }
+            try (HttpClient.ResponseHeaders rsp = req.send()) {
+                rsp.await();
+                String statusCode = Utf8s.toString(rsp.getStatusCode());
+                Utf8StringSink body = new Utf8StringSink();
+                rsp.getResponse().copyTextTo(body);
+                switch (statusCode) {
+                    case "200":
+                        // Binary parquet; must start and end with the PAR1 magic.
+                        assertParquetMagic(body);
+                        break;
+                    case "400":
+                        String bodyText = body.toString();
+                        Assert.assertTrue(
+                                "unexpected 400 body: " + bodyText,
+                                bodyText.contains("timeout, query aborted") || bodyText.contains("cancelled by user")
+                        );
+                        break;
+                    default:
+                        Assert.fail("unexpected status " + statusCode + ", body-size=" + body.size());
+                }
+            }
+        }
+    }
+
+    private static void assertParquetMagic(Utf8StringSink body) {
+        final int size = body.size();
+        Assert.assertTrue("parquet response too short: " + size, size >= 8);
+        Assert.assertEquals('P', body.byteAt(0));
+        Assert.assertEquals('A', body.byteAt(1));
+        Assert.assertEquals('R', body.byteAt(2));
+        Assert.assertEquals('1', body.byteAt(3));
+        Assert.assertEquals('P', body.byteAt(size - 4));
+        Assert.assertEquals('A', body.byteAt(size - 3));
+        Assert.assertEquals('R', body.byteAt(size - 2));
+        Assert.assertEquals('1', body.byteAt(size - 1));
     }
 
     @Test

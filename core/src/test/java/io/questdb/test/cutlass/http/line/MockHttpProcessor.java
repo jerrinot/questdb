@@ -27,6 +27,7 @@ package io.questdb.test.cutlass.http.line;
 import io.questdb.cairo.SecurityContext;
 import io.questdb.cutlass.http.HttpChunkedResponse;
 import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpPostPutProcessor;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHeader;
@@ -61,7 +62,7 @@ class MockErrorSettingsProcessor implements HttpRequestProcessor, HttpRequestHan
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         final HttpChunkedResponse r = context.getChunkedResponse();
         r.status(HttpURLConnection.HTTP_UNAUTHORIZED, "text/plain");
         r.sendHeader();
@@ -138,7 +139,7 @@ final class MockHttpProcessor implements HttpPostPutProcessor, HttpRequestHandle
     }
 
     @Override
-    public void onHeadersReady(HttpConnectionContext context) {
+    public void onHeadersReady(HttpRequestContext context) {
         ObjList<? extends Utf8Sequence> headerNames = context.getRequestHeader().getHeaderNames();
         for (int i = 0, n = headerNames.size(); i < n; i++) {
             Utf8Sequence headerNameUtf8 = headerNames.getQuick(i);
@@ -149,7 +150,7 @@ final class MockHttpProcessor implements HttpPostPutProcessor, HttpRequestHandle
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         recordedRequests.add(actualRequest);
         actualRequest = new ActualRequest();
 
@@ -289,7 +290,7 @@ class MockSettingsProcessor implements HttpRequestHandler, HttpRequestProcessor 
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         final HttpChunkedResponse r = context.getChunkedResponse();
         r.status(HttpURLConnection.HTTP_OK, "application/json");
         r.sendHeader();
@@ -313,7 +314,7 @@ class MockSettingsProcessorOldServer implements HttpRequestProcessor, HttpReques
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         final HttpChunkedResponse r = context.getChunkedResponse();
         r.status(HttpURLConnection.HTTP_OK, "application/json");
         r.sendHeader();

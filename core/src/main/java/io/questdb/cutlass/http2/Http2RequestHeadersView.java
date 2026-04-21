@@ -27,20 +27,23 @@ package io.questdb.cutlass.http2;
 /**
  * Read-only view over the pseudo-header slots captured during an HTTP/2
  * initial HEADERS block. Passed to
- * {@link Http2StreamListener#onRequestHeaders} so the request-dispatch layer
- * can read {@code :method}, {@code :scheme}, {@code :path},
- * {@code :authority}, and {@code Host} without taking a reference to the
- * mutable {@link Http2Stream}.
+ * {@link Http2StreamListener#onRequestHeaders} so the request-dispatch
+ * layer can read {@code :method}, {@code :scheme}, {@code :path},
+ * {@code :authority}, and {@code content-type} without taking a reference
+ * to the mutable {@link Http2Stream}. {@code content-type} sits alongside
+ * the four pseudo-headers because Flight SQL routers need it to
+ * distinguish gRPC traffic from other H2 clients; no other regular header
+ * is captured at this layer.
  * <p>
  * All {@code (addr, len)} pairs point into the owning stream's per-stream
- * header-staging buffer, which is stable for the duration of the enclosing
- * {@code onRequestHeaders} call but may be rewritten by a subsequent
- * request on the same stream. The handler must copy any bytes it wants to
- * retain. A {@code *Len} of {@code 0} with {@code *Addr} of {@code 0}
- * indicates the slot was absent in the request — this layer does not
- * defensively return an empty sentinel, because the pseudo-header
- * validation path in §11 has already rejected malformed requests before
- * the callback fires.
+ * header-staging buffer, which is stable for the duration of the
+ * enclosing {@code onRequestHeaders} call but may be rewritten by a
+ * subsequent request on the same stream. The handler must copy any bytes
+ * it wants to retain. A {@code *Len} of {@code 0} with {@code *Addr} of
+ * {@code 0} indicates the slot was absent in the request — this layer
+ * does not defensively return an empty sentinel, because the
+ * pseudo-header validation path in §11 has already rejected malformed
+ * requests before the callback fires.
  */
 public interface Http2RequestHeadersView {
 
@@ -48,9 +51,9 @@ public interface Http2RequestHeadersView {
 
     int getAuthorityLen();
 
-    long getHostAddr();
+    long getContentTypeAddr();
 
-    int getHostLen();
+    int getContentTypeLen();
 
     long getMethodAddr();
 

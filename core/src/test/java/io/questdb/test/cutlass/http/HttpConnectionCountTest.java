@@ -32,6 +32,7 @@ import io.questdb.client.Sender;
 import io.questdb.cutlass.Services;
 import io.questdb.cutlass.http.ActiveConnectionTracker;
 import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHandlerFactory;
 import io.questdb.cutlass.http.HttpServer;
@@ -189,7 +190,7 @@ public class HttpConnectionCountTest extends AbstractBootstrapTest {
                                         ) {
                                             @Override
                                             public void onRequestComplete(
-                                                    HttpConnectionContext context
+                                                    HttpRequestContext context
                                             ) throws PeerDisconnectedException, PeerIsSlowToReadException {
                                                 super.onRequestComplete(context);
 
@@ -333,7 +334,7 @@ public class HttpConnectionCountTest extends AbstractBootstrapTest {
                                         ) {
                                             @Override
                                             public void onRequestComplete(
-                                                    HttpConnectionContext context
+                                                    HttpRequestContext context
                                             ) throws PeerDisconnectedException, PeerIsSlowToReadException {
                                                 super.onRequestComplete(context);
                                                 await(limitBarrier);

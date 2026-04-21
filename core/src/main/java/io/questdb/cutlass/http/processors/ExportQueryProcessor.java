@@ -48,6 +48,7 @@ import io.questdb.cutlass.http.HttpException;
 import io.questdb.cutlass.http.HttpKeywords;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.cutlass.http.LocalValue;
 import io.questdb.cutlass.parquet.HTTPSerialParquetExporter;
@@ -148,7 +149,7 @@ public class ExportQueryProcessor implements HttpRequestProcessor, HttpRequestHa
     }
 
     public void execute(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             ExportQueryProcessorState state
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         try {
@@ -296,11 +297,12 @@ public class ExportQueryProcessor implements HttpRequestProcessor, HttpRequestHa
 
     @Override
     public void onRequestComplete(
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         ExportQueryProcessorState state = LV.get(context);
         if (state == null) {
-            LV.set(context, state = new ExportQueryProcessorState(context, engine.getCopyExportContext()));
+            // H1-only: state's HttpConnectionContext back-reference drives chunked-response bookkeeping.
+            LV.set(context, state = new ExportQueryProcessorState((HttpConnectionContext) context, engine.getCopyExportContext()));
         }
 
         HttpChunkedResponse response = context.getChunkedResponse();
@@ -312,7 +314,7 @@ public class ExportQueryProcessor implements HttpRequestProcessor, HttpRequestHa
     }
 
     @Override
-    public void parkRequest(HttpConnectionContext context, boolean pausedQuery) {
+    public void parkRequest(HttpRequestContext context, boolean pausedQuery) {
         ExportQueryProcessorState state = LV.get(context);
         if (state != null) {
             state.pausedQuery = pausedQuery;
@@ -323,7 +325,7 @@ public class ExportQueryProcessor implements HttpRequestProcessor, HttpRequestHa
 
     @Override
     public void resumeSend(
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         try {
             doResumeSend(context);
@@ -457,14 +459,14 @@ public class ExportQueryProcessor implements HttpRequestProcessor, HttpRequestHa
         }
     }
 
-    private static void readyForNextRequest(HttpConnectionContext context) {
+    private static void readyForNextRequest(HttpRequestContext context) {
         LOG.debug().$("all sent [fd=").$(context.getFd())
                 .$(", lastRequestBytesSent=").$(context.getLastRequestBytesSent())
                 .$(", nCompletedRequests=").$(context.getNCompletedRequests() + 1)
                 .$(", totalBytesSent=").$(context.getTotalBytesSent()).I$();
     }
 
-    private void compileParquetExport(HttpConnectionContext context, ExportQueryProcessorState state) throws SqlException {
+    private void compileParquetExport(HttpRequestContext context, ExportQueryProcessorState state) throws SqlException {
         assert state.copyID == -1;
         CopyExportContext.ExportTaskEntry entry = null;
         try {
@@ -751,7 +753,7 @@ public class ExportQueryProcessor implements HttpRequestProcessor, HttpRequestHa
         return LOG.critical().$('[').$(state.getFd()).$("] ");
     }
 
-    private void doParquetExport(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    private void doParquetExport(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         ExportQueryProcessorState state = LV.get(context);
         final HttpChunkedResponse response = context.getChunkedResponse();
 
@@ -846,7 +848,7 @@ public class ExportQueryProcessor implements HttpRequestProcessor, HttpRequestHa
         readyForNextRequest(context);
     }
 
-    private void doResumeSend(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    private void doResumeSend(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         ExportQueryProcessorState state = LV.get(context);
         if (state == null) {
             return;
@@ -1044,7 +1046,7 @@ public class ExportQueryProcessor implements HttpRequestProcessor, HttpRequestHa
             HttpChunkedResponse response,
             HttpRequestHeader request,
             ExportQueryProcessorState state,
-            HttpConnectionContext context
+            HttpRequestContext context
     ) throws PeerDisconnectedException, PeerIsSlowToReadException {
         // Query text.
         final DirectUtf8Sequence query = request.getUrlParam(URL_PARAM_QUERY);
@@ -1387,7 +1389,7 @@ public class ExportQueryProcessor implements HttpRequestProcessor, HttpRequestHa
         if (dataLen <= 0) {
             return;
         }
-        HttpConnectionContext context = state.getHttpConnectionContext();
+        HttpRequestContext context = state.getHttpConnectionContext();
         HttpChunkedResponse response = context.getChunkedResponse();
         if (state.firstParquetWriteCall) {
             state.firstParquetWriteCall = false;

@@ -25,6 +25,7 @@
 package io.questdb.cutlass.http.processors;
 
 import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpResponseSink;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
@@ -72,7 +73,7 @@ public class RejectProcessorImpl implements RejectProcessor {
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         final HttpResponseSink.SimpleResponseImpl response = httpConnectionContext.simpleResponse();
         if (rejectCode == HTTP_UNAUTHORIZED) {
             handleHttpUnauthorized(response);

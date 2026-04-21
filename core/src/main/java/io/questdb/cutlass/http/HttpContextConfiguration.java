@@ -74,5 +74,9 @@ public interface HttpContextConfiguration {
 
     long getSessionTimeout();
 
+    default boolean isH2Enabled() {
+        return false;
+    }
+
     boolean readOnlySecurityContext();
 }

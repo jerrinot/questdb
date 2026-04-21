@@ -28,6 +28,7 @@ import io.questdb.cutlass.http.HttpChunkedResponse;
 import io.questdb.cutlass.http.HttpConnectionContext;
 import io.questdb.cutlass.http.HttpRequestHandler;
 import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestContext;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.cutlass.http.HttpServerConfiguration;
 import io.questdb.cutlass.http.LocalValue;
@@ -66,7 +67,7 @@ public class PrometheusMetricsProcessor implements HttpRequestProcessor, HttpReq
     }
 
     @Override
-    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestComplete(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         final RequestState state = setupState(context);
 
         // We double-buffer the metrics response.
@@ -84,7 +85,7 @@ public class PrometheusMetricsProcessor implements HttpRequestProcessor, HttpReq
      * by `onRequestComplete` or earlier call to `resumeSend`.
      */
     @Override
-    public void resumeSend(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void resumeSend(HttpRequestContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         // Send the remainder of the current, partially sent, chunk.
         context.resumeResponseSend();
 
@@ -108,7 +109,7 @@ public class PrometheusMetricsProcessor implements HttpRequestProcessor, HttpReq
         }
     }
 
-    private RequestState setupState(HttpConnectionContext context) {
+    private RequestState setupState(HttpRequestContext context) {
         RequestState state = LV.get(context);
         if (state == null) {
             state = pool.pop();

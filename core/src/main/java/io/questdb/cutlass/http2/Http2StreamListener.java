@@ -114,6 +114,34 @@ public interface Http2StreamListener {
     void onStreamClosed(int streamId, int cause);
 
     /**
+     * Fires when an engine event makes {@code streamId}'s outbound side
+     * more writable — i.e. a prior
+     * {@link Http2ConnectionContext#enqueueData} or
+     * {@link Http2ConnectionContext#emitResponseHeaders} that returned
+     * {@link Http2ConnectionContext#ENQUEUE_PARK} could now succeed, or
+     * the scheduler unblocked a stream whose DATA was window-stuck.
+     * <p>
+     * Fires synchronously inside
+     * {@link Http2ConnectionContext#processReceivedBytes} or
+     * {@link Http2ConnectionContext#writePending}. Triggers:
+     * <ul>
+     *   <li>peer {@code WINDOW_UPDATE(streamId)} on a parked stream;</li>
+     *   <li>peer {@code WINDOW_UPDATE(0)} on the connection, fanned out
+     *       to every parked stream whose per-stream outbound window is
+     *       non-zero;</li>
+     *   <li>peer {@code SETTINGS_INITIAL_WINDOW_SIZE} increase that
+     *       raises a parked stream's outbound window;</li>
+     *   <li>scheduler emission that brings a parked stream's queued-
+     *       payload and tuple-ring occupancy below the per-stream caps.</li>
+     * </ul>
+     * The callback may run more than once per stream across the stream
+     * lifetime (every time it parks and then un-parks). The integration
+     * layer is expected to dispatch {@code processor.resumeSend} once
+     * per invocation.
+     */
+    void onStreamWritable(int streamId);
+
+    /**
      * Relayed trailer block after validation (M2). The {@code endStream}
      * flag is always {@code true} on a legal trailer block per RFC 9113
      * sec. 8.1; the layer surfaces it for symmetry with the other two

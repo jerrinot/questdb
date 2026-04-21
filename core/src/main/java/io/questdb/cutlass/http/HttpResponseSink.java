@@ -709,7 +709,7 @@ public class HttpResponseSink implements Closeable, Mutable {
         }
     }
 
-    public class SimpleResponseImpl {
+    public class SimpleResponseImpl implements SimpleResponse {
         private boolean contentSent = false;
         private boolean headerSent = false;
 

@@ -72,6 +72,31 @@ public final class Http2Preface {
     }
 
     /**
+     * Verifies that the range {@code [addr + fromInclusive, addr + toExclusive)}
+     * matches the corresponding slice of the HTTP/2 preface. Used by the
+     * preface drain in the connection layer, where the fixed 24-byte preface
+     * arrives piecewise across READ ticks and each fresh slice must match
+     * its position in the preface exactly.
+     *
+     * @param addr          buffer start (preface origin; callers pass the
+     *                      fixed scratch base so offsets line up with the
+     *                      preface)
+     * @param fromInclusive offset of the first byte to check, inclusive
+     * @param toExclusive   offset one past the last byte to check; must be
+     *                      &lt;= {@link #LENGTH}
+     * @return {@code true} if every byte in the range matches the preface
+     */
+    public static boolean matches(long addr, int fromInclusive, int toExclusive) {
+        assert fromInclusive >= 0 && toExclusive <= LENGTH && fromInclusive <= toExclusive;
+        for (int i = fromInclusive; i < toExclusive; i++) {
+            if (Unsafe.getUnsafe().getByte(addr + i) != BYTES[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Classifies a native buffer against the 24-byte preface.
      *
      * @param addr buffer start
