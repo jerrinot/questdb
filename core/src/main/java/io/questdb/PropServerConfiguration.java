@@ -1227,6 +1227,7 @@ public class PropServerConfiguration implements ServerConfiguration {
             }
 
             boolean httpH2Enabled = getBoolean(properties, env, PropertyKey.HTTP_H2_ENABLED, false);
+            boolean flightSqlEnabled = getBoolean(properties, env, PropertyKey.FLIGHT_SQL_ENABLED, false);
 
             httpContextConfiguration = new PropHttpContextConfiguration(
                     connectionPoolInitialCapacity,
@@ -1248,7 +1249,8 @@ public class PropServerConfiguration implements ServerConfiguration {
                     httpJsonQueryConnectionLimit,
                     httpIlpConnectionLimit,
                     httpExportConnectionLimit,
-                    httpH2Enabled
+                    httpH2Enabled,
+                    flightSqlEnabled
             );
 
             // Use a separate configuration for min server. It does not make sense for the min server to grow the buffer sizes together with the main http server

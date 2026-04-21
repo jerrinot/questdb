@@ -74,6 +74,10 @@ public interface HttpContextConfiguration {
 
     long getSessionTimeout();
 
+    default boolean isFlightSqlEnabled() {
+        return false;
+    }
+
     default boolean isH2Enabled() {
         return false;
     }

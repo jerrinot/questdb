@@ -187,9 +187,9 @@ park / resume on flow control, ALPN hook in the TLS handshake.
   `HttpConnectionContext` logs callbacks and never emits — the Flight
   SQL listener substitutes this in §5.6.
 
-**Remaining.** TLS + ALPN (§5.14). The `FlightService` listener
-(§5.2 + §5.6). Full §11 validator subset required for gRPC correctness
-moves into §5.2 alongside `content-type` enforcement.
+**Remaining.** TLS + ALPN (§5.14). Full §11 validator subset required
+for gRPC correctness moves into §5.2 alongside `content-type`
+enforcement.
 
 **Size estimate.** ~8.5k LOC landed (framing, HPACK, state machine,
 integration, tests). Remaining: ~300 LOC for TLS + ALPN wiring.
@@ -237,6 +237,18 @@ header reads, and the message-prefix reader. The state shows up in how
 it dovetails with HTTP/2 streams (trailers-only requires branching on
 whether any DATA has been sent; the engine's outbound arena already
 knows).
+
+**Status.** Wave 5 shipped a narrow subset of gRPC framing scoped to
+the `Handshake` RPC: `GrpcStatus` constants, `GrpcFrameReader`
+(reassembler with compressed-flag + oversize rejection),
+`GrpcFrameWriter.writePrefix`, and `GrpcTrailerWriter` (percent-encoded
+`grpc-message`). The Flight SQL dispatcher at
+`io.questdb.cutlass.flightsql.server.FlightSqlDispatchListener` routes
+`:path` exactly, with one live route
+(`/arrow.flight.protocol.FlightService/Handshake`) and trailers-only
+rejection for non-POST, non-`application/grpc*` content-types, and
+unknown paths. Per-message compression, `grpc-timeout`, `grpc-encoding`,
+`te: trailers`, and bidirectional streaming land in later waves.
 
 **Non-obvious concerns.**
 

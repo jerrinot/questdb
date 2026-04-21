@@ -42,6 +42,7 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
     private final boolean httpAllowDeflateBeforeSend;
     private final int httpForceRecvFragmentationChunkSize;
     private final int httpForceSendFragmentationChunkSize;
+    private final boolean flightSqlEnabled;
     private final boolean httpFrozenClock;
     private final boolean httpH2Enabled;
     private final int httpIlpConnectionLimit;
@@ -95,6 +96,7 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
                 -1,
                 -1,
                 -1,
+                false,
                 false
         );
     }
@@ -119,7 +121,8 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
             int httpJsonQueryConnectionLimit,
             int httpIlpConnectionLimit,
             int exportConnectionLimit,
-            boolean httpH2Enabled
+            boolean httpH2Enabled,
+            boolean flightSqlEnabled
     ) {
         this.connectionPoolInitialCapacity = connectionPoolInitialCapacity;
         this.connectionStringPoolCapacity = connectionStringPoolCapacity;
@@ -141,6 +144,7 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
         this.httpJsonQueryConnectionLimit = httpJsonQueryConnectionLimit;
         this.httpIlpConnectionLimit = httpIlpConnectionLimit;
         this.exportConnectionLimit = exportConnectionLimit;
+        this.flightSqlEnabled = flightSqlEnabled;
     }
 
     @Override
@@ -246,6 +250,11 @@ class PropHttpContextConfiguration implements HttpContextConfiguration {
     @Override
     public long getSessionTimeout() {
         return httpSessionTimeout;
+    }
+
+    @Override
+    public boolean isFlightSqlEnabled() {
+        return flightSqlEnabled;
     }
 
     @Override

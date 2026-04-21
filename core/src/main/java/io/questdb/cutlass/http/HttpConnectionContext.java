@@ -234,6 +234,9 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
             h2.close();
             h2 = null;
         }
+        if (h2Listener instanceof java.io.Closeable) {
+            Misc.free((java.io.Closeable) h2Listener);
+        }
         if (!preAllocateBuffers) {
             this.recvBuffer = Unsafe.free(recvBuffer, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
             this.peekScratchAddr = Unsafe.free(peekScratchAddr, PEEK_SCRATCH_SIZE, MemoryTag.NATIVE_HTTP_CONN);
@@ -280,6 +283,9 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
         if (h2 != null) {
             h2.close();
             h2 = null;
+        }
+        if (h2Listener instanceof java.io.Closeable) {
+            Misc.free((java.io.Closeable) h2Listener);
         }
         this.recvBuffer = Unsafe.free(recvBuffer, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
         this.peekScratchAddr = Unsafe.free(peekScratchAddr, PEEK_SCRATCH_SIZE, MemoryTag.NATIVE_HTTP_CONN);
@@ -596,8 +602,23 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
             return;
         }
         final Http2ConnectionConfig h2Config = Http2ConnectionConfig.defaults();
-        h2Listener = new NoopH2Listener();
-        h2 = new Http2ConnectionContext(h2Listener, h2Config);
+        if (configuration.getHttpContextConfiguration().isFlightSqlEnabled()) {
+            final io.questdb.cutlass.flightsql.server.FlightSqlCallContextPool pool =
+                    new io.questdb.cutlass.flightsql.server.FlightSqlCallContextPool(
+                            h2Config.ourMaxConcurrentStreams,
+                            io.questdb.cutlass.flightsql.server.FlightSqlDispatchListener.DEFAULT_MAX_MESSAGE_BYTES,
+                            io.questdb.std.MemoryTag.NATIVE_HTTP_CONN);
+            final io.questdb.cutlass.flightsql.server.HandshakeHandler handshake =
+                    new io.questdb.cutlass.flightsql.server.HandshakeHandler();
+            final io.questdb.cutlass.flightsql.server.FlightSqlDispatchListener dispatcher =
+                    new io.questdb.cutlass.flightsql.server.FlightSqlDispatchListener(pool, handshake);
+            h2 = new Http2ConnectionContext(dispatcher, h2Config);
+            dispatcher.bind(h2);
+            h2Listener = dispatcher;
+        } else {
+            h2Listener = new NoopH2Listener();
+            h2 = new Http2ConnectionContext(h2Listener, h2Config);
+        }
     }
 
     private void busyRcvLoop(HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext)
