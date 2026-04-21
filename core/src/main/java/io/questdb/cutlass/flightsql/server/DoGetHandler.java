@@ -140,13 +140,25 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
     private static void appendCell(Record r, int ci, ArrowColumnScratch s, int qtype) {
         switch (ColumnType.tagOf(qtype)) {
             case ColumnType.LONG:
-                s.appendLong(r.getLong(ci));
+                s.appendLongOrNull(r.getLong(ci));
                 break;
             case ColumnType.DOUBLE:
-                s.appendDouble(r.getDouble(ci));
+                s.appendDoubleOrNull(r.getDouble(ci));
                 break;
             case ColumnType.INT:
-                s.appendInt(r.getInt(ci));
+                s.appendIntOrNull(r.getInt(ci));
+                break;
+            case ColumnType.FLOAT:
+                s.appendFloatOrNull(r.getFloat(ci));
+                break;
+            case ColumnType.BYTE:
+                s.appendByte(r.getByte(ci));
+                break;
+            case ColumnType.SHORT:
+                s.appendShort(r.getShort(ci));
+                break;
+            case ColumnType.BOOLEAN:
+                s.appendBool(r.getBool(ci));
                 break;
             default:
                 throw new UnsupportedColumnTypeException(qtype);
@@ -177,6 +189,13 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
         int r = ctx.emitTrailersOnly(status, message);
         if (r != FlightSqlCallContext.EMIT_OK) {
             LOG.error().$("reject-with-status emit failed [rc=").$(r).I$();
+        }
+    }
+
+    private static void zeroRange(long start, long endExclusive) {
+        long bytes = endExclusive - start;
+        if (bytes > 0) {
+            Unsafe.getUnsafe().setMemory(start, bytes, (byte) 0);
         }
     }
 
@@ -323,7 +342,16 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
                     // Build FlightData{RecordBatch header, body = flushed scratches}.
                     int rowCount = ticket.getRowsBuffered();
                     int[] columnTypes = ticket.getColumnTypes();
-                    long bodyBytes = ArrowRecordBatchWriter.computeBodyBytes(columnTypes, rowCount);
+                    ArrowColumnScratch[] scratches = ticket.getScratches();
+                    long[] validityLengths = ticket.getValidityLengths();
+                    long[] valuesLengths = ticket.getValuesLengths();
+                    long[] nullCounts = ticket.getNullCounts();
+                    for (int ci = 0; ci < scratches.length; ci++) {
+                        validityLengths[ci] = scratches[ci].validityLengthBytes();
+                        valuesLengths[ci] = scratches[ci].valuesLengthBytes();
+                        nullCounts[ci] = scratches[ci].getNullCount();
+                    }
+                    long bodyBytes = ArrowRecordBatchWriter.computeBodyBytes(validityLengths, valuesLengths);
                     if (bodyBytes > Integer.MAX_VALUE) {
                         ticket.setError(GrpcStatus.INTERNAL, "batch body exceeds 2 GiB");
                         ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
@@ -332,7 +360,7 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
 
                     fbWriter.of(metadataBuffer, metadataBuffer + METADATA_BUFFER_CAP);
                     int metaLen = ArrowRecordBatchWriter.writeRecordBatchMessage(fbWriter,
-                            rowCount, columnTypes, bodyBytes);
+                            rowCount, columnTypes, nullCounts, validityLengths, valuesLengths, bodyBytes);
                     if (metaLen <= 0) {
                         ticket.setError(GrpcStatus.INTERNAL, "record batch metadata scratch overflow");
                         ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
@@ -350,19 +378,20 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
 
                     long batchAddr = ticket.getBatchScratchAddr();
                     long bodyAddr = batchAddr + ticket.getBatchScratchCap() - (int) bodyBytes;
-                    ArrowColumnScratch[] scratches = ticket.getScratches();
-                    long bodyCursor = bodyAddr;
                     for (int ci = 0; ci < scratches.length; ci++) {
-                        long nextColumnStart = bodyAddr
-                                + ArrowRecordBatchWriter.computeColumnOffset(columnTypes, rowCount, ci);
-                        bodyCursor = scratches[ci].flushValuesTo(nextColumnStart);
-                        long aligned = ArrowRecordBatchWriter.alignTo8(bodyCursor - bodyAddr);
-                        long paddingAddr = bodyCursor;
-                        long paddingEnd = bodyAddr + aligned;
-                        while (paddingAddr < paddingEnd) {
-                            Unsafe.getUnsafe().putByte(paddingAddr++, (byte) 0);
-                        }
-                        bodyCursor = paddingEnd;
+                        long validityStart = bodyAddr
+                                + ArrowRecordBatchWriter.computeColumnValidityOffset(validityLengths, valuesLengths, ci);
+                        long afterValidity = scratches[ci].flushValidityTo(validityStart);
+                        long validityAlignedEnd = bodyAddr
+                                + ArrowRecordBatchWriter.alignTo8(afterValidity - bodyAddr);
+                        zeroRange(afterValidity, validityAlignedEnd);
+
+                        long valuesStart = bodyAddr
+                                + ArrowRecordBatchWriter.computeColumnValuesOffset(validityLengths, valuesLengths, ci);
+                        long afterValues = scratches[ci].flushValuesTo(valuesStart);
+                        long valuesAlignedEnd = bodyAddr
+                                + ArrowRecordBatchWriter.alignTo8(afterValues - bodyAddr);
+                        zeroRange(afterValues, valuesAlignedEnd);
                     }
 
                     long metaAddr = fbWriter.finishedAddr();

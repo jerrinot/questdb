@@ -375,6 +375,10 @@ public final class GetFlightInfoHandler implements FlightSqlHandler, Closeable {
             case ColumnType.LONG:
             case ColumnType.DOUBLE:
             case ColumnType.INT:
+            case ColumnType.FLOAT:
+            case ColumnType.BYTE:
+            case ColumnType.SHORT:
+            case ColumnType.BOOLEAN:
                 return true;
             default:
                 return false;

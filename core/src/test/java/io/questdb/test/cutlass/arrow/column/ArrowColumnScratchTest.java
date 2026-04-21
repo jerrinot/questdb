@@ -28,12 +28,120 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cutlass.arrow.column.ArrowColumnScratch;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.Numbers;
 import io.questdb.std.Unsafe;
 import io.questdb.test.AbstractCairoTest;
 import org.junit.Assert;
 import org.junit.Test;
 
 public class ArrowColumnScratchTest extends AbstractCairoTest {
+
+    @Test
+    public void testAllNullLongValidityAllZero() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.LONG, 16);
+                for (int i = 0; i < 10; i++) {
+                    s.appendLongOrNull(Numbers.LONG_NULL);
+                }
+                Assert.assertEquals(10, s.getRowCount());
+                Assert.assertEquals(10, s.getNullCount());
+                Assert.assertEquals(80, s.valuesLengthBytes());
+                Assert.assertEquals(2, s.validityLengthBytes());
+
+                long validityDst = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+                long valuesDst = Unsafe.malloc(80, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushValidityTo(validityDst);
+                    Assert.assertEquals(0, Unsafe.getUnsafe().getByte(validityDst) & 0xFF);
+                    Assert.assertEquals(0, Unsafe.getUnsafe().getByte(validityDst + 1) & 0xFF);
+                    s.flushValuesTo(valuesDst);
+                    for (int i = 0; i < 80; i++) {
+                        Assert.assertEquals(0, Unsafe.getUnsafe().getByte(valuesDst + i));
+                    }
+                } finally {
+                    Unsafe.free(validityDst, 8, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(valuesDst, 80, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testAllValidLongOrNullKeepsEmptyValidity() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.LONG, 8);
+                for (int i = 0; i < 8; i++) {
+                    s.appendLongOrNull(i + 1L);
+                }
+                Assert.assertEquals(8, s.getRowCount());
+                Assert.assertEquals(0, s.getNullCount());
+                Assert.assertEquals(0, s.validityLengthBytes());
+                Assert.assertEquals(64, s.valuesLengthBytes());
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testBoolBitPacked() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.BOOLEAN, 16);
+                boolean[] vals = {true, false, true, false, true, false, true, false, true};
+                for (boolean b : vals) {
+                    s.appendBool(b);
+                }
+                Assert.assertEquals(9, s.getRowCount());
+                Assert.assertEquals(0, s.getNullCount());
+                Assert.assertEquals(2, s.valuesLengthBytes());
+                Assert.assertEquals(0, s.validityLengthBytes());
+
+                long dst = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushValuesTo(dst);
+                    Assert.assertEquals((byte) 0b0101_0101, Unsafe.getUnsafe().getByte(dst));
+                    Assert.assertEquals((byte) 0b0000_0001, Unsafe.getUnsafe().getByte(dst + 1));
+                } finally {
+                    Unsafe.free(dst, 8, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testByteAppendAndFlush() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.BYTE, 4);
+                byte[] values = {1, 2, 3, 4};
+                for (byte v : values) s.appendByte(v);
+                Assert.assertEquals(4, s.getRowCount());
+                Assert.assertEquals(4, s.valuesLengthBytes());
+                long dst = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushValuesTo(dst);
+                    for (int i = 0; i < 4; i++) {
+                        Assert.assertEquals(values[i], Unsafe.getUnsafe().getByte(dst + i));
+                    }
+                } finally {
+                    Unsafe.free(dst, 8, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
 
     @Test
     public void testCloseFreesNativeMemory() throws Exception {
@@ -45,7 +153,17 @@ public class ArrowColumnScratchTest extends AbstractCairoTest {
                 s.appendLong(cur.getLong(0));
             }
             s.close();
-            // Double-close must stay leak-free.
+            s.close();
+        });
+    }
+
+    @Test
+    public void testCloseFreesValidityBuffer() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            s.initFor(ColumnType.LONG, 8);
+            s.appendLongOrNull(1L);
+            s.appendLongOrNull(Numbers.LONG_NULL);
             s.close();
         });
     }
@@ -82,9 +200,108 @@ public class ArrowColumnScratchTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testDoubleInfinityDetectedAsNull() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.DOUBLE, 4);
+                s.appendDoubleOrNull(Double.POSITIVE_INFINITY);
+                s.appendDoubleOrNull(Double.NEGATIVE_INFINITY);
+                s.appendDoubleOrNull(Double.NaN);
+                s.appendDoubleOrNull(1.5);
+                Assert.assertEquals(4, s.getRowCount());
+                Assert.assertEquals(3, s.getNullCount());
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testFloatAppendAndFlush() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.FLOAT, 3);
+                float[] vals = {1.5f, -2.25f, 0.0f};
+                for (float v : vals) s.appendFloat(v);
+                Assert.assertEquals(3, s.getRowCount());
+                Assert.assertEquals(12, s.valuesLengthBytes());
+                long dst = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushValuesTo(dst);
+                    for (int i = 0; i < 3; i++) {
+                        Assert.assertEquals(Float.floatToRawIntBits(vals[i]),
+                                Unsafe.getUnsafe().getInt(dst + i * 4L));
+                    }
+                } finally {
+                    Unsafe.free(dst, 16, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testFloatNaNAndInfinityDetectedAsNull() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.FLOAT, 4);
+                s.appendFloatOrNull(Float.NaN);
+                s.appendFloatOrNull(Float.POSITIVE_INFINITY);
+                s.appendFloatOrNull(1.5f);
+                Assert.assertEquals(3, s.getRowCount());
+                Assert.assertEquals(2, s.getNullCount());
+                Assert.assertEquals(1, s.validityLengthBytes());
+                long vdst = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushValidityTo(vdst);
+                    byte bits = Unsafe.getUnsafe().getByte(vdst);
+                    Assert.assertEquals((byte) 0b0000_0100, bits);
+                } finally {
+                    Unsafe.free(vdst, 4, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testGrowValidityBufferPastInitialCap() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.LONG, 128);
+                int n = 10_000;
+                for (int i = 0; i < n; i++) {
+                    s.appendLongOrNull(Numbers.LONG_NULL);
+                }
+                Assert.assertEquals(n, s.getRowCount());
+                Assert.assertEquals(n, s.getNullCount());
+                Assert.assertEquals((n + 7) >>> 3, s.validityLengthBytes());
+                // all-null: every byte in validity must be 0.
+                int validityBytes = s.validityLengthBytes();
+                long dst = Unsafe.malloc(validityBytes, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushValidityTo(dst);
+                    for (int i = 0; i < validityBytes; i++) {
+                        Assert.assertEquals("byte " + i, 0, Unsafe.getUnsafe().getByte(dst + i));
+                    }
+                } finally {
+                    Unsafe.free(dst, validityBytes, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
     public void testGrowValuesBuffer() throws Exception {
         assertMemoryLeak(() -> {
-            // Request a tiny initial capacity so the scratch must grow.
             ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
             try {
                 s.initFor(ColumnType.LONG, 2);
@@ -108,6 +325,37 @@ public class ArrowColumnScratchTest extends AbstractCairoTest {
                     }
                 } finally {
                     Unsafe.free(dst, n * 8L, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testHalfNullLongBits() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.LONG, 8);
+                // Row 0 valid, 1 null, 2 valid, 3 null, ... 6 valid, 7 null.
+                for (int i = 0; i < 8; i++) {
+                    if ((i & 1) == 0) {
+                        s.appendLongOrNull(100L + i);
+                    } else {
+                        s.appendLongOrNull(Numbers.LONG_NULL);
+                    }
+                }
+                Assert.assertEquals(8, s.getRowCount());
+                Assert.assertEquals(4, s.getNullCount());
+                Assert.assertEquals(1, s.validityLengthBytes());
+                long dst = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushValidityTo(dst);
+                    // Bits: valid at 0,2,4,6 → 0b0101_0101 = 0x55.
+                    Assert.assertEquals((byte) 0b0101_0101, Unsafe.getUnsafe().getByte(dst));
+                } finally {
+                    Unsafe.free(dst, 4, MemoryTag.NATIVE_DEFAULT);
                 }
             } finally {
                 s.close();
@@ -166,7 +414,6 @@ public class ArrowColumnScratchTest extends AbstractCairoTest {
                     for (int i = 0; i < expected.length; i++) {
                         long v = expected[i];
                         long dstBase = dst + i * 8L;
-                        // Little-endian byte-by-byte check.
                         for (int b = 0; b < 8; b++) {
                             byte expectedByte = (byte) ((v >>> (b * 8)) & 0xFF);
                             Assert.assertEquals(expectedByte, Unsafe.getUnsafe().getByte(dstBase + b));
@@ -175,6 +422,34 @@ public class ArrowColumnScratchTest extends AbstractCairoTest {
                 } finally {
                     Unsafe.free(dst, 128, MemoryTag.NATIVE_DEFAULT);
                 }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testResetAfterNullThenAllValidEmitsEmptyValidity() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.LONG, 8);
+                s.appendLongOrNull(1L);
+                s.appendLongOrNull(Numbers.LONG_NULL);
+                s.appendLongOrNull(3L);
+                Assert.assertEquals(1, s.getNullCount());
+                Assert.assertEquals(1, s.validityLengthBytes());
+
+                s.reset();
+                Assert.assertEquals(0, s.getRowCount());
+                Assert.assertEquals(0, s.getNullCount());
+                Assert.assertEquals(0, s.validityLengthBytes());
+
+                s.appendLongOrNull(10L);
+                s.appendLongOrNull(20L);
+                Assert.assertEquals(2, s.getRowCount());
+                Assert.assertEquals(0, s.getNullCount());
+                Assert.assertEquals(0, s.validityLengthBytes());
             } finally {
                 s.close();
             }
@@ -212,6 +487,31 @@ public class ArrowColumnScratchTest extends AbstractCairoTest {
                     Assert.assertEquals(8L, Unsafe.getUnsafe().getLong(dst + 8));
                 } finally {
                     Unsafe.free(dst, 16, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                s.close();
+            }
+        });
+    }
+
+    @Test
+    public void testShortAppendAndFlush() throws Exception {
+        assertMemoryLeak(() -> {
+            ArrowColumnScratch s = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
+            try {
+                s.initFor(ColumnType.SHORT, 3);
+                short[] values = {1000, -2000, 30_000};
+                for (short v : values) s.appendShort(v);
+                Assert.assertEquals(3, s.getRowCount());
+                Assert.assertEquals(6, s.valuesLengthBytes());
+                long dst = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    s.flushValuesTo(dst);
+                    for (int i = 0; i < 3; i++) {
+                        Assert.assertEquals(values[i], Unsafe.getUnsafe().getShort(dst + i * 2L));
+                    }
+                } finally {
+                    Unsafe.free(dst, 8, MemoryTag.NATIVE_DEFAULT);
                 }
             } finally {
                 s.close();

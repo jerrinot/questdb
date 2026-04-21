@@ -333,10 +333,17 @@ preserved. Scratches are pre-allocated per ticket at `GetFlightInfo`
 compile time, reset between batches via `reset()`, and freed on ticket
 release.
 
-Null handling stays a Wave 7 carve-out: `appendLong(Long.MIN_VALUE)`
-stores the sentinel raw. Wave 7 will add `appendLongOrNull` /
-`appendDoubleOrNull` / `appendIntOrNull` plus the validity bitmap slots
-already sketched in the class javadoc.
+Wave 7a landed validity bitmaps plus BYTE/SHORT/BOOLEAN/FLOAT support.
+Nullable types (LONG/DOUBLE/INT/FLOAT) expose `appendXxxOrNull` entry
+points that detect QuestDB sentinels (`Numbers.INT_NULL`,
+`Numbers.LONG_NULL`, `Numbers.isNull(float)`, `Numbers.isNull(double)`)
+and write a zero-filled value slot plus a cleared Arrow validity bit.
+BYTE / SHORT / BOOLEAN have no QuestDB null sentinel and always mark
+their rows valid. Arrow validity is LSB-first with `1=valid` / `0=null`
+(opposite polarity to QWP's bitmap) and the buffer is lazy-allocated on
+the first null in each batch; when a batch finishes with
+`null_count==0` the Flatbuffers `Buffer{length=0}` stays empty on the
+wire so the "no nulls" fast path keeps its zero-copy shape.
 
 **Page-frame fast path.** When the factory produces columnar page frames
 (table scans, simple filters), fixed-width columns can be emitted with a
@@ -396,6 +403,15 @@ Encapsulated-message framing (the `0xFFFFFFFF` continuation marker and
 Flight, `FlightData.data_header` carries the raw Flatbuffers message
 bytes and `FlightData.data_body` carries the raw buffer bytes. The
 framing is only needed for the file / stream IPC format.
+
+Wave 7a flips every emitted Arrow `Field.nullable` to `true` regardless
+of QuestDB type. Readers treat `nullable=true + null_count=0 + empty
+validity buffer` as "all valid" without inspecting bits, so the change
+is transparent for non-null-sentinel types. `ArrowRecordBatchWriter`
+gained per-column `nullCountsPerColumn` / `validityLengthsPerColumn`
+inputs; body layout is still `[validity + padding][values + padding]`
+per column, with the validity descriptor emitted as length 0 when no
+nulls occurred.
 
 ### 5.6 Flight RPC dispatcher
 
@@ -604,16 +620,21 @@ control coupling.
 
 **Module.** `io.questdb.cutlass.arrow.type.*`
 
+Wave 7a supported scalar set: LONG, DOUBLE, INT, FLOAT (nullable via
+sentinel detection) + BYTE, SHORT, BOOLEAN (no QuestDB null sentinel;
+always emitted valid). Remaining types in the table below are deferred
+to Wave 7b and later.
+
 | QuestDB type        | Arrow type                          | Notes                                            |
 |---------------------|-------------------------------------|--------------------------------------------------|
-| BOOLEAN             | `Bool`                              | Bit-packed; Arrow's layout matches.              |
-| BYTE                | `Int8`                              |                                                  |
-| SHORT               | `Int16`                             | NULL sentinel `Short.MIN_VALUE`.                 |
-| CHAR                | `UInt16`                            | No direct Arrow `Char`.                          |
-| INT                 | `Int32`                             | NULL sentinel `Int.MIN_VALUE`.                   |
-| LONG                | `Int64`                             | NULL sentinel `Long.MIN_VALUE`.                  |
-| FLOAT               | `Float32`                           | NaN-as-NULL (same as QWP).                       |
-| DOUBLE              | `Float64`                           | NaN-as-NULL.                                     |
+| BOOLEAN             | `Bool`                              | Wave 7a. Bit-packed; Arrow layout matches.       |
+| BYTE                | `Int8`                              | Wave 7a. No null sentinel.                       |
+| SHORT               | `Int16`                             | Wave 7a. No null sentinel in QuestDB.            |
+| CHAR                | `UInt16`                            | Wave 7b. No direct Arrow `Char`.                 |
+| INT                 | `Int32`                             | Wave 7a. NULL sentinel `Int.MIN_VALUE`.          |
+| LONG                | `Int64`                             | Wave 7a. NULL sentinel `Long.MIN_VALUE`.         |
+| FLOAT               | `Float32`                           | Wave 7a. NaN-as-NULL (same as QWP).              |
+| DOUBLE              | `Float64`                           | Wave 7a. NaN-as-NULL.                            |
 | DATE                | `Date64`                            |                                                  |
 | TIMESTAMP           | `Timestamp(MICROSECOND, "UTC")`     | QuestDB stores micros UTC.                       |
 | TIMESTAMP_NANOS     | `Timestamp(NANOSECOND, "UTC")`      |                                                  |
@@ -763,10 +784,15 @@ Stage 7:  CommandStatementQuery end-to-end                      [DONE]
           responses.
           |
           v
-Stage 8:  Cursor streaming driver + flow-control coupling       [NEXT]
-          Wave 7: grpc-timeout header parsing, RST_STREAM(CANCEL)
-          cascade, validity bitmaps + null handling in ArrowColumnScratch,
-          variable-width / SYMBOL / ARRAY support, prepared statements.
+Stage 8:  Cursor streaming driver + flow-control coupling       [IN PROGRESS]
+          Wave 7a: validity bitmaps + BYTE/SHORT/BOOLEAN/FLOAT landed;
+          Arrow fields flipped to nullable=true, Arrow-shaped validity
+          (LSB-first, 1=valid) lazy-allocated per batch.
+          Wave 7b [NEXT]: CHAR, DATE/TIMESTAMP, STRING/VARCHAR/SYMBOL,
+          bulk BOOLEAN bitpack optimisation.
+          Wave 7c: metadata commands (GetSqlInfo, GetTableTypes...).
+          Wave 7d: grpc-timeout header parsing, RST_STREAM(CANCEL)
+          cascade, prepared statements.
           |
           v
 Stage 9:  Prepared statements  +  DoPut  +  StatementUpdate

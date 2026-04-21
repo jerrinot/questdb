@@ -30,19 +30,23 @@ import io.questdb.std.Unsafe;
 
 /**
  * Emits an Arrow IPC {@code Message} wrapping a {@code Schema} with one
- * or more scalar fields. Wave 6b supports LONG, DOUBLE, and INT only;
- * any other type throws {@link UnsupportedColumnTypeException} which the
- * Flight SQL handler translates into {@code grpc-status: UNIMPLEMENTED}.
+ * or more scalar fields. Wave 7a supports LONG, DOUBLE, INT, FLOAT, BYTE,
+ * SHORT and BOOLEAN; any other type throws
+ * {@link UnsupportedColumnTypeException} which the Flight SQL handler
+ * translates into {@code grpc-status: UNIMPLEMENTED}.
  * <p>
- * All fields are emitted as {@code nullable=false}; Wave 6b does not
- * emit validity bitmaps. See {@code FLIGHT_SQL_DESIGN.md} §5.10 for the
- * full type-mapping table and the deferred null-handling plan.
+ * Every field is emitted as {@code nullable=true} regardless of QuestDB
+ * type, matching Arrow conventions: readers treat
+ * {@code nullable=true + null_count=0 + empty validity} as "all valid"
+ * without inspecting the absent bits. See {@code FLIGHT_SQL_DESIGN.md}
+ * &sect;5.10 for the full type-mapping table.
  * <p>
  * Field indices (from Arrow's {@code Schema.fbs} /
  * {@code Message.fbs}) used here:
  * <ul>
  *   <li>{@code Int}: {@code bitWidth: int32 = 0}, {@code is_signed: bool = 1}.</li>
  *   <li>{@code FloatingPoint}: {@code precision: int16 = 0}.</li>
+ *   <li>{@code Bool}: empty table, just a type discriminator.</li>
  *   <li>{@code Field}: {@code name: string = 0}, {@code nullable: bool = 1},
  *       {@code type_type: uint8 = 2}, {@code type: uoffset = 3}, (rest skipped).</li>
  *   <li>{@code Schema}: {@code endianness: int16 = 0}, {@code fields: [Field] = 1},
@@ -54,8 +58,9 @@ import io.questdb.std.Unsafe;
  * <ul>
  *   <li>{@code MetadataVersion.V5 = 4}.</li>
  *   <li>{@code MessageHeader.Schema = 1} (union discriminator).</li>
- *   <li>{@code Type.Int = 2}, {@code Type.FloatingPoint = 3} (union discriminators).</li>
- *   <li>{@code Precision.DOUBLE = 2}.</li>
+ *   <li>{@code Type.Int = 2}, {@code Type.FloatingPoint = 3},
+ *       {@code Type.Bool = 6} (union discriminators).</li>
+ *   <li>{@code Precision.SINGLE = 1}, {@code Precision.DOUBLE = 2}.</li>
  *   <li>{@code Endianness.Little = 0}.</li>
  * </ul>
  */
@@ -66,6 +71,8 @@ public final class ArrowSchemaWriter {
     private static final short METADATA_VERSION_V5 = 4;
     private static final int MESSAGE_HEADER_SCHEMA = 1;
     private static final short PRECISION_DOUBLE = 2;
+    private static final short PRECISION_SINGLE = 1;
+    private static final int TYPE_BOOL = 6;
     private static final int TYPE_FLOATING_POINT = 3;
     private static final int TYPE_INT = 2;
 
@@ -150,9 +157,14 @@ public final class ArrowSchemaWriter {
         switch (ColumnType.tagOf(columnType)) {
             case ColumnType.LONG:
             case ColumnType.INT:
+            case ColumnType.SHORT:
+            case ColumnType.BYTE:
                 return TYPE_INT;
             case ColumnType.DOUBLE:
+            case ColumnType.FLOAT:
                 return TYPE_FLOATING_POINT;
+            case ColumnType.BOOLEAN:
+                return TYPE_BOOL;
             default:
                 throw new UnsupportedColumnTypeException(columnType);
         }
@@ -176,22 +188,27 @@ public final class ArrowSchemaWriter {
         return writer.writeString(nameScratchAddr, nameLen);
     }
 
+    private static int writeBoolTable(FbWriter writer) {
+        writer.startTable(0);
+        return writer.endTable();
+    }
+
     private static int writeFieldTable(FbWriter writer, int nameOffset, int typeTable, int typeDiscriminator) {
         writer.startTable(4);
         writer.prependUoffset(typeTable);
         writer.slot(3, writer.cursorFromEnd());
         writer.prependUint8(typeDiscriminator);
         writer.slot(2, writer.cursorFromEnd());
-        writer.prependInt8((byte) 0); // nullable = false
+        writer.prependInt8((byte) 1); // nullable = true
         writer.slot(1, writer.cursorFromEnd());
         writer.prependUoffset(nameOffset);
         writer.slot(0, writer.cursorFromEnd());
         return writer.endTable();
     }
 
-    private static int writeFloatingPointTable(FbWriter writer) {
+    private static int writeFloatingPointTable(FbWriter writer, short precision) {
         writer.startTable(1);
-        writer.prependInt16(PRECISION_DOUBLE);
+        writer.prependInt16(precision);
         writer.slot(0, writer.cursorFromEnd());
         return writer.endTable();
     }
@@ -211,8 +228,16 @@ public final class ArrowSchemaWriter {
                 return writeIntTable(writer, 64, true);
             case ColumnType.INT:
                 return writeIntTable(writer, 32, true);
+            case ColumnType.SHORT:
+                return writeIntTable(writer, 16, true);
+            case ColumnType.BYTE:
+                return writeIntTable(writer, 8, true);
             case ColumnType.DOUBLE:
-                return writeFloatingPointTable(writer);
+                return writeFloatingPointTable(writer, PRECISION_DOUBLE);
+            case ColumnType.FLOAT:
+                return writeFloatingPointTable(writer, PRECISION_SINGLE);
+            case ColumnType.BOOLEAN:
+                return writeBoolTable(writer);
             default:
                 throw new UnsupportedColumnTypeException(columnType);
         }

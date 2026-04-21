@@ -64,7 +64,7 @@ public class ArrowSchemaWriterTest {
         Assert.assertEquals(1, schema.fieldsLength());
         org.apache.arrow.flatbuf.Field field = schema.fields(0);
         Assert.assertEquals("col1", field.name());
-        Assert.assertFalse(field.nullable());
+        Assert.assertTrue(field.nullable());
         Assert.assertEquals(Type.Int, field.typeType());
         Int intType = (Int) field.type(new Int());
         Assert.assertEquals(64, intType.bitWidth());
@@ -122,6 +122,38 @@ public class ArrowSchemaWriterTest {
         GenericRecordMetadata metadata = new GenericRecordMetadata();
         metadata.add(new TableColumnMetadata("s", ColumnType.STRING));
         writeToBytes(metadata);
+    }
+
+    @Test
+    public void testSchemaMessageWave7aScalarTypes() {
+        GenericRecordMetadata metadata = new GenericRecordMetadata();
+        metadata.add(new TableColumnMetadata("b", ColumnType.BYTE));
+        metadata.add(new TableColumnMetadata("s", ColumnType.SHORT));
+        metadata.add(new TableColumnMetadata("f", ColumnType.FLOAT));
+        metadata.add(new TableColumnMetadata("q", ColumnType.BOOLEAN));
+        byte[] bytes = writeToBytes(metadata);
+        Message msg = Message.getRootAsMessage(ByteBuffer.wrap(bytes));
+        Schema schema = (Schema) msg.header(new Schema());
+        Assert.assertEquals(4, schema.fieldsLength());
+        for (int i = 0; i < 4; i++) {
+            Assert.assertTrue(schema.fields(i).nullable());
+        }
+
+        Assert.assertEquals(Type.Int, schema.fields(0).typeType());
+        Int i0 = (Int) schema.fields(0).type(new Int());
+        Assert.assertEquals(8, i0.bitWidth());
+        Assert.assertTrue(i0.isSigned());
+
+        Assert.assertEquals(Type.Int, schema.fields(1).typeType());
+        Int i1 = (Int) schema.fields(1).type(new Int());
+        Assert.assertEquals(16, i1.bitWidth());
+        Assert.assertTrue(i1.isSigned());
+
+        Assert.assertEquals(Type.FloatingPoint, schema.fields(2).typeType());
+        FloatingPoint fp = (FloatingPoint) schema.fields(2).type(new FloatingPoint());
+        Assert.assertEquals(Precision.SINGLE, fp.precision());
+
+        Assert.assertEquals(Type.Bool, schema.fields(3).typeType());
     }
 
     private static byte[] writeToBytes(GenericRecordMetadata metadata) {

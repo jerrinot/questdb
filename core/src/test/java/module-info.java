@@ -40,6 +40,7 @@ open module io.questdb.test {
     requires static org.apache.arrow.format;
     requires static org.apache.arrow.vector;
     requires static org.apache.arrow.memory.core;
+    requires com.google.protobuf;
 
     uses io.questdb.griffin.FunctionFactory;
 

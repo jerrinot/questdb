@@ -58,8 +58,12 @@ import org.apache.arrow.flatbuf.Schema;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
@@ -181,6 +185,198 @@ public class FlightSqlQueryEndToEndTest extends AbstractBootstrapTest {
                 QueryResult r = runGetFlightInfo(socket, "SELECT 'hello' AS greeting");
                 Assert.assertFalse("expected trailers-only unimplemented error", r.ok);
                 Assert.assertEquals("12", r.grpcStatus); // UNIMPLEMENTED
+            }
+        }
+    }
+
+    @Test
+    public void testSelectAllNullLongColumn() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket, "SELECT cast(null AS LONG) n FROM long_sequence(3)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                BigIntVector n = (BigIntVector) batch.root.getVector("n");
+                Assert.assertEquals(3, n.getValueCount());
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertTrue("row " + i + " should be null", n.isNull(i));
+                }
+                Assert.assertEquals(3L, batch.nullCountsPerBatch.get(0)[0]);
+                batch.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSelectAllValidLongEmitsEmptyValidity() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket, "SELECT x FROM long_sequence(3)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                BigIntVector col = (BigIntVector) batch.root.getVector("x");
+                Assert.assertEquals(3, col.getValueCount());
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[0]);
+                Assert.assertEquals(0L, batch.validityLengthsPerBatch.get(0)[0]);
+                batch.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSelectBooleanColumn() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket, "SELECT (x % 2 = 0) b FROM long_sequence(5)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                BitVector b = (BitVector) batch.root.getVector("b");
+                Assert.assertEquals(5, b.getValueCount());
+                Assert.assertEquals(0, b.get(0));
+                Assert.assertEquals(1, b.get(1));
+                Assert.assertEquals(0, b.get(2));
+                Assert.assertEquals(1, b.get(3));
+                Assert.assertEquals(0, b.get(4));
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[0]);
+                batch.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSelectByteAndShortColumns() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket,
+                        "SELECT cast(x AS byte) b, cast(x AS short) s FROM long_sequence(3)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                TinyIntVector b = (TinyIntVector) batch.root.getVector("b");
+                SmallIntVector s = (SmallIntVector) batch.root.getVector("s");
+                Assert.assertEquals(3, b.getValueCount());
+                Assert.assertEquals(3, s.getValueCount());
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertEquals(i + 1, b.get(i));
+                    Assert.assertEquals(i + 1, s.get(i));
+                }
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[0]);
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[1]);
+                batch.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSelectFloatWithNaNTreatedAsNull() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket,
+                        "SELECT cast(x AS float) f, cast(0.0/0.0 AS float) nv FROM long_sequence(2)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                Float4Vector f = (Float4Vector) batch.root.getVector("f");
+                Float4Vector nv = (Float4Vector) batch.root.getVector("nv");
+                Assert.assertEquals(2, f.getValueCount());
+                Assert.assertEquals(1.0f, f.get(0), 0.0f);
+                Assert.assertEquals(2.0f, f.get(1), 0.0f);
+                Assert.assertTrue(nv.isNull(0));
+                Assert.assertTrue(nv.isNull(1));
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[0]);
+                Assert.assertEquals(2L, batch.nullCountsPerBatch.get(0)[1]);
+                batch.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSelectMultiColumnMixedNullability() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket,
+                        "SELECT x, nullif(x, 2) a, (x % 2 = 0) b, cast(x AS byte) c FROM long_sequence(4)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                BigIntVector x = (BigIntVector) batch.root.getVector("x");
+                BigIntVector a = (BigIntVector) batch.root.getVector("a");
+                BitVector b = (BitVector) batch.root.getVector("b");
+                TinyIntVector c = (TinyIntVector) batch.root.getVector("c");
+                Assert.assertEquals(4, x.getValueCount());
+                for (int i = 0; i < 4; i++) {
+                    Assert.assertEquals(i + 1L, x.get(i));
+                    Assert.assertEquals(i + 1, c.get(i));
+                }
+                Assert.assertFalse(a.isNull(0));
+                Assert.assertTrue(a.isNull(1));
+                Assert.assertFalse(a.isNull(2));
+                Assert.assertFalse(a.isNull(3));
+                Assert.assertEquals(1L, batch.nullCountsPerBatch.get(0)[1]);
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[0]);
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[2]);
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[3]);
+                Assert.assertEquals(1, b.get(1));
+                Assert.assertEquals(1, b.get(3));
+                Assert.assertEquals(0, b.get(0));
+                Assert.assertEquals(0, b.get(2));
+                batch.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSelectNullInMiddleOfLongColumn() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket, "SELECT x, nullif(x, 3) y FROM long_sequence(5)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                BigIntVector x = (BigIntVector) batch.root.getVector("x");
+                BigIntVector y = (BigIntVector) batch.root.getVector("y");
+                Assert.assertEquals(5, x.getValueCount());
+                Assert.assertEquals(5, y.getValueCount());
+                for (int i = 0; i < 5; i++) {
+                    Assert.assertEquals(i + 1L, x.get(i));
+                }
+                Assert.assertFalse(y.isNull(0));
+                Assert.assertFalse(y.isNull(1));
+                Assert.assertTrue(y.isNull(2));
+                Assert.assertFalse(y.isNull(3));
+                Assert.assertFalse(y.isNull(4));
+                Assert.assertEquals(1L, batch.nullCountsPerBatch.get(0)[1]);
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[0]);
+                batch.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSelectNullAtBatchBoundary() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket, "SELECT nullif(x, 4096) n FROM long_sequence(8192)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                BigIntVector n = (BigIntVector) batch.root.getVector("n");
+                Assert.assertEquals(8192, n.getValueCount());
+                Assert.assertEquals("expected 2 RecordBatch frames", 2, batch.batchCount);
+                for (int i = 0; i < 8192; i++) {
+                    if (i == 4095) {
+                        Assert.assertTrue("row 4095 must be null", n.isNull(i));
+                    } else {
+                        Assert.assertFalse("row " + i + " must be valid", n.isNull(i));
+                        Assert.assertEquals(i + 1L, n.get(i));
+                    }
+                }
+                Assert.assertEquals(1L, batch.nullCountsPerBatch.get(0)[0]);
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(1)[0]);
+                batch.close();
             }
         }
     }
@@ -668,16 +864,30 @@ public class FlightSqlQueryEndToEndTest extends AbstractBootstrapTest {
             FlightDataParts parts = parseFlightData(bytes);
             Assert.assertNotNull(parts.header);
             Assert.assertNotNull(parts.body);
+
+            // Pull per-batch null_counts and validity lengths straight
+            // from the Flatbuffers RecordBatch for Wave 7a null assertions.
+            Message rbMsg = Message.getRootAsMessage(ByteBuffer.wrap(parts.header));
+            org.apache.arrow.flatbuf.RecordBatch rbFb =
+                    (org.apache.arrow.flatbuf.RecordBatch) rbMsg.header(new org.apache.arrow.flatbuf.RecordBatch());
+            int cols = rbFb.nodesLength();
+            long[] batchNullCounts = new long[cols];
+            long[] batchValidityLengths = new long[cols];
+            for (int ci = 0; ci < cols; ci++) {
+                batchNullCounts[ci] = rbFb.nodes(ci).nullCount();
+                batchValidityLengths[ci] = rbFb.buffers(ci * 2).length();
+            }
+            result.nullCountsPerBatch.add(batchNullCounts);
+            result.validityLengthsPerBatch.add(batchValidityLengths);
+
             ArrowBuf body = result.alloc.buffer(parts.body.length);
             body.setBytes(0, parts.body);
-            Message rbMsg = Message.getRootAsMessage(ByteBuffer.wrap(parts.header));
             ArrowRecordBatch arb = MessageSerializer.deserializeRecordBatch(rbMsg, body);
             try {
                 VectorSchemaRoot tmp = VectorSchemaRoot.create(pojoSchema, result.alloc);
                 VectorLoader loader = new VectorLoader(tmp);
                 loader.load(arb);
                 int rows = tmp.getRowCount();
-                // Copy rows into result.root.
                 if (accumulatedRows == 0) {
                     result.root.setRowCount(rows);
                 } else {
@@ -705,7 +915,11 @@ public class FlightSqlQueryEndToEndTest extends AbstractBootstrapTest {
         RootAllocator alloc;
         int batchCount;
         int columnCount;
+        /** Per-batch per-column null_count as reported by the RecordBatch FieldNode. */
+        List<long[]> nullCountsPerBatch = new ArrayList<>();
         VectorSchemaRoot root;
+        /** Per-batch per-column validity Buffer length in bytes. */
+        List<long[]> validityLengthsPerBatch = new ArrayList<>();
 
         @Override
         public void close() {

@@ -195,6 +195,8 @@ public final class TicketRegistry implements Closeable {
         RecordCursorFactory factory;
         boolean isInUse;
         int memoryTag;
+        /** Per-column Arrow {@code null_count}. Reused across batches. */
+        long[] nullCounts;
         /** Rows appended to {@link #scratches} but not yet flushed on the wire. */
         int rowsBuffered;
         ArrowColumnScratch[] scratches;
@@ -202,6 +204,10 @@ public final class TicketRegistry implements Closeable {
         int schemaCap;
         int schemaLen;
         long ticketId;
+        /** Per-column validity buffer length for the current batch, in bytes. */
+        long[] validityLengths;
+        /** Per-column values buffer length for the current batch, in bytes. */
+        long[] valuesLengths;
 
         @Override
         public void close() {
@@ -236,6 +242,10 @@ public final class TicketRegistry implements Closeable {
             return rowsBuffered;
         }
 
+        public long[] getNullCounts() {
+            return nullCounts;
+        }
+
         public ArrowColumnScratch[] getScratches() {
             return scratches;
         }
@@ -250,6 +260,14 @@ public final class TicketRegistry implements Closeable {
 
         public long getTicketId() {
             return ticketId;
+        }
+
+        public long[] getValidityLengths() {
+            return validityLengths;
+        }
+
+        public long[] getValuesLengths() {
+            return valuesLengths;
         }
 
         /**
@@ -303,6 +321,12 @@ public final class TicketRegistry implements Closeable {
 
         public void setScratches(ArrowColumnScratch[] scratches) {
             this.scratches = scratches;
+            int n = scratches == null ? 0 : scratches.length;
+            if (nullCounts == null || nullCounts.length != n) {
+                nullCounts = new long[n];
+                validityLengths = new long[n];
+                valuesLengths = new long[n];
+            }
         }
 
         /**
@@ -380,6 +404,9 @@ public final class TicketRegistry implements Closeable {
                 }
                 scratches = null;
             }
+            nullCounts = null;
+            validityLengths = null;
+            valuesLengths = null;
             columnTypes = null;
             if (batchScratchAddr != 0) {
                 Unsafe.free(batchScratchAddr, batchScratchCap, memoryTag);

@@ -71,9 +71,12 @@ public class ArrowRecordBatchWriterTest {
     public void testOneColumnInt64Metadata() {
         int[] types = {ColumnType.LONG};
         long rowCount = 3;
-        long bodyBytes = ArrowRecordBatchWriter.computeBodyBytes(types, rowCount);
+        long[] validityLens = {0L};
+        long[] valuesLens = {24L};
+        long[] nullCounts = {0L};
+        long bodyBytes = ArrowRecordBatchWriter.computeBodyBytes(validityLens, valuesLens);
         Assert.assertEquals(24L, bodyBytes);
-        byte[] metadata = writeMetadata(rowCount, types, bodyBytes);
+        byte[] metadata = writeMetadata(rowCount, types, nullCounts, validityLens, valuesLens, bodyBytes);
         Message msg = Message.getRootAsMessage(ByteBuffer.wrap(metadata));
         Assert.assertEquals(MessageHeader.RecordBatch, msg.headerType());
         Assert.assertEquals(bodyBytes, msg.bodyLength());
@@ -96,18 +99,19 @@ public class ArrowRecordBatchWriterTest {
     public void testThreeColumnAlignmentAndOffsets() {
         int[] types = {ColumnType.LONG, ColumnType.DOUBLE, ColumnType.INT};
         long rowCount = 5;
+        long[] validityLens = {0L, 0L, 0L};
+        long[] valuesLens = {40L, 40L, 20L};
+        long[] nullCounts = {0L, 0L, 0L};
         // col0: LONG, 5 * 8 = 40 bytes. Running aligned total = 40.
         // col1: DOUBLE, 40 bytes starting at offset 40. Aligned total = 80.
-        // col2: INT, 20 bytes starting at offset 80. Aligned total = 104
-        //   (the final column still aligns to 8 so the body size honours
-        //   Arrow's "values buffers start on an 8-byte boundary" rule).
+        // col2: INT, 20 bytes starting at offset 80. Aligned total = 104.
         long expectedBody = 104L;
-        Assert.assertEquals(expectedBody, ArrowRecordBatchWriter.computeBodyBytes(types, rowCount));
-        Assert.assertEquals(0L, ArrowRecordBatchWriter.computeColumnOffset(types, rowCount, 0));
-        Assert.assertEquals(40L, ArrowRecordBatchWriter.computeColumnOffset(types, rowCount, 1));
-        Assert.assertEquals(80L, ArrowRecordBatchWriter.computeColumnOffset(types, rowCount, 2));
+        Assert.assertEquals(expectedBody, ArrowRecordBatchWriter.computeBodyBytes(validityLens, valuesLens));
+        Assert.assertEquals(0L, ArrowRecordBatchWriter.computeColumnValuesOffset(validityLens, valuesLens, 0));
+        Assert.assertEquals(40L, ArrowRecordBatchWriter.computeColumnValuesOffset(validityLens, valuesLens, 1));
+        Assert.assertEquals(80L, ArrowRecordBatchWriter.computeColumnValuesOffset(validityLens, valuesLens, 2));
 
-        byte[] metadata = writeMetadata(rowCount, types, expectedBody);
+        byte[] metadata = writeMetadata(rowCount, types, nullCounts, validityLens, valuesLens, expectedBody);
         Message msg = Message.getRootAsMessage(ByteBuffer.wrap(metadata));
         RecordBatch rb = (RecordBatch) msg.header(new RecordBatch());
         Assert.assertEquals(3, rb.nodesLength());
@@ -132,7 +136,10 @@ public class ArrowRecordBatchWriterTest {
         int[] ints = {10, 20, 30, 40, 50};
         int rowCount = longs.length;
         int[] types = {ColumnType.LONG, ColumnType.DOUBLE, ColumnType.INT};
-        long bodyBytes = ArrowRecordBatchWriter.computeBodyBytes(types, rowCount);
+        long[] validityLens = {0L, 0L, 0L};
+        long[] valuesLens = {40L, 40L, 20L};
+        long[] nullCounts = {0L, 0L, 0L};
+        long bodyBytes = ArrowRecordBatchWriter.computeBodyBytes(validityLens, valuesLens);
 
         long body = Unsafe.malloc(bodyBytes, MemoryTag.NATIVE_DEFAULT);
         ArrowColumnScratch longScratch = new ArrowColumnScratch(MemoryTag.NATIVE_DEFAULT);
@@ -146,17 +153,15 @@ public class ArrowRecordBatchWriterTest {
             intScratch.initFor(ColumnType.INT, rowCount);
             for (int v : ints) intScratch.appendInt(v);
 
-            // Column 0 at offset 0.
-            longScratch.flushValuesTo(body);
-            // Column 1 at aligned offset.
-            long off1 = ArrowRecordBatchWriter.computeColumnOffset(types, rowCount, 1);
+            long off0 = ArrowRecordBatchWriter.computeColumnValuesOffset(validityLens, valuesLens, 0);
+            longScratch.flushValuesTo(body + off0);
+            long off1 = ArrowRecordBatchWriter.computeColumnValuesOffset(validityLens, valuesLens, 1);
             doubleScratch.flushValuesTo(body + off1);
-            // Column 2.
-            long off2 = ArrowRecordBatchWriter.computeColumnOffset(types, rowCount, 2);
+            long off2 = ArrowRecordBatchWriter.computeColumnValuesOffset(validityLens, valuesLens, 2);
             intScratch.flushValuesTo(body + off2);
 
             byte[] schemaBytes = writeSchemaBytes(metadata);
-            byte[] batchBytes = writeMetadata(rowCount, types, bodyBytes);
+            byte[] batchBytes = writeMetadata(rowCount, types, nullCounts, validityLens, valuesLens, bodyBytes);
 
             Schema schemaFb = (Schema) Message.getRootAsMessage(ByteBuffer.wrap(schemaBytes)).header(new Schema());
             org.apache.arrow.vector.types.pojo.Schema pojoSchema =
@@ -196,12 +201,43 @@ public class ArrowRecordBatchWriterTest {
         }
     }
 
-    private static byte[] writeMetadata(long rowCount, int[] types, long bodyBytes) {
+    @Test
+    public void testValidityBufferEmittedForNullColumn() {
+        int[] types = {ColumnType.LONG, ColumnType.LONG};
+        long rowCount = 5;
+        long[] validityLens = {1L, 0L};
+        long[] valuesLens = {40L, 40L};
+        long[] nullCounts = {2L, 0L};
+        long expectedBody = ArrowRecordBatchWriter.computeBodyBytes(validityLens, valuesLens);
+        // col0 validity 1B + pad(7) + values 40B = 48. col1 validity 0 + values 40 = 40. total 88.
+        Assert.assertEquals(88L, expectedBody);
+        Assert.assertEquals(0L, ArrowRecordBatchWriter.computeColumnValidityOffset(validityLens, valuesLens, 0));
+        Assert.assertEquals(8L, ArrowRecordBatchWriter.computeColumnValuesOffset(validityLens, valuesLens, 0));
+        Assert.assertEquals(48L, ArrowRecordBatchWriter.computeColumnValidityOffset(validityLens, valuesLens, 1));
+        Assert.assertEquals(48L, ArrowRecordBatchWriter.computeColumnValuesOffset(validityLens, valuesLens, 1));
+
+        byte[] metadata = writeMetadata(rowCount, types, nullCounts, validityLens, valuesLens, expectedBody);
+        Message msg = Message.getRootAsMessage(ByteBuffer.wrap(metadata));
+        RecordBatch rb = (RecordBatch) msg.header(new RecordBatch());
+        Assert.assertEquals(2L, rb.nodes(0).nullCount());
+        Assert.assertEquals(0L, rb.buffers(0).offset());
+        Assert.assertEquals(1L, rb.buffers(0).length());
+        Assert.assertEquals(8L, rb.buffers(1).offset());
+        Assert.assertEquals(40L, rb.buffers(1).length());
+        Assert.assertEquals(48L, rb.buffers(2).offset());
+        Assert.assertEquals(0L, rb.buffers(2).length());
+        Assert.assertEquals(48L, rb.buffers(3).offset());
+        Assert.assertEquals(40L, rb.buffers(3).length());
+    }
+
+    private static byte[] writeMetadata(long rowCount, int[] types, long[] nullCounts,
+                                        long[] validityLens, long[] valuesLens, long bodyBytes) {
         long buf = Unsafe.malloc(BUF, MemoryTag.NATIVE_DEFAULT);
         try {
             FbWriter w = new FbWriter();
             w.of(buf, buf + BUF);
-            int len = ArrowRecordBatchWriter.writeRecordBatchMessage(w, rowCount, types, bodyBytes);
+            int len = ArrowRecordBatchWriter.writeRecordBatchMessage(w, rowCount, types,
+                    nullCounts, validityLens, valuesLens, bodyBytes);
             Assert.assertTrue(len > 0);
             byte[] bytes = new byte[len];
             long addr = w.finishedAddr();
