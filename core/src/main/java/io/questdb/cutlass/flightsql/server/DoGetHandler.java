@@ -24,13 +24,18 @@
 
 package io.questdb.cutlass.flightsql.server;
 
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cutlass.arrow.column.ArrowColumnScratch;
 import io.questdb.cutlass.arrow.ipc.ArrowRecordBatchWriter;
 import io.questdb.cutlass.arrow.ipc.FbWriter;
+import io.questdb.cutlass.arrow.ipc.UnsupportedColumnTypeException;
 import io.questdb.cutlass.flightsql.proto.FlightDataCodec;
 import io.questdb.cutlass.flightsql.proto.TicketCodec;
-import io.questdb.cutlass.grpc.GrpcFrameWriter;
+import io.questdb.cutlass.flightsql.server.TicketRegistry.DoGetState;
+import io.questdb.cutlass.flightsql.server.TicketRegistry.TicketEntry;
 import io.questdb.cutlass.grpc.GrpcStatus;
 import io.questdb.cutlass.protobuf.ProtobufException;
 import io.questdb.cutlass.protobuf.ProtobufWriter;
@@ -41,24 +46,28 @@ import io.questdb.std.Unsafe;
 import java.io.Closeable;
 
 /**
- * Wave 6a {@code DoGet} handler. Consumes a {@code Ticket} gRPC message,
- * looks it up in the {@link TicketRegistry}, and streams the two
- * {@code FlightData} messages Arrow Flight clients expect for a result
- * set: one carrying the schema (metadata only, no body) and one
- * carrying the single {@code RecordBatch}. Trailers close with
- * {@code grpc-status: 0}.
+ * Wave 6b {@code DoGet} handler. Consumes a {@code Ticket} gRPC message,
+ * looks up the {@link TicketEntry} in the {@link TicketRegistry}, opens
+ * the stashed {@code RecordCursor}, and streams RecordBatches packed as
+ * {@code FlightData} messages. Terminates with {@code grpc-status} in
+ * trailers.
  * <p>
- * The metadata / body layout is fixed in Wave 6a: one {@code Int64}
- * column with three rows. Wave 6b replaces the hardcoded row set with
- * a real {@code RecordCursorFactory} + open cursor.
+ * The streaming state machine is re-entrant: when the underlying
+ * {@code Http2ConnectionContext.enqueueData} returns {@code ENQUEUE_PARK}
+ * (outbound flow-control window exhausted or the stream's egress queue
+ * full), the handler records the current state on the ticket entry and
+ * returns. The dispatcher's {@code onStreamWritable} callback re-enters
+ * the handler to continue from the saved state. Built FlightData bytes
+ * are retained across PARK so the retry does not rebuild metadata or
+ * re-iterate the cursor.
  */
 public final class DoGetHandler implements FlightSqlHandler, Closeable {
 
-    private static final int BODY_BUFFER_CAP = 64 * 1024;
+    /** Target row count per RecordBatch. */
+    public static final int BATCH_SIZE_ROWS = 4096;
+    private static final int INITIAL_BATCH_SCRATCH_CAP = 64 * 1024;
     private static final int METADATA_BUFFER_CAP = 16 * 1024;
     private static final Log LOG = LogFactory.getLog(DoGetHandler.class);
-    private final long bodyBuffer;
-    private final ArrowColumnScratch columnScratch;
     private final FbWriter fbWriter = new FbWriter();
     private final int memoryTag;
     private final long metadataBuffer;
@@ -71,8 +80,6 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
         this.ticketRegistry = ticketRegistry;
         this.memoryTag = memoryTag;
         this.metadataBuffer = Unsafe.malloc(METADATA_BUFFER_CAP, memoryTag);
-        this.bodyBuffer = Unsafe.malloc(BODY_BUFFER_CAP, memoryTag);
-        this.columnScratch = new ArrowColumnScratch(memoryTag);
     }
 
     @Override
@@ -81,8 +88,6 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
             return;
         }
         isClosed = true;
-        columnScratch.close();
-        Unsafe.free(bodyBuffer, BODY_BUFFER_CAP, memoryTag);
         Unsafe.free(metadataBuffer, METADATA_BUFFER_CAP, memoryTag);
     }
 
@@ -90,15 +95,11 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
     public void onClientStreaming(FlightSqlCallContext ctx, long messageAddr, int messageLen, boolean endOfStream) {
         if (!endOfStream) {
             if (messageLen > 0) {
-                // Stash the ticket payload for the end-of-stream branch.
-                // The registry lookup happens on END_STREAM so that
-                // clients that misbehave mid-stream do not allocate.
                 try {
                     TicketCodec.decode(messageAddr, messageAddr + messageLen, ticketFields);
                 } catch (ProtobufException e) {
                     LOG.error().$("DoGet ticket decode failed [msg=").$(e.getDebug()).I$();
                     rejectWithStatus(ctx, GrpcStatus.INVALID_ARGUMENT, "malformed Ticket");
-                    // Zero out so the end-of-stream branch bails.
                     ticketFields.clear();
                 }
             }
@@ -113,70 +114,42 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
         long ticketId = decodeTicketIdBigEndian(ticketFields.ticketAddr);
         ticketFields.clear();
 
-        TicketRegistry.TicketEntry entry = ticketRegistry.entryById(ticketId);
+        TicketEntry entry = ticketRegistry.entryById(ticketId);
         if (entry == null) {
             rejectWithStatus(ctx, GrpcStatus.INVALID_ARGUMENT, "unknown ticket");
             return;
         }
+        ctx.setTicketId(ticketId);
+        entry.setDoGetState(DoGetState.EMIT_HEADERS);
+        drive(ctx, entry);
+    }
 
-        int r = ctx.emitResponseHeaders();
-        if (r != FlightSqlCallContext.EMIT_OK) {
-            LOG.error().$("DoGet response headers emit failed [rc=").$(r).I$();
+    @Override
+    public void onStreamWritable(FlightSqlCallContext ctx) {
+        long ticketId = ctx.getTicketId();
+        if (ticketId <= 0) {
             return;
         }
+        TicketEntry entry = ticketRegistry.entryById(ticketId);
+        if (entry == null) {
+            return;
+        }
+        drive(ctx, entry);
+    }
 
-        // Message 1: FlightData{data_header = schema bytes}. No body.
-        long schemaAddr = entry.getSchemaAddr();
-        int schemaLen = entry.getSchemaLen();
-        int wrote = writeFlightDataMessage(ctx, schemaAddr, schemaLen, 0, 0);
-        if (wrote < 0) {
-            rejectAfterHeaders(ctx, GrpcStatus.INTERNAL, "schema FlightData scratch overflow");
-            return;
-        }
-        r = ctx.emitDataMessage(ctx.getResponseBodyAddr() + GrpcFrameWriter.PREFIX_LEN, wrote);
-        if (r != FlightSqlCallContext.EMIT_OK) {
-            LOG.error().$("DoGet schema data emit failed [rc=").$(r).I$();
-            return;
-        }
-
-        // Message 2: FlightData{data_header = record batch bytes,
-        // data_body = int64 values}.
-        long[] values = entry.getRowValues();
-        int rowCount = values == null ? 0 : values.length;
-        // Stage the int64 column through the per-handler ArrowColumnScratch
-        // so the Wave 6a hardcoded path exercises the same append + flush
-        // machinery Wave 6b's cursor-driven path will use.
-        columnScratch.reset();
-        columnScratch.initFor(ColumnType.LONG, rowCount);
-        for (int i = 0; i < rowCount; i++) {
-            columnScratch.appendLong(values[i]);
-        }
-        long bodyEnd = columnScratch.flushValuesTo(bodyBuffer);
-        int bodyLen = (int) (bodyEnd - bodyBuffer);
-
-        fbWriter.of(metadataBuffer, metadataBuffer + METADATA_BUFFER_CAP);
-        int[] singleLongColumn = {ColumnType.LONG};
-        int metaLen = ArrowRecordBatchWriter.writeRecordBatchMessage(fbWriter,
-                rowCount, singleLongColumn, (long) bodyLen);
-        if (metaLen <= 0) {
-            rejectAfterHeaders(ctx, GrpcStatus.INTERNAL, "record batch metadata scratch overflow");
-            return;
-        }
-        long metaAddr = fbWriter.finishedAddr();
-
-        wrote = writeFlightDataMessage(ctx, metaAddr, metaLen, bodyBuffer, bodyLen);
-        if (wrote < 0) {
-            rejectAfterHeaders(ctx, GrpcStatus.INTERNAL, "record batch FlightData scratch overflow");
-            return;
-        }
-        r = ctx.emitDataMessage(ctx.getResponseBodyAddr() + GrpcFrameWriter.PREFIX_LEN, wrote);
-        if (r != FlightSqlCallContext.EMIT_OK) {
-            LOG.error().$("DoGet batch data emit failed [rc=").$(r).I$();
-            return;
-        }
-        r = ctx.emitTrailers(GrpcStatus.OK, null);
-        if (r != FlightSqlCallContext.EMIT_OK) {
-            LOG.error().$("DoGet trailers emit failed [rc=").$(r).I$();
+    private static void appendCell(Record r, int ci, ArrowColumnScratch s, int qtype) {
+        switch (ColumnType.tagOf(qtype)) {
+            case ColumnType.LONG:
+                s.appendLong(r.getLong(ci));
+                break;
+            case ColumnType.DOUBLE:
+                s.appendDouble(r.getDouble(ci));
+                break;
+            case ColumnType.INT:
+                s.appendInt(r.getInt(ci));
+                break;
+            default:
+                throw new UnsupportedColumnTypeException(qtype);
         }
     }
 
@@ -207,21 +180,312 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
         }
     }
 
+    private void appendRow(TicketEntry ticket, Record record) {
+        int[] columnTypes = ticket.getColumnTypes();
+        ArrowColumnScratch[] scratches = ticket.getScratches();
+        for (int ci = 0; ci < columnTypes.length; ci++) {
+            appendCell(record, ci, scratches[ci], columnTypes[ci]);
+        }
+        ticket.setRowsBuffered(ticket.getRowsBuffered() + 1);
+    }
+
     /**
-     * Encodes a FlightData protobuf message into the response scratch
-     * starting at {@code gRPC prefix + 5}. Returns the byte length of
-     * the encoded message or {@code -1} on overflow.
+     * Ensures the ticket's batch scratch buffer holds at least
+     * {@code required} bytes. Rounds first-time allocation up to
+     * {@link #INITIAL_BATCH_SCRATCH_CAP} so small schema messages do
+     * not incur many reallocations.
      */
-    private int writeFlightDataMessage(FlightSqlCallContext ctx,
-                                       long headerAddr, int headerLen,
-                                       long bodyAddr, int bodyLen) {
-        long bodyWriteAddr = ctx.getResponseBodyAddr() + GrpcFrameWriter.PREFIX_LEN;
-        long bodyLimit = ctx.getResponseBodyAddr() + ctx.getResponseBodyCap();
-        protobufWriter.of(bodyWriteAddr, bodyLimit);
+    private void ensureBatchScratchCap(TicketEntry ticket, int required) {
+        int floored = Math.max(required, INITIAL_BATCH_SCRATCH_CAP);
+        ticket.ensureBatchScratchCap(floored, memoryTag);
+    }
+
+    /**
+     * Drives the per-ticket state machine. Called from
+     * {@link #onClientStreaming(FlightSqlCallContext, long, int, boolean)}
+     * after the ticket is first resolved, and from {@link #onStreamWritable}
+     * on every subsequent unpark.
+     */
+    private void drive(FlightSqlCallContext ctx, TicketEntry ticket) {
+        boolean progressing = true;
+        while (progressing) {
+            switch (ticket.getDoGetState()) {
+                case SETUP:
+                    // Initial state set by onClientStreaming before the
+                    // first drive call; should not re-enter here.
+                    ticket.setDoGetState(DoGetState.EMIT_HEADERS);
+                    break;
+                case EMIT_HEADERS: {
+                    int r = ctx.emitResponseHeaders();
+                    if (r == FlightSqlCallContext.EMIT_PARK) {
+                        return;
+                    }
+                    if (r != FlightSqlCallContext.EMIT_OK) {
+                        LOG.error().$("DoGet response headers emit failed [rc=").$(r).I$();
+                        releaseTicketAndDone(ctx, ticket);
+                        return;
+                    }
+                    ticket.setDoGetState(DoGetState.EMIT_SCHEMA);
+                    break;
+                }
+                case EMIT_SCHEMA: {
+                    // If nothing is pending (fresh entry), build the schema FlightData now.
+                    if (ticket.getBatchScratchLen() == 0) {
+                        int encoded = writeFlightDataBytes(ticket,
+                                ticket.getSchemaAddr(), ticket.getSchemaLen(), 0, 0);
+                        if (encoded < 0) {
+                            rejectAfterHeaders(ctx, GrpcStatus.INTERNAL, "schema FlightData scratch overflow");
+                            releaseTicketAndDone(ctx, ticket);
+                            return;
+                        }
+                    }
+                    int r = enqueueBatchData(ctx, ticket);
+                    if (r == FlightSqlCallContext.EMIT_PARK) {
+                        return;
+                    }
+                    if (r != FlightSqlCallContext.EMIT_OK) {
+                        LOG.error().$("DoGet schema data emit failed [rc=").$(r).I$();
+                        releaseTicketAndDone(ctx, ticket);
+                        return;
+                    }
+                    ticket.setBatchScratchLen(0);
+                    // Open cursor now; factory.getCursor may throw which
+                    // maps to an error trailer.
+                    if (ticket.getCursor() == null) {
+                        try {
+                            ticket.setCursor(ticket.getFactory().getCursor(ticket.getExecutionContext()));
+                        } catch (io.questdb.griffin.SqlException e) {
+                            LOG.error().$("DoGet cursor open failed [msg=").$(e.getFlyweightMessage()).I$();
+                            ticket.setError(GrpcStatus.INVALID_ARGUMENT, e.getFlyweightMessage());
+                            ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
+                            break;
+                        } catch (CairoException e) {
+                            LOG.error().$("DoGet cursor open failed [msg=").$(e.getFlyweightMessage()).I$();
+                            int status = e.isAuthorizationError() ? GrpcStatus.PERMISSION_DENIED : GrpcStatus.INTERNAL;
+                            ticket.setError(status, e.getFlyweightMessage());
+                            ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
+                            break;
+                        } catch (RuntimeException e) {
+                            LOG.error().$("DoGet cursor open failed [msg=").$(e.getMessage()).I$();
+                            ticket.setError(GrpcStatus.INTERNAL, "server error");
+                            ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
+                            break;
+                        }
+                    }
+                    ticket.setDoGetState(DoGetState.EMIT_BATCH);
+                    break;
+                }
+                case EMIT_BATCH: {
+                    // If the previous batch is still in-flight (PARK retry),
+                    // re-enqueue its bytes from the ticket's scratch.
+                    if (ticket.getBatchScratchLen() > 0) {
+                        int r = enqueueBatchData(ctx, ticket);
+                        if (r == FlightSqlCallContext.EMIT_PARK) {
+                            return;
+                        }
+                        if (r != FlightSqlCallContext.EMIT_OK) {
+                            LOG.error().$("DoGet batch data emit failed [rc=").$(r).I$();
+                            releaseTicketAndDone(ctx, ticket);
+                            return;
+                        }
+                        ticket.setBatchScratchLen(0);
+                        resetScratches(ticket);
+                    }
+                    // Pull up to BATCH_SIZE_ROWS from the cursor.
+                    RecordCursor cursor = ticket.getCursor();
+                    try {
+                        while (ticket.getRowsBuffered() < BATCH_SIZE_ROWS && cursor.hasNext()) {
+                            appendRow(ticket, cursor.getRecord());
+                        }
+                    } catch (CairoException e) {
+                        LOG.error().$("DoGet cursor iteration failed [msg=").$(e.getFlyweightMessage()).I$();
+                        int status = e.isAuthorizationError() ? GrpcStatus.PERMISSION_DENIED : GrpcStatus.INTERNAL;
+                        ticket.setError(status, e.getFlyweightMessage());
+                        ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
+                        break;
+                    } catch (UnsupportedColumnTypeException e) {
+                        LOG.error().$("DoGet unsupported column type [type=").$(e.getColumnType()).I$();
+                        ticket.setError(GrpcStatus.UNIMPLEMENTED, e.getMessage());
+                        ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
+                        break;
+                    } catch (RuntimeException e) {
+                        LOG.error().$("DoGet cursor iteration failed [msg=").$(e.getMessage()).I$();
+                        ticket.setError(GrpcStatus.INTERNAL, "server error");
+                        ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
+                        break;
+                    }
+
+                    if (ticket.getRowsBuffered() == 0) {
+                        ticket.setDoGetState(DoGetState.EMIT_TRAILERS_OK);
+                        break;
+                    }
+
+                    // Build FlightData{RecordBatch header, body = flushed scratches}.
+                    int rowCount = ticket.getRowsBuffered();
+                    int[] columnTypes = ticket.getColumnTypes();
+                    long bodyBytes = ArrowRecordBatchWriter.computeBodyBytes(columnTypes, rowCount);
+                    if (bodyBytes > Integer.MAX_VALUE) {
+                        ticket.setError(GrpcStatus.INTERNAL, "batch body exceeds 2 GiB");
+                        ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
+                        break;
+                    }
+
+                    fbWriter.of(metadataBuffer, metadataBuffer + METADATA_BUFFER_CAP);
+                    int metaLen = ArrowRecordBatchWriter.writeRecordBatchMessage(fbWriter,
+                            rowCount, columnTypes, bodyBytes);
+                    if (metaLen <= 0) {
+                        ticket.setError(GrpcStatus.INTERNAL, "record batch metadata scratch overflow");
+                        ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
+                        break;
+                    }
+
+                    // Layout: [PREFIX_LEN head-room][FlightData bytes][body staging].
+                    // The body is staged at the tail of the scratch while
+                    // the FlightData protobuf is serialised in front of it,
+                    // then the tail is dropped.
+                    int prefix = io.questdb.cutlass.grpc.GrpcFrameWriter.PREFIX_LEN;
+                    int flightDataUpper = estimateFlightDataUpperBound(metaLen, (int) bodyBytes);
+                    int totalScratchNeeded = prefix + flightDataUpper + (int) bodyBytes;
+                    ensureBatchScratchCap(ticket, totalScratchNeeded);
+
+                    long batchAddr = ticket.getBatchScratchAddr();
+                    long bodyAddr = batchAddr + ticket.getBatchScratchCap() - (int) bodyBytes;
+                    ArrowColumnScratch[] scratches = ticket.getScratches();
+                    long bodyCursor = bodyAddr;
+                    for (int ci = 0; ci < scratches.length; ci++) {
+                        long nextColumnStart = bodyAddr
+                                + ArrowRecordBatchWriter.computeColumnOffset(columnTypes, rowCount, ci);
+                        bodyCursor = scratches[ci].flushValuesTo(nextColumnStart);
+                        long aligned = ArrowRecordBatchWriter.alignTo8(bodyCursor - bodyAddr);
+                        long paddingAddr = bodyCursor;
+                        long paddingEnd = bodyAddr + aligned;
+                        while (paddingAddr < paddingEnd) {
+                            Unsafe.getUnsafe().putByte(paddingAddr++, (byte) 0);
+                        }
+                        bodyCursor = paddingEnd;
+                    }
+
+                    long metaAddr = fbWriter.finishedAddr();
+                    long payloadStart = batchAddr + prefix;
+                    long payloadLimit = bodyAddr;
+                    protobufWriter.of(payloadStart, payloadLimit);
+                    long end = FlightDataCodec.encode(protobufWriter, metaAddr, metaLen, bodyAddr, (int) bodyBytes);
+                    if (end < 0) {
+                        ticket.setError(GrpcStatus.INTERNAL, "record batch FlightData scratch overflow");
+                        ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
+                        break;
+                    }
+                    int builtLen = (int) (end - payloadStart);
+                    ticket.setBatchScratchLen(builtLen);
+                    int r = enqueueBatchData(ctx, ticket);
+                    if (r == FlightSqlCallContext.EMIT_PARK) {
+                        return;
+                    }
+                    if (r != FlightSqlCallContext.EMIT_OK) {
+                        LOG.error().$("DoGet batch data emit failed [rc=").$(r).I$();
+                        releaseTicketAndDone(ctx, ticket);
+                        return;
+                    }
+                    ticket.setBatchScratchLen(0);
+                    resetScratches(ticket);
+                    // Loop for the next batch.
+                    break;
+                }
+                case EMIT_TRAILERS_OK: {
+                    int r = ctx.emitTrailers(GrpcStatus.OK, null);
+                    if (r == FlightSqlCallContext.EMIT_PARK) {
+                        return;
+                    }
+                    if (r != FlightSqlCallContext.EMIT_OK) {
+                        LOG.error().$("DoGet trailers emit failed [rc=").$(r).I$();
+                    }
+                    releaseTicketAndDone(ctx, ticket);
+                    return;
+                }
+                case EMIT_TRAILERS_ERR: {
+                    int r = ctx.emitTrailers(ticket.getErrStatus(), ticket.getErrMessage());
+                    if (r == FlightSqlCallContext.EMIT_PARK) {
+                        return;
+                    }
+                    if (r != FlightSqlCallContext.EMIT_OK) {
+                        LOG.error().$("DoGet error trailers emit failed [rc=").$(r).I$();
+                    }
+                    releaseTicketAndDone(ctx, ticket);
+                    return;
+                }
+                case DONE:
+                default:
+                    progressing = false;
+                    break;
+            }
+        }
+    }
+
+    /**
+     * Enqueues the ticket's currently-built FlightData bytes, which sit
+     * at {@code batchScratchAddr + PREFIX_LEN} with {@code PREFIX_LEN}
+     * bytes of headroom at the front for the 5-byte gRPC prefix.
+     * Emits directly into the H2 outbound tuple queue via the call
+     * context passthrough; returns the H2 enqueue status.
+     */
+    private int enqueueBatchData(FlightSqlCallContext ctx, TicketEntry ticket) {
+        long batchAddr = ticket.getBatchScratchAddr();
+        int flightDataLen = ticket.getBatchScratchLen();
+        io.questdb.cutlass.grpc.GrpcFrameWriter.writePrefix(batchAddr, flightDataLen);
+        int totalLen = io.questdb.cutlass.grpc.GrpcFrameWriter.PREFIX_LEN + flightDataLen;
+        return ctx.emitDataMessagePrefixed(batchAddr, totalLen);
+    }
+
+    private int estimateFlightDataUpperBound(int metaLen, int bodyLen) {
+        // tag (1) + length-delimited header (5 + metaLen) + tag (1) +
+        // length-delimited body (5 + bodyLen) + small headroom.
+        return 16 + metaLen + bodyLen;
+    }
+
+    private void releaseTicketAndDone(FlightSqlCallContext ctx, TicketEntry ticket) {
+        ticket.setDoGetState(DoGetState.DONE);
+        ticketRegistry.release(ticket.getTicketId());
+        ctx.setTicketId(0);
+    }
+
+    /**
+     * Resets per-column scratches between batches; keeps the native
+     * buffers allocated for reuse.
+     */
+    private void resetScratches(TicketEntry ticket) {
+        ArrowColumnScratch[] scratches = ticket.getScratches();
+        if (scratches != null) {
+            for (ArrowColumnScratch s : scratches) {
+                if (s != null) {
+                    s.reset();
+                }
+            }
+        }
+        ticket.setRowsBuffered(0);
+    }
+
+    /**
+     * Encodes a FlightData message into the ticket's batch scratch
+     * leaving the first {@code PREFIX_LEN} bytes reserved for the gRPC
+     * frame prefix. Stores the encoded length (without prefix) on the
+     * ticket. Returns {@code -1} on scratch overflow.
+     */
+    private int writeFlightDataBytes(TicketEntry ticket,
+                                     long headerAddr, int headerLen,
+                                     long bodyAddr, int bodyLen) {
+        int estimated = estimateFlightDataUpperBound(headerLen, bodyLen)
+                + io.questdb.cutlass.grpc.GrpcFrameWriter.PREFIX_LEN;
+        ensureBatchScratchCap(ticket, estimated);
+        long batchAddr = ticket.getBatchScratchAddr();
+        long payloadStart = batchAddr + io.questdb.cutlass.grpc.GrpcFrameWriter.PREFIX_LEN;
+        long payloadLimit = batchAddr + ticket.getBatchScratchCap();
+        protobufWriter.of(payloadStart, payloadLimit);
         long end = FlightDataCodec.encode(protobufWriter, headerAddr, headerLen, bodyAddr, bodyLen);
         if (end < 0) {
             return -1;
         }
-        return (int) (end - bodyWriteAddr);
+        int len = (int) (end - payloadStart);
+        ticket.setBatchScratchLen(len);
+        return len;
     }
 }

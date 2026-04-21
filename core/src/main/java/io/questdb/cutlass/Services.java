@@ -105,6 +105,7 @@ public class Services {
                 networkSharedPool,
                 httpServerConfiguration.getFactoryProvider().getHttpSocketFactory()
         );
+        server.setFlightSqlBootstrap(cairoEngine, sharedQueryWorkerCount);
         HttpServer.HttpRequestHandlerBuilder jsonQueryProcessorBuilder = () -> new JsonQueryProcessor(
                 httpServerConfiguration.getJsonQueryProcessorConfiguration(),
                 cairoEngine,

@@ -322,11 +322,21 @@ a different output layout.
 `QwpResultBatchBuffer`. The per-column-type switch is ~20 cases, same as QWP
 egress. Reuse the native scratch-buffer pattern.
 
-**Status.** Wave 6a landed a narrow `Int64ColumnEmitter` behind a
-`ColumnEmitter` one-method interface (`emit(dstAddr, src, offset, count)`).
-The implementation is deliberately minimal — it serialises a caller-owned
-`long[]` as dense little-endian int64 bytes — and exists mainly to pin the
-abstraction for Wave 7's `Float64`, `Utf8`, and `Dictionary` variants.
+**Status.** Wave 6b replaces the per-type `Int64ColumnEmitter`,
+`Float64ColumnEmitter`, and `Int32ColumnEmitter` shape with a single
+stateful `ArrowColumnScratch` class modelled on `QwpColumnScratch`
+(same instance-field layout, same lazy per-type buffer allocation, same
+`close()` cleanup). Callers pick the right `appendLong`/`appendDouble`/
+`appendInt` via an outer type-switch in `DoGetHandler.appendCell(record, ci,
+scratch, columnType)` so the per-type JIT inlining QWP relies on is
+preserved. Scratches are pre-allocated per ticket at `GetFlightInfo`
+compile time, reset between batches via `reset()`, and freed on ticket
+release.
+
+Null handling stays a Wave 7 carve-out: `appendLong(Long.MIN_VALUE)`
+stores the sentinel raw. Wave 7 will add `appendLongOrNull` /
+`appendDoubleOrNull` / `appendIntOrNull` plus the validity bitmap slots
+already sketched in the class javadoc.
 
 **Page-frame fast path.** When the factory produces columnar page frames
 (table scans, simple filters), fixed-width columns can be emitted with a
@@ -430,21 +440,29 @@ Tickets must survive across a `GetFlightInfo` → `DoGet` pair. In the
 single-endpoint single-node case both RPCs ride the same gRPC connection, so
 the per-connection registry is sufficient.
 
-**Wave 6a status.** The per-connection `TicketRegistry` is live with a
-fixed-slot array (`DEFAULT_CAPACITY = 64`), monotonic 64-bit ids, and
-`acquire()` / `entryById()` / `release()` surface. Exhausted pools
-return `-1` from `acquire()`, which the handler converts to
-`grpc-status: RESOURCE_EXHAUSTED`. HMAC signing and ticket expiry are
-deferred to Wave 7; the 6a ticket is 8 raw big-endian bytes carrying
-the monotonic id.
+**Wave 6b status.** The per-connection `TicketRegistry` expanded around
+a broader `TicketEntry`: `RecordCursorFactory` + lazily opened
+`RecordCursor`, per-ticket `SqlExecutionContextImpl` + circuit breaker
+bound to the fd, the per-column type array, the per-column
+`ArrowColumnScratch[]`, the `DoGetState` enum the state machine walks
+through, and a single growable batch scratch buffer that also survives
+`ENQUEUE_PARK` so the PARK retry does not rebuild the FlightData bytes.
+`release()` runs `Misc.free` on every owned resource plus the batch
+scratch. HMAC signing and ticket expiry remain Wave 7: the 6b ticket is
+still 8 raw big-endian bytes carrying the monotonic id.
 
 The dispatcher routes `GetFlightInfo` and `DoGet` alongside the
 existing `Handshake` route. Both handlers live in
 `io.questdb.cutlass.flightsql.server` (`GetFlightInfoHandler`,
-`DoGetHandler`) and share a dispatcher-scoped `ArrowSchemaCache` that
-holds the cached Int64 schema message bytes. DoGet emits two
-`FlightData` messages per ticket (schema + record batch) and closes
-with `grpc-status: 0`; an unknown ticket gets a trailers-only
+`DoGetHandler`) and receive the owning connection's
+`FlightSqlResources` adapter (a thin interface that
+`HttpConnectionContext` implements; exposes `CairoEngine`,
+`SecurityContext`, fd, shared-query worker count, per-connection
+circuit breaker and `SqlExecutionContextImpl`). Wave 6b's
+`ArrowSchemaCache` went away: schemas are built per compiled query from
+the factory metadata and stored on the `TicketEntry`. DoGet emits
+schema then one `FlightData` per RecordBatch and closes with
+`grpc-status: 0`; an unknown ticket gets a trailers-only
 `INVALID_ARGUMENT`.
 
 ### 5.7 Flight SQL command handlers
@@ -454,6 +472,28 @@ handler class; `GetFlightInfo` picks the handler based on the `Any`-wrapped
 command type in the `FlightDescriptor.cmd`.
 
 **Module.** `io.questdb.cutlass.flightsql.commands.*`
+
+**Wave 6b status.** Only `CommandStatementQuery` is wired end-to-end.
+`GetFlightInfoHandler` decodes `FlightDescriptor.cmd` as
+`google.protobuf.Any`, verifies the `type_url` matches
+`arrow.flight.protocol.sql.CommandStatementQuery`, decodes the inner
+`query` string, acquires an `SqlCompiler` from the engine pool for the
+compile call only, validates the result is a SELECT whose columns are
+all LONG / DOUBLE / INT (anything else maps to `UNIMPLEMENTED`), builds
+the Arrow Schema bytes and pre-allocates one `ArrowColumnScratch` per
+column onto a fresh `TicketEntry`, then emits `FlightInfo`. Compile-time
+error mapping: `SqlException` / `ImplicitCastException` →
+`INVALID_ARGUMENT`; `CairoException.isAuthorizationError` →
+`PERMISSION_DENIED`; other `CairoException` → `INTERNAL`;
+`UnsupportedColumnTypeException` → `UNIMPLEMENTED`. Everything else maps
+to `INTERNAL`.
+
+Carve-outs still in force for Wave 6b: `grpc-timeout` header parsing is
+deferred (the per-connection circuit breaker runs with the engine's
+default timeout; Wave 7 will wire the `{int}{H|M|S|m|u|n}` grammar via
+a new header capture slot on the H2 dispatcher), prepared statements,
+DoPut, `CommandStatementUpdate`, `CommandGetSqlInfo` content, auth, and
+bind variables.
 
 **Commands to implement** (in rough order of ADBC client importance):
 
@@ -513,6 +553,29 @@ for the full command surface.
 
 **Scope.** Drive a `RecordCursorFactory` to completion, producing Arrow
 batches on the wire, with HTTP/2-aware flow control.
+
+**Wave 6b status.** Lives inside `DoGetHandler.drive()` as a
+re-entrant state machine walking the states `SETUP → EMIT_HEADERS →
+EMIT_SCHEMA → EMIT_BATCH (loop) → EMIT_TRAILERS_OK | EMIT_TRAILERS_ERR
+→ DONE`. Each state emits one piece of output; on `ENQUEUE_PARK` the
+method returns with the current state and the already-built FlightData
+bytes retained in `TicketEntry.batchScratchAddr`. The dispatcher's
+`onStreamWritable(streamId)` callback routes back into
+`DoGetHandler.onStreamWritable(ctx)` which re-enters `drive()` at the
+saved state. `EMIT_BATCH` pulls up to `BATCH_SIZE_ROWS = 4096` rows per
+batch, dispatches per column via `appendCell` (outer switch on the
+column type; no virtual dispatch). PARK retry correctness is exercised
+by `testSelect10kRowsAcrossMultipleBatches` which forces three
+RecordBatches over a single stream.
+
+A follow-on change in `HttpConnectionContext.handleH2Operation` was
+required: the single-pass `writePending` + `flushH2Send` drain was
+insufficient for multi-batch responses larger than the 64 KiB h2 send
+buffer, because no later READ / WRITE tick was scheduled to pick up the
+remainder. Wave 6b wraps that pair in a `while`-loop that drains until
+`writePending` reports zero bytes; short socket writes still throw
+`PeerIsSlowToReadException` so the WRITE re-registration path stays
+intact.
 
 **Module.** `io.questdb.cutlass.flightsql.server.FlightSqlStreamer`
 
@@ -610,6 +673,14 @@ This is a gap in QWP egress (see `QWP_EGRESS_PHASE2_BACKLOG.md` item #2).
 The cancellation machinery built here is shared with QWP egress: both use
 `SqlExecutionContextImpl`'s existing circuit-breaker hooks.
 
+**Wave 6b status.** The per-ticket
+`NetworkSqlExecutionCircuitBreaker` is wired (the one the connection
+ctx lazily creates via `getOrCreateCircuitBreaker`) and runs at the
+engine's default timeout; the cursor iteration inside `EMIT_BATCH`
+triggers the same `statefulThrowExceptionIfTimeout` call the rest of
+QuestDB uses. Synchronous cancellation via `RST_STREAM(CANCEL)` and
+`grpc-timeout` header parsing are Wave 7 carve-outs.
+
 **Size estimate.** ~500 LOC net-new; benefits QWP egress for free.
 
 ### 5.13 Compression (optional, later)
@@ -670,19 +741,32 @@ Stage 5:  Flight RPC dispatcher skeleton
           +  CommandGetSqlInfo / CommandGetTableTypes stubs
           |
           v
-Stage 6:  Arrow IPC encoder (Schema + RecordBatch)              [PARTIAL]
+Stage 6:  Arrow IPC encoder (Schema + RecordBatch)              [DONE]
           +  Arrow column emitters (scalar types only)
           +  Type mapping for scalars
           Wave 6a landed Int64-only encoders + a hardcoded
           GetFlightInfo / DoGet roundtrip (no CairoEngine). Wave 6b
-          wires in CommandStatementQuery decoding + SQL compilation.
+          replaced the per-type emitters with ArrowColumnScratch,
+          wired CommandStatementQuery through the SqlCompiler, and
+          ships real LONG / DOUBLE / INT SELECTs over one H2
+          connection.
           |
           v
-Stage 7:  CommandStatementQuery end-to-end                      [NEXT]
+Stage 7:  CommandStatementQuery end-to-end                      [DONE]
           (first real SELECT via Flight SQL JDBC)
+          Wave 6b: GetFlightInfoHandler decodes Any(CommandStatementQuery),
+          compiles via engine.getSqlCompiler(), validates column types,
+          stashes factory + cursor + per-column ArrowColumnScratch on
+          the TicketEntry; DoGetHandler drives a resumable SETUP ->
+          EMIT_HEADERS -> EMIT_SCHEMA -> EMIT_BATCH* -> EMIT_TRAILERS
+          state machine with PARK-retry correctness across multi-batch
+          responses.
           |
           v
-Stage 8:  Cursor streaming driver + flow-control coupling
+Stage 8:  Cursor streaming driver + flow-control coupling       [NEXT]
+          Wave 7: grpc-timeout header parsing, RST_STREAM(CANCEL)
+          cascade, validity bitmaps + null handling in ArrowColumnScratch,
+          variable-width / SYMBOL / ARRAY support, prepared statements.
           |
           v
 Stage 9:  Prepared statements  +  DoPut  +  StatementUpdate

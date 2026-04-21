@@ -64,7 +64,6 @@ public final class FlightSqlDispatchListener implements Http2StreamListener, Clo
     private Http2ConnectionContext h2;
     private final HandshakeHandler handshakeHandler;
     private final byte[] handshakePathBytes = HANDSHAKE_PATH.getBytes();
-    private final ArrowSchemaCache schemaCache;
     private final TicketRegistry ticketRegistry;
     private boolean isClosed;
 
@@ -72,13 +71,11 @@ public final class FlightSqlDispatchListener implements Http2StreamListener, Clo
                                      HandshakeHandler handshakeHandler,
                                      GetFlightInfoHandler getFlightInfoHandler,
                                      DoGetHandler doGetHandler,
-                                     ArrowSchemaCache schemaCache,
                                      TicketRegistry ticketRegistry) {
         this.contextPool = contextPool;
         this.handshakeHandler = handshakeHandler;
         this.getFlightInfoHandler = getFlightInfoHandler;
         this.doGetHandler = doGetHandler;
-        this.schemaCache = schemaCache;
         this.ticketRegistry = ticketRegistry;
     }
 
@@ -110,9 +107,6 @@ public final class FlightSqlDispatchListener implements Http2StreamListener, Clo
         }
         if (ticketRegistry != null) {
             ticketRegistry.close();
-        }
-        if (schemaCache != null) {
-            schemaCache.close();
         }
     }
 
@@ -205,11 +199,14 @@ public final class FlightSqlDispatchListener implements Http2StreamListener, Clo
 
     @Override
     public void onStreamWritable(int streamId) {
-        // Wave 5 handlers emit their full response in one turn (the
-        // Handshake response is ~8 bytes). Parking is theoretically
-        // possible under tiny flow-control windows but is not exercised
-        // by any Wave 5 test; full park / resume plumbing lands with
-        // the server-streaming DoGet handler in a later wave.
+        FlightSqlCallContext ctx = contextPool.lookup(streamId);
+        if (ctx == null) {
+            return;
+        }
+        FlightSqlHandler handler = ctx.getHandler();
+        if (handler != null) {
+            handler.onStreamWritable(ctx);
+        }
     }
 
     @Override

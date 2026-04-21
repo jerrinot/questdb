@@ -82,7 +82,7 @@ import static io.questdb.network.IODispatcher.*;
 import static java.net.HttpURLConnection.*;
 
 public class HttpConnectionContext extends IOContext<HttpConnectionContext>
-        implements Locality, Retry, HttpRequestContext {
+        implements Locality, Retry, HttpRequestContext, io.questdb.cutlass.flightsql.server.FlightSqlResources {
     private static final String FALSE = "false";
     private static final Log LOG = LogFactory.getLog(HttpConnectionContext.class);
     private static final byte MODE_H1 = 1;
@@ -143,6 +143,11 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
     private int h2SendBufferLimit;
     private NetworkSqlExecutionCircuitBreaker httpCircuitBreaker;
     private SqlExecutionContextImpl httpSqlExecutionContext;
+    // Flight SQL bootstrap. Null until bound via {@link #setFlightSqlBootstrap}.
+    // Wired by the server at startup so the H2 Flight SQL dispatcher can reach
+    // the CairoEngine from the per-connection handler callbacks.
+    private CairoEngine flightSqlEngine;
+    private int flightSqlSharedWorkerCount;
     private boolean isProtocolSwitched = false;  // WebSocket protocol switch flag
     private int nCompletedRequests;
     private long peekScratchAddr;
@@ -340,8 +345,21 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
         return metrics;
     }
 
+    @Override
+    public CairoEngine getCairoEngine() {
+        return flightSqlEngine;
+    }
+
     public int getNCompletedRequests() {
         return nCompletedRequests;
+    }
+
+    @Override
+    public NetworkSqlExecutionCircuitBreaker getOrCreateCircuitBreaker() {
+        if (flightSqlEngine == null) {
+            throw new IllegalStateException("Flight SQL bootstrap not set");
+        }
+        return getOrCreateCircuitBreaker(flightSqlEngine);
     }
 
     public NetworkSqlExecutionCircuitBreaker getOrCreateCircuitBreaker(CairoEngine engine) {
@@ -353,6 +371,14 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
             );
         }
         return httpCircuitBreaker;
+    }
+
+    @Override
+    public SqlExecutionContextImpl getOrCreateSqlExecutionContext() {
+        if (flightSqlEngine == null) {
+            throw new IllegalStateException("Flight SQL bootstrap not set");
+        }
+        return getOrCreateSqlExecutionContext(flightSqlEngine, flightSqlSharedWorkerCount);
     }
 
     public SqlExecutionContextImpl getOrCreateSqlExecutionContext(CairoEngine engine, int workerCount) {
@@ -397,6 +423,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
         return responseSink.getHeader();
     }
 
+    @Override
     public SecurityContext getSecurityContext() {
         return securityContext;
     }
@@ -412,6 +439,11 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
     /**
      * Returns the underlying socket for direct I/O after protocol switch (e.g., WebSocket).
      */
+    @Override
+    public int getSharedWorkerCount() {
+        return flightSqlSharedWorkerCount;
+    }
+
     public Socket getSocket() {
         return socket;
     }
@@ -522,6 +554,19 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
         responseSink.resumeSend();
     }
 
+    /**
+     * Wires the Flight SQL bootstrap used by the H2 dispatcher when the
+     * connection upgrades to HTTP/2. Called once at server startup via
+     * {@code HttpServer.setFlightSqlBootstrap}; subsequent calls on the
+     * same connection are no-ops (settings must be stable for the life
+     * of the HttpContextFactory). Safe to leave unset for tests that do
+     * not exercise Flight SQL.
+     */
+    public void setFlightSqlBootstrap(CairoEngine engine, int sharedWorkerCount) {
+        this.flightSqlEngine = engine;
+        this.flightSqlSharedWorkerCount = sharedWorkerCount;
+    }
+
     public void scheduleRetry(HttpRequestProcessor processor, RescheduleContext rescheduleContext) throws PeerIsSlowToReadException, ServerDisconnectException {
         try {
             pendingRetry = true;
@@ -610,21 +655,18 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
                             io.questdb.std.MemoryTag.NATIVE_HTTP_CONN);
             final io.questdb.cutlass.flightsql.server.HandshakeHandler handshake =
                     new io.questdb.cutlass.flightsql.server.HandshakeHandler();
-            final io.questdb.cutlass.flightsql.server.ArrowSchemaCache schemaCache =
-                    new io.questdb.cutlass.flightsql.server.ArrowSchemaCache("col1",
-                            io.questdb.std.MemoryTag.NATIVE_HTTP_CONN);
             final io.questdb.cutlass.flightsql.server.TicketRegistry ticketRegistry =
                     new io.questdb.cutlass.flightsql.server.TicketRegistry(
                             io.questdb.cutlass.flightsql.server.TicketRegistry.DEFAULT_CAPACITY);
             final io.questdb.cutlass.flightsql.server.GetFlightInfoHandler getFlightInfo =
-                    new io.questdb.cutlass.flightsql.server.GetFlightInfoHandler(schemaCache, ticketRegistry,
+                    new io.questdb.cutlass.flightsql.server.GetFlightInfoHandler(this, ticketRegistry,
                             io.questdb.std.MemoryTag.NATIVE_HTTP_CONN);
             final io.questdb.cutlass.flightsql.server.DoGetHandler doGet =
                     new io.questdb.cutlass.flightsql.server.DoGetHandler(ticketRegistry,
                             io.questdb.std.MemoryTag.NATIVE_HTTP_CONN);
             final io.questdb.cutlass.flightsql.server.FlightSqlDispatchListener dispatcher =
                     new io.questdb.cutlass.flightsql.server.FlightSqlDispatchListener(pool, handshake,
-                            getFlightInfo, doGet, schemaCache, ticketRegistry);
+                            getFlightInfo, doGet, ticketRegistry);
             h2 = new Http2ConnectionContext(dispatcher, h2Config);
             dispatcher.bind(h2);
             h2Listener = dispatcher;
@@ -1319,9 +1361,19 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext>
                     useful = true;
                 }
             }
-            final long written = h2.writePending(h2SendBuffer, h2SendBuffer + h2SendBufferCap);
-            final int drainedBytes = (int) (written - h2SendBuffer);
-            if (drainedBytes > 0) {
+            // Loop until h2.writePending() has no more frames to emit.
+            // Without this loop the server can leave a big streaming
+            // response (e.g. multi-batch DoGet) pending after filling the
+            // 64 KiB send buffer once, with no WRITE tick to drive it out.
+            // flushH2Send() throws PeerIsSlowToReadException on a short
+            // socket write, which propagates and registers WRITE so the
+            // dispatcher re-enters once the peer reads more.
+            while (true) {
+                final long written = h2.writePending(h2SendBuffer, h2SendBuffer + h2SendBufferCap);
+                final int drainedBytes = (int) (written - h2SendBuffer);
+                if (drainedBytes <= 0) {
+                    break;
+                }
                 h2SendBufferPos = 0;
                 h2SendBufferLimit = drainedBytes;
                 flushH2Send();

@@ -69,6 +69,12 @@ public class HttpServer implements Closeable {
     private final ActiveConnectionTracker activeConnectionTracker;
     private final ObjList<Closeable> closeables = new ObjList<>();
     private final IODispatcher<HttpConnectionContext> dispatcher;
+    // Mutable holder for Flight SQL plumbing. Set once by
+    // {@link #setFlightSqlBootstrap} before the first connection upgrade;
+    // read by every newly created HttpConnectionContext. Wrapped in an
+    // object so the captured reference in HttpContextFactory stays valid
+    // after the server writes to it.
+    private final FlightSqlBootstrap flightSqlBootstrap = new FlightSqlBootstrap();
     private final HttpContextFactory httpContextFactory;
     private final WaitProcessor rescheduleContext;
     private final AssociativeCache<RecordCursorFactory> selectCache;
@@ -100,7 +106,8 @@ public class HttpServer implements Closeable {
         }
 
         this.activeConnectionTracker = new ActiveConnectionTracker(configuration.getHttpContextConfiguration());
-        this.httpContextFactory = new HttpContextFactory(configuration, socketFactory, selectCache, activeConnectionTracker);
+        this.httpContextFactory = new HttpContextFactory(configuration, socketFactory, selectCache,
+                activeConnectionTracker, flightSqlBootstrap);
         this.dispatcher = IODispatchers.create(configuration, httpContextFactory);
         networkSharedPool.assign(dispatcher);
         this.rescheduleContext = new WaitProcessor(configuration.getWaitProcessorConfiguration(), dispatcher);
@@ -380,6 +387,18 @@ public class HttpServer implements Closeable {
         closeables.add(closeable);
     }
 
+    /**
+     * Wires the CairoEngine and shared-query worker count that newly
+     * constructed {@link HttpConnectionContext} instances inherit. Must
+     * be called at startup before the IO dispatcher starts accepting
+     * connections; without this call Flight SQL handlers cannot compile
+     * SQL and respond with {@code INTERNAL}.
+     */
+    public void setFlightSqlBootstrap(CairoEngine engine, int sharedWorkerCount) {
+        flightSqlBootstrap.engine = engine;
+        flightSqlBootstrap.sharedWorkerCount = sharedWorkerCount;
+    }
+
     private boolean handleClientOperation(
             HttpConnectionContext context,
             int operation,
@@ -406,16 +425,35 @@ public class HttpServer implements Closeable {
         HttpRequestHandler newInstance();
     }
 
+    /**
+     * Mutable holder shared between {@link HttpServer} and its
+     * {@link HttpContextFactory}. The server writes to it via
+     * {@link HttpServer#setFlightSqlBootstrap}; the factory reads from it
+     * at connection-context construction time so each new context inherits
+     * the current bootstrap. Writes happen at startup before the IO
+     * dispatcher begins accepting, so there is no race with reads.
+     */
+    static final class FlightSqlBootstrap {
+        CairoEngine engine;
+        int sharedWorkerCount;
+    }
+
     private static class HttpContextFactory extends IOContextFactoryImpl<HttpConnectionContext> {
 
         public HttpContextFactory(
                 HttpServerConfiguration configuration,
                 SocketFactory socketFactory,
                 AssociativeCache<RecordCursorFactory> selectCache,
-                ActiveConnectionTracker activeConnectionTracker
+                ActiveConnectionTracker activeConnectionTracker,
+                FlightSqlBootstrap flightSqlBootstrap
         ) {
             super(
-                    () -> new HttpConnectionContext(configuration, socketFactory, selectCache, activeConnectionTracker),
+                    () -> {
+                        HttpConnectionContext ctx = new HttpConnectionContext(
+                                configuration, socketFactory, selectCache, activeConnectionTracker);
+                        ctx.setFlightSqlBootstrap(flightSqlBootstrap.engine, flightSqlBootstrap.sharedWorkerCount);
+                        return ctx;
+                    },
                     configuration.getHttpContextConfiguration().getConnectionPoolInitialCapacity()
             );
         }

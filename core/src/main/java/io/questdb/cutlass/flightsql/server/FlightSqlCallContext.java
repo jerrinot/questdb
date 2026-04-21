@@ -97,6 +97,8 @@ public final class FlightSqlCallContext implements Closeable {
     private boolean isInUse;
     private boolean responseHeadersEmitted;
     private int streamId;
+    /** For DoGet: ticket id attached to this stream (0 if none). */
+    private long ticketId;
     private int trailerStatus;
     private CharSequence trailerMessage;
     private boolean trailersEmitted;
@@ -156,6 +158,23 @@ public final class FlightSqlCallContext implements Closeable {
             Unsafe.getUnsafe().copyMemory(msgAddr, responseBodyAddr + GrpcFrameWriter.PREFIX_LEN, msgLen);
         }
         return h2.enqueueData(streamId, generation, responseBodyAddr, totalLen, false);
+    }
+
+    /**
+     * Enqueues a DATA message whose bytes already include the 5-byte
+     * gRPC prefix. Used by server-streaming handlers that build large
+     * RecordBatch payloads in their own scratch (the fixed response-body
+     * scratch is too small for a 4096-row RecordBatch). Caller layout:
+     * {@code [prefix 5 bytes][body payloadLen-5 bytes]}.
+     */
+    public int emitDataMessagePrefixed(long payloadAddr, int payloadLen) {
+        if (trailersEmitted) {
+            throw new IllegalStateException("trailers already emitted");
+        }
+        if (payloadLen < GrpcFrameWriter.PREFIX_LEN) {
+            throw new IllegalArgumentException("payloadLen must include the 5-byte gRPC prefix: " + payloadLen);
+        }
+        return h2.enqueueData(streamId, generation, payloadAddr, payloadLen, false);
     }
 
     /**
@@ -239,6 +258,10 @@ public final class FlightSqlCallContext implements Closeable {
         return streamId;
     }
 
+    public long getTicketId() {
+        return ticketId;
+    }
+
     public boolean isInUse() {
         return isInUse;
     }
@@ -251,6 +274,7 @@ public final class FlightSqlCallContext implements Closeable {
         this.streamId = streamId;
         this.generation = generation;
         this.handler = null;
+        this.ticketId = 0;
         this.responseHeadersEmitted = false;
         this.trailersEmitted = false;
         this.isInUse = true;
@@ -259,6 +283,10 @@ public final class FlightSqlCallContext implements Closeable {
 
     public void setHandler(FlightSqlHandler handler) {
         this.handler = handler;
+    }
+
+    public void setTicketId(long ticketId) {
+        this.ticketId = ticketId;
     }
 
     public GrpcFrameReader reader() {
@@ -271,6 +299,7 @@ public final class FlightSqlCallContext implements Closeable {
         handler = null;
         streamId = 0;
         generation = 0;
+        ticketId = 0;
         trailerMessage = null;
         reader.clear();
     }

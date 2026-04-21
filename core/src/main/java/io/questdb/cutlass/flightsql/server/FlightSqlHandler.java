@@ -51,6 +51,14 @@ public interface FlightSqlHandler {
     void onClientStreaming(FlightSqlCallContext ctx, long messageAddr, int messageLen, boolean endOfStream);
 
     /**
+     * Invoked when a previously-parked outbound stream can accept more
+     * DATA / HEADERS frames. Server-streaming handlers use this to resume
+     * the cursor iteration state machine; other handlers ignore it.
+     */
+    default void onStreamWritable(FlightSqlCallContext ctx) {
+    }
+
+    /**
      * Invoked for server-streaming RPCs with the single incoming request
      * body. Wave 5 never calls this.
      */

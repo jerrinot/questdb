@@ -24,26 +24,32 @@
 
 package io.questdb.cutlass.flightsql.server;
 
+import io.questdb.cairo.sql.NetworkSqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cutlass.arrow.column.ArrowColumnScratch;
+import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
 import io.questdb.std.Unsafe;
 
 import java.io.Closeable;
 
 /**
- * Per-connection registry of outstanding Flight SQL tickets. A ticket
- * is the server-minted opaque handle returned by {@code GetFlightInfo}
- * and consumed by {@code DoGet} to drive the streaming response.
+ * Per-connection registry of outstanding Flight SQL tickets. A ticket is
+ * the server-minted opaque handle returned by {@code GetFlightInfo} and
+ * consumed by {@code DoGet} to drive the streaming response.
  * <p>
- * Wave 6a uses a fixed-capacity slot array. Ticket ids are monotonic
- * per registry and never repeat — registries are bound to a single
- * TCP connection, so the id space only needs to cover one client's
- * in-flight query count. {@link #acquire()} returns the newly-minted
- * id on success or {@code -1} when the cap is reached; callers convert
+ * Wave 6b uses a fixed-capacity slot array. Ticket ids are monotonic per
+ * registry and never repeat -- registries are bound to a single TCP
+ * connection, so the id space only needs to cover one client's
+ * in-flight query count. {@link #acquire()} returns the newly-minted id
+ * on success or {@code -1} when the cap is reached; callers convert
  * exhaustion into a {@code grpc-status: RESOURCE_EXHAUSTED} response.
  * <p>
  * Wave 7 will swap the flat scan for an HMAC-signed ticket and
- * introduce per-ticket expiration; the public surface is shaped so
- * those changes can happen behind the {@link TicketEntry} wall.
+ * introduce per-ticket expiration; the public surface is shaped so those
+ * changes can happen behind the {@link TicketEntry} wall.
  */
 public final class TicketRegistry implements Closeable {
 
@@ -128,9 +134,10 @@ public final class TicketRegistry implements Closeable {
     }
 
     /**
-     * Releases a slot previously reserved via {@link #acquire()}. The
-     * entry's native-memory payload (currently just the schema bytes)
-     * is freed. No-op if the ticket is not live.
+     * Releases a slot previously reserved via {@link #acquire()}. Frees
+     * all native-memory payloads (schema bytes, batch scratch) and
+     * closes the {@link RecordCursorFactory}, its cursor, and the
+     * per-ticket execution context. No-op if the ticket is not live.
      */
     public void release(long ticketId) {
         TicketEntry e = entryById(ticketId);
@@ -140,14 +147,57 @@ public final class TicketRegistry implements Closeable {
     }
 
     /**
-     * Per-ticket state. Wave 6a carries a pointer to a cached Arrow
-     * Schema message and a hardcoded row set; Wave 6b replaces the row
-     * set with a {@code RecordCursorFactory} + open cursor.
+     * Streaming state for a single Flight SQL DoGet response. The state
+     * machine is driven re-entrantly from {@code DoGetHandler}; when an
+     * {@code enqueueData} returns {@code ENQUEUE_PARK} the handler
+     * records the current state and returns, resuming on the next
+     * {@code onStreamWritable}.
+     */
+    public enum DoGetState {
+        /** Handler has received the ticket but not emitted response HEADERS. */
+        SETUP,
+        /** Emit {@code :status 200} + {@code content-type}. */
+        EMIT_HEADERS,
+        /** Emit {@code FlightData} carrying the schema message. */
+        EMIT_SCHEMA,
+        /** Emit / continue emitting RecordBatch {@code FlightData} messages. */
+        EMIT_BATCH,
+        /** Stream finished cleanly; emit {@code grpc-status: 0} trailers. */
+        EMIT_TRAILERS_OK,
+        /** Stream errored mid-response; emit {@code grpc-status != 0} trailers. */
+        EMIT_TRAILERS_ERR,
+        /** Terminal: no more work. */
+        DONE
+    }
+
+    /**
+     * Per-ticket state. Holds the compiled {@link RecordCursorFactory},
+     * the open {@link RecordCursor} (lazily populated on first DoGet),
+     * the per-ticket {@link SqlExecutionContextImpl} and circuit breaker,
+     * the column-type array that drives the append switch, the per-column
+     * {@link ArrowColumnScratch} instances reused across batches, the
+     * streaming state machine, and a native scratch buffer for the most
+     * recent FlightData bytes so PARK retry can resume without rebuilding.
      */
     public static final class TicketEntry implements Closeable {
+        long batchScratchAddr;
+        int batchScratchCap;
+        int batchScratchLen;
+        NetworkSqlExecutionCircuitBreaker circuitBreaker;
+        int[] columnTypes;
+        RecordCursor cursor;
+        DoGetState doGetState = DoGetState.SETUP;
+        /** Error status captured on the EMIT_TRAILERS_ERR transition. */
+        int errStatus;
+        /** Error message captured on the EMIT_TRAILERS_ERR transition. */
+        CharSequence errMessage;
+        SqlExecutionContextImpl executionContext;
+        RecordCursorFactory factory;
         boolean isInUse;
         int memoryTag;
-        long[] rowValues;
+        /** Rows appended to {@link #scratches} but not yet flushed on the wire. */
+        int rowsBuffered;
+        ArrowColumnScratch[] scratches;
         long schemaAddr;
         int schemaCap;
         int schemaLen;
@@ -155,14 +205,39 @@ public final class TicketRegistry implements Closeable {
 
         @Override
         public void close() {
-            freeSchema();
-            rowValues = null;
-            isInUse = false;
-            ticketId = 0;
+            release();
         }
 
-        public long[] getRowValues() {
-            return rowValues;
+        public NetworkSqlExecutionCircuitBreaker getCircuitBreaker() {
+            return circuitBreaker;
+        }
+
+        public int[] getColumnTypes() {
+            return columnTypes;
+        }
+
+        public RecordCursor getCursor() {
+            return cursor;
+        }
+
+        public DoGetState getDoGetState() {
+            return doGetState;
+        }
+
+        public SqlExecutionContextImpl getExecutionContext() {
+            return executionContext;
+        }
+
+        public RecordCursorFactory getFactory() {
+            return factory;
+        }
+
+        public int getRowsBuffered() {
+            return rowsBuffered;
+        }
+
+        public ArrowColumnScratch[] getScratches() {
+            return scratches;
         }
 
         public long getSchemaAddr() {
@@ -175,6 +250,59 @@ public final class TicketRegistry implements Closeable {
 
         public long getTicketId() {
             return ticketId;
+        }
+
+        /**
+         * Ensures the batch scratch buffer holds at least {@code required}
+         * bytes. Grows via {@link Unsafe#realloc}. On first allocation
+         * captures the memory tag so {@link #release()} frees under the
+         * correct bucket.
+         */
+        public void ensureBatchScratchCap(int required, int memoryTag) {
+            if (batchScratchCap >= required) {
+                return;
+            }
+            int newCap = Math.max(batchScratchCap * 2, required);
+            batchScratchAddr = Unsafe.realloc(batchScratchAddr, batchScratchCap, newCap, memoryTag);
+            batchScratchCap = newCap;
+            this.memoryTag = memoryTag;
+        }
+
+        public void setCircuitBreaker(NetworkSqlExecutionCircuitBreaker circuitBreaker) {
+            this.circuitBreaker = circuitBreaker;
+        }
+
+        public void setColumnTypes(int[] columnTypes) {
+            this.columnTypes = columnTypes;
+        }
+
+        public void setCursor(RecordCursor cursor) {
+            this.cursor = cursor;
+        }
+
+        public void setDoGetState(DoGetState doGetState) {
+            this.doGetState = doGetState;
+        }
+
+        public void setError(int status, CharSequence message) {
+            this.errStatus = status;
+            this.errMessage = message;
+        }
+
+        public void setExecutionContext(SqlExecutionContextImpl executionContext) {
+            this.executionContext = executionContext;
+        }
+
+        public void setFactory(RecordCursorFactory factory) {
+            this.factory = factory;
+        }
+
+        public void setRowsBuffered(int rowsBuffered) {
+            this.rowsBuffered = rowsBuffered;
+        }
+
+        public void setScratches(ArrowColumnScratch[] scratches) {
+            this.scratches = scratches;
         }
 
         /**
@@ -198,22 +326,71 @@ public final class TicketRegistry implements Closeable {
             this.memoryTag = memoryTag;
         }
 
-        public void setRowValues(long[] rowValues) {
-            this.rowValues = rowValues;
+        public int getErrStatus() {
+            return errStatus;
+        }
+
+        public CharSequence getErrMessage() {
+            return errMessage;
+        }
+
+        public int getBatchScratchCap() {
+            return batchScratchCap;
+        }
+
+        public long getBatchScratchAddr() {
+            return batchScratchAddr;
+        }
+
+        public int getBatchScratchLen() {
+            return batchScratchLen;
+        }
+
+        public void setBatchScratchLen(int batchScratchLen) {
+            this.batchScratchLen = batchScratchLen;
         }
 
         void of(long ticketId) {
             this.ticketId = ticketId;
             this.isInUse = true;
-            this.rowValues = null;
             this.schemaAddr = 0;
             this.schemaLen = 0;
             this.schemaCap = 0;
+            this.doGetState = DoGetState.SETUP;
+            this.rowsBuffered = 0;
+            this.batchScratchLen = 0;
+            this.errStatus = 0;
+            this.errMessage = null;
         }
 
         void release() {
             freeSchema();
-            rowValues = null;
+            cursor = Misc.free(cursor);
+            factory = Misc.free(factory);
+            // SqlExecutionContextImpl doesn't own native memory directly in
+            // the Wave 6b shape; reset for reuse rather than free.
+            executionContext = null;
+            // The circuit breaker is shared with the connection ctx
+            // (HttpConnectionContext.getOrCreateCircuitBreaker reuses a
+            // single instance per connection) -- do not close.
+            circuitBreaker = null;
+            if (scratches != null) {
+                for (int i = 0; i < scratches.length; i++) {
+                    scratches[i] = Misc.free(scratches[i]);
+                }
+                scratches = null;
+            }
+            columnTypes = null;
+            if (batchScratchAddr != 0) {
+                Unsafe.free(batchScratchAddr, batchScratchCap, memoryTag);
+                batchScratchAddr = 0;
+                batchScratchCap = 0;
+                batchScratchLen = 0;
+            }
+            rowsBuffered = 0;
+            doGetState = DoGetState.SETUP;
+            errStatus = 0;
+            errMessage = null;
             isInUse = false;
             ticketId = 0;
         }
