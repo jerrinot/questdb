@@ -24,7 +24,8 @@
 
 package io.questdb.cutlass.flightsql.server;
 
-import io.questdb.cutlass.arrow.column.Int64ColumnEmitter;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cutlass.arrow.column.ArrowColumnScratch;
 import io.questdb.cutlass.arrow.ipc.ArrowRecordBatchWriter;
 import io.questdb.cutlass.arrow.ipc.FbWriter;
 import io.questdb.cutlass.flightsql.proto.FlightDataCodec;
@@ -57,6 +58,7 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
     private static final int METADATA_BUFFER_CAP = 16 * 1024;
     private static final Log LOG = LogFactory.getLog(DoGetHandler.class);
     private final long bodyBuffer;
+    private final ArrowColumnScratch columnScratch;
     private final FbWriter fbWriter = new FbWriter();
     private final int memoryTag;
     private final long metadataBuffer;
@@ -70,6 +72,7 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
         this.memoryTag = memoryTag;
         this.metadataBuffer = Unsafe.malloc(METADATA_BUFFER_CAP, memoryTag);
         this.bodyBuffer = Unsafe.malloc(BODY_BUFFER_CAP, memoryTag);
+        this.columnScratch = new ArrowColumnScratch(memoryTag);
     }
 
     @Override
@@ -78,6 +81,7 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
             return;
         }
         isClosed = true;
+        columnScratch.close();
         Unsafe.free(bodyBuffer, BODY_BUFFER_CAP, memoryTag);
         Unsafe.free(metadataBuffer, METADATA_BUFFER_CAP, memoryTag);
     }
@@ -139,14 +143,21 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
         // data_body = int64 values}.
         long[] values = entry.getRowValues();
         int rowCount = values == null ? 0 : values.length;
-        // Emit values into the dedicated body buffer.
-        long bodyEnd = Int64ColumnEmitter.INSTANCE.emit(bodyBuffer, values == null ? new long[0] : values,
-                0, rowCount);
+        // Stage the int64 column through the per-handler ArrowColumnScratch
+        // so the Wave 6a hardcoded path exercises the same append + flush
+        // machinery Wave 6b's cursor-driven path will use.
+        columnScratch.reset();
+        columnScratch.initFor(ColumnType.LONG, rowCount);
+        for (int i = 0; i < rowCount; i++) {
+            columnScratch.appendLong(values[i]);
+        }
+        long bodyEnd = columnScratch.flushValuesTo(bodyBuffer);
         int bodyLen = (int) (bodyEnd - bodyBuffer);
 
         fbWriter.of(metadataBuffer, metadataBuffer + METADATA_BUFFER_CAP);
-        int metaLen = ArrowRecordBatchWriter.writeInt64RecordBatchMessage(fbWriter,
-                rowCount, 0L, (long) bodyLen);
+        int[] singleLongColumn = {ColumnType.LONG};
+        int metaLen = ArrowRecordBatchWriter.writeRecordBatchMessage(fbWriter,
+                rowCount, singleLongColumn, (long) bodyLen);
         if (metaLen <= 0) {
             rejectAfterHeaders(ctx, GrpcStatus.INTERNAL, "record batch metadata scratch overflow");
             return;

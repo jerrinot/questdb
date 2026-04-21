@@ -26,12 +26,14 @@ package io.questdb.test.cutlass.flightsql.proto;
 
 import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.CodedOutputStream;
+import io.questdb.cutlass.flightsql.proto.CommandStatementQueryCodec;
 import io.questdb.cutlass.flightsql.proto.FlightDataCodec;
 import io.questdb.cutlass.flightsql.proto.FlightDescriptorCodec;
 import io.questdb.cutlass.flightsql.proto.FlightEndpointCodec;
 import io.questdb.cutlass.flightsql.proto.FlightInfoCodec;
 import io.questdb.cutlass.flightsql.proto.LocationCodec;
 import io.questdb.cutlass.flightsql.proto.TicketCodec;
+import io.questdb.cutlass.protobuf.AnyCodec;
 import io.questdb.cutlass.protobuf.ProtobufWireFormat;
 import io.questdb.cutlass.protobuf.ProtobufWriter;
 import io.questdb.std.MemoryTag;
@@ -40,12 +42,138 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
 public class FlightMessageCodecTest {
 
     private static final int BUF = 4096;
+
+    @Test
+    public void testAnyDecodeCommandStatementQuery() throws IOException {
+        String typeUrl = CommandStatementQueryCodec.TYPE_URL;
+        byte[] innerValue = "inner-bytes".getBytes(StandardCharsets.UTF_8);
+        byte[] wire = new byte[256];
+        CodedOutputStream cos = CodedOutputStream.newInstance(wire);
+        cos.writeString(AnyCodec.FIELD_TYPE_URL, typeUrl);
+        cos.writeByteArray(AnyCodec.FIELD_VALUE, innerValue);
+        int len = wire.length - cos.spaceLeft();
+
+        long buf = Unsafe.malloc(BUF, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < len; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, wire[i]);
+            }
+            AnyCodec.Fields f = new AnyCodec.Fields();
+            AnyCodec.decode(buf, buf + len, f);
+            byte[] typeUrlBytes = typeUrl.getBytes(StandardCharsets.UTF_8);
+            Assert.assertEquals(typeUrlBytes.length, f.typeUrlLen);
+            for (int i = 0; i < typeUrlBytes.length; i++) {
+                Assert.assertEquals(typeUrlBytes[i], Unsafe.getUnsafe().getByte(f.typeUrlAddr + i));
+            }
+            Assert.assertEquals(innerValue.length, f.valueLen);
+            for (int i = 0; i < innerValue.length; i++) {
+                Assert.assertEquals(innerValue[i], Unsafe.getUnsafe().getByte(f.valueAddr + i));
+            }
+        } finally {
+            Unsafe.free(buf, BUF, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testAnyDecodeEmptyFields() throws IOException {
+        byte[] wire = new byte[16];
+        CodedOutputStream cos = CodedOutputStream.newInstance(wire);
+        cos.writeString(AnyCodec.FIELD_TYPE_URL, "");
+        cos.writeByteArray(AnyCodec.FIELD_VALUE, new byte[0]);
+        int len = wire.length - cos.spaceLeft();
+
+        long buf = Unsafe.malloc(BUF, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < len; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, wire[i]);
+            }
+            AnyCodec.Fields f = new AnyCodec.Fields();
+            AnyCodec.decode(buf, buf + len, f);
+            Assert.assertEquals(0, f.typeUrlLen);
+            Assert.assertEquals(0, f.valueLen);
+        } finally {
+            Unsafe.free(buf, BUF, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testAnyDecodeSkipsUnknownField() throws IOException {
+        byte[] wire = new byte[64];
+        CodedOutputStream cos = CodedOutputStream.newInstance(wire);
+        cos.writeString(AnyCodec.FIELD_TYPE_URL, "type.googleapis.com/x.Y");
+        cos.writeInt32(42, 9999);
+        cos.writeByteArray(AnyCodec.FIELD_VALUE, "v".getBytes());
+        int len = wire.length - cos.spaceLeft();
+
+        long buf = Unsafe.malloc(BUF, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < len; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, wire[i]);
+            }
+            AnyCodec.Fields f = new AnyCodec.Fields();
+            AnyCodec.decode(buf, buf + len, f);
+            Assert.assertTrue(f.typeUrlLen > 0);
+            Assert.assertEquals(1, f.valueLen);
+            Assert.assertEquals((byte) 'v', Unsafe.getUnsafe().getByte(f.valueAddr));
+        } finally {
+            Unsafe.free(buf, BUF, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testCommandStatementQueryDecode() throws IOException {
+        String sql = "SELECT x FROM long_sequence(3)";
+        byte[] wire = new byte[128];
+        CodedOutputStream cos = CodedOutputStream.newInstance(wire);
+        cos.writeString(CommandStatementQueryCodec.FIELD_QUERY, sql);
+        int len = wire.length - cos.spaceLeft();
+
+        long buf = Unsafe.malloc(BUF, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < len; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, wire[i]);
+            }
+            CommandStatementQueryCodec.Fields f = new CommandStatementQueryCodec.Fields();
+            CommandStatementQueryCodec.decode(buf, buf + len, f);
+            byte[] sqlBytes = sql.getBytes(StandardCharsets.UTF_8);
+            Assert.assertEquals(sqlBytes.length, f.queryLen);
+            for (int i = 0; i < sqlBytes.length; i++) {
+                Assert.assertEquals(sqlBytes[i], Unsafe.getUnsafe().getByte(f.queryAddr + i));
+            }
+        } finally {
+            Unsafe.free(buf, BUF, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testCommandStatementQueryDecodeSkipsTransactionId() throws IOException {
+        String sql = "SELECT 1";
+        byte[] txn = {(byte) 0xde, (byte) 0xad, (byte) 0xbe, (byte) 0xef};
+        byte[] wire = new byte[64];
+        CodedOutputStream cos = CodedOutputStream.newInstance(wire);
+        cos.writeString(CommandStatementQueryCodec.FIELD_QUERY, sql);
+        cos.writeByteArray(CommandStatementQueryCodec.FIELD_TRANSACTION_ID, txn);
+        int len = wire.length - cos.spaceLeft();
+
+        long buf = Unsafe.malloc(BUF, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < len; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, wire[i]);
+            }
+            CommandStatementQueryCodec.Fields f = new CommandStatementQueryCodec.Fields();
+            CommandStatementQueryCodec.decode(buf, buf + len, f);
+            Assert.assertEquals(sql.length(), f.queryLen);
+        } finally {
+            Unsafe.free(buf, BUF, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
 
     @Test
     public void testFlightDataEncodeRoundTripViaGoogle() throws IOException {

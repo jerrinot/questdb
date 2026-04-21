@@ -1182,7 +1182,7 @@ public class QwpEgressUpgradeProcessor implements HttpRequestProcessor {
      * caller's credit-bookkeeping debit.
      */
     private int sendResultBatchAndEnd(
-            HttpConnectionContext context,
+            HttpRequestContext context,
             QwpEgressProcessorState state,
             long requestId,
             long batchSeq,

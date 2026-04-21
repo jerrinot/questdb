@@ -24,6 +24,9 @@
 
 package io.questdb.cutlass.flightsql.server;
 
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cutlass.arrow.ipc.ArrowSchemaWriter;
 import io.questdb.cutlass.arrow.ipc.FbWriter;
 import io.questdb.std.Unsafe;
@@ -32,9 +35,14 @@ import java.io.Closeable;
 
 /**
  * Cached, dispatcher-scoped Arrow IPC {@code Schema} message bytes for
- * the hardcoded Wave 6a response shape: a single {@code Int64} column
+ * the placeholder Wave 6a response shape: a single {@code Int64} column
  * named {@code "col1"}. Built once at dispatcher construction; read-only
  * after that.
+ * <p>
+ * Wave 6b retains this cache for the scaffolded GetFlightInfo path that
+ * still returns the cached single-column schema; the cursor-driven
+ * schema derivation from a compiled {@code RecordCursorFactory} lands
+ * with the {@code SqlCompiler} integration step.
  * <p>
  * The buffer is native-allocated under the supplied memory tag. Callers
  * treat the returned {@code (addr, len)} pair as borrowed; the cache
@@ -58,9 +66,11 @@ public final class ArrowSchemaCache implements Closeable {
         long scratch = Unsafe.malloc(cap, memoryTag);
         long nameScratch = Unsafe.malloc(256, memoryTag);
         try {
+            GenericRecordMetadata metadata = new GenericRecordMetadata();
+            metadata.add(new TableColumnMetadata(columnName, ColumnType.LONG));
             FbWriter w = new FbWriter();
             w.of(scratch, scratch + cap);
-            int len = ArrowSchemaWriter.writeInt64SchemaMessage(w, nameScratch, 256, columnName, 64, true);
+            int len = ArrowSchemaWriter.writeSchemaMessage(w, nameScratch, 256, metadata);
             if (len <= 0) {
                 throw new IllegalStateException("schema scratch too small");
             }
