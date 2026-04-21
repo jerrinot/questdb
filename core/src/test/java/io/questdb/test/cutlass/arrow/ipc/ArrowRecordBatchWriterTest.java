@@ -68,6 +68,13 @@ public class ArrowRecordBatchWriterTest {
     }
 
     @Test
+    public void testBytesPerRowOfDateAndTimestamp() {
+        Assert.assertEquals(8, ArrowRecordBatchWriter.bytesPerRowOf(ColumnType.DATE));
+        Assert.assertEquals(8, ArrowRecordBatchWriter.bytesPerRowOf(ColumnType.TIMESTAMP_MICRO));
+        Assert.assertEquals(8, ArrowRecordBatchWriter.bytesPerRowOf(ColumnType.TIMESTAMP_NANO));
+    }
+
+    @Test
     public void testOneColumnInt64Metadata() {
         int[] types = {ColumnType.LONG};
         long rowCount = 3;

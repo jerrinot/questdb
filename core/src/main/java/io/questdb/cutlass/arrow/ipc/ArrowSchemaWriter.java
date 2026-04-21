@@ -30,8 +30,8 @@ import io.questdb.std.Unsafe;
 
 /**
  * Emits an Arrow IPC {@code Message} wrapping a {@code Schema} with one
- * or more scalar fields. Wave 7a supports LONG, DOUBLE, INT, FLOAT, BYTE,
- * SHORT and BOOLEAN; any other type throws
+ * or more scalar fields. Wave 7c covers LONG, DOUBLE, INT, FLOAT, BYTE,
+ * SHORT, BOOLEAN, DATE and TIMESTAMP; any other type throws
  * {@link UnsupportedColumnTypeException} which the Flight SQL handler
  * translates into {@code grpc-status: UNIMPLEMENTED}.
  * <p>
@@ -47,6 +47,12 @@ import io.questdb.std.Unsafe;
  *   <li>{@code Int}: {@code bitWidth: int32 = 0}, {@code is_signed: bool = 1}.</li>
  *   <li>{@code FloatingPoint}: {@code precision: int16 = 0}.</li>
  *   <li>{@code Bool}: empty table, just a type discriminator.</li>
+ *   <li>{@code Date}: {@code unit: DateUnit = 0}.</li>
+ *   <li>{@code Timestamp}: {@code unit: TimeUnit = 0},
+ *       {@code timezone: string = 1}. Absent timezone slot means
+ *       "no timezone / local wall-clock semantics" per Arrow spec; an
+ *       empty string would mean "UTC" and must not be emitted for
+ *       timezone-naive QuestDB timestamps.</li>
  *   <li>{@code Field}: {@code name: string = 0}, {@code nullable: bool = 1},
  *       {@code type_type: uint8 = 2}, {@code type: uoffset = 3}, (rest skipped).</li>
  *   <li>{@code Schema}: {@code endianness: int16 = 0}, {@code fields: [Field] = 1},
@@ -59,22 +65,31 @@ import io.questdb.std.Unsafe;
  *   <li>{@code MetadataVersion.V5 = 4}.</li>
  *   <li>{@code MessageHeader.Schema = 1} (union discriminator).</li>
  *   <li>{@code Type.Int = 2}, {@code Type.FloatingPoint = 3},
- *       {@code Type.Bool = 6} (union discriminators).</li>
+ *       {@code Type.Bool = 6}, {@code Type.Date = 8},
+ *       {@code Type.Timestamp = 10} (union discriminators).</li>
  *   <li>{@code Precision.SINGLE = 1}, {@code Precision.DOUBLE = 2}.</li>
+ *   <li>{@code DateUnit.DAY = 0}, {@code DateUnit.MILLISECOND = 1}.</li>
+ *   <li>{@code TimeUnit.SECOND = 0}, {@code TimeUnit.MILLISECOND = 1},
+ *       {@code TimeUnit.MICROSECOND = 2}, {@code TimeUnit.NANOSECOND = 3}.</li>
  *   <li>{@code Endianness.Little = 0}.</li>
  * </ul>
  */
 public final class ArrowSchemaWriter {
 
+    private static final short DATE_UNIT_MILLISECOND = 1;
     private static final int ENDIANNESS_LITTLE = 0;
     private static final int MAX_INLINE_FIELDS = 64;
     private static final short METADATA_VERSION_V5 = 4;
     private static final int MESSAGE_HEADER_SCHEMA = 1;
     private static final short PRECISION_DOUBLE = 2;
     private static final short PRECISION_SINGLE = 1;
+    private static final short TIME_UNIT_MICROSECOND = 2;
+    private static final short TIME_UNIT_NANOSECOND = 3;
     private static final int TYPE_BOOL = 6;
+    private static final int TYPE_DATE = 8;
     private static final int TYPE_FLOATING_POINT = 3;
     private static final int TYPE_INT = 2;
+    private static final int TYPE_TIMESTAMP = 10;
 
     private ArrowSchemaWriter() {
     }
@@ -165,6 +180,10 @@ public final class ArrowSchemaWriter {
                 return TYPE_FLOATING_POINT;
             case ColumnType.BOOLEAN:
                 return TYPE_BOOL;
+            case ColumnType.DATE:
+                return TYPE_DATE;
+            case ColumnType.TIMESTAMP:
+                return TYPE_TIMESTAMP;
             default:
                 throw new UnsupportedColumnTypeException(columnType);
         }
@@ -190,6 +209,13 @@ public final class ArrowSchemaWriter {
 
     private static int writeBoolTable(FbWriter writer) {
         writer.startTable(0);
+        return writer.endTable();
+    }
+
+    private static int writeDateTable(FbWriter writer, short unit) {
+        writer.startTable(1);
+        writer.prependInt16(unit);
+        writer.slot(0, writer.cursorFromEnd());
         return writer.endTable();
     }
 
@@ -222,6 +248,16 @@ public final class ArrowSchemaWriter {
         return writer.endTable();
     }
 
+    private static int writeTimestampTable(FbWriter writer, short unit) {
+        // Skip slot 1 (timezone string) entirely: "absent" carries
+        // timezone-naive / local wall-clock semantics; an empty string
+        // would mean "UTC".
+        writer.startTable(1);
+        writer.prependInt16(unit);
+        writer.slot(0, writer.cursorFromEnd());
+        return writer.endTable();
+    }
+
     private static int writeTypeTable(FbWriter writer, int columnType) {
         switch (ColumnType.tagOf(columnType)) {
             case ColumnType.LONG:
@@ -238,6 +274,13 @@ public final class ArrowSchemaWriter {
                 return writeFloatingPointTable(writer, PRECISION_SINGLE);
             case ColumnType.BOOLEAN:
                 return writeBoolTable(writer);
+            case ColumnType.DATE:
+                return writeDateTable(writer, DATE_UNIT_MILLISECOND);
+            case ColumnType.TIMESTAMP:
+                short unit = columnType == ColumnType.TIMESTAMP_NANO
+                        ? TIME_UNIT_NANOSECOND
+                        : TIME_UNIT_MICROSECOND;
+                return writeTimestampTable(writer, unit);
             default:
                 throw new UnsupportedColumnTypeException(columnType);
         }

@@ -63,6 +63,7 @@ import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -173,6 +174,28 @@ public class FlightSqlQueryEndToEndTest extends AbstractBootstrapTest {
                     Assert.assertEquals(2L * (i + 1), y.get(i));
                     Assert.assertEquals(i + 1, z.get(i));
                 }
+                batch.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSelectTimestampMicroColumn() throws Exception {
+        try (final TestServerMain serverMain = startFlightSqlServer()) {
+            serverMain.start();
+            try (Socket socket = openH2(serverMain)) {
+                QueryResult r = runGetFlightInfo(socket,
+                        "SELECT cast('2024-01-01T12:00:00.000000Z' AS timestamp) t FROM long_sequence(3)");
+                Assert.assertTrue("GetFlightInfo failed: " + r.grpcStatus, r.ok);
+                BatchResult batch = runDoGet(socket, 3, r);
+                TimeStampMicroVector t = (TimeStampMicroVector) batch.root.getVector("t");
+                Assert.assertEquals(3, t.getValueCount());
+                long expected = 1_704_110_400_000_000L;
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertFalse(t.isNull(i));
+                    Assert.assertEquals(expected, t.get(i));
+                }
+                Assert.assertEquals(0L, batch.nullCountsPerBatch.get(0)[0]);
                 batch.close();
             }
         }

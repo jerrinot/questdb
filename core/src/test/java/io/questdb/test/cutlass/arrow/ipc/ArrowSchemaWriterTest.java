@@ -32,6 +32,8 @@ import io.questdb.cutlass.arrow.ipc.FbWriter;
 import io.questdb.cutlass.arrow.ipc.UnsupportedColumnTypeException;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
+import org.apache.arrow.flatbuf.Date;
+import org.apache.arrow.flatbuf.DateUnit;
 import org.apache.arrow.flatbuf.FloatingPoint;
 import org.apache.arrow.flatbuf.Int;
 import org.apache.arrow.flatbuf.Message;
@@ -39,6 +41,8 @@ import org.apache.arrow.flatbuf.MessageHeader;
 import org.apache.arrow.flatbuf.MetadataVersion;
 import org.apache.arrow.flatbuf.Precision;
 import org.apache.arrow.flatbuf.Schema;
+import org.apache.arrow.flatbuf.TimeUnit;
+import org.apache.arrow.flatbuf.Timestamp;
 import org.apache.arrow.flatbuf.Type;
 import org.junit.Assert;
 import org.junit.Test;
@@ -49,6 +53,22 @@ public class ArrowSchemaWriterTest {
 
     private static final int BUF = 8192;
     private static final int NAME_SCRATCH = 64;
+
+    @Test
+    public void testSchemaMessageDateColumn() {
+        GenericRecordMetadata metadata = new GenericRecordMetadata();
+        metadata.add(new TableColumnMetadata("d", ColumnType.DATE));
+        byte[] bytes = writeToBytes(metadata);
+        Message msg = Message.getRootAsMessage(ByteBuffer.wrap(bytes));
+        Schema schema = (Schema) msg.header(new Schema());
+        Assert.assertEquals(1, schema.fieldsLength());
+        org.apache.arrow.flatbuf.Field field = schema.fields(0);
+        Assert.assertEquals("d", field.name());
+        Assert.assertTrue(field.nullable());
+        Assert.assertEquals(Type.Date, field.typeType());
+        Date dateType = (Date) field.type(new Date());
+        Assert.assertEquals(DateUnit.MILLISECOND, dateType.unit());
+    }
 
     @Test
     public void testSchemaMessageOneColumnInt64() {
@@ -122,6 +142,38 @@ public class ArrowSchemaWriterTest {
         GenericRecordMetadata metadata = new GenericRecordMetadata();
         metadata.add(new TableColumnMetadata("s", ColumnType.STRING));
         writeToBytes(metadata);
+    }
+
+    @Test
+    public void testSchemaMessageTimestampMicroColumn() {
+        GenericRecordMetadata metadata = new GenericRecordMetadata();
+        metadata.add(new TableColumnMetadata("t", ColumnType.TIMESTAMP_MICRO));
+        byte[] bytes = writeToBytes(metadata);
+        Message msg = Message.getRootAsMessage(ByteBuffer.wrap(bytes));
+        Schema schema = (Schema) msg.header(new Schema());
+        Assert.assertEquals(1, schema.fieldsLength());
+        org.apache.arrow.flatbuf.Field field = schema.fields(0);
+        Assert.assertEquals("t", field.name());
+        Assert.assertTrue(field.nullable());
+        Assert.assertEquals(Type.Timestamp, field.typeType());
+        Timestamp ts = (Timestamp) field.type(new Timestamp());
+        Assert.assertEquals(TimeUnit.MICROSECOND, ts.unit());
+        Assert.assertNull("timezone slot must be absent for naive timestamps", ts.timezone());
+    }
+
+    @Test
+    public void testSchemaMessageTimestampNanoColumn() {
+        GenericRecordMetadata metadata = new GenericRecordMetadata();
+        metadata.add(new TableColumnMetadata("t", ColumnType.TIMESTAMP_NANO));
+        byte[] bytes = writeToBytes(metadata);
+        Message msg = Message.getRootAsMessage(ByteBuffer.wrap(bytes));
+        Schema schema = (Schema) msg.header(new Schema());
+        Assert.assertEquals(1, schema.fieldsLength());
+        org.apache.arrow.flatbuf.Field field = schema.fields(0);
+        Assert.assertEquals(Type.Timestamp, field.typeType());
+        Timestamp ts = (Timestamp) field.type(new Timestamp());
+        Assert.assertEquals(TimeUnit.NANOSECOND, ts.unit());
+        Assert.assertNull(ts.timezone());
     }
 
     @Test

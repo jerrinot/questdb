@@ -71,7 +71,7 @@ public final class ArrowRecordBatchWriter {
     }
 
     /**
-     * Byte width of the values buffer row for the given Wave 7a column
+     * Byte width of the values buffer row for the given Wave 7c column
      * type. BOOLEAN returns 0 since the caller uses bit-packed layout
      * that does not admit a whole-byte-per-row product (callers size
      * BOOLEAN values buffers via {@code (rowCount + 7) / 8}).
@@ -80,6 +80,8 @@ public final class ArrowRecordBatchWriter {
         switch (ColumnType.tagOf(columnType)) {
             case ColumnType.LONG:
             case ColumnType.DOUBLE:
+            case ColumnType.DATE:
+            case ColumnType.TIMESTAMP:
                 return 8;
             case ColumnType.INT:
             case ColumnType.FLOAT:

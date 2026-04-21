@@ -160,6 +160,12 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
             case ColumnType.BOOLEAN:
                 s.appendBool(r.getBool(ci));
                 break;
+            case ColumnType.DATE:
+                s.appendLongOrNull(r.getDate(ci));
+                break;
+            case ColumnType.TIMESTAMP:
+                s.appendLongOrNull(r.getTimestamp(ci));
+                break;
             default:
                 throw new UnsupportedColumnTypeException(qtype);
         }

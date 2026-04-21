@@ -296,6 +296,8 @@ public final class ArrowColumnScratch implements QuietCloseable {
         switch (ColumnType.tagOf(columnType)) {
             case ColumnType.LONG:
             case ColumnType.DOUBLE:
+            case ColumnType.DATE:
+            case ColumnType.TIMESTAMP:
                 return rowCap * 8;
             case ColumnType.INT:
             case ColumnType.FLOAT:

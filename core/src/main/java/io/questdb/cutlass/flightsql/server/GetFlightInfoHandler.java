@@ -397,6 +397,8 @@ public final class GetFlightInfoHandler implements FlightSqlHandler, Closeable {
             case ColumnType.BYTE:
             case ColumnType.SHORT:
             case ColumnType.BOOLEAN:
+            case ColumnType.DATE:
+            case ColumnType.TIMESTAMP:
                 return true;
             default:
                 return false;

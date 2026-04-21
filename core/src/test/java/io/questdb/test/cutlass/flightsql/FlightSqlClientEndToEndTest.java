@@ -38,11 +38,13 @@ import org.apache.arrow.flight.sql.FlightSqlClient;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.DateMilliVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.AfterClass;
@@ -133,6 +135,25 @@ public class FlightSqlClientEndToEndTest extends AbstractBootstrapTest {
     }
 
     @Test
+    public void testNullDate() throws Exception {
+        try (TestServerMain serverMain = startFlightSqlServer();
+             FlightClient flightClient = openFlightClient(serverMain);
+             FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
+            FlightInfo info = sqlClient.execute("SELECT cast(null AS date) d FROM long_sequence(3)");
+            try (FlightStream stream = sqlClient.getStream(info.getEndpoints().get(0).getTicket())) {
+                Assert.assertTrue(stream.next());
+                VectorSchemaRoot root = stream.getRoot();
+                DateMilliVector d = (DateMilliVector) root.getVector("d");
+                Assert.assertEquals(3, root.getRowCount());
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertTrue("row " + i + " must be null", d.isNull(i));
+                }
+                Assert.assertFalse(stream.next());
+            }
+        }
+    }
+
+    @Test
     public void testNullInMiddleDouble() throws Exception {
         try (TestServerMain serverMain = startFlightSqlServer();
              FlightClient flightClient = openFlightClient(serverMain);
@@ -170,6 +191,25 @@ public class FlightSqlClientEndToEndTest extends AbstractBootstrapTest {
                 Assert.assertEquals(1L, n.get(0));
                 Assert.assertEquals(3L, n.get(2));
                 Assert.assertEquals(4L, n.get(3));
+                Assert.assertFalse(stream.next());
+            }
+        }
+    }
+
+    @Test
+    public void testNullTimestamp() throws Exception {
+        try (TestServerMain serverMain = startFlightSqlServer();
+             FlightClient flightClient = openFlightClient(serverMain);
+             FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
+            FlightInfo info = sqlClient.execute("SELECT cast(null AS timestamp) t FROM long_sequence(3)");
+            try (FlightStream stream = sqlClient.getStream(info.getEndpoints().get(0).getTicket())) {
+                Assert.assertTrue(stream.next());
+                VectorSchemaRoot root = stream.getRoot();
+                TimeStampMicroVector t = (TimeStampMicroVector) root.getVector("t");
+                Assert.assertEquals(3, root.getRowCount());
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertTrue("row " + i + " must be null", t.isNull(i));
+                }
                 Assert.assertFalse(stream.next());
             }
         }
@@ -219,6 +259,27 @@ public class FlightSqlClientEndToEndTest extends AbstractBootstrapTest {
     }
 
     @Test
+    public void testSelectDate() throws Exception {
+        try (TestServerMain serverMain = startFlightSqlServer();
+             FlightClient flightClient = openFlightClient(serverMain);
+             FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
+            FlightInfo info = sqlClient.execute("SELECT cast('2024-01-01' AS date) d FROM long_sequence(3)");
+            try (FlightStream stream = sqlClient.getStream(info.getEndpoints().get(0).getTicket())) {
+                Assert.assertTrue(stream.next());
+                VectorSchemaRoot root = stream.getRoot();
+                DateMilliVector d = (DateMilliVector) root.getVector("d");
+                Assert.assertEquals(3, root.getRowCount());
+                long expected = 1_704_067_200_000L;
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertFalse("row " + i + " must be valid", d.isNull(i));
+                    Assert.assertEquals(expected, d.get(i));
+                }
+                Assert.assertFalse(stream.next());
+            }
+        }
+    }
+
+    @Test
     public void testSelectLongSequence() throws Exception {
         try (TestServerMain serverMain = startFlightSqlServer();
              FlightClient flightClient = openFlightClient(serverMain);
@@ -233,6 +294,28 @@ public class FlightSqlClientEndToEndTest extends AbstractBootstrapTest {
                 Assert.assertEquals(1L, x.get(0));
                 Assert.assertEquals(2L, x.get(1));
                 Assert.assertEquals(3L, x.get(2));
+                Assert.assertFalse(stream.next());
+            }
+        }
+    }
+
+    @Test
+    public void testSelectTimestampMicro() throws Exception {
+        try (TestServerMain serverMain = startFlightSqlServer();
+             FlightClient flightClient = openFlightClient(serverMain);
+             FlightSqlClient sqlClient = new FlightSqlClient(flightClient)) {
+            FlightInfo info = sqlClient.execute(
+                    "SELECT cast('2024-01-01T12:00:00.000000Z' AS timestamp) t FROM long_sequence(3)");
+            try (FlightStream stream = sqlClient.getStream(info.getEndpoints().get(0).getTicket())) {
+                Assert.assertTrue(stream.next());
+                VectorSchemaRoot root = stream.getRoot();
+                TimeStampMicroVector t = (TimeStampMicroVector) root.getVector("t");
+                Assert.assertEquals(3, root.getRowCount());
+                long expected = 1_704_110_400_000_000L;
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertFalse("row " + i + " must be valid", t.isNull(i));
+                    Assert.assertEquals(expected, t.get(i));
+                }
                 Assert.assertFalse(stream.next());
             }
         }
