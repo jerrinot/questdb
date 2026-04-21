@@ -746,6 +746,35 @@ size update. When multiple peer SETTINGS between blocks do move
 `selectedMax`, `beginBlock` emits two updates — the minimum interim
 value and the final `selectedMax` — as RFC 7541 sec. 4.2 requires.
 
+**Snapshot / restore for PARK rollback.** The HTTP/2 integration layer
+emits a HEADERS or trailer block from the engine's scheduler in a
+single shot (`Http2ConnectionContext.emitResponseHeaders` /
+`emitTrailers`). When the per-stream outbound tuple ring is full or the
+HPACK-encoded block would not fit the send buffer, the emit aborts
+with a PARK sentinel and the caller retries later. To keep the encoder
+and the peer's decoder coherent across a PARK + retry, `HpackEncoder`
+exposes `snapshot() → long` and `restore(long token)`:
+
+- `snapshot()` captures enough state to revert a single in-flight
+  emission: block-open flag, queued interim-minimum and final
+  size-update values, and the dynamic-table pointers (`currentSize`,
+  `dynamicCount`, ring-buffer `newestSlot` / `oldestSlot`, pool
+  cursor). Returns an opaque token.
+- `restore(long token)` rolls the encoder back to the snapshot;
+  pool bytes themselves are unchanged because the dynamic table is a
+  ring buffer and the rollback just re-points the slot pointers.
+  Token mismatch (stale or fabricated) throws
+  `IllegalStateException` — callers must not hold a snapshot across
+  an unrelated `beginBlock` / `endBlock` cycle.
+
+The engine takes the snapshot immediately before
+`writer.write(encoder, cursor, limit)` inside `emitHeaderBlock` and
+restores on any non-`ENQUEUE_OK` return from
+`tryEnqueueOutbound` (PARK, `HEADER_LIST_TOO_LARGE`, propagated
+exceptions). Without this the dynamic table would record a
+literal-with-incremental-indexing write that never reached the peer,
+desynchronising decoders for the rest of the connection.
+
 **Hint values.** The encoder consults `hint` to skip cost computations:
 
 - `HpackEncoder.HINT_STATIC_INDEX | idx` — the caller knows the header

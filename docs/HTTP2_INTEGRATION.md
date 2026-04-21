@@ -46,9 +46,57 @@ streaming semantics. The H1-mimicry layer
 `HttpRequestContext` interface extraction, `SimpleResponse`
 interface extraction, `LocalValueMap.release`,
 `HttpRequestProcessorSelector` wiring on H2) is dead weight
-under the new framing and is removed in Wave 4. §7 and §8 of
-this doc describe that layer for historical context only; §15
-reflects the current milestone shape.
+under the new framing and is removed in Wave 4 (commit
+`428062d08b`).
+
+**Retired sections (historical context only).** The following
+sections describe the H1-mimicry layer in detail and do NOT
+reflect the current implementation:
+
+- §4.3 Class inventory — every H1-mimicry class (adapter,
+  response sink, chunked response, simple response, adapter
+  pool, `HttpRequestContext`-as-H2-surface) is gone.
+- §7 HttpRequestContext Interface Extraction — the interface
+  was extracted and remains (it's harmless churn to revert),
+  but the H2 side that implemented it is gone. H1 still uses
+  it; Flight SQL does not.
+- §8 Per-Stream Request Context — the entire adapter / pool
+  design is retired.
+- §9 Request Reading Path — described routing via
+  `HttpRequestProcessorSelector`; replaced by a slim
+  `Http2StreamListener` that the Flight SQL dispatcher will
+  install in M2.
+- §10 Response Writing Path — described `Http2ResponseSink` /
+  `Http2ChunkedResponse`; Flight SQL handlers now call
+  `Http2ConnectionContext.emitResponseHeaders` / `enqueueData` /
+  `emitTrailers` directly.
+- §11 LocalValue and Per-Stream State — adapter lifecycle is
+  retired; Flight SQL owns its own per-stream state on its
+  listener.
+
+**Still load-bearing (current implementation matches):**
+
+- §1 Scope — this section.
+- §5 Threading Model — same threading story applies to the
+  Flight SQL listener.
+- §6 Preface Detection and Mode Selection — exactly what was
+  built; `protocolMode` switch, `sniffAndSelectMode`,
+  `drainH2Preface`, `allocateH2EngineIfNeeded`.
+- §12 Park / Resume — the engine-level surface is accurate; the
+  "parked-streams set on the adapter" lives on the Flight SQL
+  listener now.
+- §14 Error Mapping — translation rules between Java exceptions
+  and RST_STREAM / GOAWAY remain correct.
+- §15 Milestone Scoping — reflects the current Flight-SQL-only
+  milestone shape.
+
+§§ marked "retired" are kept so that future readers can
+reconstruct the design history (why certain interface
+extractions remain in the H1 code, why `Http2Stream`'s
+per-stream outbound arena exists at all, etc.) but should not
+be consulted when reasoning about how to add the next feature.
+Start from §15 instead, and consult `FLIGHT_SQL_DESIGN.md` for
+the overall stack.
 
 The rest of the H2 engine work — frame codec, HPACK codec,
 stream state machine, outbound arena, scheduler, park / resume,

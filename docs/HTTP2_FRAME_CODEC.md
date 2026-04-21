@@ -48,9 +48,10 @@ It does **not** cover:
   and serialised here; the window math lives with the stream state machine).
 - TLS termination and ALPN negotiation. The first milestone ships clear-text
   h2c only, so the codec sees plaintext bytes straight from the socket.
-  ALPN-driven `h2` / `http/1.1` selection is deferred to the same later stage
-  that wires TLS across Flight SQL as a whole (see
-  [`FLIGHT_SQL_DESIGN.md`](FLIGHT_SQL_DESIGN.md) sec. 4.11 / Stage 10+).
+  ALPN-driven `h2` / `http/1.1` selection is deferred to the TLS + ALPN
+  track that runs in parallel with the gRPC / Flight SQL stages (see
+  [`FLIGHT_SQL_DESIGN.md`](FLIGHT_SQL_DESIGN.md) §5.14 and the
+  dependency-graph note in §6).
 
 ## 2. Non-Goals
 
@@ -193,12 +194,18 @@ Detection strategy in the existing HTTP/1.1 listener:
    `SETTINGS` frame (RFC 7540 sec. 3.5).
 
 TLS / ALPN is **not** part of the first milestone. Milestone 1 is clear-text
-h2c only: the HTTP/1.1 listener sniffs the preface and promotes the connection
-to `Http2ConnectionContext` on the same plaintext fd. The TLS / ALPN path
-(ALPN selection of `h2` vs `http/1.1` during the handshake, routing on the
-negotiated protocol, no preface sniffing) lands alongside the Flight SQL TLS
-work; see [`FLIGHT_SQL_DESIGN.md`](FLIGHT_SQL_DESIGN.md) sec. 4.11 and the
-dependency graph.
+h2c only: the HTTP/1.1 listener sniffs the preface and, on a positive match,
+flips a `protocolMode` bit on the same `HttpConnectionContext` that owns the
+fd. The context keeps the fd and dispatches subsequent reads into a composed
+`Http2ConnectionContext` engine held as a lazy-allocated field
+(`HTTP2_INTEGRATION.md` §4). There is no context swap and no dispatcher
+change — `Http2ConnectionContext` is socket-free by contract.
+
+The TLS / ALPN path (ALPN selection of `h2` vs `http/1.1` during the
+handshake, pre-setting `protocolMode = MODE_H2_PREFACE_PENDING` from the
+negotiated protocol, no MSG_PEEK sniff) lands alongside the Flight SQL TLS
+work; see [`FLIGHT_SQL_DESIGN.md`](FLIGHT_SQL_DESIGN.md) §5.14 and the
+dependency-graph TLS note in §6.
 
 ## 8. Buffer and Allocation Model
 
@@ -302,26 +309,39 @@ All debug strings are ASCII-only per project convention.
 
 ## 11. Integration with `HttpConnectionContext`
 
-The HTTP/1.1 and HTTP/2 contexts diverge after preface detection but share
-I/O plumbing:
+The frame codec runs inside the H2 branch of `HttpConnectionContext`, not as
+a separate `IOContext`. On a positive preface match,
+`HttpConnectionContext` flips `protocolMode` to `MODE_H2_PREFACE_PENDING`,
+lazy-allocates an `Http2ConnectionContext` engine (composition, not
+inheritance), drains the 24-byte preface, transitions to `MODE_H2`, and
+dispatches subsequent reads through the engine. The engine never touches
+the socket — it reads from caller-provided `(addr, limit)` buffers and
+writes to a caller-provided wire buffer. See
+[`HTTP2_INTEGRATION.md`](HTTP2_INTEGRATION.md) §4 for the full
+architecture.
+
+Shared I/O plumbing:
 
 - Same `IODispatcher`, same worker pool, same socket buffer pool.
-- `Http2ConnectionContext` replaces `HttpConnectionContext` on the same fd once
-  the preface or ALPN selection fires.
-- Receive path: `read()` into the existing native recv buffer, then invoke
-  `Http2FrameReader.tryReadNext(addr, limit, header, inboundMaxFrameSize)` on
-  a per-connection reader instance. It returns the number of bytes consumed
+- `HttpConnectionContext` keeps the fd and drives recv / send; `Http2ConnectionContext` is a composed field that receives decrypted-but-protocol-encoded bytes.
+- Receive path: `HttpConnectionContext` reads into its existing native recv
+  buffer, then calls `Http2ConnectionContext.processReceivedBytes(addr, limit)`
+  which internally invokes `Http2FrameReader.tryReadNext(...)` frame by
+  frame. `tryReadNext` returns the number of bytes consumed
   (`9 + payloadLength`) on success, or `0` if the frame is not yet fully
-  buffered. The reader throws `Http2ConnectionException` /
-  `Http2StreamException` for protocol violations; the caller closes or resets
-  as appropriate. After a successful read the caller branches on
-  `header.getType()` to dispatch to the per-type handler and compacts or
-  preserves any trailing partial frame bytes before the next read.
-- Send path: `Http2FrameWriter.writeXxx(wireBuf, wireLimit, ...)` into the
-  existing native send buffer. `PeerIsSlowToReadException` parks the connection
-  when the buffer or HTTP/2 send window fills. Resume state includes stream id,
-  logical payload pointer, payload offset, and remaining bytes for split
-  `DATA` / `HEADERS` / `CONTINUATION` output.
+  buffered. Protocol violations surface as `Http2ConnectionException` /
+  `Http2StreamException`; the engine handles them per §10 (GOAWAY /
+  RST_STREAM emission). Partial frame bytes stay in the recv buffer for the
+  next read.
+- Send path: `HttpConnectionContext` calls
+  `Http2ConnectionContext.writePending(addr, limit)` which emits frames via
+  `Http2FrameWriter` into a native send buffer, then `socket.send`s the
+  buffer. When the buffer fills, the engine returns with bytes still
+  queued; `HttpConnectionContext` drains and retries on the next write tick.
+  Per-stream outbound arenas (`Http2Stream.tryEnqueueOutbound`) hold
+  application-level DATA / HEADERS / trailer tuples with copy-on-enqueue
+  ownership; the scheduler drains them round-robin across streams subject to
+  per-stream and connection-level flow-control windows.
 
 ## 12. Testing Strategy
 
@@ -436,7 +456,12 @@ cross-validation corpus.
 
 A JUnit test (`Http2ConformanceTest`) that:
 
-1. Starts `ServerMain` with the `flight-sql` endpoint enabled on a random port.
+1. Starts `ServerMain` with `http.h2.enabled=true` on a random port. The
+   H2 listener binds a minimal test-only handler (pre-Flight-SQL this is
+   the `NoopH2Listener` placeholder in `HttpConnectionContext`; once
+   Flight SQL is wired, a minimal route on the Flight SQL dispatcher
+   suffices — h2spec does not exercise anything above the HTTP/2
+   protocol layer).
 2. Spawns `h2spec -h 127.0.0.1 -p $port --strict -j h2spec.json`.
 3. Parses the JSON report and asserts zero failures.
 

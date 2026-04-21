@@ -5,8 +5,26 @@ Flight SQL, implemented in pure Java in QuestDB's zero-dependency, zero-GC
 idiom. This document scopes the **big blocks**; each block will have its own
 detailed design doc before implementation starts.
 
-Companion document: [`HTTP2_FRAME_CODEC.md`](HTTP2_FRAME_CODEC.md) (the
-foundational transport).
+**Pivot note (2026-04-20):** the HTTP/2 integration layer was re-scoped to
+serve Flight SQL only — see `HTTP2_INTEGRATION.md` §1. Earlier revisions of
+that doc had planned to run existing `HttpRequestProcessor` implementations
+over H2 (HealthCheck, JsonQuery, TextImport, ...) so that Flight SQL would
+sit on top of a general-purpose H2 server. That goal is retired. Flight SQL
+binds directly to `Http2StreamListener` +
+`Http2ConnectionContext.{emitResponseHeaders,enqueueData,emitTrailers}`; no
+`HttpRequestProcessor` adapter layer sits between them. The protocol stack
+is still Flight SQL-agnostic at the engine level (any future gRPC service
+could substitute a different listener), but the H2 integration work is sized
+for exactly what gRPC needs and nothing more.
+
+Companion documents:
+- [`HTTP2_INTEGRATION.md`](HTTP2_INTEGRATION.md) — H2 protocol-mode switch
+  on the existing HTTP listener, pseudo-header capture, response emit
+  surface, park / resume, trailers.
+- [`HTTP2_FRAME_CODEC.md`](HTTP2_FRAME_CODEC.md) — frame-level codec.
+- [`HPACK_CODEC.md`](HPACK_CODEC.md) — header compression.
+- [`STREAM_STATE_MACHINE.md`](STREAM_STATE_MACHINE.md) — per-stream FSM
+  and flow control.
 
 ## Table of Contents
 
@@ -137,59 +155,100 @@ Flight SQL dispatcher without re-implementing the protocol stack.
 ### 5.1 HTTP/2 transport
 
 **Scope.** Frame codec, HPACK, stream state machine, connection-level and
-stream-level flow control, preface detection on the HTTP listener, ALPN hook
-in the TLS handshake.
+stream-level flow control, preface detection on the HTTP listener,
+pseudo-header capture, response emit surface (HEADERS + DATA + trailers),
+park / resume on flow control, ALPN hook in the TLS handshake.
 
 **Module.** `io.questdb.cutlass.http2.*`
 
-**Status.** Framing is specified in `HTTP2_FRAME_CODEC.md` and the frame
-codec + HPACK codec are implemented (see `HPACK_CODEC.md` for the HPACK
-design and Milestone 1 scope). The stream state machine design lives in
-`STREAM_STATE_MACHINE.md`; implementation is pending.
+**Status.** Landed as of commit `428062d08b`:
 
-**Size estimate.** Framing ~1.5k LOC. HPACK ~2k LOC (static + dynamic table +
-Huffman codec). Stream state machine + flow control ~1.5k LOC. Integration
-with existing HTTP context ~500 LOC. **~5.5k LOC total.**
+- Frame codec (`HTTP2_FRAME_CODEC.md`) — full frame surface.
+- HPACK codec (`HPACK_CODEC.md`) — static + dynamic table + Huffman, with
+  encoder snapshot / restore for PARK rollback.
+- Stream state machine (`STREAM_STATE_MACHINE.md`) — 7-state FSM with
+  `END_STREAM` / `RST_STREAM` transitions.
+- Per-connection + per-stream flow control with SETTINGS-driven initial
+  values and round-robin scheduler across ready streams.
+- Preface sniff on the existing HTTP listen socket
+  (`HttpConnectionContext.protocolMode`), lazy H2 engine allocation,
+  preface drain, all gated by `http.h2.enabled` (default off).
+- Response emit: `emitResponseHeaders`, `enqueueData`, `emitTrailers`,
+  with per-stream outbound arena (copy-on-enqueue) and tuple ring.
+- Pseudo-header capture for `:method`, `:scheme`, `:path`, `:authority`,
+  and `content-type` into per-stream staging buffers — exactly the set
+  a gRPC router needs. Overflow → `PROTOCOL_ERROR`. Full §11 validator
+  (ordering, forbidden-headers, content-length reconciliation) deferred
+  to the gRPC framing layer where the error path is trailers-in-HEADERS.
+- Park / resume end-to-end: listener gets `onStreamWritable` on
+  `WINDOW_UPDATE`, `SETTINGS_INITIAL_WINDOW_SIZE` increase, and tuple-
+  ring drain. Tested with tiny initial windows and multi-park cycles.
+- Slim placeholder `Http2StreamListener` inside
+  `HttpConnectionContext` logs callbacks and never emits — the Flight
+  SQL listener substitutes this in §5.6.
 
-**Load-bearing pieces.**
+**Remaining.** TLS + ALPN (§5.14). The `FlightService` listener
+(§5.2 + §5.6). Full §11 validator subset required for gRPC correctness
+moves into §5.2 alongside `content-type` enforcement.
 
-- The 7-state per-stream FSM (`idle`, `reserved`, `open`, `half-closed-local`,
-  `half-closed-remote`, `closed`, and transitions on `END_STREAM` /
-  `RST_STREAM`).
-- Per-connection and per-stream send/receive windows with SETTINGS-driven
-  initial values.
-- The preface hand-off from `HttpConnectionContext` to an HTTP/2 context
-  without losing bytes or fd ownership.
+**Size estimate.** ~8.5k LOC landed (framing, HPACK, state machine,
+integration, tests). Remaining: ~300 LOC for TLS + ALPN wiring.
 
 ### 5.2 gRPC framing
 
 **Scope.** The thin layer gRPC places on top of HTTP/2:
 
-- Method dispatch on `:path` header (`/arrow.flight.protocol.FlightService/DoGet`).
-- Content-type negotiation (`application/grpc`, `application/grpc+proto`).
-- 5-byte message prefix: 1-byte compressed flag + 4-byte big-endian length.
-- Trailers-only status (`grpc-status`, `grpc-message`) — responses that error
-  early use trailers on the empty HEADERS frame; normal responses write
-  trailers after the last DATA frame.
+- Method dispatch on `:path` header
+  (`/arrow.flight.protocol.FlightService/DoGet`).
+- Content-type negotiation (`application/grpc`,
+  `application/grpc+proto`). Non-conforming requests get trailers-only
+  `grpc-status: UNIMPLEMENTED`.
+- Request validation subset: reject non-POST, reject uppercase header
+  names, reject requests missing required pseudo-headers. The full §11
+  HTTP/2 validator (forbidden-headers, content-length reconciliation,
+  TE restrictions, connection ban) is not implemented — gRPC clients are
+  a closed set and won't send any of those, and the error path for a bad
+  request under gRPC is an HTTP 200 with trailers, not an HTTP-level
+  error code.
+- 5-byte message prefix: 1-byte compressed flag + 4-byte big-endian
+  length. Message reassembly across DATA frame boundaries.
+- Trailers-only status (`grpc-status`, `grpc-message`) — responses that
+  error early use trailers on the empty HEADERS frame; normal responses
+  write trailers after the last DATA frame.
 - `grpc-timeout` header → per-request deadline, plumbed through to the
   cursor cancellation path.
-- gRPC status codes (`OK`, `CANCELLED`, `UNAVAILABLE`, `INVALID_ARGUMENT`,
-  `UNIMPLEMENTED`, `INTERNAL`, `PERMISSION_DENIED`, ...).
+- gRPC status codes (`OK`, `CANCELLED`, `UNAVAILABLE`,
+  `INVALID_ARGUMENT`, `UNIMPLEMENTED`, `INTERNAL`, `PERMISSION_DENIED`,
+  ...).
 
 **Module.** `io.questdb.cutlass.grpc.*`
 
-**Size estimate.** ~1k LOC. Thin layer — mostly a `switch` on `:path` and
-header reads. The state shows up in how it dovetails with HTTP/2 streams
-(trailers-only requires a small stream-state hook).
+**Binding.** This layer is a subclass or composition of
+`Http2StreamListener` rather than an `HttpRequestProcessor`. It reads
+pseudo-headers via `Http2RequestHeadersView`, consumes request DATA
+directly from the engine's listener callback, and emits response HEADERS
+/ DATA / trailers via `Http2ConnectionContext.emitResponseHeaders` /
+`enqueueData` / `emitTrailers`. No bridge to the existing
+`HttpRequestProcessor` surface — that's exactly the H1-mimicry layer the
+H2 integration pivot retired.
+
+**Size estimate.** ~1k LOC. Thin layer — mostly a `switch` on `:path`,
+header reads, and the message-prefix reader. The state shows up in how
+it dovetails with HTTP/2 streams (trailers-only requires branching on
+whether any DATA has been sent; the engine's outbound arena already
+knows).
 
 **Non-obvious concerns.**
 
-- **Compression is per-message**, not per-stream. The 1-byte flag on each gRPC
-  message indicates compression. Flight IPC bodies have their own separate
-  compression negotiated via IPC options — they do not use gRPC's.
+- **Compression is per-message**, not per-stream. The 1-byte flag on
+  each gRPC message indicates compression. Flight IPC bodies have their
+  own separate compression negotiated via IPC options — they do not use
+  gRPC's.
 - **Error responses that precede any DATA frame** write trailers on the
-  initial HEADERS frame with `END_STREAM` set; the client never sees an empty
-  DATA frame. The gRPC layer must know the difference.
+  initial HEADERS frame with `END_STREAM` set; the client never sees an
+  empty DATA frame. The gRPC layer must know the difference — ask the
+  engine "has any DATA been enqueued yet?" before picking the error
+  path. `Http2Stream` exposes this via its outbound queue.
 
 ### 5.3 Protobuf codec
 
@@ -296,6 +355,14 @@ are straight-line code. ~2k LOC for the full Arrow message surface.
 handlers.
 
 **Module.** `io.questdb.cutlass.flightsql.server.*`
+
+**Binding.** The dispatcher is the concrete `Http2StreamListener` that
+replaces the `NoopH2Listener` placeholder currently inside
+`HttpConnectionContext`. On `MODE_H2` allocation, `HttpConnectionContext`
+instantiates the Flight SQL listener (when `flight.sql.enabled=true`)
+and passes it to `Http2ConnectionContext`'s constructor. One listener
+instance per TCP connection; per-stream state lives in the dispatcher's
+own stream table.
 
 **RPC surface required for a usable server.**
 
@@ -524,17 +591,21 @@ Defer to a later milestone; ship the baseline uncompressed.
 
 ## 6. Dependency Graph and Build Order
 
-Build bottom-up, validating each layer against real clients before adding the
-next one.
+Build bottom-up, validating each layer against real clients before adding
+the next one.
 
 ```
-Stage 1:  HTTP/2 framing (HTTP2_FRAME_CODEC.md)
+Stage 1:  HTTP/2 framing (HTTP2_FRAME_CODEC.md)                 [DONE]
           |
           v
-Stage 2:  HPACK  +  Stream state machine  +  Flow control
+Stage 2:  HPACK  +  Stream state machine  +  Flow control       [DONE]
+          +  Integration layer: protocolMode, preface sniff,
+             pseudo-header capture, emit surface, trailers,
+             park / resume
           |
           v
-Stage 3:  gRPC framing layer
+Stage 3:  gRPC framing layer (direct Http2StreamListener bind;  [NEXT]
+          no HttpRequestProcessor adapter)
           |
           v
 Stage 4:  Protobuf codec (Flight + Flight SQL messages)
@@ -569,11 +640,15 @@ Stage 11: Metadata commands (full set)
 Stage 12: Page-frame fast path  +  compression  +  dictionary deltas
 ```
 
+**TLS + ALPN runs in parallel** with Stages 3–5; it touches only the
+socket init path in `HttpConnectionContext.doInit()` and is independent
+of the gRPC / Flight SQL code paths.
+
 Client validation at each stage:
 
 | Stage | Client used as oracle                                |
 |-------|------------------------------------------------------|
-| 1–2   | `curl --http2-prior-knowledge`, `nghttp -v`          |
+| 1–2   | `curl --http2-prior-knowledge`, `nghttp -v` — both working against the current build |
 | 3     | `grpcurl -plaintext` against a hello-world service   |
 | 5     | ADBC Python: `adbc_driver_flightsql.connect(...)` + `list_table_types()` |
 | 7+    | Flight SQL JDBC driver + ADBC Python `execute()`     |
@@ -639,10 +714,12 @@ the wire protocol clients. Same pattern, new subjects.
 
 ## 9. Open Questions
 
-1. **Single HTTP port for h1.1 + h2, or a dedicated h2 port?** The default is
-   shared via ALPN / preface detection. A dedicated h2 port is simpler to
-   configure for operators who want strict isolation — cheap to offer as a
-   config toggle.
+1. **Single HTTP port for h1.1 + h2, or a dedicated h2 port?** Resolved:
+   the shared-port path is already implemented via preface sniffing in
+   `HttpConnectionContext.protocolMode` and gated by
+   `http.h2.enabled`. A dedicated h2 port remains a cheap config toggle
+   if operators ask for strict isolation, but there's nothing in the
+   current design that requires one.
 2. **Batch size default.** Arrow readers are happy with 64k-row batches;
    QWP ships 4096. Likely a higher default is better for throughput but
    increases latency-to-first-byte. Benchmark once Stage 7 is live.
