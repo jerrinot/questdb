@@ -24,6 +24,7 @@
 
 package io.questdb.test.cutlass.flightsql;
 
+import io.questdb.cutlass.arrow.column.ArrowColumnScratch;
 import io.questdb.cutlass.flightsql.server.TicketRegistry;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
@@ -81,6 +82,25 @@ public class TicketRegistryTest {
                 Assert.assertEquals((long) i, t);
                 r.release(t);
             }
+        }
+    }
+
+    @Test
+    public void testReleaseClearsBatchLayout() {
+        try (TicketRegistry r = new TicketRegistry(1)) {
+            long t1 = r.acquire();
+            TicketRegistry.TicketEntry e1 = r.entryById(t1);
+            Assert.assertNotNull(e1);
+            e1.setScratches(new ArrowColumnScratch[2]);
+            Assert.assertNotNull(e1.getBatchLayout());
+            Assert.assertEquals(2, e1.getBatchLayout().columnCount());
+
+            r.release(t1);
+
+            long t2 = r.acquire();
+            TicketRegistry.TicketEntry e2 = r.entryById(t2);
+            Assert.assertNotNull(e2);
+            Assert.assertNull(e2.getBatchLayout());
         }
     }
 

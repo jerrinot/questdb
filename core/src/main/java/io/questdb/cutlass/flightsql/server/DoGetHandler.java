@@ -29,6 +29,7 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cutlass.arrow.column.ArrowColumnScratch;
+import io.questdb.cutlass.arrow.ipc.ArrowBatchLayout;
 import io.questdb.cutlass.arrow.ipc.ArrowRecordBatchWriter;
 import io.questdb.cutlass.arrow.ipc.FbWriter;
 import io.questdb.cutlass.arrow.ipc.UnsupportedColumnTypeException;
@@ -384,17 +385,19 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
                     int rowCount = ticket.getRowsBuffered();
                     int[] columnTypes = ticket.getColumnTypes();
                     ArrowColumnScratch[] scratches = ticket.getScratches();
-                    long[] validityLengths = ticket.getValidityLengths();
-                    long[] offsetsLengths = ticket.getOffsetsLengths();
-                    long[] valuesLengths = ticket.getValuesLengths();
-                    long[] nullCounts = ticket.getNullCounts();
+                    ArrowBatchLayout layout = ticket.getBatchLayout();
+                    layout.reset(scratches.length);
                     for (int ci = 0; ci < scratches.length; ci++) {
-                        validityLengths[ci] = scratches[ci].validityLengthBytes();
-                        offsetsLengths[ci] = scratches[ci].offsetsLengthBytes();
-                        valuesLengths[ci] = scratches[ci].valuesLengthBytes();
-                        nullCounts[ci] = scratches[ci].getNullCount();
+                        layout.set(
+                                ci,
+                                scratches[ci].getNullCount(),
+                                scratches[ci].validityLengthBytes(),
+                                scratches[ci].offsetsLengthBytes(),
+                                scratches[ci].valuesLengthBytes()
+                        );
                     }
-                    long bodyBytes = ArrowRecordBatchWriter.computeBodyBytes(validityLengths, offsetsLengths, valuesLengths);
+                    layout.finish();
+                    long bodyBytes = layout.bodyBytes();
                     if (bodyBytes > Integer.MAX_VALUE) {
                         ticket.setError(GrpcStatus.INTERNAL, "batch body exceeds 2 GiB");
                         ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
@@ -403,8 +406,7 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
 
                     fbWriter.of(metadataBuffer, metadataBuffer + METADATA_BUFFER_CAP);
                     int metaLen = ArrowRecordBatchWriter.writeRecordBatchMessage(fbWriter,
-                            rowCount, columnTypes, nullCounts, validityLengths, offsetsLengths,
-                            valuesLengths, bodyBytes);
+                            rowCount, columnTypes, layout);
                     if (metaLen <= 0) {
                         ticket.setError(GrpcStatus.INTERNAL, "record batch metadata scratch overflow");
                         ticket.setDoGetState(DoGetState.EMIT_TRAILERS_ERR);
@@ -423,27 +425,21 @@ public final class DoGetHandler implements FlightSqlHandler, Closeable {
                     long batchAddr = ticket.getBatchScratchAddr();
                     long bodyAddr = batchAddr + ticket.getBatchScratchCap() - (int) bodyBytes;
                     for (int ci = 0; ci < scratches.length; ci++) {
-                        long validityStart = bodyAddr
-                                + ArrowRecordBatchWriter.computeColumnValidityOffset(
-                                validityLengths, offsetsLengths, valuesLengths, ci);
+                        long validityStart = bodyAddr + layout.validityOffset(ci);
                         long afterValidity = scratches[ci].flushValidityTo(validityStart);
                         long validityAlignedEnd = bodyAddr
                                 + ArrowRecordBatchWriter.alignTo8(afterValidity - bodyAddr);
                         zeroRange(afterValidity, validityAlignedEnd);
 
-                        if (offsetsLengths[ci] > 0) {
-                            long offsetsStart = bodyAddr
-                                    + ArrowRecordBatchWriter.computeColumnOffsetsOffset(
-                                    validityLengths, offsetsLengths, valuesLengths, ci);
+                        if (layout.hasOffsets(ci)) {
+                            long offsetsStart = bodyAddr + layout.offsetsOffset(ci);
                             long afterOffsets = scratches[ci].flushOffsetsTo(offsetsStart);
                             long offsetsAlignedEnd = bodyAddr
                                     + ArrowRecordBatchWriter.alignTo8(afterOffsets - bodyAddr);
                             zeroRange(afterOffsets, offsetsAlignedEnd);
                         }
 
-                        long valuesStart = bodyAddr
-                                + ArrowRecordBatchWriter.computeColumnValuesOffset(
-                                validityLengths, offsetsLengths, valuesLengths, ci);
+                        long valuesStart = bodyAddr + layout.valuesOffset(ci);
                         long afterValues = scratches[ci].flushValuesTo(valuesStart);
                         long valuesAlignedEnd = bodyAddr
                                 + ArrowRecordBatchWriter.alignTo8(afterValues - bodyAddr);

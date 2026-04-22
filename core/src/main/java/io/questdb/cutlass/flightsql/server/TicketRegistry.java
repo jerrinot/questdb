@@ -28,6 +28,7 @@ import io.questdb.cairo.sql.NetworkSqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cutlass.arrow.column.ArrowColumnScratch;
+import io.questdb.cutlass.arrow.ipc.ArrowBatchLayout;
 import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
@@ -194,14 +195,9 @@ public final class TicketRegistry implements Closeable {
         SqlExecutionContextImpl executionContext;
         RecordCursorFactory factory;
         boolean isInUse;
+        /** Per-column Arrow RecordBatch body layout. Reused across batches. */
+        ArrowBatchLayout layout;
         int memoryTag;
-        /** Per-column Arrow {@code null_count}. Reused across batches. */
-        long[] nullCounts;
-        /**
-         * Per-column offsets buffer length for the current batch, in bytes.
-         * Zero for fixed-width columns; {@code 4 * (rowCount + 1)} for Utf8.
-         */
-        long[] offsetsLengths;
         /** Rows appended to {@link #scratches} but not yet flushed on the wire. */
         int rowsBuffered;
         ArrowColumnScratch[] scratches;
@@ -210,14 +206,14 @@ public final class TicketRegistry implements Closeable {
         int schemaCap;
         int schemaLen;
         long ticketId;
-        /** Per-column validity buffer length for the current batch, in bytes. */
-        long[] validityLengths;
-        /** Per-column values buffer length for the current batch, in bytes. */
-        long[] valuesLengths;
 
         @Override
         public void close() {
             release();
+        }
+
+        public ArrowBatchLayout getBatchLayout() {
+            return layout;
         }
 
         public NetworkSqlExecutionCircuitBreaker getCircuitBreaker() {
@@ -244,24 +240,16 @@ public final class TicketRegistry implements Closeable {
             return factory;
         }
 
-        public int getRowsBuffered() {
-            return rowsBuffered;
-        }
-
-        public long[] getNullCounts() {
-            return nullCounts;
-        }
-
-        public long[] getOffsetsLengths() {
-            return offsetsLengths;
-        }
-
         public ArrowColumnScratch[] getScratches() {
             return scratches;
         }
 
         public int getRawSchemaLen() {
             return rawSchemaLen;
+        }
+
+        public int getRowsBuffered() {
+            return rowsBuffered;
         }
 
         public long getSchemaAddr() {
@@ -274,14 +262,6 @@ public final class TicketRegistry implements Closeable {
 
         public long getTicketId() {
             return ticketId;
-        }
-
-        public long[] getValidityLengths() {
-            return validityLengths;
-        }
-
-        public long[] getValuesLengths() {
-            return valuesLengths;
         }
 
         /**
@@ -336,12 +316,10 @@ public final class TicketRegistry implements Closeable {
         public void setScratches(ArrowColumnScratch[] scratches) {
             this.scratches = scratches;
             int n = scratches == null ? 0 : scratches.length;
-            if (nullCounts == null || nullCounts.length != n) {
-                nullCounts = new long[n];
-                validityLengths = new long[n];
-                offsetsLengths = new long[n];
-                valuesLengths = new long[n];
+            if (layout == null) {
+                layout = new ArrowBatchLayout();
             }
+            layout.reset(n);
         }
 
         /**
@@ -429,10 +407,7 @@ public final class TicketRegistry implements Closeable {
                 }
                 scratches = null;
             }
-            nullCounts = null;
-            validityLengths = null;
-            offsetsLengths = null;
-            valuesLengths = null;
+            layout = null;
             columnTypes = null;
             if (batchScratchAddr != 0) {
                 Unsafe.free(batchScratchAddr, batchScratchCap, memoryTag);

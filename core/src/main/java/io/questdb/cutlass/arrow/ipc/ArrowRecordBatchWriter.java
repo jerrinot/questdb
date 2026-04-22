@@ -100,159 +100,66 @@ public final class ArrowRecordBatchWriter {
     }
 
     /**
-     * Computes the total aligned body size given per-column validity,
-     * offsets and values buffer lengths. Each buffer starts at an
-     * 8-byte-aligned offset. {@code offsetsLengthsPerColumn[i] == 0}
-     * indicates a fixed-width column (no offsets buffer). The arrays must
-     * have length equal to the column count.
-     */
-    public static long computeBodyBytes(long[] validityLengthsPerColumn,
-                                        long[] offsetsLengthsPerColumn,
-                                        long[] valuesLengthsPerColumn) {
-        validateLengths(validityLengthsPerColumn, offsetsLengthsPerColumn, valuesLengthsPerColumn);
-        long total = 0;
-        for (int i = 0, n = valuesLengthsPerColumn.length; i < n; i++) {
-            total = alignTo8(total + validityLengthsPerColumn[i]);
-            if (offsetsLengthsPerColumn[i] > 0) {
-                total = alignTo8(total + offsetsLengthsPerColumn[i]);
-            }
-            total = alignTo8(total + valuesLengthsPerColumn[i]);
-        }
-        return total;
-    }
-
-    /**
-     * Computes the body offset of column {@code columnIndex}'s offsets
-     * buffer. Valid only for variable-width Utf8 columns (those with
-     * {@code offsetsLengthsPerColumn[columnIndex] > 0}); callers must
-     * gate on the length array before invoking.
-     */
-    public static long computeColumnOffsetsOffset(long[] validityLengthsPerColumn,
-                                                  long[] offsetsLengthsPerColumn,
-                                                  long[] valuesLengthsPerColumn, int columnIndex) {
-        long base = computeColumnValidityOffset(validityLengthsPerColumn, offsetsLengthsPerColumn,
-                valuesLengthsPerColumn, columnIndex);
-        return alignTo8(base + validityLengthsPerColumn[columnIndex]);
-    }
-
-    /**
-     * Computes the body offset of column {@code columnIndex}'s validity
-     * buffer. Offsets are 8-byte aligned; column 0 starts at offset 0.
-     */
-    public static long computeColumnValidityOffset(long[] validityLengthsPerColumn,
-                                                   long[] offsetsLengthsPerColumn,
-                                                   long[] valuesLengthsPerColumn, int columnIndex) {
-        long offset = 0;
-        for (int i = 0; i < columnIndex; i++) {
-            offset = alignTo8(offset + validityLengthsPerColumn[i]);
-            if (offsetsLengthsPerColumn[i] > 0) {
-                offset = alignTo8(offset + offsetsLengthsPerColumn[i]);
-            }
-            offset = alignTo8(offset + valuesLengthsPerColumn[i]);
-        }
-        return offset;
-    }
-
-    /**
-     * Computes the body offset of column {@code columnIndex}'s values
-     * buffer. Starts after the column's validity (and, for Utf8 columns,
-     * offsets) buffer(s) and their alignment padding.
-     */
-    public static long computeColumnValuesOffset(long[] validityLengthsPerColumn,
-                                                 long[] offsetsLengthsPerColumn,
-                                                 long[] valuesLengthsPerColumn, int columnIndex) {
-        long base = computeColumnValidityOffset(validityLengthsPerColumn, offsetsLengthsPerColumn,
-                valuesLengthsPerColumn, columnIndex);
-        long afterValidity = alignTo8(base + validityLengthsPerColumn[columnIndex]);
-        if (offsetsLengthsPerColumn[columnIndex] > 0) {
-            return alignTo8(afterValidity + offsetsLengthsPerColumn[columnIndex]);
-        }
-        return afterValidity;
-    }
-
-    /**
      * Writes a multi-column RecordBatch message. The caller composes the
      * body as per-column validity + (optional) offsets + values buffer
-     * groups, each 8-byte padded (see {@link #computeColumnValidityOffset},
-     * {@link #computeColumnOffsetsOffset}, {@link #computeColumnValuesOffset});
-     * this method emits only the Flatbuffers metadata. A column with
-     * {@code offsetsLengthsPerColumn[i] > 0} is treated as variable-width
-     * (three Buffer descriptors emitted); zero means fixed-width (two
-     * descriptors). Returns the byte length of the emitted message, or
-     * {@code -1} on FlatBuffer scratch overflow.
+     * groups according to {@link ArrowBatchLayout}; this method emits
+     * only the Flatbuffers metadata. A column with
+     * {@link ArrowBatchLayout#hasOffsets(int)} is treated as
+     * variable-width (three Buffer descriptors emitted); otherwise it is
+     * fixed-width (two descriptors). Returns the byte length of the
+     * emitted message, or {@code -1} on FlatBuffer scratch overflow.
      *
-     * @param writer                    destination FlatBuffer writer
-     * @param rowCount                  rows in the batch
-     * @param columnTypes               per-column QuestDB type codes (validated for caller convenience)
-     * @param nullCountsPerColumn       per-column Arrow {@code null_count}
-     * @param validityLengthsPerColumn  per-column validity buffer length in bytes (0 when all valid)
-     * @param offsetsLengthsPerColumn   per-column offsets buffer length in bytes (0 for fixed-width)
-     * @param valuesLengthsPerColumn    per-column values buffer length in bytes
-     * @param totalBodyBytes            the aligned size of the body; must equal
-     *                                  {@link #computeBodyBytes(long[], long[], long[])}
+     * @param writer      destination FlatBuffer writer
+     * @param rowCount    rows in the batch
+     * @param columnTypes per-column QuestDB type codes
+     * @param layout      finished per-column body layout
      */
     public static int writeRecordBatchMessage(FbWriter writer, long rowCount,
                                               int[] columnTypes,
-                                              long[] nullCountsPerColumn,
-                                              long[] validityLengthsPerColumn,
-                                              long[] offsetsLengthsPerColumn,
-                                              long[] valuesLengthsPerColumn,
-                                              long totalBodyBytes) {
+                                              ArrowBatchLayout layout) {
         if (rowCount < 0) {
             throw new IllegalArgumentException("rowCount must be non-negative");
         }
         if (columnTypes == null || columnTypes.length == 0) {
             throw new IllegalArgumentException("columnTypes must be non-empty");
         }
-        if (nullCountsPerColumn == null) {
-            throw new IllegalArgumentException("per-column arrays must be non-null");
+        if (layout == null) {
+            throw new IllegalArgumentException("layout must be non-null");
         }
-        validateLengths(validityLengthsPerColumn, offsetsLengthsPerColumn, valuesLengthsPerColumn);
+        if (!layout.isFinished()) {
+            throw new IllegalArgumentException("layout must be finished");
+        }
         int columnCount = columnTypes.length;
-        if (nullCountsPerColumn.length != columnCount
-                || validityLengthsPerColumn.length != columnCount
-                || offsetsLengthsPerColumn.length != columnCount
-                || valuesLengthsPerColumn.length != columnCount) {
-            throw new IllegalArgumentException("per-column array lengths must equal columnCount");
+        if (layout.columnCount() != columnCount) {
+            throw new IllegalArgumentException("layout column count must equal columnCount");
         }
-        if (totalBodyBytes < 0) {
-            throw new IllegalArgumentException("totalBodyBytes must be non-negative");
-        }
+        long totalBodyBytes = layout.bodyBytes();
         try {
-            int totalBuffers = 0;
-            for (int i = 0; i < columnCount; i++) {
-                totalBuffers += offsetsLengthsPerColumn[i] > 0 ? 3 : 2;
-            }
             // Buffers vector: 2 or 3 Buffer structs per column, 16 bytes each.
             // Elements emitted last-column-first, within a column values
             // last so column 0 / buffer 0 ends up at the lowest memory
             // address in the finished buffer.
+            int totalBuffers = layout.bufferCount();
             writer.startVector(16, totalBuffers, 8);
             for (int i = columnCount - 1; i >= 0; i--) {
-                long validityOffset = computeColumnValidityOffset(validityLengthsPerColumn,
-                        offsetsLengthsPerColumn, valuesLengthsPerColumn, i);
-                long valuesOffset = computeColumnValuesOffset(validityLengthsPerColumn,
-                        offsetsLengthsPerColumn, valuesLengthsPerColumn, i);
                 // Buffer N-1 for column i: values.
-                writer.prependInt64(valuesLengthsPerColumn[i]);
-                writer.prependInt64(valuesOffset);
-                if (offsetsLengthsPerColumn[i] > 0) {
-                    long offsetsOffset = computeColumnOffsetsOffset(validityLengthsPerColumn,
-                            offsetsLengthsPerColumn, valuesLengthsPerColumn, i);
+                writer.prependInt64(layout.valuesLength(i));
+                writer.prependInt64(layout.valuesOffset(i));
+                if (layout.hasOffsets(i)) {
                     // Buffer 1 for column i: offsets (Utf8 only).
-                    writer.prependInt64(offsetsLengthsPerColumn[i]);
-                    writer.prependInt64(offsetsOffset);
+                    writer.prependInt64(layout.offsetsLength(i));
+                    writer.prependInt64(layout.offsetsOffset(i));
                 }
                 // Buffer 0 for column i: validity.
-                writer.prependInt64(validityLengthsPerColumn[i]);
-                writer.prependInt64(validityOffset);
+                writer.prependInt64(layout.validityLength(i));
+                writer.prependInt64(layout.validityOffset(i));
             }
             int buffersVector = writer.endVector(totalBuffers);
 
             // FieldNode vector: one struct per column, 16 bytes each.
             writer.startVector(16, columnCount, 8);
             for (int i = columnCount - 1; i >= 0; i--) {
-                writer.prependInt64(nullCountsPerColumn[i]);
+                writer.prependInt64(layout.nullCount(i));
                 writer.prependInt64(rowCount);
             }
             int nodesVector = writer.endVector(columnCount);
@@ -283,19 +190,6 @@ public final class ArrowRecordBatchWriter {
             return writer.finishedLen();
         } catch (IllegalStateException overflow) {
             return -1;
-        }
-    }
-
-    private static void validateLengths(long[] validityLengthsPerColumn,
-                                        long[] offsetsLengthsPerColumn,
-                                        long[] valuesLengthsPerColumn) {
-        if (validityLengthsPerColumn == null || offsetsLengthsPerColumn == null
-                || valuesLengthsPerColumn == null) {
-            throw new IllegalArgumentException("lengths arrays must be non-null");
-        }
-        int n = valuesLengthsPerColumn.length;
-        if (validityLengthsPerColumn.length != n || offsetsLengthsPerColumn.length != n) {
-            throw new IllegalArgumentException("lengths arrays must have equal length");
         }
     }
 }
