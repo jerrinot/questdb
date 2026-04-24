@@ -39,9 +39,9 @@ import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
 
 /**
- * Factory implements select with window functions that support streaming, that is:
+ * Factory implements select with window functions that explicitly support the streaming fast path, that is:
  * - they don't specify order by or order by is the same as underlying query
- * - all functions and their framing clause do support stream-ed processing (single pass)
+ * - all functions opt into stream-ed processing via {@link WindowFunction#supportsStreamingFastPath()}
  */
 public class WindowRecordCursorFactory extends AbstractRecordCursorFactory {
     private final RecordCursorFactory base;
@@ -64,7 +64,9 @@ public class WindowRecordCursorFactory extends AbstractRecordCursorFactory {
         for (int i = 0, n = functions.size(); i < n; i++) {
             Function func = functions.getQuick(i);
             if (func instanceof WindowFunction) {
-                windowFunctions.add((WindowFunction) func);
+                final WindowFunction windowFunction = (WindowFunction) func;
+                assert windowFunction.supportsStreamingFastPath();
+                windowFunctions.add(windowFunction);
             }
         }
         windowFunctionsCount = windowFunctions.size();

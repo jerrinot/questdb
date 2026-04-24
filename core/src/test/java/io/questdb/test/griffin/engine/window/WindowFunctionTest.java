@@ -479,6 +479,81 @@ public class WindowFunctionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testWindowExecutionContracts() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("create table tab (ts #TIMESTAMP, val long) timestamp(ts)", timestampType.getTypeName());
+            execute("insert into tab values (1::timestamp, 10)");
+            execute("insert into tab values (1::timestamp, 20)");
+            execute("insert into tab values (2::timestamp, 30)");
+            execute("insert into tab values (3::timestamp, 40)");
+
+            assertPlanNoLeakCheck(
+                    "select ts, row_number() over () as rn from tab",
+                    """
+                            Window
+                              functions: [row_number()]
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: tab
+                            """
+            );
+
+            assertPlanNoLeakCheck(
+                    "select ts, rank() over (order by ts) as rnk from tab",
+                    """
+                            Window
+                              functions: [rank() over ()]
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: tab
+                            """
+            );
+
+            assertQueryAndPlan(
+                    "select ts, val, lead(val) over () as lead_val, last_value(val) over () as last_val from tab",
+                    """
+                            CachedWindow
+                              unorderedFunctions: [lead(val, 1, NULL) over (),last_value(val) over ()]
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: tab
+                            """,
+                    replaceTimestampSuffix("""
+                            ts\tval\tlead_val\tlast_val
+                            1970-01-01T00:00:00.000001Z\t10\t20\t40
+                            1970-01-01T00:00:00.000001Z\t20\t30\t40
+                            1970-01-01T00:00:00.000002Z\t30\t40\t40
+                            1970-01-01T00:00:00.000003Z\t40\tnull\t40
+                            """),
+                    "ts",
+                    true,
+                    true
+            );
+
+            assertQueryAndPlan(
+                    "select ts, val, percent_rank() over (order by ts) as pr from tab",
+                    """
+                            CachedWindow
+                              unorderedFunctions: [percent_rank() over (order by [ts])]
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: tab
+                            """,
+                    replaceTimestampSuffix("""
+                            ts\tval\tpr
+                            1970-01-01T00:00:00.000001Z\t10\t0.0
+                            1970-01-01T00:00:00.000001Z\t20\t0.0
+                            1970-01-01T00:00:00.000002Z\t30\t0.6666666666666666
+                            1970-01-01T00:00:00.000003Z\t40\t1.0
+                            """),
+                    "ts",
+                    true,
+                    true
+            );
+        });
+    }
+
+    @Test
     public void testCaseWindowFnUsesNonSelectedColumn() throws Exception {
         // Regression for issue https://github.com/questdb/questdb/issues/6769
         // Price is only used inside the CASE expression, not as a
@@ -4814,6 +4889,40 @@ public class WindowFunctionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testKSumPartitionedRangeCachedWindow() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("create table tab (ts #TIMESTAMP, sym symbol, val double) timestamp(ts)", timestampType.getTypeName());
+            execute("insert into tab values (1000000::timestamp, 'A', 10.0)");
+            execute("insert into tab values (2000000::timestamp, 'B', 100.0)");
+            execute("insert into tab values (2000000::timestamp, 'A', 30.0)");
+            execute("insert into tab values (3000000::timestamp, 'B', 200.0)");
+
+            String oneSecond = timestampType == TestTimestampType.MICRO ? "1000000" : "1000000000";
+
+            assertPlanNoLeakCheck(
+                    "select ts, sym, val, ksum(val) over (partition by sym order by ts range between 1 second preceding and current row) as ksum_val, avg(val) over () as avg_all from tab",
+                    "CachedWindow\n" +
+                            "  unorderedFunctions: [ksum(val) over (partition by [sym] range between " + oneSecond + " preceding and current row),avg(val) over ()]\n" +
+                            "    PageFrame\n" +
+                            "        Row forward scan\n" +
+                            "        Frame forward scan on: tab\n"
+            );
+
+            assertSql(
+                    replaceTimestampSuffix("""
+                            ts\tsym\tval\tksum_val\tavg_all
+                            1970-01-01T00:00:01.000000Z\tA\t10.0\t10.0\t85.0
+                            1970-01-01T00:00:02.000000Z\tB\t100.0\t100.0\t85.0
+                            1970-01-01T00:00:02.000000Z\tA\t30.0\t40.0\t85.0
+                            1970-01-01T00:00:03.000000Z\tB\t200.0\t300.0\t85.0
+                            """),
+                    "select ts, sym, val, ksum(val) over (partition by sym order by ts range between 1 second preceding and current row) as ksum_val, avg(val) over () as avg_all " +
+                            "from tab"
+            );
+        });
+    }
+
+    @Test
     public void testKSumPartitionedRangeUnboundedPreceding() throws Exception {
         // Test ksum() with partition by and range between unbounded preceding and N preceding
         // This tests the else branch (frameLoBounded=false) in KSumOverPartitionRangeFrameFunction
@@ -5087,6 +5196,40 @@ public class WindowFunctionTest extends AbstractCairoTest {
                             "        Row forward scan\n" +
                             "        Frame forward scan on: tab\n",
                     "explain select ts, val, ksum(val) over (order by ts range between unbounded preceding and 2 second preceding) from tab"
+            );
+        });
+    }
+
+    @Test
+    public void testKSumRangeCachedWindow() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("create table tab (ts #TIMESTAMP, sym symbol, val double) timestamp(ts)", timestampType.getTypeName());
+            execute("insert into tab values (1000000::timestamp, 'A', 10.0)");
+            execute("insert into tab values (2000000::timestamp, 'B', 20.0)");
+            execute("insert into tab values (3000000::timestamp, 'A', 30.0)");
+            execute("insert into tab values (4000000::timestamp, 'B', 40.0)");
+
+            String oneSecond = timestampType == TestTimestampType.MICRO ? "1000000" : "1000000000";
+
+            assertPlanNoLeakCheck(
+                    "select ts, sym, val, ksum(val) over (order by ts range between 1 second preceding and current row) as ksum_val, avg(val) over () as avg_all from tab",
+                    "CachedWindow\n" +
+                            "  unorderedFunctions: [ksum(val) over (range between " + oneSecond + " preceding and current row),avg(val) over ()]\n" +
+                            "    PageFrame\n" +
+                            "        Row forward scan\n" +
+                            "        Frame forward scan on: tab\n"
+            );
+
+            assertSql(
+                    replaceTimestampSuffix("""
+                            ts\tsym\tval\tksum_val\tavg_all
+                            1970-01-01T00:00:01.000000Z\tA\t10.0\t10.0\t25.0
+                            1970-01-01T00:00:02.000000Z\tB\t20.0\t30.0\t25.0
+                            1970-01-01T00:00:03.000000Z\tA\t30.0\t50.0\t25.0
+                            1970-01-01T00:00:04.000000Z\tB\t40.0\t70.0\t25.0
+                            """),
+                    "select ts, sym, val, ksum(val) over (order by ts range between 1 second preceding and current row) as ksum_val, avg(val) over () as avg_all " +
+                            "from tab"
             );
         });
     }

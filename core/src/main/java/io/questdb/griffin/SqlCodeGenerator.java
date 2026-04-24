@@ -8415,8 +8415,9 @@ public class SqlCodeGenerator implements Mutable, Closeable {
 
                         functions.extendAndSet(i, f);
 
-                        // sorting and/or multiple passes are required, so fall back to old implementation
-                        if ((osz > 0 && !dismissOrder) || af.getPassCount() != WindowFunction.ZERO_PASS) {
+                        // sorting and/or a function that does not support the streaming fast path are required,
+                        // so fall back to the cached implementation
+                        if ((osz > 0 && !dismissOrder) || !af.supportsStreamingFastPath()) {
                             isFastPath = false;
                             break;
                         }
@@ -8425,7 +8426,6 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                     }
 
                     WindowFunction windowFunction = (WindowFunction) f;
-                    windowFunction.setColumnIndex(i);
 
                     factoryMetadata.add(new TableColumnMetadata(
                             Chars.toString(qc.getAlias()),
@@ -8552,6 +8552,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
             // window columns recursively
 
             deferredWindowMetadata.clear();
+            final ObjObjHashMap<WindowFunction, WindowFunction.CachedFunctionLayout> cachedFunctionLayouts = new ObjObjHashMap<>();
+            final ObjList<WindowFunction> cachedFunctionLayoutOrder = new ObjList<>();
             for (int i = 0; i < columnCount; i++) {
                 final QueryColumn qc = columns.getQuick(i);
                 if (qc.isWindowExpression()) {
@@ -8657,10 +8659,16 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                     }
 
                     WindowFunction windowFunction = (WindowFunction) f;
+                    final WindowFunction.CachedFunctionLayout cachedFunctionLayout = new WindowFunction.CachedFunctionLayout(i);
+                    for (int scratchColumnIndex = 0, scratchColumnCount = windowFunction.getScratchColumnCount(); scratchColumnIndex < scratchColumnCount; scratchColumnIndex++) {
+                        cachedFunctionLayout.addScratchColumnType(windowFunction.getScratchColumnType(scratchColumnIndex));
+                    }
+                    cachedFunctionLayouts.put(windowFunction, cachedFunctionLayout);
+                    cachedFunctionLayoutOrder.add(windowFunction);
 
                     if (osz > 0 && !dismissOrder) {
                         IntList directions = ac.getOrderByDirection();
-                        if (windowFunction.getPass1ScanDirection() == WindowFunction.Pass1ScanDirection.BACKWARD) {
+                        if (windowFunction.getPrimaryCachedTraversalDirection() == WindowFunction.PrimaryCachedTraversalDirection.BACKWARD) {
                             for (int j = 0, size = directions.size(); j < size; j++) {
                                 directions.set(j, 1 - directions.getQuick(j));
                             }
@@ -8685,8 +8693,6 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                         naturalOrderFunctions.add(windowFunction);
                     }
 
-                    windowFunction.setColumnIndex(i);
-
                     deferredWindowMetadata.extendAndSet(i, new TableColumnMetadata(
                             Chars.toString(qc.getAlias()),
                             windowFunction.getType(),
@@ -8706,6 +8712,15 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                 if (m != null) {
                     chainTypes.add(i, m.getColumnType());
                     factoryMetadata.add(i, m);
+                }
+            }
+            for (int i = 0, n = cachedFunctionLayoutOrder.size(); i < n; i++) {
+                final WindowFunction windowFunction = cachedFunctionLayoutOrder.getQuick(i);
+                final WindowFunction.CachedFunctionLayout layout = cachedFunctionLayouts.get(windowFunction);
+                for (int scratchIndex = 0, scratchCount = layout.getScratchColumnCount(); scratchIndex < scratchCount; scratchIndex++) {
+                    final int chainColumnIndex = chainTypes.getColumnCount();
+                    chainTypes.add(chainColumnIndex, layout.getScratchColumnType(scratchIndex));
+                    layout.setScratchColumnIndex(scratchIndex, chainColumnIndex);
                 }
             }
 
@@ -8740,7 +8755,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                     naturalOrderFunctions,
                     columnIndexes,
                     keys,
-                    chainMetadata
+                    chainMetadata,
+                    cachedFunctionLayouts
             );
         } catch (Throwable th) {
             for (ObjObjHashMap.Entry<IntList, ObjList<WindowFunction>> e : groupedWindow) {

@@ -428,14 +428,14 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public int getPassCount() {
-            return ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putDouble(recordOffset, value);
         }
 
         @Override
@@ -476,12 +476,12 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             // Welford's online algorithm: map stores [0]=meanX, [1]=sumXX, [2]=meanY, [3]=sumYY, [4]=sumXY, [5]=count
             double y = argY.getDouble(record);
             double x = argX.getDouble(record);
@@ -518,18 +518,18 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
             MapValue value = key.findValue();
 
             final double result = value != null ? value.getDouble(0) : Double.NaN;
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), result);
+            context.getResultColumn().putDouble(recordOffset, result);
         }
 
         @Override
-        public void preparePass2() {
+        public void prepareSecondaryCachedPass(WindowFunction.CachedFunctionContext context) {
             RecordCursor cursor = map.getCursor();
             MapRecord record = map.getRecord();
             while (cursor.hasNext()) {
@@ -816,14 +816,14 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), result);
+            context.getResultColumn().putDouble(recordOffset, result);
         }
 
         @Override
@@ -1046,14 +1046,14 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), result);
+            context.getResultColumn().putDouble(recordOffset, result);
         }
 
         @Override
@@ -1311,14 +1311,14 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), result);
+            context.getResultColumn().putDouble(recordOffset, result);
         }
 
         @Override
@@ -1504,14 +1504,14 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), result);
+            context.getResultColumn().putDouble(recordOffset, result);
         }
 
         @Override
@@ -1680,14 +1680,14 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), result);
+            context.getResultColumn().putDouble(recordOffset, result);
         }
 
         @Override
@@ -1757,14 +1757,14 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), result);
+            context.getResultColumn().putDouble(recordOffset, result);
         }
 
         @Override
@@ -1828,12 +1828,12 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             double y = argY.getDouble(record);
             double x = argX.getDouble(record);
             if (Numbers.isFinite(y) && Numbers.isFinite(x)) {
@@ -1849,12 +1849,12 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
         }
 
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), result);
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putDouble(recordOffset, result);
         }
 
         @Override
-        public void preparePass2() {
+        public void prepareSecondaryCachedPass(WindowFunction.CachedFunctionContext context) {
             if (isCorrelation) {
                 result = computeCorrWelford(sumXY, sumXX, sumYY, count);
             } else {
@@ -1896,7 +1896,7 @@ public abstract class AbstractBivariateStatWindowFunctionFactory extends Abstrac
 
     static {
         // Used by Welford classes (OverPartition, OverUnboundedPartitionRows):
-        //   [0] = meanX (pass1) / result (pass2), [1] = sumXX, [2] = meanY, [3] = sumYY, [4] = sumXY, [5] = count
+        //   [0] = meanX (primary cached traversal) / result (secondary cached pass), [1] = sumXX, [2] = meanY, [3] = sumYY, [4] = sumXY, [5] = count
         // Used by naive classes (sliding-frame variants):
         //   [0] = sumX, [1] = sumXX, [2] = sumY, [3] = sumYY, [4] = sumXY, [5] = count
         BIVAR_COLUMN_TYPES = new ArrayColumnTypes();

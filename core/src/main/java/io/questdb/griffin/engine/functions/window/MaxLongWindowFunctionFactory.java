@@ -448,11 +448,11 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
         /**
          * Returns the number of processing passes required by this window function.
          *
-         * @return ZERO_PASS indicating this function requires no processing passes.
+         * @return streamable primary cached traversal indicating this function requires no processing passes.
          */
         @Override
-        public int getPassCount() {
-            return ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -465,9 +465,9 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * columnIndex.
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putLong(recordOffset, value);
         }
     }
 
@@ -509,16 +509,16 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
         }
 
         /**
-         * Indicates the function requires two processing passes.
+         * Indicates the function requires a secondary cached pass.
          * <p>
-         * The first pass aggregates values (e.g., computes a partition or global maximum)
-         * and the second pass emits results for each row.
+         * The primary cached traversal aggregates values (for example, computes a partition or global maximum)
+         * and the secondary cached pass emits results for each row.
          *
-         * @return WindowFunction.TWO_PASS
+         * @return true because this implementation requires a secondary cached pass.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         /**
@@ -535,7 +535,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * Nulls are ignored (no map access or modification when the argument is `Numbers.LONG_NULL`).
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             long l = arg.getLong(record);
             if (l != Numbers.LONG_NULL) {
                 partitionByRecord.of(record);
@@ -564,7 +564,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * @param recordOffset the offset passed to WindowSPI used to obtain the output write address
          */
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -572,7 +572,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
 
             long val = value != null ? value.getLong(0) : Numbers.LONG_NULL;
 
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), val);
+            context.getResultColumn().putLong(recordOffset, val);
         }
     }
 
@@ -862,7 +862,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * Return the previously computed max value for the current row.
          * <p>
          * The provided Record parameter is ignored; this function returns the value
-         * cached in the instance (set during pass1).
+         * cached in the instance (set during the primary cached traversal).
          *
          * @param rec ignored
          * @return the cached maximum long value (may be LONG_NULL if no non-null input was seen)
@@ -885,17 +885,17 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
         /**
          * Returns the number of processing passes required by this window function.
          *
-         * @return WindowFunction.ZERO_PASS
+         * @return streamable primary cached traversal
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -1184,7 +1184,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * Return the previously computed max value for the current row.
          * <p>
          * The provided Record parameter is ignored; this function returns the value
-         * cached in the instance (set during pass1).
+         * cached in the instance (set during the primary cached traversal).
          *
          * @param rec ignored
          * @return the cached maximum long value (may be LONG_NULL if no non-null input was seen)
@@ -1207,11 +1207,11 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
         /**
          * Returns the number of processing passes required by this window function.
          *
-         * @return WindowFunction.ZERO_PASS
+         * @return streamable primary cached traversal
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -1220,9 +1220,9 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * slot addressed by {@code spi.getAddress(recordOffset, columnIndex)}.
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -1560,7 +1560,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * Return the previously computed max value for the current row.
          * <p>
          * The provided Record parameter is ignored; this function returns the value
-         * cached in the instance (set during pass1).
+         * cached in the instance (set during the primary cached traversal).
          *
          * @param rec ignored
          * @return the cached maximum long value (may be LONG_NULL if no non-null input was seen)
@@ -1583,17 +1583,17 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
         /**
          * Returns the number of processing passes required by this window function.
          *
-         * @return WindowFunction.ZERO_PASS
+         * @return streamable primary cached traversal
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -1838,7 +1838,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * Return the previously computed max value for the current row.
          * <p>
          * The provided Record parameter is ignored; this function returns the value
-         * cached in the instance (set during pass1).
+         * cached in the instance (set during the primary cached traversal).
          *
          * @param rec ignored
          * @return the cached maximum long value (may be LONG_NULL if no non-null input was seen)
@@ -1861,11 +1861,11 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
         /**
          * Returns the number of processing passes required by this window function.
          *
-         * @return WindowFunction.ZERO_PASS
+         * @return streamable primary cached traversal
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -1874,9 +1874,9 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * slot addressed by {@code spi.getAddress(recordOffset, columnIndex)}.
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -2044,7 +2044,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * Return the previously computed max value for the current row.
          * <p>
          * The provided Record parameter is ignored; this function returns the value
-         * cached in the instance (set during pass1).
+         * cached in the instance (set during the primary cached traversal).
          *
          * @param rec ignored
          * @return the cached maximum long value (may be LONG_NULL if no non-null input was seen)
@@ -2067,11 +2067,11 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
         /**
          * Returns the number of processing passes required by this window function.
          *
-         * @return WindowFunction.ZERO_PASS
+         * @return streamable primary cached traversal
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -2080,9 +2080,9 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * slot addressed by {@code spi.getAddress(recordOffset, columnIndex)}.
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -2144,7 +2144,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * Return the previously computed max value for the current row.
          * <p>
          * The provided Record parameter is ignored; this function returns the value
-         * cached in the instance (set during pass1).
+         * cached in the instance (set during the primary cached traversal).
          *
          * @param rec ignored
          * @return the cached maximum long value (may be LONG_NULL if no non-null input was seen)
@@ -2167,11 +2167,11 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
         /**
          * Returns the number of processing passes required by this window function.
          *
-         * @return WindowFunction.ZERO_PASS
+         * @return streamable primary cached traversal
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -2180,9 +2180,9 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * slot addressed by {@code spi.getAddress(recordOffset, columnIndex)}.
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -2256,16 +2256,16 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
         }
 
         /**
-         * Indicates the function requires two processing passes.
+         * Indicates the function requires a secondary cached pass.
          * <p>
-         * The first pass aggregates values (e.g., computes a partition or global maximum)
-         * and the second pass emits results for each row.
+         * The primary cached traversal aggregates values (for example, computes a partition or global maximum)
+         * and the secondary cached pass emits results for each row.
          *
-         * @return WindowFunction.TWO_PASS
+         * @return true because this implementation requires a secondary cached pass.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         /**
@@ -2276,7 +2276,7 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * `maxMin` is LONG_NULL), replaces `maxMin` with this value.
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             long l = arg.getLong(record);
             if (l != Numbers.LONG_NULL && (maxMin == Numbers.LONG_NULL || comparator.compare(l, maxMin))) {
                 maxMin = l;
@@ -2293,8 +2293,8 @@ public class MaxLongWindowFunctionFactory extends AbstractWindowFunctionFactory 
          * @param recordOffset byte offset identifying the target row in the SPI output memory
          */
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**

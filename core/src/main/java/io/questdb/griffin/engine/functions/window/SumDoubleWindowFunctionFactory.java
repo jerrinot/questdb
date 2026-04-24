@@ -324,7 +324,7 @@ public class SumDoubleWindowFunctionFactory extends AbstractWindowFunctionFactor
         }
 
         @Override
-        public void preparePass2() {
+        public void prepareSecondaryCachedPass(WindowFunction.CachedFunctionContext context) {
             RecordCursor cursor = map.getCursor();
             MapRecord record = map.getRecord();
             while (cursor.hasNext()) {
@@ -395,9 +395,9 @@ public class SumDoubleWindowFunctionFactory extends AbstractWindowFunctionFactor
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), sum);
+            context.getResultColumn().putDouble(recordOffset, sum);
         }
     }
 
@@ -457,9 +457,9 @@ public class SumDoubleWindowFunctionFactory extends AbstractWindowFunctionFactor
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), externalSum);
+            context.getResultColumn().putDouble(recordOffset, externalSum);
         }
 
         @Override
@@ -521,15 +521,15 @@ public class SumDoubleWindowFunctionFactory extends AbstractWindowFunctionFactor
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), sum);
+            context.getResultColumn().putDouble(recordOffset, sum);
         }
 
         @Override
@@ -576,15 +576,15 @@ public class SumDoubleWindowFunctionFactory extends AbstractWindowFunctionFactor
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), externalSum);
+            context.getResultColumn().putDouble(recordOffset, externalSum);
         }
 
         @Override
@@ -628,13 +628,13 @@ public class SumDoubleWindowFunctionFactory extends AbstractWindowFunctionFactor
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             double d = arg.getDouble(record);
             if (Numbers.isFinite(d)) {
                 sum += d;
@@ -643,12 +643,12 @@ public class SumDoubleWindowFunctionFactory extends AbstractWindowFunctionFactor
         }
 
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), externalSum);
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putDouble(recordOffset, externalSum);
         }
 
         @Override
-        public void preparePass2() {
+        public void prepareSecondaryCachedPass(WindowFunction.CachedFunctionContext context) {
             externalSum = count > 0 ? sum : Double.NaN;
         }
 

@@ -35,6 +35,7 @@ import io.questdb.cairo.sql.WindowSPI;
 import io.questdb.cairo.vm.api.MemoryARW;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.window.WindowFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
@@ -103,9 +104,9 @@ public class LagDoubleFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), lagValue);
+            context.getResultColumn().putDouble(recordOffset, lagValue);
         }
     }
 
@@ -131,9 +132,9 @@ public class LagDoubleFunctionFactory extends AbstractWindowFunctionFactory {
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), lagValue);
+            context.getResultColumn().putDouble(recordOffset, lagValue);
         }
 
         @Override
@@ -171,9 +172,9 @@ public class LagDoubleFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putDouble(recordOffset, value);
         }
     }
 }

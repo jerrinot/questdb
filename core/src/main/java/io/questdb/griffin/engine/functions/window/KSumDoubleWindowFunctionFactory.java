@@ -319,15 +319,10 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public int getPassCount() {
-            return ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
-        @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), value);
-        }
     }
 
     // handles ksum() over (partition by x)
@@ -344,12 +339,12 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             double d = arg.getDouble(record);
             if (Numbers.isFinite(d)) {
                 partitionByRecord.of(record);
@@ -382,7 +377,7 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -390,14 +385,14 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
 
             double val = value != null ? value.getDouble(0) : Double.NaN;
 
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), val);
+            context.getResultColumn().putDouble(recordOffset, val);
         }
 
         @Override
-        public void preparePass2() {
+        public void prepareSecondaryCachedPass(WindowFunction.CachedFunctionContext context) {
             // No-op: map entries are only created when there's at least one finite value,
             // so no fixup is needed. Partitions with all NULLs have no map entry and
-            // pass2() handles that by returning NaN.
+            // processSecondaryCachedRow() handles that by returning NaN.
         }
     }
 
@@ -618,14 +613,8 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
-        }
-
-        @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            // pass1 is never called when getPassCount() returns ZERO_PASS
-            throw new UnsupportedOperationException();
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -808,14 +797,8 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
-        }
-
-        @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), sum);
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -1010,14 +993,8 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
-        }
-
-        @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            // pass1 is never called when getPassCount() returns ZERO_PASS
-            throw new UnsupportedOperationException();
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -1170,14 +1147,8 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
-        }
-
-        @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), externalSum);
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -1296,14 +1267,8 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
-        }
-
-        @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), sum);
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -1355,14 +1320,8 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
-        }
-
-        @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), externalSum);
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -1408,12 +1367,12 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             double d = arg.getDouble(record);
             if (Numbers.isFinite(d)) {
                 // Kahan addition
@@ -1426,12 +1385,12 @@ public class KSumDoubleWindowFunctionFactory extends AbstractWindowFunctionFacto
         }
 
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), externalSum);
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putDouble(recordOffset, externalSum);
         }
 
         @Override
-        public void preparePass2() {
+        public void prepareSecondaryCachedPass(WindowFunction.CachedFunctionContext context) {
             externalSum = count > 0 ? sum : Double.NaN;
         }
 

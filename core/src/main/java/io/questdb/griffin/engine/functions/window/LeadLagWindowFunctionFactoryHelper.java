@@ -194,8 +194,8 @@ public class LeadLagWindowFunctionFactoryHelper {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -313,8 +313,8 @@ public class LeadLagWindowFunctionFactoryHelper {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -397,8 +397,8 @@ public class LeadLagWindowFunctionFactoryHelper {
         }
 
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
         @Override
@@ -410,8 +410,8 @@ public class LeadLagWindowFunctionFactoryHelper {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            if (doPass1(record, recordOffset, spi)) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            if (doPass1(record, recordOffset, spi, context)) {
                 loIdx = (int) ((loIdx + 1) % offset);
                 count++;
             }
@@ -454,7 +454,7 @@ public class LeadLagWindowFunctionFactoryHelper {
             count = 0;
         }
 
-        protected abstract boolean doPass1(Record record, long recordOffset, WindowSPI spi);
+        protected abstract boolean doPass1(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context);
     }
 
     abstract static class BaseLeadLagCurrentRow extends BaseWindowFunction {
@@ -484,8 +484,8 @@ public class LeadLagWindowFunctionFactoryHelper {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -533,8 +533,8 @@ public class LeadLagWindowFunctionFactoryHelper {
         }
 
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
         @Override
@@ -546,7 +546,7 @@ public class LeadLagWindowFunctionFactoryHelper {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -564,7 +564,7 @@ public class LeadLagWindowFunctionFactoryHelper {
                 count = mapValue.getLong(2);
             }
 
-            if (doPass1(count, offset, startOffset, firstIdx, record, recordOffset, spi)) {
+            if (doPass1(count, offset, startOffset, firstIdx, record, recordOffset, spi, context)) {
                 firstIdx++;
                 count++;
             }
@@ -611,7 +611,8 @@ public class LeadLagWindowFunctionFactoryHelper {
                                            long firstIdx,
                                            Record record,
                                            long recordOffset,
-                                           WindowSPI spi);
+                                           WindowSPI spi,
+                                           WindowFunction.CachedFunctionContext context);
     }
 
     static {

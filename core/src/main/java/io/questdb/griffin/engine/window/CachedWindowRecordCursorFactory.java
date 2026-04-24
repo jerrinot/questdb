@@ -38,6 +38,7 @@ import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.WindowSPI;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
@@ -48,6 +49,7 @@ import io.questdb.std.DirectIntList;
 import io.questdb.std.IntList;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
+import io.questdb.std.ObjObjHashMap;
 import io.questdb.std.Transient;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -58,11 +60,15 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
     private final GenericRecordMetadata chainMetadata;
     private final ObjList<RecordComparator> comparators;
     private final CachedWindowRecordCursor cursor;
-    private final ObjList<ObjList<WindowFunction>> ordered2PassFunctions;
+    private final ObjList<ObjList<WindowFunction.CachedFunctionContext>> orderedFunctionContexts;
+    private final ObjList<ObjList<WindowFunction>> orderedSecondaryPassFunctions;
+    private final ObjList<ObjList<WindowFunction.CachedFunctionContext>> orderedSecondaryPassFunctionContexts;
     private final ObjList<ObjList<WindowFunction>> orderedFunctions;
     private final int orderedGroupCount;
     private final ObjList<IntList> sortKeys;
-    private final ObjList<WindowFunction> unordered2PassFunctions;
+    private final ObjList<WindowFunction.CachedFunctionContext> unorderedFunctionContexts;
+    private final ObjList<WindowFunction> unorderedSecondaryPassFunctions;
+    private final ObjList<WindowFunction.CachedFunctionContext> unorderedSecondaryPassFunctionContexts;
     @Nullable
     private final ObjList<WindowFunction> unorderedFunctions;
     private boolean closed = false;
@@ -78,7 +84,8 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
             @Nullable ObjList<WindowFunction> unorderedFunctions,
             @NotNull IntList columnIndexes,
             @NotNull final ObjList<IntList> sortKeys,
-            @NotNull GenericRecordMetadata chainMetadata
+            @NotNull GenericRecordMetadata chainMetadata,
+            @Nullable ObjObjHashMap<WindowFunction, WindowFunction.CachedFunctionLayout> functionLayouts
     ) {
         super(metadata);
         try {
@@ -129,48 +136,65 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
 
             this.cursor = new CachedWindowRecordCursor(columnIndexes, recordChain, orderedSources, perGroupRankMaps);
             this.allFunctions = new ObjList<>();
+            this.orderedFunctionContexts = new ObjList<>(orderedGroupCount);
 
             ObjList<ObjList<WindowFunction>> orderedTmp = null;
+            ObjList<ObjList<WindowFunction.CachedFunctionContext>> orderedSecondaryContextsTmp = null;
             for (int i = 0, n = orderedFunctions.size(); i < n; i++) {
                 ObjList<WindowFunction> functions = orderedFunctions.getQuick(i);
                 allFunctions.addAll(functions);
+                final ObjList<WindowFunction.CachedFunctionContext> functionContexts = createFunctionContexts(functions, recordChain, functionLayouts);
+                orderedFunctionContexts.extendAndSet(i, functionContexts);
 
                 ObjList<WindowFunction> twoPassFunctions = null;
+                ObjList<WindowFunction.CachedFunctionContext> twoPassFunctionContexts = null;
                 for (int j = 0, k = functions.size(); j < k; j++) {
                     WindowFunction function = functions.getQuick(j);
-                    if (function.getPassCount() > WindowFunction.ONE_PASS) {
+                    if (function.needsSecondaryCachedPass()) {
                         if (twoPassFunctions == null) {
                             twoPassFunctions = new ObjList<>();
+                            twoPassFunctionContexts = new ObjList<>();
                         }
                         twoPassFunctions.add(function);
+                        twoPassFunctionContexts.add(functionContexts.getQuick(j));
                     }
                 }
                 if (twoPassFunctions != null) {
                     if (orderedTmp == null) {
                         orderedTmp = new ObjList<>();
+                        orderedSecondaryContextsTmp = new ObjList<>();
                     }
 
                     orderedTmp.extendAndSet(i, twoPassFunctions);
+                    orderedSecondaryContextsTmp.extendAndSet(i, twoPassFunctionContexts);
                 }
             }
 
-            ordered2PassFunctions = orderedTmp;
+            orderedSecondaryPassFunctions = orderedTmp;
+            orderedSecondaryPassFunctionContexts = orderedSecondaryContextsTmp;
 
             ObjList<WindowFunction> unorderedTmp = null;
+            ObjList<WindowFunction.CachedFunctionContext> unorderedContextTmp = null;
+            ObjList<WindowFunction.CachedFunctionContext> unorderedSecondaryContextTmp = null;
             if (unorderedFunctions != null) {
                 allFunctions.addAll(unorderedFunctions);
+                unorderedContextTmp = createFunctionContexts(unorderedFunctions, recordChain, functionLayouts);
 
                 for (int i = 0, n = unorderedFunctions.size(); i < n; i++) {
                     WindowFunction function = unorderedFunctions.getQuick(i);
-                    if (function.getPassCount() > WindowFunction.ONE_PASS) {
+                    if (function.needsSecondaryCachedPass()) {
                         if (unorderedTmp == null) {
                             unorderedTmp = new ObjList<>();
+                            unorderedSecondaryContextTmp = new ObjList<>();
                         }
                         unorderedTmp.add(function);
+                        unorderedSecondaryContextTmp.add(unorderedContextTmp.getQuick(i));
                     }
                 }
             }
-            this.unordered2PassFunctions = unorderedTmp;
+            this.unorderedSecondaryPassFunctions = unorderedTmp;
+            this.unorderedFunctionContexts = unorderedContextTmp;
+            this.unorderedSecondaryPassFunctionContexts = unorderedSecondaryContextTmp;
 
             this.unorderedFunctions = unorderedFunctions;
         } catch (Throwable th) {
@@ -267,6 +291,38 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
         for (int i = 0, n = perGroupRankMaps.size(); i < n; i++) {
             Misc.freeObjList(perGroupRankMaps.getQuick(i));
         }
+    }
+
+    private static ObjList<WindowFunction.CachedFunctionContext> createFunctionContexts(
+            ObjList<WindowFunction> functions,
+            WindowSPI spi,
+            @Nullable ObjObjHashMap<WindowFunction, WindowFunction.CachedFunctionLayout> functionLayouts
+    ) {
+        assert functionLayouts != null;
+        final ObjList<WindowFunction.CachedFunctionContext> contexts = new ObjList<>(functions.size());
+        for (int i = 0, n = functions.size(); i < n; i++) {
+            final WindowFunction function = functions.getQuick(i);
+            final WindowFunction.CachedFunctionLayout layout = functionLayouts.get(function);
+            assert layout != null;
+            final WindowSPI.FixedSizeColumn resultColumn = spi.getFixedSizeColumn(
+                    layout.getResultColumnIndex(),
+                    function.getType()
+            );
+            ObjList<WindowSPI.FixedSizeColumn> scratchColumns = null;
+            if (layout.getScratchColumnCount() > 0) {
+                scratchColumns = new ObjList<>(layout.getScratchColumnCount());
+                for (int scratchIndex = 0, scratchCount = layout.getScratchColumnCount(); scratchIndex < scratchCount; scratchIndex++) {
+                    scratchColumns.add(
+                            spi.getFixedSizeColumn(
+                                    layout.getScratchColumnIndex(scratchIndex),
+                                    layout.getScratchColumnType(scratchIndex)
+                            )
+                    );
+                }
+            }
+            contexts.add(new LegacyCachedFunctionContext(resultColumn, scratchColumns));
+        }
+        return contexts;
     }
 
     private void addSortKeys(PlanSink sink, IntList list) {
@@ -419,12 +475,13 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
             }
 
             // step #2: populate all window functions with records in order of respective tree
-            // run pass1 for all ordered functions
+            // run primary cached traversal for all ordered functions
             long offset;
             if (orderedGroupCount > 0) {
                 for (int i = 0; i < orderedGroupCount; i++) {
                     final LongTreeChain tree = orderedSources.getQuick(i);
                     final ObjList<WindowFunction> functions = orderedFunctions.getQuick(i);
+                    final ObjList<WindowFunction.CachedFunctionContext> functionContexts = orderedFunctionContexts.getQuick(i);
                     final LongTreeChain.TreeCursor cursor = tree.getCursor();
                     final int functionCount = functions.size();
                     while (cursor.hasNext()) {
@@ -432,56 +489,59 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
                         offset = cursor.next();
                         recordChain.recordAt(chainRecord, offset);
                         for (int j = 0; j < functionCount; j++) {
-                            functions.getQuick(j).pass1(chainRecord, offset, recordChain);
+                            functions.getQuick(j).processPrimaryCachedRow(chainRecord, offset, recordChain, functionContexts.getQuick(j));
                         }
                     }
                 }
             }
 
-            // run pass1 for all unordered functions
+            // run primary cached traversal for all unordered functions
             if (unorderedFunctions != null) {
                 for (int j = 0, n = unorderedFunctions.size(); j < n; j++) {
                     final WindowFunction f = unorderedFunctions.getQuick(j);
-                    if (f.getPass1ScanDirection() == WindowFunction.Pass1ScanDirection.FORWARD) {
+                    final WindowFunction.CachedFunctionContext context = unorderedFunctionContexts.getQuick(j);
+                    if (f.getPrimaryCachedTraversalDirection() == WindowFunction.PrimaryCachedTraversalDirection.FORWARD) {
                         recordChain.toTop();
                         while (recordChain.hasNext()) {
                             circuitBreaker.statefulThrowExceptionIfTripped();
-                            f.pass1(chainRecord, chainRecord.getRowId(), recordChain);
+                            f.processPrimaryCachedRow(chainRecord, chainRecord.getRowId(), recordChain, context);
                         }
                     } else {
                         recordChain.toBottom();
                         while (recordChain.hasPrev()) {
                             circuitBreaker.statefulThrowExceptionIfTripped();
-                            f.pass1(chainRecord, chainRecord.getRowId(), recordChain);
+                            f.processPrimaryCachedRow(chainRecord, chainRecord.getRowId(), recordChain, context);
                         }
                     }
                 }
             }
 
-            // prepare pass 2 for ordered functions
-            if (ordered2PassFunctions != null) {
-                for (int i = 0, n = ordered2PassFunctions.size(); i < n; i++) {
-                    final ObjList<WindowFunction> functions = ordered2PassFunctions.getQuick(i);
+            // prepare secondary cached pass for ordered functions
+            if (orderedSecondaryPassFunctions != null) {
+                for (int i = 0, n = orderedSecondaryPassFunctions.size(); i < n; i++) {
+                    final ObjList<WindowFunction> functions = orderedSecondaryPassFunctions.getQuick(i);
+                    final ObjList<WindowFunction.CachedFunctionContext> functionContexts = orderedSecondaryPassFunctionContexts.getQuick(i);
                     if (functions == null) {
                         continue;
                     }
                     for (int j = 0, k = functions.size(); j < k; j++) {
-                        functions.getQuick(j).preparePass2();
+                        functions.getQuick(j).prepareSecondaryCachedPass(functionContexts.getQuick(j));
                     }
                 }
             }
-            // prepare pass 2 for unordered functions
-            if (unordered2PassFunctions != null) {
-                for (int j = 0, n = unordered2PassFunctions.size(); j < n; j++) {
-                    unordered2PassFunctions.getQuick(j).preparePass2();
+            // prepare secondary cached pass for unordered functions
+            if (unorderedSecondaryPassFunctions != null) {
+                for (int j = 0, n = unorderedSecondaryPassFunctions.size(); j < n; j++) {
+                    unorderedSecondaryPassFunctions.getQuick(j).prepareSecondaryCachedPass(unorderedSecondaryPassFunctionContexts.getQuick(j));
                 }
             }
 
-            // run pass2 for all ordered functions
-            if (ordered2PassFunctions != null) {
-                for (int i = 0, n = ordered2PassFunctions.size(); i < n; i++) {
+            // run secondary cached pass for all ordered functions
+            if (orderedSecondaryPassFunctions != null) {
+                for (int i = 0, n = orderedSecondaryPassFunctions.size(); i < n; i++) {
                     final LongTreeChain tree = orderedSources.getQuick(i);
-                    final ObjList<WindowFunction> functions = ordered2PassFunctions.getQuick(i);
+                    final ObjList<WindowFunction> functions = orderedSecondaryPassFunctions.getQuick(i);
+                    final ObjList<WindowFunction.CachedFunctionContext> functionContexts = orderedSecondaryPassFunctionContexts.getQuick(i);
                     if (functions == null) {
                         continue;
                     }
@@ -492,20 +552,21 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
                         offset = cursor.next();
                         recordChain.recordAt(chainRecord, offset);
                         for (int j = 0; j < functionCount; j++) {
-                            functions.getQuick(j).pass2(chainRecord, offset, recordChain);
+                            functions.getQuick(j).processSecondaryCachedRow(chainRecord, offset, recordChain, functionContexts.getQuick(j));
                         }
                     }
                 }
             }
 
-            // run pass2 for all unordered functions
-            if (unordered2PassFunctions != null) {
-                for (int j = 0, n = unordered2PassFunctions.size(); j < n; j++) {
-                    final WindowFunction f = unordered2PassFunctions.getQuick(j);
+            // run secondary cached pass for all unordered functions
+            if (unorderedSecondaryPassFunctions != null) {
+                for (int j = 0, n = unorderedSecondaryPassFunctions.size(); j < n; j++) {
+                    final WindowFunction f = unorderedSecondaryPassFunctions.getQuick(j);
+                    final WindowFunction.CachedFunctionContext context = unorderedSecondaryPassFunctionContexts.getQuick(j);
                     recordChain.toTop();
                     while (recordChain.hasNext()) {
                         circuitBreaker.statefulThrowExceptionIfTripped();
-                        f.pass2(chainRecord, chainRecord.getRowId(), recordChain);
+                        f.processSecondaryCachedRow(chainRecord, chainRecord.getRowId(), recordChain, context);
                     }
                 }
             }
@@ -542,6 +603,29 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
             for (int i = 0; i < orderedGroupCount; i++) {
                 orderedSources.getQuick(i).reopen();
             }
+        }
+    }
+
+    private static final class LegacyCachedFunctionContext implements WindowFunction.CachedFunctionContext {
+        private final WindowSPI.FixedSizeColumn resultColumn;
+        private final ObjList<WindowSPI.FixedSizeColumn> scratchColumns;
+
+        private LegacyCachedFunctionContext(WindowSPI.FixedSizeColumn resultColumn, @Nullable ObjList<WindowSPI.FixedSizeColumn> scratchColumns) {
+            this.resultColumn = resultColumn;
+            this.scratchColumns = scratchColumns;
+        }
+
+        @Override
+        public WindowSPI.FixedSizeColumn getResultColumn() {
+            return resultColumn;
+        }
+
+        @Override
+        public WindowSPI.FixedSizeColumn getScratchColumn(int index) {
+            if (scratchColumns == null) {
+                throw new IndexOutOfBoundsException("scratch column is not bound");
+            }
+            return scratchColumns.getQuick(index);
         }
     }
 }

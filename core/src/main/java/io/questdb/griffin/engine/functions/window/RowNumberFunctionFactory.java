@@ -48,7 +48,6 @@ import io.questdb.griffin.engine.window.WindowFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
-import io.questdb.std.Unsafe;
 
 public class RowNumberFunctionFactory implements FunctionFactory {
 
@@ -99,7 +98,6 @@ public class RowNumberFunctionFactory implements FunctionFactory {
         private final Map map;
         private final VirtualRecord partitionByRecord;
         private final RecordSink partitionBySink;
-        private int columnIndex;
 
         private long rowNumber;
 
@@ -137,8 +135,8 @@ public class RowNumberFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -148,9 +146,9 @@ public class RowNumberFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), rowNumber);
+            context.getResultColumn().putLong(recordOffset, rowNumber);
         }
 
         @Override
@@ -162,11 +160,6 @@ public class RowNumberFunctionFactory implements FunctionFactory {
         @Override
         public void reset() {
             map.close();
-        }
-
-        @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
         }
 
         @Override
@@ -186,7 +179,6 @@ public class RowNumberFunctionFactory implements FunctionFactory {
     }
 
     private static class SequenceRowNumberFunction extends LongFunction implements WindowFunction, Reopenable {
-        private int columnIndex;
         private long rowNumber = 0;
 
         @Override
@@ -200,8 +192,8 @@ public class RowNumberFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public int getPassCount() {
-            return ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -210,8 +202,8 @@ public class RowNumberFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), ++rowNumber);
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putLong(recordOffset, ++rowNumber);
         }
 
         @Override
@@ -222,11 +214,6 @@ public class RowNumberFunctionFactory implements FunctionFactory {
         @Override
         public void reset() {
             toTop();
-        }
-
-        @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
         }
 
         @Override

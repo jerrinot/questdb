@@ -486,8 +486,8 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
@@ -497,9 +497,9 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putDouble(recordOffset, lastValue);
         }
 
         @Override
@@ -547,8 +547,8 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
@@ -558,9 +558,9 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putDouble(recordOffset, value);
         }
     }
 
@@ -578,13 +578,13 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
 
@@ -594,7 +594,7 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -608,13 +608,13 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
             MapValue value = key.findValue();
             double val = value != null ? value.getDouble(0) : Double.NaN;
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), val);
+            context.getResultColumn().putDouble(recordOffset, val);
         }
     }
 
@@ -856,8 +856,8 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
@@ -867,9 +867,9 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putDouble(recordOffset, lastValue);
         }
 
         @Override
@@ -1085,8 +1085,8 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
@@ -1096,9 +1096,9 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putDouble(recordOffset, lastValue);
         }
 
         @Override
@@ -1191,8 +1191,8 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
@@ -1202,9 +1202,9 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putDouble(recordOffset, value);
         }
 
         @Override
@@ -1233,13 +1233,13 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
         @Override
-        public int getPassCount() {
-            return TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
 
@@ -1249,7 +1249,7 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             if (!found) {
                 double d = arg.getDouble(record);
                 if (Numbers.isFinite(d)) {
@@ -1260,8 +1260,8 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), value);
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putDouble(recordOffset, value);
         }
 
         @Override
@@ -1308,15 +1308,15 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putDouble(recordOffset, value);
         }
 
         @Override
@@ -1384,15 +1384,15 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putDouble(recordOffset, value);
         }
 
         @Override
@@ -1433,13 +1433,13 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -1452,7 +1452,7 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
             } else {
                 val = value.getDouble(0);
             }
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), val);
+            context.getResultColumn().putDouble(recordOffset, val);
         }
     }
 
@@ -1607,15 +1607,15 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putDouble(recordOffset, lastValue);
         }
 
         @Override
@@ -1729,15 +1729,15 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putDouble(recordOffset, lastValue);
         }
 
         @Override
@@ -1906,15 +1906,15 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putDouble(recordOffset, lastValue);
         }
 
         @Override
@@ -2004,15 +2004,15 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putDouble(recordOffset, lastValue);
         }
 
         @Override
@@ -2079,18 +2079,18 @@ public class LastValueDoubleWindowFunctionFactory extends AbstractWindowFunction
         }
 
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             if (!found) {
                 value = arg.getDouble(record);
                 found = true;
             }
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putDouble(recordOffset, value);
         }
 
         @Override

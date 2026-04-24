@@ -568,11 +568,11 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -597,9 +597,9 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset the memory offset/row index supplied by the WindowSPI where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putLong(recordOffset, lastValue);
         }
 
         /**
@@ -694,11 +694,11 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Returns the number of processing passes required by this window function.
          *
-         * @return {@code ZERO_PASS} indicating the function requires no separate processing passes
+         * @return {@code streamable primary cached traversal} indicating the function requires no separate processing passes
          */
         @Override
-        public int getPassCount() {
-            return ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -722,9 +722,9 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset byte offset (address) of the output row where the long result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putLong(recordOffset, value);
         }
     }
 
@@ -759,25 +759,25 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         }
 
         /**
-         * Indicates that pass1 should scan rows in the backward direction.
+         * Indicates that the primary cached traversal should scan rows in the backward direction.
          *
-         * @return {@link Pass1ScanDirection#BACKWARD} to request a backward pass1 scan.
+         * @return {@link WindowFunction.PrimaryCachedTraversalDirection#BACKWARD} to request backward primary traversal.
          */
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
         /**
          * The number of execution passes this window function requires.
          * <p>
-         * This implementation requires two-pass execution (build intermediate state in pass1, produce output in pass2).
+         * This implementation builds intermediate state during the primary cached traversal and emits output during the secondary cached pass.
          *
-         * @return {@link WindowFunction#TWO_PASS}
+         * @return true because this implementation requires a secondary cached pass.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         /**
@@ -801,7 +801,7 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset unused in this implementation
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -826,13 +826,13 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param spi          window SPI used to obtain the output memory address
          */
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
             MapValue value = key.findValue();
             long val = value != null ? value.getLong(0) : Numbers.LONG_NULL;
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), val);
+            context.getResultColumn().putLong(recordOffset, val);
         }
     }
 
@@ -1177,11 +1177,11 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -1206,9 +1206,9 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset the memory offset/row index supplied by the WindowSPI where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putLong(recordOffset, lastValue);
         }
 
         /**
@@ -1528,11 +1528,11 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -1557,9 +1557,9 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset the memory offset/row index supplied by the WindowSPI where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putLong(recordOffset, lastValue);
         }
 
         /**
@@ -1727,11 +1727,11 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -1755,9 +1755,9 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset byte offset (address) of the output row where the long result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putLong(recordOffset, value);
         }
 
         /**
@@ -1806,26 +1806,26 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         }
 
         /**
-         * Indicates that pass1 should scan rows in the backward direction.
+         * Indicates that the primary cached traversal should scan rows in the backward direction.
          *
-         * @return {@link Pass1ScanDirection#BACKWARD} to request a backward pass1 scan.
+         * @return {@link WindowFunction.PrimaryCachedTraversalDirection#BACKWARD} to request backward primary traversal.
          */
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
         /**
-         * Indicates this window function requires two processing passes.
+         * Indicates this window function requires a secondary cached pass.
          *
          * <p>Two-pass functions perform an initial scan to collect state followed by a second pass
          * that produces the final outputs.</p>
          *
-         * @return the pass count constant {@code TWO_PASS}
+         * @return the pass count constant {@code secondary cached pass}
          */
         @Override
-        public int getPassCount() {
-            return TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         /**
@@ -1848,7 +1848,7 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset offset of the current record (unused by this implementation)
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             if (!found) {
                 long d = arg.getLong(record);
                 if (d != Numbers.LONG_NULL) {
@@ -1868,8 +1868,8 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset offset of the output row within the SPI's address space
          */
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), value);
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putLong(recordOffset, value);
         }
 
         /**
@@ -1957,11 +1957,11 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -1975,9 +1975,9 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset byte offset (address) of the output row where the long result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putLong(recordOffset, value);
         }
 
         /**
@@ -2101,11 +2101,11 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -2119,9 +2119,9 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset byte offset (address) of the output row where the long result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putLong(recordOffset, value);
         }
 
         /**
@@ -2186,13 +2186,13 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         }
 
         /**
-         * Indicates that pass1 should scan rows in the backward direction.
+         * Indicates that the primary cached traversal should scan rows in the backward direction.
          *
-         * @return {@link Pass1ScanDirection#BACKWARD} to request a backward pass1 scan.
+         * @return {@link WindowFunction.PrimaryCachedTraversalDirection#BACKWARD} to request backward primary traversal.
          */
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
         /**
@@ -2207,7 +2207,7 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset offset within the SPI output buffer where the long value will be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -2220,7 +2220,7 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
             } else {
                 val = value.getLong(0);
             }
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), val);
+            context.getResultColumn().putLong(recordOffset, val);
         }
     }
 
@@ -2420,17 +2420,17 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putLong(recordOffset, lastValue);
         }
 
         /**
@@ -2605,11 +2605,11 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -2624,9 +2624,9 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset the memory offset/row index supplied by the WindowSPI where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putLong(recordOffset, lastValue);
         }
 
         /**
@@ -2883,17 +2883,17 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putLong(recordOffset, lastValue);
         }
 
         /**
@@ -3049,11 +3049,11 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         /**
          * Indicates this window function requires no separate passes.
          *
-         * @return the pass count constant {@link WindowFunction#ZERO_PASS}
+         * @return the pass count constant {@link streamable primary cached traversal}
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -3068,9 +3068,9 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset the memory offset/row index supplied by the WindowSPI where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), lastValue);
+            context.getResultColumn().putLong(recordOffset, lastValue);
         }
 
         /**
@@ -3180,13 +3180,13 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
         }
 
         /**
-         * Indicates that pass1 should scan rows in the backward direction.
+         * Indicates that the primary cached traversal should scan rows in the backward direction.
          *
-         * @return {@link Pass1ScanDirection#BACKWARD} to request a backward pass1 scan.
+         * @return {@link WindowFunction.PrimaryCachedTraversalDirection#BACKWARD} to request backward primary traversal.
          */
         @Override
-        public Pass1ScanDirection getPass1ScanDirection() {
-            return Pass1ScanDirection.BACKWARD;
+        public PrimaryCachedTraversalDirection getPrimaryCachedTraversalDirection() {
+            return PrimaryCachedTraversalDirection.BACKWARD;
         }
 
         /**
@@ -3201,12 +3201,12 @@ public class LastValueLongWindowFunctionFactory extends AbstractWindowFunctionFa
          * @param recordOffset memory offset (row address) in the SPI where the output value should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             if (!found) {
                 value = arg.getLong(record);
                 found = true;
             }
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putLong(recordOffset, value);
         }
 
         /**

@@ -31,6 +31,7 @@ import io.questdb.cairo.sql.WindowSPI;
 import io.questdb.cairo.vm.api.MemoryARW;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.engine.window.WindowFunction;
 import io.questdb.std.LongList;
 import io.questdb.std.Misc;
 import io.questdb.std.Unsafe;
@@ -114,8 +115,8 @@ public abstract class AbstractWindowFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public int getPassCount() {
-            return ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -169,8 +170,8 @@ public abstract class AbstractWindowFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), Double.NaN);
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putDouble(recordOffset, Double.NaN);
         }
     }
 
@@ -183,7 +184,7 @@ public abstract class AbstractWindowFunctionFactory implements FunctionFactory {
          * The constructor initializes the null-function frame (name, bounds, range flag and partition spec)
          * and sets the constant value written/read by this function.
          *
-         * @param zeroValue the constant long value returned by getLong and written into window memory during pass1
+         * @param zeroValue the constant long value returned by getLong and written into window memory during the primary cached traversal
          */
         LongNullFunction(Function arg, String name, long rowLo, long rowHi, boolean isRange, VirtualRecord partitionByRecord, long zeroValue) {
             super(arg, name, rowLo, rowHi, isRange, partitionByRecord);
@@ -202,8 +203,8 @@ public abstract class AbstractWindowFunctionFactory implements FunctionFactory {
          * @param recordOffset byte offset of the record within window memory
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), zeroValue);
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putLong(recordOffset, zeroValue);
         }
     }
 
@@ -267,8 +268,8 @@ public abstract class AbstractWindowFunctionFactory implements FunctionFactory {
          * @param recordOffset byte offset of the record within window memory
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), zeroValue);
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putLong(recordOffset, zeroValue);
         }
     }
 }

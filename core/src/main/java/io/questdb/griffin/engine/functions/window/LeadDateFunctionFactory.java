@@ -36,6 +36,7 @@ import io.questdb.cairo.sql.WindowSPI;
 import io.questdb.cairo.vm.api.MemoryARW;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.window.WindowFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
@@ -81,7 +82,7 @@ public class LeadDateFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        protected boolean doPass1(Record record, long recordOffset, WindowSPI spi) {
+        protected boolean doPass1(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             long leadValue;
             if (count < offset) {
                 leadValue = defaultValue == null ? Numbers.LONG_NULL : defaultValue.getDate(record);
@@ -93,7 +94,7 @@ public class LeadDateFunctionFactory extends AbstractWindowFunctionFactory {
             if (respectNull) {
                 buffer.putLong((long) loIdx * Long.BYTES, l);
             }
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), leadValue);
+            context.getResultColumn().putLong(recordOffset, leadValue);
             return respectNull;
         }
     }
@@ -117,7 +118,8 @@ public class LeadDateFunctionFactory extends AbstractWindowFunctionFactory {
                                   long firstIdx,
                                   Record record,
                                   long recordOffset,
-                                  WindowSPI spi) {
+                                  WindowSPI spi,
+                                  WindowFunction.CachedFunctionContext context) {
             long l = arg.getDate(record);
             long leadValue;
             if (count < offset) {
@@ -129,7 +131,7 @@ public class LeadDateFunctionFactory extends AbstractWindowFunctionFactory {
             if (respectNulls) {
                 memory.putLong(startOffset + firstIdx * Long.BYTES, l);
             }
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), leadValue);
+            context.getResultColumn().putLong(recordOffset, leadValue);
             return respectNulls;
         }
     }

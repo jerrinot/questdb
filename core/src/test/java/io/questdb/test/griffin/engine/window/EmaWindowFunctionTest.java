@@ -545,6 +545,218 @@ public class EmaWindowFunctionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testEmaPeriodUsesCachedWindowWhenOrderCannotBeDismissed() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("create table tab (ts #TIMESTAMP, sort_key long, val double) timestamp(ts)", timestampType.getTypeName());
+
+            assertPlanNoLeakCheck(
+                    "select ts, sort_key, val, avg(val, 'period', 3) over (order by sort_key) from tab",
+                    """
+                            CachedWindow
+                              orderedFunctions: [[sort_key] => [avg(val, 'period', 3.0) over (rows between unbounded preceding and current row)]]
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: tab
+                            """
+            );
+        });
+    }
+
+    @Test
+    public void testEmaPeriodCachedWindowSingleFunction() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("create table tab (ts #TIMESTAMP, sort_key long, val double) timestamp(ts)", timestampType.getTypeName());
+            execute("insert into tab values (1::timestamp, 2, 10.0)");
+            execute("insert into tab values (2::timestamp, 1, 20.0)");
+            execute("insert into tab values (3::timestamp, 3, 30.0)");
+
+            assertQueryNoLeakCheck(
+                    replaceTimestampSuffix("""
+                            ts\tsort_key\tval\tavg
+                            1970-01-01T00:00:00.000001Z\t2\t10.0\t15.0
+                            1970-01-01T00:00:00.000002Z\t1\t20.0\t20.0
+                            1970-01-01T00:00:00.000003Z\t3\t30.0\t22.5
+                            """),
+                    "select ts, sort_key, val, avg(val, 'period', 3) over (order by sort_key) from tab",
+                    "ts",
+                    true,
+                    true
+            );
+        });
+    }
+
+    @Test
+    public void testEmaPeriodCachedWindowPartitioned() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("create table tab (ts #TIMESTAMP, sort_key long, i long, val double) timestamp(ts)", timestampType.getTypeName());
+            execute("insert into tab values (1::timestamp, 1, 0, 10.0)");
+            execute("insert into tab values (2::timestamp, 1, 1, 100.0)");
+            execute("insert into tab values (3::timestamp, 2, 0, 20.0)");
+            execute("insert into tab values (4::timestamp, 2, 1, 200.0)");
+
+            assertQueryNoLeakCheck(
+                    replaceTimestampSuffix("""
+                            ts\tsort_key\ti\tval\tavg
+                            1970-01-01T00:00:00.000001Z\t1\t0\t10.0\t10.0
+                            1970-01-01T00:00:00.000002Z\t1\t1\t100.0\t100.0
+                            1970-01-01T00:00:00.000003Z\t2\t0\t20.0\t15.0
+                            1970-01-01T00:00:00.000004Z\t2\t1\t200.0\t150.0
+                            """),
+                    "select ts, sort_key, i, val, avg(val, 'period', 3) over (partition by i order by sort_key) from tab",
+                    "ts",
+                    true,
+                    true
+            );
+        });
+    }
+
+    @Test
+    public void testEmaPeriodCachedWindowPartitionedReorderedReplay() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("create table tab (ts #TIMESTAMP, sort_key long, i long, val double) timestamp(ts)", timestampType.getTypeName());
+            execute("insert into tab values (1::timestamp, 2, 0, 10.0)");
+            execute("insert into tab values (2::timestamp, 2, 1, 100.0)");
+            execute("insert into tab values (3::timestamp, 1, 0, 20.0)");
+            execute("insert into tab values (4::timestamp, 3, 1, 300.0)");
+            execute("insert into tab values (5::timestamp, 3, 0, 30.0)");
+            execute("insert into tab values (6::timestamp, 1, 1, 200.0)");
+
+            assertQueryNoLeakCheck(
+                    replaceTimestampSuffix("""
+                            ts\tsort_key\ti\tval\tavg
+                            1970-01-01T00:00:00.000001Z\t2\t0\t10.0\t15.0
+                            1970-01-01T00:00:00.000002Z\t2\t1\t100.0\t150.0
+                            1970-01-01T00:00:00.000003Z\t1\t0\t20.0\t20.0
+                            1970-01-01T00:00:00.000004Z\t3\t1\t300.0\t225.0
+                            1970-01-01T00:00:00.000005Z\t3\t0\t30.0\t22.5
+                            1970-01-01T00:00:00.000006Z\t1\t1\t200.0\t200.0
+                            """),
+                    "select ts, sort_key, i, val, avg(val, 'period', 3) over (partition by i order by sort_key) from tab",
+                    "ts",
+                    true,
+                    true
+            );
+        });
+    }
+
+    @Test
+    public void testEmaTimeWeightedCachedWindowSingleFunction() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("create table tab (ts #TIMESTAMP, sort_key long, val double) timestamp(ts)", timestampType.getTypeName());
+            execute("insert into tab values ('1970-01-01T00:00:01.000000Z'::timestamp, 1, 10.0)");
+            execute("insert into tab values ('1970-01-01T00:00:02.000000Z'::timestamp, 2, 20.0)");
+            execute("insert into tab values ('1970-01-01T00:00:03.000000Z'::timestamp, 3, 30.0)");
+
+            assertQueryNoLeakCheck(
+                    replaceTimestampSuffix("""
+                            ts\tsort_key\tval\tavg
+                            1970-01-01T00:00:01.000000Z\t1\t10.0\t10.0
+                            1970-01-01T00:00:02.000000Z\t2\t20.0\t16.321205588285576
+                            1970-01-01T00:00:03.000000Z\t3\t30.0\t24.967852755919452
+                            """),
+                    "select ts, sort_key, val, avg(val, 'second', 1) over (order by sort_key) from tab",
+                    "ts",
+                    true,
+                    true
+            );
+        });
+    }
+
+    @Test
+    public void testEmaTimeWeightedCachedWindowPartitioned() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("create table tab (ts #TIMESTAMP, sort_key long, i long, val double) timestamp(ts)", timestampType.getTypeName());
+            execute("insert into tab values ('1970-01-01T00:00:01.000000Z'::timestamp, 1, 0, 10.0)");
+            execute("insert into tab values ('1970-01-01T00:00:02.000000Z'::timestamp, 1, 1, 100.0)");
+            execute("insert into tab values ('1970-01-01T00:00:03.000000Z'::timestamp, 2, 0, 20.0)");
+            execute("insert into tab values ('1970-01-01T00:00:04.000000Z'::timestamp, 2, 1, 200.0)");
+
+            assertQueryNoLeakCheck(
+                    replaceTimestampSuffix("""
+                            ts\tsort_key\ti\tval\tavg
+                            1970-01-01T00:00:01.000000Z\t1\t0\t10.0\t10.0
+                            1970-01-01T00:00:02.000000Z\t1\t1\t100.0\t100.0
+                            1970-01-01T00:00:03.000000Z\t2\t0\t20.0\t18.646647167633873
+                            1970-01-01T00:00:04.000000Z\t2\t1\t200.0\t186.46647167633873
+                            """),
+                    "select ts, sort_key, i, val, avg(val, 'second', 1) over (partition by i order by sort_key) from tab",
+                    "ts",
+                    true,
+                    true
+            );
+        });
+    }
+
+    @Test
+    public void testEmaPeriodRegression7006() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp(
+                    "create table fx_trades_ohlc_1m (" +
+                            "timestamp #TIMESTAMP, " +
+                            "symbol symbol, " +
+                            "open double, " +
+                            "high double, " +
+                            "low double, " +
+                            "close double, " +
+                            "total_volume double" +
+                            ") timestamp(timestamp)",
+                    timestampType.getTypeName()
+            );
+            execute(
+                    "insert into fx_trades_ohlc_1m values " +
+                            "('2026-04-22T00:01:00.000000Z'::timestamp, 'EURUSD', 1.1000, 1.1000, 1.1000, 1.1000, 10.0), " +
+                            "('2026-04-22T00:16:00.000000Z'::timestamp, 'EURUSD', 1.1010, 1.1010, 1.1010, 1.1010, 11.0), " +
+                            "('2026-04-22T00:31:00.000000Z'::timestamp, 'EURUSD', 1.1030, 1.1030, 1.1030, 1.1030, 12.0), " +
+                            "('2026-04-22T00:46:00.000000Z'::timestamp, 'EURUSD', 1.1020, 1.1020, 1.1020, 1.1020, 13.0), " +
+                            "('2026-04-22T01:01:00.000000Z'::timestamp, 'EURUSD', 1.1050, 1.1050, 1.1050, 1.1050, 14.0)"
+            );
+
+            // Regression for https://github.com/questdb/questdb/issues/7006.
+            // The issue shape is two avg(..., 'period', 14) window calls sharing
+            // the same named window in a CTE after SAMPLE BY and lag().
+            assertSql(
+                    "avg_gain_count\tavg_loss_count\n5\t5\n",
+                    "WITH ohlc AS (\n" +
+                            "  SELECT\n" +
+                            "    timestamp,\n" +
+                            "    first(open) AS open,\n" +
+                            "    max(high) AS high,\n" +
+                            "    min(low) AS low,\n" +
+                            "    last(close) AS close,\n" +
+                            "    sum(total_volume) AS total_volume\n" +
+                            "  FROM fx_trades_ohlc_1m\n" +
+                            "  WHERE symbol = 'EURUSD'\n" +
+                            "    AND timestamp > '2026-04-22T00:00:00.000000Z'::timestamp\n" +
+                            "  SAMPLE BY 15m\n" +
+                            "), changes AS (\n" +
+                            "  SELECT\n" +
+                            "    timestamp,\n" +
+                            "    close,\n" +
+                            "    close - lag(close) OVER (ORDER BY timestamp) AS change\n" +
+                            "  FROM ohlc\n" +
+                            "), gains_losses AS (\n" +
+                            "  SELECT\n" +
+                            "    timestamp,\n" +
+                            "    close,\n" +
+                            "    CASE WHEN change > 0 THEN change ELSE 0 END AS gain,\n" +
+                            "    CASE WHEN change < 0 THEN -change ELSE 0 END AS loss\n" +
+                            "  FROM changes\n" +
+                            "), smoothed AS (\n" +
+                            "  SELECT\n" +
+                            "    timestamp,\n" +
+                            "    close,\n" +
+                            "    avg(gain, 'period', 14) OVER w AS avg_gain,\n" +
+                            "    avg(loss, 'period', 14) OVER w AS avg_loss\n" +
+                            "  FROM gains_losses\n" +
+                            "  WINDOW w AS (ORDER BY timestamp)\n" +
+                            ")\n" +
+                            "SELECT count(avg_gain) AS avg_gain_count, count(avg_loss) AS avg_loss_count\n" +
+                            "FROM smoothed"
+            );
+        });
+    }
+
+    @Test
     public void testEmaResetBetweenQueries() throws Exception {
         // Test that EMA state resets properly between queries
         assertMemoryLeak(() -> {

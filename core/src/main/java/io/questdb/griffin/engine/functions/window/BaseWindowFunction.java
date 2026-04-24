@@ -34,7 +34,6 @@ import io.questdb.std.Misc;
 
 public abstract class BaseWindowFunction implements WindowFunction {
     protected final Function arg;
-    protected int columnIndex;
 
     public BaseWindowFunction(Function arg) {
         this.arg = arg;
@@ -64,11 +63,6 @@ public abstract class BaseWindowFunction implements WindowFunction {
 
     @Override
     public void reset() {
-    }
-
-    @Override
-    public void setColumnIndex(int columnIndex) {
-        this.columnIndex = columnIndex;
     }
 
     @Override

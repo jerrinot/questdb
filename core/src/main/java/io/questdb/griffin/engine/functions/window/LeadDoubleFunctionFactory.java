@@ -36,6 +36,7 @@ import io.questdb.cairo.sql.WindowSPI;
 import io.questdb.cairo.vm.api.MemoryARW;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.window.WindowFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
@@ -81,7 +82,7 @@ public class LeadDoubleFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        protected boolean doPass1(Record record, long recordOffset, WindowSPI spi) {
+        protected boolean doPass1(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             double leadValue;
             if (count < offset) {
                 leadValue = defaultValue == null ? Double.NaN : defaultValue.getDouble(record);
@@ -93,7 +94,7 @@ public class LeadDoubleFunctionFactory extends AbstractWindowFunctionFactory {
             if (respectNull) {
                 buffer.putDouble((long) loIdx * Double.BYTES, d);
             }
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), leadValue);
+            context.getResultColumn().putDouble(recordOffset, leadValue);
             return respectNull;
         }
     }
@@ -117,7 +118,8 @@ public class LeadDoubleFunctionFactory extends AbstractWindowFunctionFactory {
                                   long firstIdx,
                                   Record record,
                                   long recordOffset,
-                                  WindowSPI spi) {
+                                  WindowSPI spi,
+                                  WindowFunction.CachedFunctionContext context) {
             double d = arg.getDouble(record);
             double leadValue;
             if (count < offset) {
@@ -129,7 +131,7 @@ public class LeadDoubleFunctionFactory extends AbstractWindowFunctionFactory {
             if (respectNulls) {
                 memory.putDouble(startOffset + firstIdx * Double.BYTES, d);
             }
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), leadValue);
+            context.getResultColumn().putDouble(recordOffset, leadValue);
             return respectNulls;
         }
     }

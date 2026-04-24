@@ -116,7 +116,6 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         private final CairoConfiguration configuration;
         private final boolean dense;
         private final String name;
-        private int columnIndex;
         private long count = 1;
         private long lastRecordOffset;
         private long rank;
@@ -166,8 +165,8 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -208,7 +207,7 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             if (count == 1) {
                 rank = 1;
             } else {
@@ -219,7 +218,7 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
             }
             lastRecordOffset = recordOffset;
             count++;
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), rank);
+            context.getResultColumn().putLong(recordOffset, rank);
         }
 
         @Override
@@ -240,11 +239,6 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
-        }
-
-        @Override
         public void toPlan(PlanSink sink) {
             sink.val(getName());
             sink.val("() over ()");
@@ -262,7 +256,6 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         private static final long RANK_CONST = 1;
         private final String name;
         private final VirtualRecord partitionByRecord;
-        private int columnIndex;
 
         public RankNoOrderFunction(VirtualRecord partitionByRecord, String name) {
             this.partitionByRecord = partitionByRecord;
@@ -288,8 +281,8 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -301,8 +294,8 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), RANK_CONST);
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putLong(recordOffset, RANK_CONST);
         }
 
         @Override
@@ -311,11 +304,6 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
 
         @Override
         public void reset() {
-        }
-
-        @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
         }
 
         @Override
@@ -334,7 +322,6 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         private final VirtualRecord partitionByRecord;
         private final RecordSink partitionBySink;
         private int chainTypeIndex;
-        private int columnIndex;
         private Map map;
         private long rank;
         private ObjList<DirectIntList> rankMaps;
@@ -397,8 +384,8 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -449,7 +436,7 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -471,7 +458,7 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
             mapValue.putLong(0, recordOffset);
             mapValue.putLong(1, rank);
             mapValue.putLong(2, count + 1);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), rank);
+            context.getResultColumn().putLong(recordOffset, rank);
         }
 
         @Override
@@ -487,11 +474,6 @@ public class RankFunctionFactory extends AbstractWindowFunctionFactory {
             Misc.free(map);
             Misc.freeObjListAndKeepObjects(rankMaps);
             rank = 0;
-        }
-
-        @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
         }
 
         @Override

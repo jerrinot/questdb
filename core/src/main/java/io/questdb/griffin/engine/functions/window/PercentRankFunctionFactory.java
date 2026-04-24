@@ -117,7 +117,6 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
     // percent_rank() over (order by xxx) - no partition by
     static class PercentRankFunction extends DoubleFunction implements Function, WindowFunction, Reopenable {
 
-        private int columnIndex;
         private long count = 1;
         private long lastRecordOffset;
         private ObjList<ExpressionNode> orderBy;
@@ -141,8 +140,21 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
+        }
+
+        @Override
+        public int getScratchColumnCount() {
+            return 1;
+        }
+
+        @Override
+        public int getScratchColumnType(int index) {
+            if (index == 0) {
+                return ColumnType.LONG;
+            }
+            throw new IndexOutOfBoundsException("scratch column index out of range: " + index);
         }
 
         @Override
@@ -165,7 +177,7 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             if (count == 1) {
                 rank = 1;
             } else {
@@ -175,15 +187,13 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
                 }
             }
             lastRecordOffset = recordOffset;
-            // Store rank temporarily in the output column (as long)
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), rank);
+            context.getScratchColumn(0).putLong(recordOffset, rank);
             count++;
         }
 
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
-            // Read rank stored in pass1
-            long storedRank = Unsafe.getLong(spi.getAddress(recordOffset, columnIndex));
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            long storedRank = context.getScratchColumn(0).getLong(recordOffset);
             // Calculate percent_rank = (rank - 1) / (total_rows - 1)
             double percentRank;
             if (totalRows <= 1) {
@@ -191,11 +201,11 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
             } else {
                 percentRank = (double) (storedRank - 1) / (double) (totalRows - 1);
             }
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), percentRank);
+            context.getResultColumn().putDouble(recordOffset, percentRank);
         }
 
         @Override
-        public void preparePass2() {
+        public void prepareSecondaryCachedPass(WindowFunction.CachedFunctionContext context) {
             totalRows = count - 1; // count was incremented after each row
         }
 
@@ -209,11 +219,6 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
             count = 1;
             totalRows = 0;
             Misc.freeObjListAndKeepObjects(rankMaps);
-        }
-
-        @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
         }
 
         @Override
@@ -239,7 +244,6 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
 
         private static final double PERCENT_RANK_CONST = 0.0;
         private final VirtualRecord partitionByRecord;
-        private int columnIndex;
 
         public PercentRankNoOrderFunction(VirtualRecord partitionByRecord) {
             this.partitionByRecord = partitionByRecord;
@@ -264,8 +268,8 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         @Override
@@ -277,8 +281,8 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), PERCENT_RANK_CONST);
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putDouble(recordOffset, PERCENT_RANK_CONST);
         }
 
         @Override
@@ -287,11 +291,6 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
 
         @Override
         public void reset() {
-        }
-
-        @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
         }
 
         @Override
@@ -320,7 +319,6 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
         private final ColumnTypes keyColumnTypes;
         private final VirtualRecord partitionByRecord;
         private final RecordSink partitionBySink;
-        private int columnIndex;
         private Map map;
         private ObjList<ExpressionNode> orderBy;
         private ObjList<DirectIntList> rankMaps;
@@ -352,8 +350,21 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
+        }
+
+        @Override
+        public int getScratchColumnCount() {
+            return 1;
+        }
+
+        @Override
+        public int getScratchColumnType(int index) {
+            if (index == 0) {
+                return ColumnType.LONG;
+            }
+            throw new IndexOutOfBoundsException("scratch column index out of range: " + index);
         }
 
         @Override
@@ -382,7 +393,7 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -405,19 +416,17 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
             mapValue.putLong(0, recordOffset);
             mapValue.putLong(1, rank);
             mapValue.putLong(2, count + 1);
-            // Store rank temporarily in the output column (as long)
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), rank);
+            context.getScratchColumn(0).putLong(recordOffset, rank);
         }
 
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
             MapValue mapValue = key.findValue();
 
-            // Read rank stored in pass1
-            long storedRank = Unsafe.getLong(spi.getAddress(recordOffset, columnIndex));
+            long storedRank = context.getScratchColumn(0).getLong(recordOffset);
 
             // Get total rows for this partition (count was incremented after each row, so it's total + 1)
             long totalRows = mapValue.getLong(2) - 1;
@@ -429,11 +438,11 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
             } else {
                 percentRank = (double) (storedRank - 1) / (double) (totalRows - 1);
             }
-            Unsafe.putDouble(spi.getAddress(recordOffset, columnIndex), percentRank);
+            context.getResultColumn().putDouble(recordOffset, percentRank);
         }
 
         @Override
-        public void preparePass2() {
+        public void prepareSecondaryCachedPass(WindowFunction.CachedFunctionContext context) {
             // Nothing to prepare - each partition's total is in the map
         }
 
@@ -448,11 +457,6 @@ public class PercentRankFunctionFactory extends AbstractWindowFunctionFactory {
         public void reset() {
             Misc.free(map);
             Misc.freeObjListAndKeepObjects(rankMaps);
-        }
-
-        @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
         }
 
         @Override

@@ -431,11 +431,11 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         /**
          * Returns the number of processing passes required by this window function.
          *
-         * @return ZERO_PASS indicating the function produces results without additional passes
+         * @return streamable primary cached traversal indicating the function produces results without additional passes
          */
         @Override
-        public int getPassCount() {
-            return ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -465,9 +465,9 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
          * @param recordOffset the row-address/offset where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), value);
+            context.getResultColumn().putLong(recordOffset, value);
         }
     }
 
@@ -509,13 +509,13 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         /**
-         * Indicates this window function requires two processing passes.
+         * Indicates this window function requires a secondary cached pass.
          *
-         * @return {@link WindowFunction#TWO_PASS} signifying the function performs work in two passes
+         * @return true because this implementation requires a secondary cached pass.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         @Override
@@ -535,7 +535,7 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
          * @param recordOffset unused here (present for API compatibility)
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             long l = arg.getTimestamp(record);
             if (l != Numbers.LONG_NULL) {
                 partitionByRecord.of(record);
@@ -564,7 +564,7 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
          * @param recordOffset offset passed to WindowSPI to obtain the output address where the timestamp is written
          */
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             partitionByRecord.of(record);
             MapKey key = map.withKey();
             key.put(partitionByRecord, partitionBySink);
@@ -572,7 +572,7 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
 
             long val = value != null ? value.getTimestamp(0) : Numbers.LONG_NULL;
 
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), val);
+            context.getResultColumn().putLong(recordOffset, val);
         }
     }
 
@@ -884,13 +884,13 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         /**
-         * Returns the number of passes required by this window function.
+         * Indicates whether this window function requires a secondary cached pass.
          *
-         * @return {@code WindowFunction.ZERO_PASS} indicating the function produces results without multi-pass aggregation.
+         * @return {@code streamable primary cached traversal} indicating the function produces results without multi-pass aggregation.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -913,9 +913,9 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -1206,13 +1206,13 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         /**
-         * Returns the number of passes required by this window function.
+         * Indicates whether this window function requires a secondary cached pass.
          *
-         * @return {@code WindowFunction.ZERO_PASS} indicating the function produces results without multi-pass aggregation.
+         * @return {@code streamable primary cached traversal} indicating the function produces results without multi-pass aggregation.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -1244,9 +1244,9 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
          * @param recordOffset byte offset identifying the output row frame where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -1585,13 +1585,13 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         /**
-         * Returns the number of passes required by this window function.
+         * Indicates whether this window function requires a secondary cached pass.
          *
-         * @return {@code WindowFunction.ZERO_PASS} indicating the function produces results without multi-pass aggregation.
+         * @return {@code streamable primary cached traversal} indicating the function produces results without multi-pass aggregation.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -1614,9 +1614,9 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -1886,13 +1886,13 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         /**
-         * Returns the number of passes required by this window function.
+         * Indicates whether this window function requires a secondary cached pass.
          *
-         * @return {@code WindowFunction.ZERO_PASS} indicating the function produces results without multi-pass aggregation.
+         * @return {@code streamable primary cached traversal} indicating the function produces results without multi-pass aggregation.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -1924,9 +1924,9 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
          * @param recordOffset byte offset identifying the output row frame where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -2105,13 +2105,13 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         /**
-         * Returns the number of passes required by this window function.
+         * Indicates whether this window function requires a secondary cached pass.
          *
-         * @return {@code WindowFunction.ZERO_PASS} indicating the function produces results without multi-pass aggregation.
+         * @return {@code streamable primary cached traversal} indicating the function produces results without multi-pass aggregation.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -2143,9 +2143,9 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
          * @param recordOffset byte offset identifying the output row frame where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -2218,13 +2218,13 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         /**
-         * Returns the number of passes required by this window function.
+         * Indicates whether this window function requires a secondary cached pass.
          *
-         * @return {@code WindowFunction.ZERO_PASS} indicating the function produces results without multi-pass aggregation.
+         * @return {@code streamable primary cached traversal} indicating the function produces results without multi-pass aggregation.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.ZERO_PASS;
+        public boolean isPrimaryCachedTraversalStreamable() {
+            return true;
         }
 
         /**
@@ -2256,9 +2256,9 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
          * @param recordOffset byte offset identifying the output row frame where the result should be written
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             computeNext(record);
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
@@ -2328,13 +2328,13 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
         }
 
         /**
-         * Indicates this window function requires two processing passes.
+         * Indicates this window function requires a secondary cached pass.
          *
-         * @return {@link WindowFunction#TWO_PASS} signifying the function performs work in two passes
+         * @return true because this implementation requires a secondary cached pass.
          */
         @Override
-        public int getPassCount() {
-            return WindowFunction.TWO_PASS;
+        public boolean needsSecondaryCachedPass() {
+            return true;
         }
 
         @Override
@@ -2351,7 +2351,7 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
          * @param recordOffset offset associated with the record (not used by this implementation)
          */
         @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+        public void processPrimaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
             long l = arg.getTimestamp(record);
             if (l != Numbers.LONG_NULL && (maxMin == Numbers.LONG_NULL || comparator.compare(l, maxMin))) {
                 maxMin = l;
@@ -2365,8 +2365,8 @@ public class MaxTimestampWindowFunctionFactory extends AbstractWindowFunctionFac
          * @param recordOffset row identifier used by WindowSPI to locate the output slot
          */
         @Override
-        public void pass2(Record record, long recordOffset, WindowSPI spi) {
-            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), maxMin);
+        public void processSecondaryCachedRow(Record record, long recordOffset, WindowSPI spi, WindowFunction.CachedFunctionContext context) {
+            context.getResultColumn().putLong(recordOffset, maxMin);
         }
 
         /**
