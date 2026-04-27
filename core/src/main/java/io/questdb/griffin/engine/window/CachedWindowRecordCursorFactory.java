@@ -320,7 +320,7 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
                     );
                 }
             }
-            contexts.add(new LegacyCachedFunctionContext(resultColumn, scratchColumns));
+            contexts.add(new WindowFunction.CachedFunctionContext(resultColumn, scratchColumns));
         }
         return contexts;
     }
@@ -603,29 +603,6 @@ public class CachedWindowRecordCursorFactory extends AbstractRecordCursorFactory
             for (int i = 0; i < orderedGroupCount; i++) {
                 orderedSources.getQuick(i).reopen();
             }
-        }
-    }
-
-    private static final class LegacyCachedFunctionContext implements WindowFunction.CachedFunctionContext {
-        private final WindowSPI.FixedSizeColumn resultColumn;
-        private final ObjList<WindowSPI.FixedSizeColumn> scratchColumns;
-
-        private LegacyCachedFunctionContext(WindowSPI.FixedSizeColumn resultColumn, @Nullable ObjList<WindowSPI.FixedSizeColumn> scratchColumns) {
-            this.resultColumn = resultColumn;
-            this.scratchColumns = scratchColumns;
-        }
-
-        @Override
-        public WindowSPI.FixedSizeColumn getResultColumn() {
-            return resultColumn;
-        }
-
-        @Override
-        public WindowSPI.FixedSizeColumn getScratchColumn(int index) {
-            if (scratchColumns == null) {
-                throw new IndexOutOfBoundsException("scratch column is not bound");
-            }
-            return scratchColumns.getQuick(index);
         }
     }
 }

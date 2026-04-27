@@ -137,18 +137,33 @@ public interface WindowFunction extends Function {
      * The context is created by the cached executor after it finalizes the record-chain layout. Result and scratch
      * columns refer to fixed-width storage owned by that executor.
      */
-    interface CachedFunctionContext {
+    final class CachedFunctionContext {
+        private final WindowSPI.FixedSizeColumn resultColumn;
+        private final ObjList<WindowSPI.FixedSizeColumn> scratchColumns;
+
+        public CachedFunctionContext(WindowSPI.FixedSizeColumn resultColumn, ObjList<WindowSPI.FixedSizeColumn> scratchColumns) {
+            this.resultColumn = resultColumn;
+            this.scratchColumns = scratchColumns;
+        }
+
         /**
          * Returns the bound output column for this function.
          */
-        WindowSPI.FixedSizeColumn getResultColumn();
+        public WindowSPI.FixedSizeColumn getResultColumn() {
+            return resultColumn;
+        }
 
         /**
          * Returns the bound scratch column declared by {@link #getScratchColumnType(int)}.
          *
          * @param index scratch column index in the range {@code [0, getScratchColumnCount())}
          */
-        WindowSPI.FixedSizeColumn getScratchColumn(int index);
+        public WindowSPI.FixedSizeColumn getScratchColumn(int index) {
+            if (scratchColumns == null) {
+                throw new IndexOutOfBoundsException("scratch column is not bound");
+            }
+            return scratchColumns.getQuick(index);
+        }
     }
 
     enum PrimaryCachedTraversalDirection {
