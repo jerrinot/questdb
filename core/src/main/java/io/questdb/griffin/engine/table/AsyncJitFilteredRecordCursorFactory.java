@@ -226,6 +226,8 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
         return compiledFilter;
     }
 
+    public CompiledCountOnlyFilter getCompiledCountOnlyFilter() { return compiledCountOnlyFilter; }
+
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
         // Consult the breaker at open, so a scan over an empty table still observes cancellation.
@@ -337,6 +339,7 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("Async JIT Filter");
+        if (compiledFilter.getBackendName() != null) sink.meta("compiledFilter").val(compiledFilter.getBackendName());
         sink.meta("workers").val(sharedQueryWorkerCount);
         // calc order and limit if possible
         long rowsRemaining;

@@ -166,7 +166,7 @@ public class EqDoubleFunctionFactory implements FunctionFactory {
         }
     }
 
-    protected static class FuncIntIsNaN extends AbstractIsNaNFunction {
+    public static class FuncIntIsNaN extends AbstractIsNaNFunction {
         public FuncIntIsNaN(Function arg) {
             super(arg);
         }
@@ -177,7 +177,7 @@ public class EqDoubleFunctionFactory implements FunctionFactory {
         }
     }
 
-    protected static class FuncLongIsNaN extends AbstractIsNaNFunction {
+    public static class FuncLongIsNaN extends AbstractIsNaNFunction {
         public FuncLongIsNaN(Function arg) {
             super(arg);
         }

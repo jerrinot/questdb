@@ -46,6 +46,7 @@ import io.questdb.griffin.HashJoinGroupByMetadata;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.GroupByRecordCursorFactory;
 import io.questdb.griffin.engine.join.FrozenHashJoinBuild;
@@ -125,6 +126,26 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
             int logicalJoinType,
             boolean isInputSwapped
     ) {
+        this(engine, probeFactory, buildFactory, buildFilterContext, buildOnFilter, workerBuildOnFilters,
+                metadata, functions, filterContext, isOuter, workerCount, logicalJoinType, isInputSwapped, null);
+    }
+
+    public AsyncHashJoinGroupByRecordCursorFactory(
+            CairoEngine engine,
+            RecordCursorFactory probeFactory,
+            RecordCursorFactory buildFactory,
+            AsyncFilterContext buildFilterContext,
+            @Nullable Function buildOnFilter,
+            @Nullable ObjList<Function> workerBuildOnFilters,
+            HashJoinGroupByMetadata metadata,
+            HashJoinGroupByFunctions functions,
+            AsyncFilterContext filterContext,
+            boolean isOuter,
+            int workerCount,
+            int logicalJoinType,
+            boolean isInputSwapped,
+            @Nullable QueryCodeGenerator compiler
+    ) {
         super(functions.getOutputMetadata());
         this.probeFactory = probeFactory;
         this.buildFactory = buildFactory;
@@ -155,6 +176,7 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
             frameSequence = new UnorderedPageFrameSequence<>(engine, engine.getConfiguration(),
                     engine.getMessageBus(), atom, reducer, workerCount);
             atom.bindFrameSequence(frameSequence);
+            atom.compileJoin(compiler, metadata);
             cursor = new AsyncHashJoinGroupByRecordCursor(engine, frameSequence, functions);
         } catch (Throwable th) {
             Misc.free(this, th);
@@ -166,6 +188,10 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
     @TestOnly
     public AsyncHashJoinGroupByAtom getAtom() {
         return frameSequence.getAtom();
+    }
+
+    public boolean hasCompiledJoinPipeline() {
+        return frameSequence.getAtom().getCompiledJoinName() != null;
     }
 
     @Override
@@ -225,6 +251,7 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
             sink.attr("symbolKeyJoin").val(true);
         }
         sink.attr("buildStrategy").val("shared");
+        sink.optAttr("compiledJoinPipeline", frameSequence.getAtom().getCompiledJoinName());
         // The copy is chosen per execution, from the build's and the probe's row counts, so the plan
         // names the rule rather than the outcome.
         if (frameSequence.getAtom().isPayloadCopyable()) {
@@ -305,6 +332,9 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
                 final Map map = fragment == null ? null
                         : fragment.isNotSharded() ? fragment.reopenMap() : fragment.getShards().getQuick(0);
                 final long rowCount = sequence.getFrameRowCount(frameIndex);
+                if (atom.aggregateCompiled(slot, slotId, fragment, map, probeRecord, rowCount, 0, breaker)) {
+                    return;
+                }
                 // One loop method per probe implementation, so that a hot call site sees one
                 // receiver class. The branch below runs once per page frame, not per row.
                 if (atom.isCountedByKey()) {
@@ -1975,6 +2005,9 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
                 }
                 final Map map = fragment == null ? null
                         : fragment.isNotSharded() ? fragment.reopenMap() : fragment.getShards().getQuick(0);
+                if (atom.aggregateCompiled(slot, slotId, fragment, map, probeRecord, rows.size(), rows.getAddress(), breaker)) {
+                    return;
+                }
                 // One loop method per probe implementation, so that a hot call site sees one
                 // receiver class. The branch below runs once per page frame, not per row.
                 if (atom.isCountedByKey()) {

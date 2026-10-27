@@ -128,6 +128,12 @@ class LongTopKRecordCursor implements RecordCursor {
     }
 
     @Override
+    public boolean selectRows(io.questdb.std.DirectLongList rows, long skip, long take) {
+        setupTopK();
+        return baseCursor.selectSortedRows(sortedList, rows, skip, take);
+    }
+
+    @Override
     public long size() {
         return initialized ? sortedList.size() : -1;
     }

@@ -41,6 +41,16 @@ public interface DirectLongLongSortedList extends QuietCloseable, Mutable, Reope
 
     void add(long index, long value);
 
+    /** Exclusive borrow of capacity pairs (value, row ID); invalid after close/reopen. */
+    default long getNativeAddress() {
+        return 0;
+    }
+
+    /** Publish after native mutation, before a cursor or another add accesses this list. */
+    default void publishNativeSize(int size) {
+        throw new UnsupportedOperationException();
+    }
+
     int getCapacity();
 
     Cursor getCursor();

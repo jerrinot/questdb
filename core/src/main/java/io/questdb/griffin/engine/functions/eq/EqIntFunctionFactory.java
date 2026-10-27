@@ -48,7 +48,7 @@ public class EqIntFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0), args.getQuick(1));
     }
 
-    private static class Func extends AbstractEqBinaryFunction {
+    public static class Func extends AbstractEqBinaryFunction {
         public Func(Function left, Function right) {
             super(left, right);
         }

@@ -188,6 +188,16 @@ public class DirectLongHashSet implements Closeable, Mutable, Reopenable, Sinkab
         return size + (hasZero ? 1 : 0);
     }
 
+    /** Snapshot primitive keys for planning; no address or mutable set state escapes. */
+    public void copyKeys(LongList destination) {
+        destination.clear();
+        if (hasZero) destination.add(0);
+        for (long address = memStart; address < memLimit; address += Long.BYTES) {
+            long key = Unsafe.getLong(address);
+            if (key != 0) destination.add(key);
+        }
+    }
+
     @Override
     public void toSink(@NotNull CharSink<?> sink) {
         int totalSize = size();

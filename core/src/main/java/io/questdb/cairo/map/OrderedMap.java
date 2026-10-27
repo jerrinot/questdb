@@ -129,6 +129,7 @@ public class OrderedMap implements Map, Reopenable {
     // valueTypes argument is @Transient and must not outlive the call.
     private final long[] valueOffsets;
     private final long valueSize;
+    private ProbeView nativeKeyStaging;
     private long batchEmptyValueStart;
     private int free;
     // The map owns the heap range [heapAddr, heapLimit) and derives the heap size from that pair
@@ -349,6 +350,10 @@ public class OrderedMap implements Map, Reopenable {
 
     @Override
     public void close() {
+        if (nativeKeyStaging != null) {
+            nativeKeyStaging.close();
+            nativeKeyStaging = null;
+        }
         if (heapAddr != 0) {
             offsetsAddr = Unsafe.free(offsetsAddr, (long) keyCapacity << 3, listMemoryTag, memoryTracker);
             keyCapacity = 0;
@@ -603,6 +608,77 @@ public class OrderedMap implements Map, Reopenable {
         final Key rawKey = key.init();
         rawKey.copyFromRawKey(address, size);
         return rawKey;
+    }
+
+    @Override
+    public void writeNativeProbeView(long address) {
+        Unsafe.putLong(address + NativeMapView.ENTRIES, heapAddr);
+        Unsafe.putLong(address + NativeMapView.OFFSETS, offsetsAddr);
+        Unsafe.putLong(address + NativeMapView.MASK, mask);
+        Unsafe.putLong(address + NativeMapView.STRIDE, 0);
+        Unsafe.putLong(address + NativeMapView.Ordered.APPEND, 0);
+        Unsafe.putLong(address + NativeMapView.Ordered.LIMIT, 0);
+    }
+
+    public long getFixedKeySize() {
+        return keySize;
+    }
+
+    /** Map-owned staging shares this query's tracker and is released with the map. */
+    public void writeNativeKeyStagingView(long address, long requiredBytes) {
+        if (nativeKeyStaging == null) nativeKeyStaging = new ProbeView();
+        nativeKeyStaging.writeNativeStagingView(this, address, requiredBytes);
+    }
+
+    // Mutation view: heap, offsets, mask, fixed entry stride (or variable value size), append, limit, free, size.
+    @Override
+    public void writeNativeMutationView(long address) {
+        writeNativeProbeView(address);
+        Unsafe.putLong(address + NativeMapView.STRIDE, keySize < 0 ? valueSize : Bytes.align8b(keySize + valueSize));
+        Unsafe.putLong(address + NativeMapView.Ordered.APPEND, kPos);
+        Unsafe.putLong(address + NativeMapView.Ordered.LIMIT, heapLimit);
+        Unsafe.putLong(address + NativeMapView.FREE, free);
+        Unsafe.putLong(address + NativeMapView.SIZE, size);
+    }
+
+    @Override
+    public void publishNativeMutationView(long address) {
+        long append = Unsafe.getLong(address + NativeMapView.Ordered.APPEND);
+        long remaining = Unsafe.getLong(address + NativeMapView.FREE);
+        long count = Unsafe.getLong(address + NativeMapView.SIZE);
+        if (Unsafe.getLong(address + NativeMapView.ENTRIES) != heapAddr || Unsafe.getLong(address + NativeMapView.OFFSETS) != offsetsAddr
+                || append < heapAddr || append > heapLimit || ((append - heapAddr) & 7) != 0
+                || remaining < 1 || remaining > keyCapacity || count < 0 || count > keyCapacity) {
+            throw new IllegalStateException("Invalid OrderedMap mutation view");
+        }
+        kPos = append;
+        free = (int) remaining;
+        size = (int) count;
+        key.startAddr = key.appendAddr = kPos;
+    }
+
+    @Override
+    public void growNative(NativeRehash relocation) {
+        if (keySize < 0) throw new UnsupportedOperationException("Variable key mutation");
+        growNative(Bytes.align8b(keySize + valueSize), relocation);
+    }
+
+    /** Reserve one pending encoded entry; generated execution has not inserted it yet. */
+    public void growNative(long entryBytes, NativeRehash relocation) {
+        if (entryBytes < valueSize + keyOffset || entryBytes > maxHeapSize || (entryBytes & 7) != 0) {
+            throw LimitOverflowException.instance().put("invalid native map entry size: ").put(entryBytes);
+        }
+        if (kPos + entryBytes > heapLimit) resize(entryBytes, kPos);
+        if (free < 2) rehash((long) keyCapacity << 1, relocation);
+    }
+
+    @Override
+    public void reserveNative(long additionalKeys, NativeRehash relocation) {
+        if (keySize < 0) throw new UnsupportedOperationException("Variable key mutation");
+        // Match probeBatch*FixedSize: reserve heap for a full accepted-row batch;
+        // the offset table still grows on insertion, not on worst-case batch size.
+        long bytes = Math.multiplyExact(additionalKeys, Bytes.align8b(keySize + valueSize));
+        if (kPos + bytes > heapLimit) resize(bytes, kPos);
     }
 
     private static int compressOffset(long offset) {
@@ -962,6 +1038,10 @@ public class OrderedMap implements Map, Reopenable {
     }
 
     private void rehash(long newKeyCapacity) {
+        rehash(newKeyCapacity, null);
+    }
+
+    private void rehash(long newKeyCapacity, NativeRehash relocation) {
         if (newKeyCapacity > MAX_SAFE_INT_POW_2) {
             throw CairoException.nonCritical().put("map capacity overflow");
         }
@@ -973,24 +1053,33 @@ public class OrderedMap implements Map, Reopenable {
         Vect.memset(newOffsetsAddr, newKeyCapacity << 3, 0);
         final int newMask = (int) newKeyCapacity - 1;
 
-        for (int i = 0; i < keyCapacity; i++) {
-            // The slot is one 8-byte-aligned unit, so carry it across as a single value: the new
-            // table wants the very bytes the old one holds, and neither half needs re-encoding.
-            // Layout: [rawOffset (4 bytes) | hashCodeLo (4 bytes)]
-            long slotValue = Unsafe.getLong(offsetsAddr + ((long) i << 3));
-            if (isEmptySlot(Numbers.decodeLowInt(slotValue))) {
-                continue;
-            }
-            int index = Numbers.decodeHighInt(slotValue) & newMask;
+        try {
+            if (relocation != null) {
+                relocation.rehash(offsetsAddr, keyCapacity, newOffsetsAddr, newKeyCapacity, Long.BYTES);
+            } else {
+                for (int i = 0; i < keyCapacity; i++) {
+                    // The slot is one 8-byte-aligned unit, so carry it across as a single value: the new
+                    // table wants the very bytes the old one holds, and neither half needs re-encoding.
+                    // Layout: [rawOffset (4 bytes) | hashCodeLo (4 bytes)]
+                    long slotValue = Unsafe.getLong(offsetsAddr + ((long) i << 3));
+                    if (isEmptySlot(Numbers.decodeLowInt(slotValue))) {
+                        continue;
+                    }
+                    int index = Numbers.decodeHighInt(slotValue) & newMask;
 
-            long newOffsetAddr = newOffsetsAddr + ((long) index << 3);
-            // memset zeroed the new table, so emptiness is all the probe needs; it never compares
-            // a hash and so never reads the high half.
-            while (!isEmptySlot(Unsafe.getInt(newOffsetAddr))) {
-                index = (index + 1) & newMask;
-                newOffsetAddr = newOffsetsAddr + ((long) index << 3);
+                    long newOffsetAddr = newOffsetsAddr + ((long) index << 3);
+                    // memset zeroed the new table, so emptiness is all the probe needs; it never compares
+                    // a hash and so never reads the high half.
+                    while (!isEmptySlot(Unsafe.getInt(newOffsetAddr))) {
+                        index = (index + 1) & newMask;
+                        newOffsetAddr = newOffsetsAddr + ((long) index << 3);
+                    }
+                    Unsafe.putLong(newOffsetAddr, slotValue);
+                }
             }
-            Unsafe.putLong(newOffsetAddr, slotValue);
+        } catch (Throwable failure) {
+            Unsafe.free(newOffsetsAddr, newKeyCapacity << 3, listMemoryTag, memoryTracker);
+            throw failure;
         }
         Unsafe.free(offsetsAddr, (long) keyCapacity << 3, listMemoryTag, memoryTracker);
         offsetsAddr = newOffsetsAddr;
@@ -1160,6 +1249,21 @@ public class OrderedMap implements Map, Reopenable {
         @Override
         public long getSizeInBytes() {
             return stagingCapacity;
+        }
+
+        /** Borrow this view's existing tracked buffer for a native prepared-key window.
+         * The caller has exclusive ownership and rebuilds the window after growth.
+         * This method binds only the layout, never snapshots a mutable map's lookup state.
+         */
+        private void writeNativeStagingView(OrderedMap map, long address, long requiredBytes) {
+            if (requiredBytes < 0 || requiredBytes > Integer.MAX_VALUE) {
+                throw LimitOverflowException.instance().put("native key staging size exceeds integer range");
+            }
+            setMemoryTracker(map.memoryTracker);
+            ofLayout(map);
+            ensureStagingCapacity(requiredBytes);
+            Unsafe.putLong(address, stagingAddr);
+            Unsafe.putLong(address + 8, stagingCapacity);
         }
 
         @Override

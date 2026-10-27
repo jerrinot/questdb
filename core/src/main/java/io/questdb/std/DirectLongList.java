@@ -103,6 +103,15 @@ public class DirectLongList implements Mutable, Closeable, Reopenable {
         pos = address;
     }
 
+    /** Starts a fresh output buffer; growth need not copy discarded elements. */
+    public void clearAndEnsureCapacity(long required) {
+        clear();
+        if (getCapacity() < required) {
+            close();
+            setCapacity(required);
+        }
+    }
+
     @Override
     public void close() {
         if (address != 0) {

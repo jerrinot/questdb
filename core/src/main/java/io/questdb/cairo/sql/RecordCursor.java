@@ -62,6 +62,17 @@ import java.io.Closeable;
  */
 public interface RecordCursor extends RecordRandomAccess, Closeable, SymbolTableSource {
 
+    /** Exclusive borrowed output/scratch buffers; false is allowed only before output mutation. */
+    /** Fill stable row IDs in cursor order. False is permitted only before changing the list. */
+    default boolean selectRows(DirectLongList rows, long skip, long take) { return false; }
+
+    /** Select a window from borrowed sorted (value, row ID) pairs; false precedes output mutation. */
+    default boolean selectSortedRows(DirectLongLongSortedList sorted, DirectLongList rows, long skip, long take) { return false; }
+
+    default boolean sortLong(DirectLongList entries, DirectLongList scratch, int columnIndex,
+                             boolean ascending, long maxEntries) { return false; }
+
+
     /**
      * Sentinel for {@link #skipRows(Counter, long)}'s {@code maxRowsAfterSkip}
      * parameter that indicates the caller has no upper bound on subsequent

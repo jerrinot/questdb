@@ -69,7 +69,7 @@ public class SubLongFunctionFactory implements FunctionFactory {
         return new SubLongFunc(left, right);
     }
 
-    private static class SubLongFunc extends LongFunction implements ArithmeticBinaryFunction {
+    public static class SubLongFunc extends LongFunction implements ArithmeticBinaryFunction {
         private final Function left;
         private final Function right;
 

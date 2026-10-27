@@ -86,6 +86,18 @@ public class AsyncGroupBySharedCursor implements RecordCursor {
     }
 
     @Override
+    public boolean selectSortedRows(io.questdb.std.DirectLongLongSortedList sorted, io.questdb.std.DirectLongList rows, long skip, long take) {
+        buildMapConditionally();
+        return primaryCursor.selectSortedRows(sorted, rows, skip, take);
+    }
+
+    @Override
+    public boolean selectRows(io.questdb.std.DirectLongList rows, long skip, long take) {
+        buildMapConditionally();
+        return primaryCursor.selectRows(rows, skip, take);
+    }
+
+    @Override
     public void longTopK(DirectLongLongSortedList list, int columnIndex) {
         buildMapConditionally();
         primaryCursor.longTopK(list, recordFunctions.getQuick(columnIndex), mapCursor);

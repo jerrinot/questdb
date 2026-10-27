@@ -765,6 +765,15 @@ public final class IntHashJoinBuild implements Closeable {
             return size;
         }
 
+        @Override
+        public boolean writeNativePayload(int column, long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            return !heap.hasChainLengths() && heap.hasRowId() && payloads != null
+                    && payloads.writeNativeColumn(column, address);
+        }
+
         void ofHeap(HashJoinPayloadSource payloads, long keysCount) {
             handleBase = heap.nextHandleBase();
             this.keysCount = keysCount;
@@ -779,6 +788,22 @@ public final class IntHashJoinBuild implements Closeable {
     private class Frozen extends AbstractFrozen {
         private long keysAddress;
         private int slots;
+
+        @Override
+        public boolean writeLookup(long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            if (heap.hasChainLengths()) {
+                return false;
+            }
+            Unsafe.putLong(address, keysAddress);
+            Unsafe.putLong(address + 8, slots - 1);
+            Unsafe.putLong(address + 16, 0);
+            Unsafe.putLong(address + 24, 0);
+            Unsafe.putLong(address + 32, rowsAddress);
+            return true;
+        }
 
         @Override
         public FrozenHashJoinBuild.IntProbe newProbe() {
@@ -889,6 +914,22 @@ public final class IntHashJoinBuild implements Closeable {
     private class PartitionedFrozen extends AbstractFrozen {
         private long directoryAddress;
         private int partitionShift;
+
+        @Override
+        public boolean writeLookup(long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            if (heap.hasChainLengths()) {
+                return false;
+            }
+            Unsafe.putLong(address, 0);
+            Unsafe.putLong(address + 8, 0);
+            Unsafe.putLong(address + 16, directoryAddress);
+            Unsafe.putLong(address + 24, partitionShift);
+            Unsafe.putLong(address + 32, rowsAddress);
+            return true;
+        }
 
         @Override
         public FrozenHashJoinBuild.IntProbe newProbe() {

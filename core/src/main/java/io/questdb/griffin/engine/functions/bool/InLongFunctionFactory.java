@@ -211,7 +211,7 @@ public class InLongFunctionFactory implements FunctionFactory {
         return val;
     }
 
-    private static class InLongConstFunction extends NegatableBooleanFunction implements UnaryFunction {
+    public static class InLongConstFunction extends NegatableBooleanFunction implements UnaryFunction {
         private final DirectLongHashSet set;
         private final Function tsFunc;
 
@@ -219,6 +219,10 @@ public class InLongFunctionFactory implements FunctionFactory {
             this.tsFunc = tsFunc;
             this.set = set;
         }
+
+        public int getValueCount() { return set.size(); }
+
+        public void copyValues(LongList values) { set.copyKeys(values); }
 
         @Override
         public void close() {
@@ -297,7 +301,7 @@ public class InLongFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class InLongSingleConstFunction extends NegatableBooleanFunction implements UnaryFunction {
+    public static class InLongSingleConstFunction extends NegatableBooleanFunction implements UnaryFunction {
         private final long inVal;
         private final Function longFunc;
 
@@ -305,6 +309,8 @@ public class InLongFunctionFactory implements FunctionFactory {
             this.longFunc = longFunc;
             this.inVal = inVal;
         }
+
+        public long getValue() { return inVal; }
 
         @Override
         public Function getArg() {
@@ -326,7 +332,7 @@ public class InLongFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class InLongTwoConstFunction extends NegatableBooleanFunction implements UnaryFunction {
+    public static class InLongTwoConstFunction extends NegatableBooleanFunction implements UnaryFunction {
         private final long inVal0;
         private final long inVal1;
         private final Function longFunc;
@@ -336,6 +342,10 @@ public class InLongFunctionFactory implements FunctionFactory {
             this.inVal0 = inVal0;
             this.inVal1 = inVal1;
         }
+
+        public long getValue0() { return inVal0; }
+
+        public long getValue1() { return inVal1; }
 
         @Override
         public Function getArg() {

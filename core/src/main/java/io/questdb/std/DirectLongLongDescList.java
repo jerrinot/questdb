@@ -77,6 +77,17 @@ public class DirectLongLongDescList implements DirectLongLongSortedList {
     }
 
     @Override
+    public long getNativeAddress() {
+        return ptr;
+    }
+
+    @Override
+    public void publishNativeSize(int size) {
+        assert size >= 0 && size <= capacity;
+        this.size = size;
+    }
+
+    @Override
     public Cursor getCursor() {
         return cursor;
     }

@@ -213,6 +213,46 @@ public interface Map extends Mutable, Closeable, Reopenable {
         // no-op
     }
 
+    /**
+     * Experimental native lookup snapshot ({@link NativeMapView}), six longs: entries/heap, offset index (ordered),
+     * mask, entry stride (unordered), zero-key entry, zero-key-present. The caller holds the
+     * exclusive reducer slot and must refresh after insertion/growth. Native code may update
+     * existing values only; insertion, counters, allocation and ownership remain with this map.
+     */
+    default void writeNativeProbeView(long address) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Experimental exclusive mutation lease. The first six words match the probe view;
+     * words six and seven contain free slots and nonzero-key count for unordered maps.
+     * OrderedMap uses its documented heap/offset-table view instead; its fourth word
+     * is the aligned fixed entry stride or the value size for variable keys. Publish in a finally
+     * block before Java observes the map or grows it. No other map operation may run while
+     * this view is borrowed. Growth invalidates every borrowed entry address.
+     */
+    default void writeNativeMutationView(long address) {
+        throw new UnsupportedOperationException();
+    }
+
+    default void publishNativeMutationView(long address) {
+        throw new UnsupportedOperationException();
+    }
+
+    /** Allocation, limits and ownership stay here; the callback only relocates entries. */
+    default void growNative(NativeRehash rehash) {
+        throw new UnsupportedOperationException();
+    }
+
+    /** Same whole-batch reservation policy, with generated relocation on growth. */
+    default void reserveNative(long additionalKeys, NativeRehash rehash) {
+        throw new UnsupportedOperationException();
+    }
+
+    interface NativeRehash {
+        void rehash(long oldStart, long oldCapacity, long newStart, long newCapacity, long entryStride);
+    }
+
     void setKeyCapacity(int keyCapacity);
 
     /**

@@ -51,6 +51,9 @@ import io.questdb.std.Vect;
 
 class EncodedSortLightRecordCursor implements DelegatingRecordCursor, RecordCursor.RowIdSource {
     private final IntHashSet buildReadColumns;
+    private final int compiledSortColumn;
+    private final boolean compiledSortAscending;
+    private final DirectLongList sortScratch;
     private final SortKeyEncoder encoder;
     private final DirectLongList entryMem;
     private final long keyCapBytes;
@@ -74,9 +77,13 @@ class EncodedSortLightRecordCursor implements DelegatingRecordCursor, RecordCurs
     public EncodedSortLightRecordCursor(
             CairoConfiguration configuration,
             RecordMetadata metadata,
-            IntList sortColumnFilter
+            IntList sortColumnFilter,
+            boolean compiledSort
     ) {
+        compiledSortColumn = compiledSort ? Math.abs(sortColumnFilter.getQuick(0)) - 1 : -1;
+        compiledSortAscending = compiledSort && sortColumnFilter.getQuick(0) > 0;
         try {
+            sortScratch = compiledSort ? new DirectLongList(64, MemoryTag.NATIVE_DEFAULT, true) : null;
             this.encoder = new SortKeyEncoder(metadata, sortColumnFilter);
             this.buildReadColumns = SortKeyEncoder.extractSortKeyColumnIndexes(sortColumnFilter);
             this.entryMem = new DirectLongList(16 * 1024, MemoryTag.NATIVE_DEFAULT, true); // 128KB
@@ -183,9 +190,11 @@ class EncodedSortLightRecordCursor implements DelegatingRecordCursor, RecordCurs
         this.baseCursor = baseCursor;
         this.baseRecord = baseCursor.getRecord();
         entryMem.setMemoryTracker(executionContext.getMemoryTracker());
+        if (sortScratch != null) sortScratch.setMemoryTracker(executionContext.getMemoryTracker());
         if (!isOpen) {
             isOpen = true;
             entryMem.reopen();
+            if (sortScratch != null) sortScratch.reopen();
         }
         baseCursor.setParquetDecodeHint(ParquetDecodeHint.SCATTERED);
         baseCursor.setParentUsedColumns(buildReadColumns);
@@ -242,6 +251,14 @@ class EncodedSortLightRecordCursor implements DelegatingRecordCursor, RecordCurs
         long estimatedSize = baseCursor.size();
         long maxEntries = SortKeyEncoder.maxEntries(keyCapBytes, valueCapBytes, keyType);
         long maxEntryMemBytes = maxEntries * entrySize;
+        if (compiledSortColumn >= 0 && baseCursor.sortLong(entryMem, sortScratch, compiledSortColumn, compiledSortAscending, maxEntries)) {
+            count = entryMem.size() / longsPerEntry;
+            startAddr = entryMem.getAddress() + rowIdOffset;
+            toTop();
+            if (count > 0) baseCursor.setRecordAtRows(this);
+            Misc.free(encoder);
+            return;
+        }
         if (estimatedSize > 0) {
             if (estimatedSize > maxEntries) {
                 SortKeyEncoder.throwSortHeapOverflow(maxEntryMemBytes);
@@ -313,6 +330,7 @@ class EncodedSortLightRecordCursor implements DelegatingRecordCursor, RecordCurs
 
     private void forceClose() {
         Misc.free(entryMem);
+        Misc.free(sortScratch);
         Misc.free(keyHeap);
         Misc.free(encoder);
         baseCursor = Misc.free(baseCursor);

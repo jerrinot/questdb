@@ -52,6 +52,8 @@ public class CompiledCountOnlyFilter implements Closeable {
     private static final CarrierLocal<FiltersCompiler.JitError> tlJitError = new CarrierLocal<>(FiltersCompiler.JitError::new);
     private long fnAddress;
 
+    public long getNativeInputRows() { return 0; }
+
     /**
      * Executes the compiled count-only filter function on the given data.
      *

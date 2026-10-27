@@ -62,7 +62,7 @@ public class EqIntStrCFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class Func extends NegatableBooleanFunction implements UnaryFunction {
+    public static class Func extends NegatableBooleanFunction implements UnaryFunction {
         private final Function left;
         private final int right;
 
@@ -74,6 +74,10 @@ public class EqIntStrCFunctionFactory implements FunctionFactory {
         @Override
         public Function getArg() {
             return left;
+        }
+
+        public int getConstant() {
+            return right;
         }
 
         @Override

@@ -282,6 +282,7 @@ import io.questdb.griffin.engine.orderby.SortKeyEncoder;
 import io.questdb.griffin.engine.orderby.SortKeyMaterializingRecordCursorFactory;
 import io.questdb.griffin.engine.orderby.SortedLightRecordCursorFactory;
 import io.questdb.griffin.engine.orderby.SortedRecordCursorFactory;
+import io.questdb.griffin.engine.table.AdaptiveSymbolPatternRecordCursorFactory;
 import io.questdb.griffin.engine.table.AsyncFilterContext;
 import io.questdb.griffin.engine.table.AsyncFilteredRecordCursorFactory;
 import io.questdb.griffin.engine.table.AsyncGroupByNotKeyedRecordCursorFactory;
@@ -295,7 +296,6 @@ import io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory;
 import io.questdb.griffin.engine.table.AsyncMultiHorizonJoinNotKeyedRecordCursorFactory;
 import io.questdb.griffin.engine.table.AsyncMultiHorizonJoinRecordCursorFactory;
 import io.questdb.griffin.engine.table.AsyncTopKRecordCursorFactory;
-import io.questdb.griffin.engine.table.AdaptiveSymbolPatternRecordCursorFactory;
 import io.questdb.griffin.engine.table.CoveringIndexRecordCursorFactory;
 import io.questdb.griffin.engine.table.DeferredSingleSymbolFilterPageFrameRecordCursorFactory;
 import io.questdb.griffin.engine.table.DeferredSymbolIndexFilteredRowCursorFactory;
@@ -5382,11 +5382,17 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                 jitOptions = jitIRSerializer.serialize(filterExpr, forceScalar, enableJitDebug, enableJitNullChecks);
                             }
 
-                            compiledFilter = new CompiledFilter();
-                            compiledFilter.compile(jitIRMem, jitOptions);
-
-                            compiledCountOnlyFilter = new CompiledCountOnlyFilter();
-                            compiledCountOnlyFilter.compile(jitIRMem, jitOptions);
+                            var compiler = executionContext.getQueryCodeGenerator();
+                            var generated = compiler == null ? null : compiler.compileFilters(factory.getMetadata(), filter);
+                            if (generated != null) {
+                                compiledFilter = generated.rows();
+                                compiledCountOnlyFilter = generated.count();
+                            } else {
+                                compiledFilter = new CompiledFilter();
+                                compiledFilter.compile(jitIRMem, jitOptions);
+                                compiledCountOnlyFilter = new CompiledCountOnlyFilter();
+                                compiledCountOnlyFilter.compile(jitIRMem, jitOptions);
+                            }
                         } catch (Throwable th) {
                             jitScratchFailure = th;
                             throw th;
@@ -5730,11 +5736,15 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                 workerBuildOnFilters = null;
                 functions = null;
                 filterContext = null;
-                return new AsyncHashJoinGroupByRecordCursorFactory(executionContext.getCairoEngine(),
+                final AsyncHashJoinGroupByRecordCursorFactory factory = new AsyncHashJoinGroupByRecordCursorFactory(executionContext.getCairoEngine(),
                         probeOwned, buildOwned, buildFiltersOwned, buildOnFilterOwned, workerBuildOnFiltersOwned,
                         metadata, functionsOwned, filtersOwned,
                         candidate.getPhysicalJoinType() == IQueryModel.JOIN_LEFT_OUTER, workerCount,
-                        candidate.getLogicalJoinType(), candidate.isInputSwapped());
+                        candidate.getLogicalJoinType(), candidate.isInputSwapped(), executionContext.getQueryCodeGenerator());
+                if (candidate.requiresCompiledPipeline() && !factory.hasCompiledJoinPipeline()) {
+                    return Misc.free(factory);
+                }
+                return factory;
             }
         } finally {
             executionContext.popHasInterval();
@@ -8521,7 +8531,6 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                         }
                     }
 
-
                     return new LatestByValuesIndexedFilteredRecordCursorFactory(
                             configuration,
                             metadata,
@@ -9500,6 +9509,18 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                         && SortKeyEncoder.isSupported(metadata, listColumnFilterA);
 
                 if (recordCursorFactory.recordCursorSupportsRandomAccess()) {
+                    if (!preSortedByTs && loFunc != null && hiFunc != null && loFunc.isConstant() && hiFunc.isConstant()
+                            && listColumnFilterA.size() == 1) {
+                        final long from = loFunc.getLong(null), to = hiFunc.getLong(null);
+                        final int index = listColumnFilterA.getQuick(0);
+                        final int columnIndex = Math.abs(index) - 1;
+                        if (from >= 0 && to > from && to <= Integer.MAX_VALUE
+                                && recordCursorFactory.recordCursorSupportsCompiledLongTopK(columnIndex)) {
+                            RecordCursorFactory topK = new LongTopKRecordCursorFactory(
+                                    orderedMetadata, recordCursorFactory, columnIndex, (int) to, index > 0);
+                            return new LimitRecordCursorFactory(topK, loFunc, hiFunc, model.getLimitLo().position);
+                        }
+                    }
                     if (canSortAndLimitBeOptimized(model, executionContext, loFunc, hiFunc)) {
                         if (!preSortedByTs && loFunc.isConstant() && hiFunc == null) {
                             final long lo = loFunc.getLong(null);
@@ -11428,7 +11449,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                     filterUsedColumnIndexes,
                                     perWorkerFilters0,
                                     executionContext.getSharedQueryWorkerCount(),
-                                    sharedOuterProjectionFunctions0
+                                    sharedOuterProjectionFunctions0,
+                                    executionContext.getQueryCodeGenerator()
                             ),
                             executionContext
                     );
@@ -11868,7 +11890,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                     priorityMetadata,
                     functions,
                     factory,
-                    virtualColumnReservedSlots
+                    virtualColumnReservedSlots,
+                    executionContext.getQueryCodeGenerator()
             );
         } catch (Throwable e) {
             // Constant-folding a cast (e.g. `(-1234567L)::DECIMAL(4,2)`) can throw

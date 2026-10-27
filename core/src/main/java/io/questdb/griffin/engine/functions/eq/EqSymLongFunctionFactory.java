@@ -156,7 +156,7 @@ public class EqSymLongFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class EqLongNullFunction extends NegatableBooleanFunction implements UnaryFunction {
+    public static class EqLongNullFunction extends NegatableBooleanFunction implements UnaryFunction {
         private final Function longFn;
 
         public EqLongNullFunction(Function longFn) {

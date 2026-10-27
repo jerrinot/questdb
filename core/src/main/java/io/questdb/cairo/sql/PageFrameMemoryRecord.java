@@ -652,6 +652,24 @@ public class PageFrameMemoryRecord implements Record, StableStringSource, QuietC
         return Numbers.ipv4ToLong(getIPv4(columnIndex));
     }
 
+    /** Borrow a VARCHAR frame descriptor while this record's owning pool remains pinned.
+     * Layout: aux, data, aux bytes, data bytes, slice format, stable strings (six longs).
+     * A lazy conversion has no directly readable target representation.
+     */
+    public boolean writeNativeVarcharView(int columnIndex, long address) {
+        if (hasTypeCasts && sourceColumnTypes.getQuick(columnIndex) != -1) {
+            return false;
+        }
+        int index = columnOffset + columnIndex;
+        Unsafe.putLong(address, auxPageAddresses.get(index));
+        Unsafe.putLong(address + 8, pageAddresses.get(index));
+        Unsafe.putLong(address + 16, auxPageSizes.get(index));
+        Unsafe.putLong(address + 24, pageSizes.get(index));
+        Unsafe.putLong(address + 32, frameFormat == PartitionFormat.PARQUET ? 1 : 0);
+        Unsafe.putLong(address + 40, stableStrings ? 1 : 0);
+        return true;
+    }
+
     public long getPageAddress(int columnIndex) {
         // A column decoded in its pre-conversion source type (e.g. VARCHAR_SLICE for a
         // STRING->INT cast) has no directly-readable target-typed buffer. Returning 0 makes

@@ -131,6 +131,7 @@ public class UnorderedVarcharMap implements Map, Reopenable {
     private MemoryTracker memoryTracker;
     private int nResizes;
     private int size = 0;
+    private boolean preferLargePages;
 
     public UnorderedVarcharMap(
             @Transient @Nullable ColumnTypes valueTypes,
@@ -478,11 +479,16 @@ public class UnorderedVarcharMap implements Map, Reopenable {
 
     @Override
     public void reserveCapacity(long additionalKeys) {
+        reserveNative(additionalKeys, null);
+    }
+
+    @Override
+    public void reserveNative(long additionalKeys, NativeRehash nativeRehash) {
         // +1: guarantee free > additionalKeys on return so that asNew's --free == 0
         // rehash never fires on the last insertion within a probeBatch.
         if (free <= additionalKeys) {
             long required = keyCapacity + (long) Math.ceil((additionalKeys - free + 1) / loadFactor);
-            rehash(Numbers.ceilPow2(required));
+            rehash(Numbers.ceilPow2(required), nativeRehash);
         }
     }
 
@@ -504,7 +510,24 @@ public class UnorderedVarcharMap implements Map, Reopenable {
             keySink.reopen();
         }
 
+        adviseLargePages(memStart, memLimit - memStart);
         clear();
+    }
+
+    /** Advisory only, for large shared tables. Allocation and query tracking stay unchanged. */
+    public void preferLargePages() {
+        preferLargePages = true;
+    }
+
+    private void adviseLargePages(long address, long bytes) {
+        if (preferLargePages && io.questdb.std.Os.isLinux() && bytes >= (1L << 21)) {
+            long pageMask = io.questdb.std.Files.PAGE_SIZE - 1;
+            long start = (address + pageMask) & ~pageMask;
+            long end = (address + bytes) & ~pageMask;
+            // Linux MADV_HUGEPAGE=14. Exclude partial pages belonging to malloc metadata
+            // or neighbouring allocations; correctness does not depend on acceptance.
+            if (end > start) io.questdb.std.Files.madvise0(start, end - start, 14);
+        }
     }
 
     @Override
@@ -583,6 +606,44 @@ public class UnorderedVarcharMap implements Map, Reopenable {
      */
     private static long makePackComparable(long packedHashSizeFlags) {
         return packedHashSizeFlags & 0x7fffffffffffffffL;
+    }
+
+    @Override
+    public void writeNativeProbeView(long address) {
+        Unsafe.putLong(address + NativeMapView.ENTRIES, memStart);
+        Unsafe.putLong(address + NativeMapView.OFFSETS, 0);
+        Unsafe.putLong(address + NativeMapView.MASK, mask);
+        Unsafe.putLong(address + NativeMapView.STRIDE, entrySize);
+        Unsafe.putLong(address + NativeMapView.ZERO_ENTRY, 0);
+        Unsafe.putLong(address + NativeMapView.HAS_ZERO, 0);
+    }
+
+    @Override
+    public void writeNativeMutationView(long address) {
+        writeNativeProbeView(address);
+        Unsafe.putLong(address + NativeMapView.FREE, free);
+        Unsafe.putLong(address + NativeMapView.SIZE, size);
+    }
+
+    @Override
+    public void publishNativeMutationView(long address) {
+        assert Unsafe.getLong(address + NativeMapView.ENTRIES) == memStart;
+        free = (int) Unsafe.getLong(address + NativeMapView.FREE);
+        size = (int) Unsafe.getLong(address + NativeMapView.SIZE);
+        assert free > 0 && size >= 0;
+    }
+
+    @Override
+    public void growNative(NativeRehash rehash) {
+        rehash((long) keyCapacity << 1, rehash);
+    }
+
+    /** Copy an unstable key into this map's existing, query-tracked arena. */
+    public long copyNativeKey(long source, int size) {
+        assert size > 0;
+        long destination = allocator.malloc(size);
+        Unsafe.copyMemory(source, destination, size);
+        return destination | PTR_UNSTABLE_MASK;
     }
 
     private static void validateBatchAddressable(long sizeBytes) {
@@ -749,6 +810,10 @@ public class UnorderedVarcharMap implements Map, Reopenable {
     }
 
     private void rehash(long newKeyCapacity) {
+        rehash(newKeyCapacity, null);
+    }
+
+    private void rehash(long newKeyCapacity, NativeRehash nativeRehash) {
         if (nResizes == maxResizes) {
             throw LimitOverflowException.instance().put("limit of ").put(maxResizes).put(" resizes exceeded in unordered map");
         }
@@ -763,24 +828,34 @@ public class UnorderedVarcharMap implements Map, Reopenable {
         validateBatchAddressable(newSizeBytes);
         final long newMemStart = Unsafe.malloc(newSizeBytes, memoryTag, memoryTracker);
         final long newMemLimit = newMemStart + newSizeBytes;
+        adviseLargePages(newMemStart, newSizeBytes);
         Vect.memset(newMemStart, newSizeBytes, 0);
         final int newMask = (int) newKeyCapacity - 1;
 
-        for (long addr = memStart; addr < memLimit; addr += entrySize) {
-            long packedHashSizeFlags = Unsafe.getLong(addr);
-            if (packedHashSizeFlags == 0) {
-                continue;
-            }
+        try {
+            if (nativeRehash != null) {
+                nativeRehash.rehash(memStart, keyCapacity, newMemStart, newKeyCapacity, entrySize);
+            } else {
+                for (long addr = memStart; addr < memLimit; addr += entrySize) {
+                    long packedHashSizeFlags = Unsafe.getLong(addr);
+                    if (packedHashSizeFlags == 0) {
+                        continue;
+                    }
 
-            int hash = Unsafe.getInt(addr);
-            long newAddr = getStartAddress(newMemStart, hash & newMask);
-            while (Unsafe.getLong(newAddr) != 0) {
-                newAddr += entrySize;
-                if (newAddr >= newMemLimit) {
-                    newAddr = newMemStart;
+                    int hash = Unsafe.getInt(addr);
+                    long newAddr = getStartAddress(newMemStart, hash & newMask);
+                    while (Unsafe.getLong(newAddr) != 0) {
+                        newAddr += entrySize;
+                        if (newAddr >= newMemLimit) {
+                            newAddr = newMemStart;
+                        }
+                    }
+                    Unsafe.copyMemory(addr, newAddr, entrySize);
                 }
             }
-            Unsafe.copyMemory(addr, newAddr, entrySize);
+        } catch (Throwable failure) {
+            Unsafe.free(newMemStart, newSizeBytes, memoryTag, memoryTracker);
+            throw failure;
         }
 
         Unsafe.free(memStart, memLimit - memStart, memoryTag, memoryTracker);

@@ -44,6 +44,7 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.PerWorkerLockOwner;
 import io.questdb.griffin.engine.PerWorkerLocks;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.PerWorkerFunctionList;
 import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
@@ -51,6 +52,7 @@ import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByAllocatorFactory;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdaterFactory;
+import io.questdb.griffin.engine.groupby.GroupByKernel;
 import io.questdb.griffin.engine.groupby.GroupByUtils;
 import io.questdb.jit.CompiledFilter;
 import io.questdb.std.BytecodeAssembler;
@@ -68,9 +70,9 @@ import org.jetbrains.annotations.TestOnly;
 
 import java.io.Closeable;
 
-
 public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Closeable, Reopenable, Plannable {
     private final int batchSize;
+    private final CairoConfiguration configuration;
     private final AsyncFilterContext filterCtx;
     private final GroupByAllocator ownerAllocator;
     private final DirectLongList ownerBatchList;
@@ -78,7 +80,7 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
     private final ObjList<GroupByFunction> ownerGroupByFunctions;
     private final ObjList<Function> ownerKeyFunctions;
     private final RecordSink ownerMapSink;
-    private final ObjList<GroupByAllocator> perWorkerAllocators;
+    private ObjList<GroupByAllocator> perWorkerAllocators;
     private final ObjList<DirectLongList> perWorkerBatchLists;
     private final ObjList<FlyweightPackedMapValue> perWorkerBatchMapValues;
     private final ObjList<ObjList<GroupByFunction>> perWorkerGroupByFunctions;
@@ -88,6 +90,8 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
     private final ObjList<DirectLongLongSortedList> perWorkerLongTopKLists;
     private final ObjList<RecordSink> perWorkerMapSinks;
     private final GroupByShardingContext shardingCtx;
+    private GroupByKernel compiledAggregates;
+    private ObjList<GroupByKernel.Updater> compiledUpdaters;
     // Per-query native memory tracker captured from SqlExecutionContext on init.
     // Null when no per-query limit applies. Workers and operator code feed it to
     // tracker-aware Unsafe overloads to charge allocations to the active workload.
@@ -119,6 +123,7 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
         assert perWorkerGroupByFunctions == null || perWorkerGroupByFunctions.size() == workerCount;
 
         try {
+            this.configuration = configuration;
             this.ownerKeyFunctions = ownerKeyFunctions;
             this.perWorkerKeyFunctions = perWorkerKeyFunctions;
             this.ownerGroupByFunctions = ownerGroupByFunctions;
@@ -261,7 +266,12 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
 
     @Override
     public void close() {
-        Throwable cleanupFailure = null;
+        final GroupByKernel compiledAggregates = this.compiledAggregates;
+        this.compiledAggregates = null;
+        final ObjList<GroupByKernel.Updater> compiledUpdaters = this.compiledUpdaters;
+        this.compiledUpdaters = null;
+        Throwable cleanupFailure = Misc.freeObjListBestEffort(null, compiledUpdaters);
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, compiledAggregates);
         cleanupFailure = Misc.freeBestEffort(cleanupFailure, shardingCtx);
         cleanupFailure = Misc.freeObjListBestEffort(cleanupFailure, ownerKeyFunctions);
         // clear() already freed the data chunks under the bound tracker (the index is on the
@@ -288,6 +298,37 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
         cleanupFailure = Misc.freeObjListBestEffort(cleanupFailure, perWorkerBatchLists);
         cleanupFailure = Misc.freeBestEffort(cleanupFailure, filterCtx);
         CairoException.rethrowCleanupFailure(cleanupFailure);
+    }
+
+    // The factory/sequence already owns this atom. Its failure path closes partial adoption.
+    void compileAggregates(QueryCodeGenerator compiler, ColumnTypes inputTypes, ColumnTypes valueTypes,
+                           ColumnTypes keyTypes, ListColumnFilter keyColumns) {
+        compiledAggregates = compiler.compile(inputTypes, valueTypes, ownerGroupByFunctions,
+                keyTypes, keyColumns, ownerKeyFunctions, getFragment(-1).getMap());
+        if (compiledAggregates != null) {
+            if (filterCtx.getFilter(-1) != null) {
+                compiledAggregates.prepareFilter(inputTypes, filterCtx.getFilter(-1));
+            }
+            final int workerCount = perWorkerBatchLists.size();
+            if (compiledAggregates.needsWorkerAllocators() && perWorkerAllocators == null) {
+                perWorkerAllocators = new ObjList<>(workerCount);
+                for (int i = 0; i < workerCount; i++) {
+                    perWorkerAllocators.add(GroupByAllocatorFactory.createAllocator(configuration, false));
+                }
+            }
+            compiledUpdaters = new ObjList<>(workerCount + 1);
+            compiledUpdaters.add(compiledAggregates.newUpdater(ownerAllocator));
+            for (int i = 0; i < workerCount; i++) {
+                compiledUpdaters.add(compiledAggregates.newUpdater(
+                        perWorkerAllocators != null ? perWorkerAllocators.getQuick(i) : ownerAllocator
+                ));
+            }
+            shardingCtx.setCompiledUpdaters(compiledUpdaters);
+        }
+    }
+
+    ObjList<Function> outputFunctions(ObjList<Function> functions) {
+        return compiledAggregates != null ? compiledAggregates.outputFunctions(functions) : functions;
     }
 
     private static Throwable closePerWorkerFunctions(Throwable cleanupFailure, ObjList<? extends ObjList<? extends Function>> perWorkerFunctions) {
@@ -327,6 +368,18 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
         return batchSize;
     }
 
+    public @Nullable CharSequence getCompiledAggregateName() {
+        return compiledAggregates != null ? compiledAggregates.getName() : null;
+    }
+
+    public @Nullable CharSequence getCompiledAggregateFilterName() {
+        return compiledAggregates != null && compiledAggregates.hasCompiledFilter() ? compiledAggregates.getName() : null;
+    }
+
+    public @Nullable GroupByKernel.Updater getCompiledUpdater(int slotId) {
+        return compiledUpdaters != null ? compiledUpdaters.getQuick(slotId + 1) : null;
+    }
+
     public ObjList<Map> getDestShards() {
         return shardingCtx.getDestShards();
     }
@@ -348,6 +401,56 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
             return ownerGroupByFunctions;
         }
         return perWorkerGroupByFunctions.getQuick(slotId);
+    }
+
+    public boolean prepareSortedRowLimit() {
+        return compiledAggregates != null && compiledAggregates.prepareSortedRowLimit();
+    }
+
+    public boolean prepareRowLimit() {
+        return compiledAggregates != null && compiledAggregates.prepareRowLimit();
+    }
+
+    public boolean prepareLongSort(Function function) {
+        return compiledAggregates != null && compiledAggregates.prepareLongSort(function);
+    }
+
+    public boolean supportsCompiledLongTopK(Function function) {
+        return compiledAggregates != null && compiledAggregates.supportsLongTopK(function);
+    }
+
+    public void prepareLongTopK(Function function) {
+        if (compiledAggregates != null) {
+            compiledAggregates.prepareLongTopK(function);
+        }
+    }
+
+    public void prepareLongTopK(Function function, boolean ascending, int limit) {
+        if (compiledAggregates != null) {
+            compiledAggregates.prepareLongTopK(function, ascending, limit);
+        }
+    }
+
+    public void longTopK(int slotId, Map map, DirectLongLongSortedList list, Function function, Runnable checkpoint) {
+        final GroupByKernel.Updater updater = getCompiledUpdater(slotId);
+        if (updater == null || !updater.longTopK(map, list, function, checkpoint)) {
+            map.getCursor().longTopK(list, function);
+        }
+    }
+
+    public boolean longTopK(ObjList<Map> maps, DirectLongLongSortedList list, Function function, Runnable checkpoint) {
+        final GroupByKernel.Updater updater = getCompiledUpdater(-1);
+        return updater != null && updater.longTopK(maps, list, function, checkpoint);
+    }
+
+    public void mergeLongTopK(DirectLongLongSortedList destination, DirectLongLongSortedList source, Runnable checkpoint) {
+        final GroupByKernel.Updater updater = getCompiledUpdater(-1);
+        if (updater == null || !updater.mergeLongTopK(destination, source, checkpoint)) {
+            final DirectLongLongSortedList.Cursor cursor = source.getCursor();
+            while (cursor.hasNext()) {
+                destination.add(cursor.index(), cursor.value());
+            }
+        }
     }
 
     public DirectLongLongSortedList getLongTopKList(int slotId, int order, int limit) {
@@ -477,6 +580,10 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
     }
 
     public void resetLocalStats(int slotId) {
+        final GroupByKernel.Updater updater = getCompiledUpdater(slotId);
+        if (updater != null) {
+            updater.resetStats();
+        }
         final ObjList<GroupByFunction> groupByFunctions = getGroupByFunctions(slotId);
         for (int i = 0, n = groupByFunctions.size(); i < n; i++) {
             groupByFunctions.getQuick(i).resetStats();
@@ -498,7 +605,8 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
 
     private long getTotalFunctionCardinality(int slotId) {
         final ObjList<GroupByFunction> groupByFunctions = getGroupByFunctions(slotId);
-        long totalCardinality = 0;
+        final GroupByKernel.Updater updater = getCompiledUpdater(slotId);
+        long totalCardinality = updater != null ? updater.getCardinalityStat() : 0;
         for (int i = 0, n = groupByFunctions.size(); i < n; i++) {
             totalCardinality += groupByFunctions.getQuick(i).getCardinalityStat();
         }
@@ -528,4 +636,5 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
             }
         }
     }
+
 }

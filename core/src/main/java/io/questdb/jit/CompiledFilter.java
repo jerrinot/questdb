@@ -52,6 +52,11 @@ public class CompiledFilter implements Closeable {
     private static final CarrierLocal<FiltersCompiler.JitError> tlJitError = new CarrierLocal<>(FiltersCompiler.JitError::new);
     private long fnAddress;
 
+    /** Optional backend marker for an installed whole-query compiler. */
+    public CharSequence getBackendName() { return null; }
+
+    public long getNativeInputRows() { return 0; }
+
     /**
      * Executes the compiled filter function on the given data.
      *

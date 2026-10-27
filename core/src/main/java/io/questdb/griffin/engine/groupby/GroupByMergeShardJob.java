@@ -129,7 +129,11 @@ public class GroupByMergeShardJob extends AbstractQueueConsumerJob<GroupByMergeS
             final int slotId = ctx.maybeAcquire(carrierId, owner, circuitBreaker);
             try {
                 if (!circuitBreaker.checkIfTrippedOrYield()) {
-                    ctx.mergeShard(slotId, shardIndex);
+                    ctx.mergeShard(slotId, shardIndex, () -> {
+                        if (circuitBreaker.checkIfTripped()) {
+                            throw io.questdb.cairo.CairoException.queryCancelled();
+                        }
+                    });
                 }
             } finally {
                 ctx.release(slotId);

@@ -283,9 +283,7 @@ public class PageFrameReduceTask implements QuietCloseable, Mutable {
         populateJitAddresses(frameMemory, frameSequence.getPageFrameAddressCache(), dataAddresses, auxAddresses);
         if (!isCountOnly) {
             final long rowCount = getFrameRowCount();
-            if (filteredRows.getCapacity() < rowCount) {
-                filteredRows.setCapacity(rowCount);
-            }
+            filteredRows.clearAndEnsureCapacity(rowCount);
         }
     }
 

@@ -46,7 +46,7 @@ public class NotFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0));
     }
 
-    private static class Func extends BooleanFunction implements UnaryFunction {
+    public static class Func extends BooleanFunction implements UnaryFunction {
         private final Function arg;
 
         public Func(Function arg) {

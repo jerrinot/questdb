@@ -39,6 +39,7 @@ import io.questdb.cairo.sql.TableRecordMetadata;
 import io.questdb.cairo.sql.TableReferenceOutOfDateException;
 import io.questdb.cairo.sql.VirtualRecord;
 import io.questdb.cairo.view.ViewDefinition;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.rnd.SharedRandom;
 import io.questdb.griffin.engine.window.WindowContext;
 import io.questdb.griffin.model.IntrinsicModel;
@@ -141,6 +142,11 @@ public interface SqlExecutionContext extends Sinkable, Closeable {
     Decimal64 getDecimal64();
 
     default @Nullable ExecutionState getExecutionState() {
+        return null;
+    }
+
+    /** Optional compilation service; the context does not own it. Absent by default. */
+    default @Nullable QueryCodeGenerator getQueryCodeGenerator() {
         return null;
     }
 

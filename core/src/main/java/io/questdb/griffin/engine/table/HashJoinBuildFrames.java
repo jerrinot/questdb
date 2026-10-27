@@ -421,6 +421,31 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
         return new Reader(getReaderCacheSize());
     }
 
+    @Override
+    public boolean writeNativeColumn(int column, long address) {
+        if (frameCursor == null || column < 0 || column >= payloadColumns.length) {
+            return false;
+        }
+        final int type = payloadTypes[column];
+        if (type != ColumnType.BYTE && type != ColumnType.SHORT && type != ColumnType.INT && type != ColumnType.LONG) {
+            return false;
+        }
+        if (copyAddress != 0) {
+            Unsafe.putLong(address, copyAddress + copyOffsets[column]);
+            Unsafe.putLong(address + 8, copyRowSize);
+            Unsafe.putLong(address + 16, 1);
+            return true;
+        }
+        // A zero native page is a column top; a Parquet page requires a reader's decoder.
+        if (addressCache.hasParquetFrames()) {
+            return false;
+        }
+        Unsafe.putLong(address, addressCache.getPageAddresses().getAddress() + (long) payloadColumns[column] * Long.BYTES);
+        Unsafe.putLong(address + 8, (long) addressCache.getColumnCount() * Long.BYTES);
+        Unsafe.putLong(address + 16, 0);
+        return true;
+    }
+
     /**
      * Switches every reader of this execution to the copy that {@link #copyRows} filled, and
      * releases what the copy readers decoded. Call it on the owner once every copying thread has

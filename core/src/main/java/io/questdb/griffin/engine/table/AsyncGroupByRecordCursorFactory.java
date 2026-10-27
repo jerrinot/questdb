@@ -53,9 +53,11 @@ import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
+import io.questdb.griffin.engine.groupby.GroupByKernel;
 import io.questdb.griffin.engine.groupby.GroupByRecordCursorFactory;
 import io.questdb.jit.CompiledFilter;
 import io.questdb.std.BytecodeAssembler;
@@ -106,7 +108,8 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
             @Nullable IntHashSet filterUsedColumnIndexes,
             @Nullable ObjList<Function> perWorkerFilters,
             int workerCount,
-            @Nullable ObjList<ObjList<Function>> sharedRecordFunctions
+            @Nullable ObjList<ObjList<Function>> sharedRecordFunctions,
+            @Nullable QueryCodeGenerator aggregateCompiler
     ) {
         super(groupByMetadata);
         try {
@@ -140,8 +143,11 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
                     filter != null ? FILTER_AND_AGGREGATE : AGGREGATE,
                     workerCount
             );
-            this.cursor = new AsyncGroupByRecordCursor(engine, messageBus, recordFunctions);
             this.workerCount = workerCount;
+            if (aggregateCompiler != null) {
+                atom.compileAggregates(aggregateCompiler, base.getMetadata(), valueTypes, keyTypes, listColumnFilter);
+            }
+            this.cursor = new AsyncGroupByRecordCursor(engine, messageBus, atom.outputFunctions(recordFunctions));
         } catch (Throwable th) {
             Misc.free(this, th);
             throw th;
@@ -189,11 +195,37 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
         if (shared == null) {
             assert sharedRecordFunctions != null;
             assert idx < sharedRecordFunctions.size();
-            shared = new AsyncGroupBySharedCursor(sharedRecordFunctions.getQuick(idx));
+            shared = new AsyncGroupBySharedCursor(frameSequence.getAtom().outputFunctions(sharedRecordFunctions.getQuick(idx)));
             sharedCursors.extendAndSet(idx, shared);
         }
         shared.of(cursor);
         return shared;
+    }
+
+    @Override
+    public boolean prepareRowLimit() { return frameSequence.getAtom().prepareRowLimit(); }
+
+    @Override
+    public boolean prepareSortedRowLimit() { return frameSequence.getAtom().prepareSortedRowLimit(); }
+
+    @Override
+    public boolean prepareLongSort(int columnIndex) {
+        return frameSequence.getAtom().prepareLongSort(recordFunctions.getQuick(columnIndex));
+    }
+
+    @Override
+    public boolean recordCursorSupportsCompiledLongTopK(int columnIndex) {
+        return frameSequence.getAtom().supportsCompiledLongTopK(recordFunctions.getQuick(columnIndex));
+    }
+
+    @Override
+    public void prepareLongTopK(int columnIndex) {
+        frameSequence.getAtom().prepareLongTopK(recordFunctions.getQuick(columnIndex));
+    }
+
+    @Override
+    public void prepareLongTopK(int columnIndex, boolean ascending, int limit) {
+        frameSequence.getAtom().prepareLongTopK(recordFunctions.getQuick(columnIndex), ascending, limit);
     }
 
     @Override
@@ -220,6 +252,14 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
             sink.type("Async Group By");
         }
         sink.meta("workers").val(workerCount);
+        CharSequence compiledAggregateName = frameSequence.getAtom().getCompiledAggregateName();
+        if (compiledAggregateName != null) {
+            sink.meta("compiledAggregateBatches").val(compiledAggregateName);
+        }
+        CharSequence compiledFilterName = frameSequence.getAtom().getCompiledAggregateFilterName();
+        if (compiledFilterName != null) {
+            sink.meta("compiledAggregateFilter").val(compiledFilterName);
+        }
         sink.optAttr("keys", GroupByRecordCursorFactory.getKeys(recordFunctions, getMetadata()));
         sink.optAttr("keyFunctions", frameSequence.getAtom().getOwnerKeyFunctions(), true);
         sink.optAttr("values", frameSequence.getAtom().getOwnerGroupByFunctions(), true);
@@ -266,15 +306,15 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
             atom.resetLocalStats(slotId);
 
             if (atom.isSharded()) {
-                fragment.shard();
+                fragment.shard(circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
             }
 
             record.setRowIndex(0);
             long baseRowId = record.getRowId();
 
             if (fragment.isNotSharded()) {
-                aggregateNonShardedBatched(record, frameRowCount, baseRowId, atom, slotId, fragment, mapSink);
-            } else {
+                aggregateNonShardedBatched(record, frameRowCount, baseRowId, atom, slotId, fragment, mapSink, circuitBreaker);
+            } else if (!aggregateShardedCompiled(record, frameRowCount, 0, atom, slotId, fragment, mapSink, circuitBreaker)) {
                 aggregateSharded(record, frameRowCount, baseRowId, functionUpdater, fragment, mapSink);
             }
 
@@ -319,16 +359,22 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
             AsyncGroupByAtom atom,
             int slotId,
             GroupByMapFragment fragment,
-            RecordSink mapSink
+            RecordSink mapSink,
+            SqlExecutionCircuitBreaker circuitBreaker
     ) {
         final Map map = fragment.reopenMap();
         final ObjList<GroupByFunction> functions = atom.getGroupByFunctions(slotId);
         final DirectLongList batchList = atom.getBatchList(slotId);
         final FlyweightPackedMapValue mapValue = atom.getBatchMapValue(slotId);
+        final GroupByKernel.Updater compiledUpdater = atom.getCompiledUpdater(slotId);
         final int functionCount = functions.size();
         final int batchSize = atom.getBatchSize();
         final long rowCount = rows.size();
         final long rowIdsAddr = rows.getAddress();
+
+        if (compiledUpdater != null && compiledUpdater.updateMap(record, rowCount, rowIdsAddr, map, batchSize, circuitBreaker)) {
+            return;
+        }
 
         // Size the batch buffer once — probeBatch writes via the raw base address, never advancing pos.
         // ensureCapacity reopens the list if it's closed.
@@ -351,6 +397,9 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
                     batchAddr
             );
 
+            if (compiledUpdater != null && compiledUpdater.update(record, baseValueAddress, batchAddr, batchRows, circuitBreaker)) {
+                continue;
+            }
             for (int i = 0; i < functionCount; i++) {
                 functions.getQuick(i).computeKeyedBatch(
                         record,
@@ -408,14 +457,20 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
             AsyncGroupByAtom atom,
             int slotId,
             GroupByMapFragment fragment,
-            RecordSink mapSink
+            RecordSink mapSink,
+            SqlExecutionCircuitBreaker circuitBreaker
     ) {
         final Map map = fragment.reopenMap();
         final ObjList<GroupByFunction> functions = atom.getGroupByFunctions(slotId);
         final DirectLongList batchList = atom.getBatchList(slotId);
         final FlyweightPackedMapValue mapValue = atom.getBatchMapValue(slotId);
+        final GroupByKernel.Updater compiledUpdater = atom.getCompiledUpdater(slotId);
         final int functionCount = functions.size();
         final int batchSize = atom.getBatchSize();
+
+        if (compiledUpdater != null && compiledUpdater.updateMap(record, frameRowCount, 0, map, batchSize, circuitBreaker)) {
+            return;
+        }
 
         // Size the batch buffer once — probeBatch writes via the raw base address, never advancing pos.
         // ensureCapacity reopens the list if it's closed.
@@ -436,6 +491,9 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
             // Update phase — one call per function per sub-batch. The encoded rowIndex in each
             // batch entry is already the frame-relative row id, so computeKeyedBatch computes
             // the global row id as baseRowId + rowIndex.
+            if (compiledUpdater != null && compiledUpdater.update(record, baseValueAddress, batchAddr, batchRows, circuitBreaker)) {
+                continue;
+            }
             for (int i = 0; i < functionCount; i++) {
                 functions.getQuick(i).computeKeyedBatch(
                         record,
@@ -447,6 +505,21 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
                 );
             }
         }
+    }
+
+    private static boolean aggregateShardedCompiled(
+            PageFrameMemoryRecord record,
+            long rowCount,
+            long rowIdsAddress,
+            AsyncGroupByAtom atom,
+            int slotId,
+            GroupByMapFragment fragment,
+            RecordSink mapSink,
+            SqlExecutionCircuitBreaker circuitBreaker
+    ) {
+        final GroupByKernel.Updater updater = atom.getCompiledUpdater(slotId);
+        return updater != null && updater.updateSharded(record, rowCount, rowIdsAddress,
+                fragment.getShards(), mapSink, atom.getFunctionUpdater(slotId), circuitBreaker);
     }
 
     private static void aggregateSharded(
@@ -527,9 +600,25 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
 
             atom.resetLocalStats(slotId);
 
-            if (compiledFilter == null || frameMemory.hasColumnTops() || frameMemory.hasColumnTypeCasts()) {
+            final GroupByKernel.Updater compiledUpdater = atom.getCompiledUpdater(slotId);
+            if (compiledUpdater != null && compiledUpdater.hasFusedFilter() && !useLateMaterialization
+                    && !frameMemory.hasColumnTops() && !frameMemory.hasColumnTypeCasts()) {
+                if (atom.isSharded()) fragment.shard(circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
+                boolean local = fragment.isNotSharded();
+                long selected = compiledUpdater.updateFiltered(record, frameRowCount,
+                        local ? fragment.reopenMap() : null, local ? null : fragment.getShards(),
+                        atom.getBatchSize(), circuitBreaker);
+                if (selected >= 0) {
+                    if (isParquetFrame) filterCtx.getSelectivityStats(slotId).update(selected, frameRowCount);
+                    atom.maybeEnableSharding(fragment);
+                    return;
+                }
+            }
+            final boolean filtered = compiledUpdater != null && !frameMemory.hasColumnTops() && !frameMemory.hasColumnTypeCasts()
+                    && compiledUpdater.filter(record, frameRowCount, rows, circuitBreaker);
+            if (!filtered && (compiledFilter == null || frameMemory.hasColumnTops() || frameMemory.hasColumnTypeCasts())) {
                 AsyncFilterUtils.applyFilter(filter, rows, record, frameRowCount);
-            } else {
+            } else if (!filtered) {
                 AsyncFilterUtils.applyCompiledFilter(
                         compiledFilter,
                         filterCtx.getBindVarMemory(),
@@ -560,7 +649,7 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
             }
 
             if (atom.isSharded()) {
-                fragment.shard();
+                fragment.shard(circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
             }
 
             long baseRowId = Rows.toRowID(frameIndex, 0);
@@ -569,9 +658,9 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
                 if (lateMaterialized) {
                     aggregateFilteredNonSharded(record, rows, baseRowId, functionUpdater, fragment, mapSink);
                 } else {
-                    aggregateFilteredNonShardedBatched(record, rows, baseRowId, atom, slotId, fragment, mapSink);
+                    aggregateFilteredNonShardedBatched(record, rows, baseRowId, atom, slotId, fragment, mapSink, circuitBreaker);
                 }
-            } else {
+            } else if (!aggregateShardedCompiled(record, rows.size(), rows.getAddress(), atom, slotId, fragment, mapSink, circuitBreaker)) {
                 aggregateFilteredSharded(record, rows, baseRowId, functionUpdater, fragment, mapSink);
             }
 

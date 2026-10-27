@@ -69,7 +69,7 @@ public class AddIntFunctionFactory implements FunctionFactory {
         return new AddIntFunc(left, right);
     }
 
-    private static class AddIntFunc extends IntFunction implements ArithmeticBinaryFunction {
+    public static class AddIntFunc extends IntFunction implements ArithmeticBinaryFunction {
         private final Function left;
         private final Function right;
 

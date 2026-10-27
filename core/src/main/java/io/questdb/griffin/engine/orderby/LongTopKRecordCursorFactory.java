@@ -58,6 +58,7 @@ public class LongTopKRecordCursorFactory extends AbstractRecordCursorFactory {
         this.columnIndex = columnIndex;
         this.lo = lo;
         this.ascending = ascending;
+        base.prepareLongTopK(columnIndex, ascending, lo);
         this.cursor = new LongTopKRecordCursor(columnIndex, lo, ascending);
     }
 
@@ -97,6 +98,11 @@ public class LongTopKRecordCursorFactory extends AbstractRecordCursorFactory {
     @Override
     public boolean implementsLimit() {
         return true;
+    }
+
+    @Override
+    public boolean prepareRowLimit() {
+        return base.prepareSortedRowLimit();
     }
 
     @Override

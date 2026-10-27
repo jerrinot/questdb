@@ -79,6 +79,30 @@ public interface FrozenHashJoinBuild {
      * A build whose probes look up a single INT key.
      */
     interface IntKeyed extends FrozenHashJoinBuild {
+        int LOOKUP_BYTES = 40;
+
+        /**
+         * Optional native lookup snapshot: five eight-byte words containing serial key-table
+         * address, slot mask, partition directory address (zero for serial), partition shift and
+         * row-heap address. Directory entries hold table address and mask. Table slots are an INT
+         * key and an unsigned compressed head (head * 8 is the biased row link). A row begins with
+         * its next biased byte link; zero ends the chain. Hashing is Hash.hashInt64, as in the Java
+         * probe. All backing is immutable and borrowed until this execution drains, before close.
+         * Returns false for an unsupported/chain-counted snapshot, before the consumer mutates state.
+         */
+        default boolean writeLookup(long address) {
+            return false;
+        }
+
+        /**
+         * Borrows the payload view described by {@link HashJoinPayloadSource#writeNativeColumn}.
+         * A supported heap has 16-byte rows: next link followed by row id. The ordinal is
+         * the unbiased byte offset divided by 16. This view has the lookup snapshot's lifetime.
+         */
+        default boolean writeNativePayload(int column, long address) {
+            return false;
+        }
+
         /**
          * Each acquired execution slot needs its own probe. Probes do not consult a circuit
          * breaker; callers check cancellation at frame boundaries and on a work budget.

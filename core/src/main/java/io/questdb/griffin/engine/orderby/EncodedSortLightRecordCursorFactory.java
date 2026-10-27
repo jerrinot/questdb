@@ -47,6 +47,7 @@ public class EncodedSortLightRecordCursorFactory extends AbstractRecordCursorFac
     private final ListColumnFilter sortColumnFilter;
     private RecordCursorFactory base;
     private EncodedSortLightRecordCursor cursor;
+    private final boolean compiledSort;
 
     public EncodedSortLightRecordCursorFactory(
             CairoConfiguration configuration,
@@ -58,10 +59,13 @@ public class EncodedSortLightRecordCursorFactory extends AbstractRecordCursorFac
         // The light cursor re-fetches rows with baseCursor.recordAt during emit.
         assert base.recordCursorSupportsRandomAccess();
         this.base = base;
+        this.compiledSort = sortColumnFilter.size() == 1
+                && base.prepareLongSort(Math.abs(sortColumnFilter.getQuick(0)) - 1);
         this.cursor = new EncodedSortLightRecordCursor(
                 configuration,
                 metadata,
-                sortColumnFilter
+                sortColumnFilter,
+                compiledSort
         );
         this.sortColumnFilter = sortColumnFilter;
     }
@@ -96,6 +100,7 @@ public class EncodedSortLightRecordCursorFactory extends AbstractRecordCursorFac
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("Encode sort light");
+        if (compiledSort) sink.meta("compiledSort").val(true);
         SortedLightRecordCursorFactory.addSortKeys(sink, sortColumnFilter);
         sink.child(base);
     }

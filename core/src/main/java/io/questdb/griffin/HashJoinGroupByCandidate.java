@@ -73,6 +73,7 @@ public final class HashJoinGroupByCandidate {
     private final ObjList<QueryColumn> resolvedColumns;
     private final RecordMetadata resolvedMetadata;
     private final ObjList<ExpressionNode> resolvedPostJoinFilters;
+    private final boolean requiresCompiledPipeline;
 
     private HashJoinGroupByCandidate(
             Analyzer analyzer,
@@ -87,6 +88,7 @@ public final class HashJoinGroupByCandidate {
         this.resolvedColumns = analyzer.resolvedColumns;
         this.resolvedMetadata = analyzer.metadata;
         this.resolvedPostJoinFilters = analyzer.resolvedPostJoinFilters;
+        this.requiresCompiledPipeline = analyzer.requiresCompiledPipeline;
         this.buildIndex = analyzer.buildIndex;
         this.keys = keys;
         this.isInputSwapped = isInputSwapped;
@@ -509,6 +511,10 @@ public final class HashJoinGroupByCandidate {
         return resolvedMetadata;
     }
 
+    boolean requiresCompiledPipeline() {
+        return requiresCompiledPipeline;
+    }
+
     ObjList<ExpressionNode> getResolvedPostJoinFilters() {
         return resolvedPostJoinFilters;
     }
@@ -717,6 +723,7 @@ public final class HashJoinGroupByCandidate {
         private final IntList requiredBuildColumns = new IntList();
         private final ObjList<QueryColumn> resolvedColumns = new ObjList<>();
         private final ObjList<ExpressionNode> resolvedPostJoinFilters = new ObjList<>();
+        private boolean requiresCompiledPipeline;
         private final RecordMetadata[] sources;
         private ExpressionNode buildOnFilter;
         // Bind variables without a type in the inputs' own WHERE clauses, whose types the analysis
@@ -831,7 +838,8 @@ public final class HashJoinGroupByCandidate {
             if (node == null) {
                 return true;
             }
-            // Independently single-input conjuncts are legal; a cross-input OR is not.
+            // Independently single-input conjuncts are legal. A cross-input conjunct additionally
+            // requires admission of the complete compiled pipeline below.
             // A sub-query predicate is a QUERY node without a token; resolve() rejects it below.
             if (isPostJoin && node.type == ExpressionNode.OPERATION && Chars.equalsIgnoreCase(node.token, "and")) {
                 return checkFilter(node.lhs, model, source, true) && checkFilter(node.rhs, model, source, true);
@@ -852,8 +860,17 @@ public final class HashJoinGroupByCandidate {
                     isDeferringBindVariables = false;
                 }
             }
-            if (expression == null || (isPostJoin && usedSources == 3)) {
+            if (expression == null) {
                 return false;
+            }
+            if (isPostJoin && usedSources == 3) {
+                // Preserve the ordinary admission gate unless the optional compiler accepts the
+                // complete pipeline later. SqlCodeGenerator closes a rejected factory and restores
+                // the input models before producing the ordinary plan.
+                if (executionContext.getQueryCodeGenerator() == null) {
+                    return false;
+                }
+                requiresCompiledPipeline = true;
             }
             if (isPostJoin) {
                 resolvedPostJoinFilters.add(expression);

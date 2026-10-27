@@ -37,6 +37,7 @@ import io.questdb.cairo.sql.async.QueryParallelOwnerLoop;
 import io.questdb.cairo.sql.async.WorkStealingStrategy;
 import io.questdb.griffin.engine.PerWorkerLocks;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
+import io.questdb.griffin.engine.groupby.GroupByKernel;
 import io.questdb.griffin.engine.groupby.GroupByMergeShardJob;
 import io.questdb.griffin.engine.groupby.PostAggregationCircuitBreaker;
 import io.questdb.log.Log;
@@ -91,6 +92,13 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
     private final PerWorkerLocks perWorkerLocks;
     private final AsyncQueryProgressState progressState = new AsyncQueryProgressState();
     private final ColumnTypes valueTypes;
+    private ObjList<GroupByKernel.Updater> compiledUpdaters;
+    private boolean bounded;
+    private boolean shared;
+    // Each phase drains fully before the next is published. Existing slot ownership and
+    // cancellation apply unchanged; no worker waits for children while holding a slot.
+    private final ObjList<GroupByKernel.MergeTask> postMergeTasks = new ObjList<>();
+    private int mergePhase;
     volatile boolean sharded;
     boolean shardedHint;
 
@@ -136,6 +144,11 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
     @Override
     public void clear() {
         sharded = false;
+        mergePhase = 0;
+        postMergeTasks.clear();
+        if (compiledUpdaters != null) {
+            for (int i = 0; i < compiledUpdaters.size(); i++) compiledUpdaters.getQuick(i).clear();
+        }
         Misc.free(ownerFragment);
         Misc.freeObjListAndKeepObjects(perWorkerFragments);
         Misc.freeObjListAndKeepObjects(destShards);
@@ -164,15 +177,41 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         return perWorkerLocks.acquireSlot(carrierId, circuitBreaker);
     }
 
-    public void mergeShard(int slotId, int shardIndex) {
-        mergeShard(shardIndex, getFunctionUpdater(slotId));
+    public void mergeShard(int slotId, int shardIndex, Runnable checkpoint) {
+        if (mergePhase == 1) {
+            compiledUpdater(slotId).runMergeTask(postMergeTasks.getQuick(shardIndex), checkpoint);
+        } else if (mergePhase == 2) {
+            compiledUpdater(slotId).finalizeMap(destShards.getQuick(shardIndex), checkpoint);
+        } else {
+            mergeShard(shardIndex, getFunctionUpdater(slotId), compiledUpdater(slotId), checkpoint);
+        }
+    }
+
+    void setCompiledUpdaters(ObjList<GroupByKernel.Updater> updaters) {
+        compiledUpdaters = updaters;
+        bounded = updaters.getQuick(0).localMapCapacity() > 0;
+        ownerFragment.setCompiledUpdater(updaters.getQuick(0));
+        for (int i = 0; i < perWorkerFragments.size(); i++) {
+            perWorkerFragments.getQuick(i).setCompiledUpdater(updaters.getQuick(i + 1));
+        }
+    }
+
+    private GroupByKernel.Updater compiledUpdater(int slot) {
+        return compiledUpdaters == null ? null : compiledUpdaters.getQuick(slot + 1);
+    }
+
+    private static void merge(Map destination, Map source, GroupByFunctionsUpdater functions,
+                              GroupByKernel.Updater compiled, Runnable checkpoint) {
+        if (compiled == null || !compiled.merge(destination, source, checkpoint)) {
+            destination.merge(source, functions);
+        }
     }
 
     public void release(int slotId) {
         perWorkerLocks.releaseSlot(slotId);
     }
 
-    private Map mergeOwnerMap(GroupByFunctionsUpdater functionUpdater) {
+    private Map mergeOwnerMap(GroupByFunctionsUpdater functionUpdater, Runnable checkpoint) {
         final Map destMap = ownerFragment.reopenMap();
         final int perWorkerMapCount = perWorkerFragments.size();
 
@@ -203,7 +242,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         // Now do the actual merge.
         for (int i = 0; i < perWorkerMapCount; i++) {
             final Map srcMap = perWorkerFragments.getQuick(i).getMap();
-            destMap.merge(srcMap, functionUpdater);
+            merge(destMap, srcMap, functionUpdater, compiledUpdater(-1), checkpoint);
             srcMap.close();
         }
 
@@ -213,14 +252,43 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         }
 
         updateShardedHint();
+        if (compiledUpdater(-1) != null) compiledUpdater(-1).finalizeMap(destMap, checkpoint);
 
         return destMap;
     }
 
-    private void mergeShard(int shardIndex, GroupByFunctionsUpdater functionUpdater) {
+    private void mergeShard(int shardIndex, GroupByFunctionsUpdater functionUpdater, GroupByKernel.Updater compiled, Runnable checkpoint) {
         assert sharded;
 
         final Map destMap = reopenDestShard(shardIndex);
+        if (shared) {
+            compiled.finishSharedMap(shardIndex, checkpoint);
+            // Unsupported frame representations still use their ordinary local maps.
+            // Those fragments were sharded after scanning; merge them into the shared result.
+            for (int i = -1; i < perWorkerFragments.size(); i++) {
+                GroupByMapFragment fragment = getFragment(i);
+                if (fragment.sharded) {
+                    Map source = fragment.getShards().getQuick(shardIndex);
+                    merge(destMap, source, functionUpdater, compiled, checkpoint);
+                    source.close();
+                }
+            }
+            compiled.finalizeMap(destMap, checkpoint);
+            if (configuration.isGroupByPresizeEnabled()) {
+                lastShardStats.getQuick(shardIndex).update(0, -1, destMap.size(), destMap.getHeapSize());
+            }
+            return;
+        }
+        if (bounded) {
+            for (int i = 0; i < compiledUpdaters.size(); i++) {
+                compiled.mergePartition(destMap, compiledUpdaters.getQuick(i), shardIndex, checkpoint);
+            }
+            compiled.finalizeMap(destMap, checkpoint);
+            if (configuration.isGroupByPresizeEnabled()) {
+                lastShardStats.getQuick(shardIndex).update(0, -1, destMap.size(), destMap.getHeapSize());
+            }
+            return;
+        }
         final int perWorkerMapCount = perWorkerFragments.size();
 
         // Calculate medians before the merge.
@@ -257,12 +325,13 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         for (int i = 0; i < perWorkerMapCount; i++) {
             final GroupByMapFragment srcFragment = perWorkerFragments.getQuick(i);
             final Map srcMap = srcFragment.getShards().getQuick(shardIndex);
-            destMap.merge(srcMap, functionUpdater);
+            merge(destMap, srcMap, functionUpdater, compiled, checkpoint);
             srcMap.close();
         }
         // Merge shard from the owner fragment.
-        destMap.merge(srcOwnerMap, functionUpdater);
+        merge(destMap, srcOwnerMap, functionUpdater, compiled, checkpoint);
         srcOwnerMap.close();
+        if (compiled != null) compiled.finalizeMap(destMap, checkpoint);
 
         // Don't forget to update the stats.
         if (configuration.isGroupByPresizeEnabled()) {
@@ -354,6 +423,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
     }
 
     void maybeEnableSharding(GroupByMapFragment fragment, long functionCardinalityIncrement) {
+        if (bounded || shared) return;
         fragment.totalFunctionCardinality += functionCardinalityIncrement;
         // Functions are cheaper to merge when compared with merging the maps, hence the 10x multiplier.
         final int shardingThreshold = configuration.getGroupByShardingThreshold();
@@ -363,7 +433,11 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
     }
 
     Map mergeOwnerMap() {
-        return mergeOwnerMap(getFunctionUpdater(-1));
+        return mergeOwnerMap(null);
+    }
+
+    Map mergeOwnerMap(Runnable checkpoint) {
+        return mergeOwnerMap(getFunctionUpdater(-1), checkpoint);
     }
 
     /**
@@ -381,12 +455,62 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
             AtomicInteger postAggregationStartedCounter
     ) {
         postAggregationCircuitBreaker.reset();
+        shardAll(circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
+        boolean deferred = false;
+        if (compiledUpdaters != null) {
+            for (int i = 0; i < compiledUpdaters.size(); i++) deferred |= compiledUpdaters.getQuick(i).beginParallelMerge();
+        }
+        try {
+            executeMergeTasks(NUM_SHARDS, messageBus, workStealingStrategy, circuitBreaker,
+                    postAggregationCircuitBreaker, postAggregationDoneLatch, postAggregationStartedCounter);
+            if (postAggregationCircuitBreaker.checkIfTrippedOrYield()) return destShards;
+            if (deferred) {
+                Runnable checkpoint = circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled;
+                int states = 0;
+                for (int i = 0; i < compiledUpdaters.size(); i++) states += compiledUpdaters.getQuick(i).getPendingMergeCount();
+                int parallelism = Math.max(1, compiledUpdaters.size() / Math.max(1, states));
+                mergePhase = 1;
+                boolean more;
+                do {
+                    postMergeTasks.clear();
+                    more = false;
+                    for (int i = 0; i < compiledUpdaters.size(); i++) {
+                        more |= compiledUpdaters.getQuick(i).prepareMergeTasks(postMergeTasks, parallelism, checkpoint);
+                    }
+                    if (postMergeTasks.size() > 0) {
+                        executeMergeTasks(postMergeTasks.size(), messageBus, workStealingStrategy, circuitBreaker,
+                                postAggregationCircuitBreaker, postAggregationDoneLatch, postAggregationStartedCounter);
+                        if (postAggregationCircuitBreaker.checkIfTrippedOrYield()) return destShards;
+                    }
+                } while (more);
+                for (int i = 0; i < compiledUpdaters.size(); i++) compiledUpdaters.getQuick(i).endParallelMerge(states > 0);
+                mergePhase = 2;
+                executeMergeTasks(NUM_SHARDS, messageBus, workStealingStrategy, circuitBreaker,
+                        postAggregationCircuitBreaker, postAggregationDoneLatch, postAggregationStartedCounter);
+            }
+            if (!postAggregationCircuitBreaker.checkIfTrippedOrYield()) finalizeShardStats();
+            return destShards;
+        } finally {
+            // executeMergeTasks drains every published task, including on cancellation.
+            mergePhase = 0;
+            postMergeTasks.clear();
+            if (compiledUpdaters != null) {
+                for (int i = 0; i < compiledUpdaters.size(); i++) compiledUpdaters.getQuick(i).endParallelMerge(false);
+            }
+        }
+    }
+
+    private void executeMergeTasks(
+            int taskCount,
+            MessageBus messageBus,
+            WorkStealingStrategy workStealingStrategy,
+            SqlExecutionCircuitBreaker circuitBreaker,
+            PostAggregationCircuitBreaker postAggregationCircuitBreaker,
+            SOUnboundedCountDownLatch postAggregationDoneLatch,
+            AtomicInteger postAggregationStartedCounter
+    ) {
         postAggregationStartedCounter.set(0);
         postAggregationDoneLatch.reset();
-
-        // First, make sure to shard all non-sharded maps, if any.
-        shardAll();
-
         // Next, merge each set of partial shard maps into the final shard map. This is done in parallel.
         final RingQueue<GroupByMergeShardTask> queue = messageBus.getGroupByMergeShardQueue();
         final MPSequence pubSeq = messageBus.getGroupByMergeShardPubSeq();
@@ -397,12 +521,11 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         ownerLoop.tryAcquirePublication();
 
         if (!ownerLoop.hasPublication()) {
-            for (int shardIndex = 0; shardIndex < NUM_SHARDS; shardIndex++) {
+            for (int shardIndex = 0; shardIndex < taskCount; shardIndex++) {
                 ownerLoop.checkBeforeHelping();
-                mergeShard(-1, shardIndex);
+                mergeShard(-1, shardIndex, circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
             }
-            finalizeShardStats();
-            return destShards;
+            return;
         }
 
         int queuedCount = 0;
@@ -412,14 +535,14 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         int mergedCount = 0; // positive completed-task count; the latch counts down from zero
 
         try {
-            for (int shardIndex = 0; shardIndex < NUM_SHARDS; shardIndex++) {
+            for (int shardIndex = 0; shardIndex < taskCount; shardIndex++) {
                 while (true) {
                     ownerLoop.observeProgress();
                     long cursor = pubSeq.next();
                     if (cursor < 0) {
                         if (strategy.shouldSteal(mergedCount)) {
                             ownerLoop.checkBeforeHelping();
-                            mergeShard(-1, shardIndex);
+                            mergeShard(-1, shardIndex, circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
                             ownCount++;
                             total++;
                             mergedCount = -postAggregationDoneLatch.getCount();
@@ -483,21 +606,16 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
             }
         }
 
-        if (!postAggregationCircuitBreaker.checkIfTrippedOrYield()) {
-            finalizeShardStats();
-        }
-
         LOG.debug().$("merge shards done [total=").$(total)
                 .$(", ownCount=").$(ownCount)
                 .$(", reclaimed=").$(reclaimed)
                 .$(", queuedCount=").$(queuedCount)
                 .I$();
-
-        return destShards;
     }
 
     void reopen() {
-        if (shardedHint) {
+        shared = compiledUpdaters != null && compiledUpdaters.getQuick(0).initSharedMaps(this::reopenDestShard);
+        if (shardedHint && !bounded && !shared) {
             // Looks like we had to shard during previous execution, so let's do it ahead of time.
             sharded = true;
         }
@@ -511,10 +629,42 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         }
     }
 
-    void shardAll() {
-        ownerFragment.shard();
+    void shardAll(Runnable checkpoint) {
+        if (shared) {
+            for (int i = -1; i < perWorkerFragments.size(); i++) {
+                GroupByMapFragment fragment = getFragment(i);
+                if (fragment.getMap().size() > 0) fragment.shard(checkpoint);
+            }
+            return;
+        }
+        if (bounded) {
+            for (int i = 0; i < compiledUpdaters.size(); i++) {
+                Map source = getFragment(i - 1).getMap();
+                compiledUpdaters.getQuick(i).partition(source, checkpoint);
+                source.close();
+            }
+            return;
+        }
+        ownerFragment.shard(checkpoint);
         for (int i = 0, n = perWorkerFragments.size(); i < n; i++) {
-            perWorkerFragments.getQuick(i).shard();
+            perWorkerFragments.getQuick(i).shard(checkpoint);
+        }
+    }
+
+    /** Scan state is now immutable; no worker can observe this transition. */
+    void finishScan() {
+        if (shared) {
+            sharded = true;
+            return;
+        }
+        if (bounded) {
+            for (int i = 0; i < compiledUpdaters.size(); i++) {
+                GroupByKernel.Updater updater = compiledUpdaters.getQuick(i);
+                if (updater.hasPartitions() || getFragment(i - 1).getMap().size() >= updater.localMapCapacity()) {
+                    sharded = true;
+                    break;
+                }
+            }
         }
     }
 }

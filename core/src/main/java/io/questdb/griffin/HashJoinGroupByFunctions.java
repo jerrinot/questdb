@@ -70,6 +70,7 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
     private final ObjList<GroupByFunctionsUpdater> updaters = new ObjList<>();
     private final ArrayColumnTypes valueTypes = new ArrayColumnTypes();
     private final int workerCount;
+    private final int singleKeyColumn;
     private Function filter;
     private ObjList<Function> outputOnlyFunctions;
     private ObjList<Function> workerFilters;
@@ -116,6 +117,9 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
                 }
             }
             outputOnlyFunctions = GroupByUtils.extractNonGroupByFunctions(outputFunctions);
+            singleKeyColumn = keyTypes.getColumnCount() == 1 && columnFilter.size() == 1
+                    && columnFilter.getQuick(0) > 0 && keyFunctions.size() == 0
+                    ? columnFilter.getQuick(0) - 1 : -1;
             SqlCodeGenerator.WorkerFunctionLists workers = generator.compilePerWorkerInnerProjectionFunctions(
                     executionContext, metadata.getColumns(), innerFunctions, workerCount, joined, flags);
             if (workers != null) {
@@ -206,6 +210,11 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
 
     public ArrayColumnTypes getKeyTypes() {
         return keyTypes;
+    }
+
+    /** Direct joined-record column for a single grouping key, or -1 for other key expressions. */
+    public int getSingleKeyColumn() {
+        return singleKeyColumn;
     }
 
     public RecordSink getMapSink(int slot) {
