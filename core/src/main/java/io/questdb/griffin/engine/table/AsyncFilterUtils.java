@@ -100,9 +100,7 @@ public class AsyncFilterUtils {
     ) {
         PageFrameReduceTask.populateJitAddresses(frameMemory, pageAddressCache, dataAddresses, auxAddresses);
 
-        if (filteredRows.getCapacity() < frameRowCount) {
-            filteredRows.setCapacity(frameRowCount);
-        }
+        filteredRows.clearAndEnsureCapacity(frameRowCount);
 
         long hi = compiledFilter.call(
                 dataAddresses.getAddress(),

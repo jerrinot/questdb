@@ -29,6 +29,7 @@ import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.TableReader;
+import io.questdb.cairo.map.Map;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.PageFrameMemoryPool;
@@ -50,10 +51,12 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.PerWorkerLockOwner;
 import io.questdb.griffin.engine.PerWorkerLocks;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongConstGroupByFunction;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.SimpleMapValue;
+import io.questdb.griffin.engine.join.CompiledJoin;
 import io.questdb.griffin.engine.join.FrozenHashJoinBuild;
 import io.questdb.griffin.engine.join.HashJoinGroupByRecord;
 import io.questdb.griffin.engine.join.IntHashJoinBuild;
@@ -106,6 +109,11 @@ import org.jetbrains.annotations.TestOnly;
  * key adds one; see {@link #isCountedByMatch()}.
  */
 public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLockOwner {
+    // Opt-in phase diagnostics; no clocks are read on the ordinary path.
+    boolean collectExecutionTimings;
+    long buildNanos;
+    long probeNanos;
+    long mergeNanos;
     private static final UnorderedPageFrameReducer BUILD_PARTITION = AsyncHashJoinGroupByAtom::buildPartition;
     private static final UnorderedPageFrameReducer COPY_FRAME_PAYLOAD = AsyncHashJoinGroupByAtom::copyFramePayload;
     private static final UnorderedPageFrameReducer COUNT_PARTITIONS = AsyncHashJoinGroupByAtom::countPartitions;
@@ -199,6 +207,7 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
     // The open cursor's probe scan, whose dictionaries build() sizes the SYMBOL key translation by.
     private SymbolTableSource probeSymbols;
     private GroupByShardingContext shardingContext;
+    private CompiledJoin compiledJoin;
 
     AsyncHashJoinGroupByAtom(
             CairoEngine engine,
@@ -423,6 +432,8 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
         }
         failure = Misc.freeObjListBestEffort(failure, slots);
         slots.clear();
+        failure = Misc.freeBestEffort(failure, compiledJoin);
+        compiledJoin = null;
         failure = Misc.freeBestEffort(failure, shardingContext);
         shardingContext = null;
         frameSequence = null;
@@ -472,6 +483,97 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
 
     public HashJoinGroupByFunctions getFunctions() {
         return functions;
+    }
+
+    public CharSequence getCompiledJoinName() {
+        return compiledJoin != null ? compiledJoin.getName() : null;
+    }
+
+    @TestOnly
+    public void collectExecutionTimings() {
+        collectExecutionTimings = true;
+    }
+
+    /** Last completed execution; read after drain, including after cursor close. */
+    @TestOnly
+    public long[] getExecutionTimings() {
+        return new long[]{buildNanos, probeNanos, mergeNanos};
+    }
+
+    /** Read after the sequence drains; coverage of native probe rows, not joined pairs. */
+    @TestOnly
+    public long getCompiledJoinNativeRows() {
+        long rows = 0;
+        for (int i = 0; i < slots.size(); i++) {
+            CompiledJoin.Updater updater = slots.getQuick(i).compiledUpdater;
+            if (updater != null) {
+                rows += updater.getNativeRows();
+            }
+        }
+        return rows;
+    }
+
+    /** Read after drain; one slow-path crossing per newly inserted slot-local group. */
+    @TestOnly
+    public long getCompiledJoinMapMisses() {
+        long misses = 0;
+        for (int i = 0; i < slots.size(); i++) {
+            CompiledJoin.Updater updater = slots.getQuick(i).compiledUpdater;
+            if (updater != null) {
+                misses += updater.getNativeMapMisses();
+            }
+        }
+        return misses;
+    }
+
+    void compileJoin(@Nullable QueryCodeGenerator compiler, HashJoinGroupByMetadata metadata) {
+        if (compiler == null || isOuter || isKeyStaged || isSymbolKey
+                || isCountOnly) {
+            return;
+        }
+        if (functions.isKeyed() && functions.getSingleKeyColumn() < 0) {
+            return;
+        }
+        compiledJoin = compiler.compileJoin(metadata.getJoinedMetadata(), metadata.getProbeColumnCount(),
+                functions.getValueTypes(), functions.getGroupByFunctions(-1), probeKeyColumn, getSlot(-1).value, functions.getFilter(-1),
+                functions.getSingleKeyColumn(), functions.isKeyed() ? getFragment(-1).getMap() : null);
+        if (compiledJoin != null) {
+            for (int i = 0; i < slots.size(); i++) {
+                Slot slot = slots.getQuick(i);
+                slot.compiledUpdater = compiledJoin.newUpdater(() -> {
+                    if (!frameSequence.isActive()) {
+                        throw frameSequence.buildInterruptionException();
+                    }
+                    if (!frameSequence.isUninterruptible()) {
+                        int state = slot.compiledBreaker.getState(frameSequence.getStartTime(),
+                                frameSequence.getCircuitBreaker().getFd());
+                        if (state != SqlExecutionCircuitBreaker.STATE_OK) {
+                            frameSequence.cancel(state);
+                            throw frameSequence.buildInterruptionException();
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    boolean aggregateCompiled(Slot slot, int slotId, GroupByMapFragment fragment, Map map,
+                              PageFrameMemoryRecord record, long rowCount, long rowIdsAddress, SqlExecutionCircuitBreaker breaker) {
+        if (slot.compiledUpdater == null) {
+            return false;
+        }
+        slot.compiledBreaker = breaker;
+        try {
+            if (fragment != null) {
+                return slot.compiledUpdater.updateKeyed(record, rowCount, rowIdsAddress,
+                        (FrozenHashJoinBuild.IntKeyed) frozen, map, fragment.isNotSharded() ? null : fragment.getShards(),
+                        functions.getUpdater(slotId));
+            }
+            return slot.compiledUpdater.update(record, rowCount, rowIdsAddress,
+                    (FrozenHashJoinBuild.IntKeyed) frozen, slot.value);
+        } finally {
+            slot.compiledBreaker = null;
+        }
     }
 
     /**
@@ -1466,6 +1568,8 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
         FrozenHashJoinBuild.RecordProbe partitionedRecordProbe;
         FrozenHashJoinBuild.RecordProbe recordProbe;
         SimpleMapValue value;
+        CompiledJoin.Updater compiledUpdater;
+        SqlExecutionCircuitBreaker compiledBreaker;
         // The open cursor's build scan, which serves this slot's build symbol tables; null otherwise.
         private SymbolTableSource buildSymbols;
 
@@ -1495,7 +1599,9 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
 
         @Override
         public void close() {
-            Throwable failure = Misc.freeBestEffort(null, value);
+            Throwable failure = Misc.freeBestEffort(null, compiledUpdater);
+            compiledUpdater = null;
+            failure = Misc.freeBestEffort(failure, value);
             value = null;
             failure = Misc.freeBestEffort(failure, intProbe);
             intProbe = null;

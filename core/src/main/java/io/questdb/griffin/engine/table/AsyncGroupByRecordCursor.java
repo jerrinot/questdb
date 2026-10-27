@@ -43,6 +43,7 @@ import io.questdb.cairo.sql.async.UnorderedPageFrameSequence;
 import io.questdb.cairo.sql.async.WorkStealingStrategy;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.griffin.engine.groupby.GroupByLongTopKJob;
 import io.questdb.griffin.engine.groupby.GroupByUtils;
@@ -148,20 +149,41 @@ class AsyncGroupByRecordCursor implements RecordCursor {
     }
 
     @Override
+    public boolean selectSortedRows(io.questdb.std.DirectLongLongSortedList sorted, io.questdb.std.DirectLongList rows, long skip, long take) {
+        buildMapConditionally();
+        var updater = frameSequence.getAtom().getCompiledUpdater(-1);
+        return updater != null && updater.selectSortedRows(sorted, rows, skip, take,
+                circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled);
+    }
+
+    @Override
+    public boolean selectRows(io.questdb.std.DirectLongList rows, long skip, long take) {
+        buildMapConditionally();
+        var updater = frameSequence.getAtom().getCompiledUpdater(-1);
+        return updater != null && updater.selectRows(ownerMap, shards, rows, skip, take,
+                circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled);
+    }
+
+    @Override
+    public boolean sortLong(io.questdb.std.DirectLongList entries, io.questdb.std.DirectLongList scratch,
+                            int columnIndex, boolean ascending, long maxEntries) {
+        buildMapConditionally();
+        var updater = frameSequence.getAtom().getCompiledUpdater(-1);
+        return updater != null && updater.sortLong(ownerMap, shards, entries, scratch,
+                recordFunctions.getQuick(columnIndex), ascending, maxEntries,
+                circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled);
+    }
+
+    @Override
     public void longTopK(DirectLongLongSortedList list, int columnIndex) {
         buildMapConditionally();
         final Function recordFunction = recordFunctions.getQuick(columnIndex);
-        // Only run in parallel when the function is thread-safe. This is a simplified check that won't
-        // pass for functions like count(varchar), but it's good enough for now since it'll pass for
-        // count() and count() over a fixed-size column.
-        //
-        // Later on, we can introduce a special method for GroupByFunction that will stand for aggregation
-        // thread-safety (the current value of the isThreadSafe() flag) while the isThreadSafe() flag
-        // will stand for read thread-safety, just like for non-GROUP BY functions.
-        if (recordFunction.isThreadSafe() && mapCursor == shardedCursor && mapCursor.size() > configuration.getGroupByParallelTopKThreshold()) {
+        // Build/merge has drained. Each shard job owns its record and result list, including
+        // when generated collection declines and the ordinary getter is used instead.
+        if (isReadThreadSafe(recordFunction) && mapCursor == shardedCursor && mapCursor.size() > configuration.getGroupByParallelTopKThreshold()) {
             parallelLongTopK(list, recordFunction);
         } else {
-            mapCursor.longTopK(list, recordFunction);
+            collectLongTopK(list, recordFunction, mapCursor);
         }
     }
 
@@ -209,9 +231,10 @@ class AsyncGroupByRecordCursor implements RecordCursor {
         final AsyncGroupByAtom atom = frameSequence.getAtom();
 
         final GroupByShardingContext shardingCtx = atom.getShardingContext();
+        shardingCtx.finishScan();
         if (!atom.isSharded()) {
             // No sharding was necessary, so the maps are small, and we merge them ourselves.
-            ownerMap = shardingCtx.mergeOwnerMap();
+            ownerMap = shardingCtx.mergeOwnerMap(circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
             mapCursor = ownerMap.getCursor();
             shards = null;
         } else {
@@ -269,7 +292,7 @@ class AsyncGroupByRecordCursor implements RecordCursor {
                             destList.getOrder(),
                             destList.getCapacity()
                     );
-                    shard.getCursor().longTopK(ownerList, longFunc);
+                    atom.longTopK(-1, shard, ownerList, longFunc, circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
                     ownCount++;
                     total++;
                     continue;
@@ -282,7 +305,7 @@ class AsyncGroupByRecordCursor implements RecordCursor {
                             ownerLoop.checkBeforeHelping();
                             final Map shard = atom.getDestShards().getQuick(shardIndex);
                             final DirectLongLongSortedList ownerList = atom.getLongTopKList(-1, destList.getOrder(), destList.getCapacity());
-                            shard.getCursor().longTopK(ownerList, longFunc);
+                            atom.longTopK(-1, shard, ownerList, longFunc, circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
                             ownCount++;
                             total++;
                             processedCount = -postAggregationDoneLatch.getCount();
@@ -356,19 +379,13 @@ class AsyncGroupByRecordCursor implements RecordCursor {
         // Now merge everything into the destination list.
         final DirectLongLongSortedList ownerList = atom.getOwnerLongTopKList();
         if (ownerList != null) {
-            final DirectLongLongSortedList.Cursor cursor = ownerList.getCursor();
-            while (cursor.hasNext()) {
-                destList.add(cursor.index(), cursor.value());
-            }
+            atom.mergeLongTopK(destList, ownerList, circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
         }
         final ObjList<DirectLongLongSortedList> perWorkerLists = atom.getPerWorkerLongTopKLists();
         for (int i = 0, n = perWorkerLists.size(); i < n; i++) {
             final DirectLongLongSortedList workerList = perWorkerLists.getQuick(i);
             if (workerList != null) {
-                final DirectLongLongSortedList.Cursor cursor = workerList.getCursor();
-                while (cursor.hasNext()) {
-                    destList.add(cursor.index(), cursor.value());
-                }
+                atom.mergeLongTopK(destList, workerList, circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
             }
         }
 
@@ -408,11 +425,30 @@ class AsyncGroupByRecordCursor implements RecordCursor {
 
     void longTopK(DirectLongLongSortedList list, Function recordFunction, MapRecordCursor sharedMapCursor) {
         final AsyncGroupByAtom atom = frameSequence.getAtom();
-        if (recordFunction.isThreadSafe() && atom.isSharded() && sharedMapCursor.size() > configuration.getGroupByParallelTopKThreshold()) {
+        if (isReadThreadSafe(recordFunction) && atom.isSharded() && sharedMapCursor.size() > configuration.getGroupByParallelTopKThreshold()) {
             parallelLongTopK(list, recordFunction);
         } else {
-            sharedMapCursor.longTopK(list, recordFunction);
+            collectLongTopK(list, recordFunction, sharedMapCursor);
         }
+    }
+
+    private void collectLongTopK(DirectLongLongSortedList list, Function function, MapRecordCursor cursor) {
+        final AsyncGroupByAtom atom = frameSequence.getAtom();
+        if (atom.getCompiledUpdater(-1) == null) {
+            cursor.longTopK(list, function);
+        } else if (atom.isSharded()) {
+            if (atom.longTopK(atom.getDestShards(), list, function, circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled)) return;
+            for (int i = 0; i < NUM_SHARDS; i++) {
+                atom.longTopK(-1, atom.getDestShards().getQuick(i), list, function,
+                        circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
+            }
+        } else {
+            atom.longTopK(-1, ownerMap, list, function, circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
+        }
+    }
+
+    private static boolean isReadThreadSafe(Function function) {
+        return function instanceof GroupByFunction aggregate ? aggregate.isReadThreadSafe() : function.isThreadSafe();
     }
 
     void of(UnorderedPageFrameSequence<AsyncGroupByAtom> frameSequence, SqlExecutionContext executionContext) throws SqlException {

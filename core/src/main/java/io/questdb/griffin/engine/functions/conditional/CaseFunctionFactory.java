@@ -27,6 +27,7 @@ package io.questdb.griffin.engine.functions.conditional;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
@@ -103,23 +104,49 @@ public class CaseFunctionFactory implements FunctionFactory {
             elseBranch = CaseCommon.getCastFunction(elseBranch, elseBranchPosition, returnType, configuration, sqlExecutionContext);
         }
 
-        final int argsLen = vars.size();
         final Function elseB = elseBranch != null ? elseBranch : Constants.getNullConstant(returnType);
-
-        final CaseFunctionPicker picker = record -> {
-            for (int i = 0; i < argsLen; i += 2) {
-                if (vars.getQuick(i).getBool(record)) {
-                    return vars.getQuick(i + 1);
-                }
-            }
-            return elseB;
-        };
-
-        return CaseCommon.getCaseFunction(position, returnType, picker, argsToPoke);
+        return CaseCommon.getCaseFunction(position, returnType, new SearchedCasePicker(vars, elseB), argsToPoke);
     }
 
     @Override
     public int resolvePreferredVariadicType(int sqlPos, int argPos, ObjList<Function> args) throws SqlException {
         throw SqlException.$(sqlPos, "CASE values cannot be bind variables");
+    }
+
+    /** Resolved, casted branches. Functions are borrowed from the owning CASE expression. */
+    public static final class SearchedCasePicker implements CaseFunctionPicker {
+        private final ObjList<Function> branches;
+        private final Function elseBranch;
+
+        private SearchedCasePicker(ObjList<Function> branches, Function elseBranch) {
+            this.branches = branches;
+            this.elseBranch = elseBranch;
+        }
+
+        public int getBranchCount() {
+            return branches.size() / 2;
+        }
+
+        public Function getCondition(int index) {
+            return branches.getQuick(index * 2);
+        }
+
+        public Function getElseBranch() {
+            return elseBranch;
+        }
+
+        public Function getValue(int index) {
+            return branches.getQuick(index * 2 + 1);
+        }
+
+        @Override
+        public Function pick(Record record) {
+            for (int i = 0, n = branches.size(); i < n; i += 2) {
+                if (branches.getQuick(i).getBool(record)) {
+                    return branches.getQuick(i + 1);
+                }
+            }
+            return elseBranch;
+        }
     }
 }

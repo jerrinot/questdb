@@ -53,7 +53,7 @@ public class IPv4MinusIntFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0), args.getQuick(1));
     }
 
-    private static class Func extends IPv4Function implements ArithmeticBinaryFunction {
+    public static class Func extends IPv4Function implements ArithmeticBinaryFunction {
         private final Function left;
         private final Function right;
 

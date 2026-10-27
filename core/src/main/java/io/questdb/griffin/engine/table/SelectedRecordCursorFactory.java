@@ -242,6 +242,37 @@ public final class SelectedRecordCursorFactory extends AbstractRecordCursorFacto
     }
 
     @Override
+    public boolean prepareRowLimit() { return base.prepareRowLimit(); }
+
+    @Override
+    public boolean prepareSortedRowLimit() { return base.prepareSortedRowLimit(); }
+
+    @Override
+    public boolean prepareLongSort(int columnIndex) {
+        int baseColumn = columnCrossIndex.getQuick(columnIndex);
+        return baseColumn >= 0 && base.prepareLongSort(baseColumn);
+    }
+
+    @Override
+    public boolean recordCursorSupportsCompiledLongTopK(int columnIndex) {
+        return base.recordCursorSupportsCompiledLongTopK(columnCrossIndex.getQuick(columnIndex));
+    }
+
+    @Override
+    public void prepareLongTopK(int columnIndex) {
+        if (columnIndex >= 0 && columnIndex < columnCrossIndex.size()) {
+            base.prepareLongTopK(columnCrossIndex.getQuick(columnIndex));
+        }
+    }
+
+    @Override
+    public void prepareLongTopK(int columnIndex, boolean ascending, int limit) {
+        if (columnIndex >= 0 && columnIndex < columnCrossIndex.size()) {
+            base.prepareLongTopK(columnCrossIndex.getQuick(columnIndex), ascending, limit);
+        }
+    }
+
+    @Override
     public boolean recordCursorSupportsLongTopK(int columnIndex) {
         if (columnIndex < 0 || columnIndex >= columnCrossIndex.size()) {
             return false;

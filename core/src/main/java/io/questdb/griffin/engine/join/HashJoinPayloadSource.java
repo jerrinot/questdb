@@ -46,6 +46,19 @@ import io.questdb.std.QuietCloseable;
  * state and symbol tables, and must not be shared across workers.
  */
 public interface HashJoinPayloadSource {
+    int NATIVE_COLUMN_BYTES = 24;
+
+    /**
+     * Optional fixed-width native column view, borrowed until the build execution drains.
+     * Three eight-byte words: base address, byte stride, and mode (0: frame page-address
+     * table, 1: copied rows). For mode 0, base addresses this column of frame zero;
+     * the frame index selects a page address using stride. A zero page denotes nulls.
+     * For mode 1, base addresses this column of copied row zero; the build ordinal
+     * selects the value using stride. Returns false before consumer state is changed.
+     */
+    default boolean writeNativeColumn(int column, long address) {
+        return false;
+    }
 
     /**
      * A reader for one probe. The probe owns it: it closes it with every execution it ends.

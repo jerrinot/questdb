@@ -80,6 +80,12 @@ public class PageFrameFilteredMemoryRecord extends PageFrameMemoryRecord {
     private long compactedRowIndex = -1;
 
     @Override
+    public boolean writeNativeVarcharView(int columnIndex, long address) {
+        // Columns use different row spaces; the plain frame descriptor cannot express them.
+        return false;
+    }
+
+    @Override
     public void clear() {
         super.clear();
         compactedRowIndex = -1;

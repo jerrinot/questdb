@@ -94,6 +94,12 @@
 
     <profiles>
         <profile>
+            <id>query-compiler-prototype</id>
+            <modules>
+                <module>experimental/query-compiler</module>
+            </modules>
+        </profile>
+        <profile>
             <id>local-client</id>
             <modules>
                 <module>java-questdb-client</module>

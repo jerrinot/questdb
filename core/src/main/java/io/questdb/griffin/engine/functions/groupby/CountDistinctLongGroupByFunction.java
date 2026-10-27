@@ -124,6 +124,14 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
         return GroupByFunction.SAMPLE_BY_FILL_ALL;
     }
 
+    public int getSetInitialCapacity() {
+        return setA.getInitialCapacity();
+    }
+
+    public double getSetLoadFactor() {
+        return setA.getLoadFactor();
+    }
+
     @Override
     public int getValueIndex() {
         return valueIndex;
@@ -146,6 +154,12 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
     @Override
     public boolean isConstant() {
         return false;
+    }
+
+    @Override
+    public boolean isReadThreadSafe() {
+        // getLong reads the finalized count; it does not access the mutable set flyweights.
+        return true;
     }
 
     @Override

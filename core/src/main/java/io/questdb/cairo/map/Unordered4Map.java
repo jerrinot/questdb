@@ -500,11 +500,16 @@ public class Unordered4Map implements Map, Reopenable {
 
     @Override
     public void reserveCapacity(long additionalKeys) {
+        reserveNative(additionalKeys, null);
+    }
+
+    @Override
+    public void reserveNative(long additionalKeys, NativeRehash nativeRehash) {
         // +1: guarantee free > additionalKeys on return so that asNew's --free == 0
         // rehash never fires on the last insertion within a probeBatch.
         if (free <= additionalKeys) {
             long required = keyCapacity + (long) Math.ceil((additionalKeys - free + 1) / loadFactor);
-            rehash(Numbers.ceilPow2(required));
+            rehash(Numbers.ceilPow2(required), nativeRehash);
         }
     }
 
@@ -596,6 +601,37 @@ public class Unordered4Map implements Map, Reopenable {
     @Override
     public MapKey withKey() {
         return key;
+    }
+
+    @Override
+    public void writeNativeProbeView(long address) {
+        Unsafe.putLong(address + NativeMapView.ENTRIES, memStart);
+        Unsafe.putLong(address + NativeMapView.OFFSETS, 0);
+        Unsafe.putLong(address + NativeMapView.MASK, mask);
+        Unsafe.putLong(address + NativeMapView.STRIDE, entrySize);
+        Unsafe.putLong(address + NativeMapView.ZERO_ENTRY, zeroMemStart);
+        Unsafe.putLong(address + NativeMapView.HAS_ZERO, hasZero ? 1 : 0);
+    }
+
+    @Override
+    public void writeNativeMutationView(long address) {
+        writeNativeProbeView(address);
+        Unsafe.putLong(address + NativeMapView.FREE, free);
+        Unsafe.putLong(address + NativeMapView.SIZE, size);
+    }
+
+    @Override
+    public void publishNativeMutationView(long address) {
+        assert Unsafe.getLong(address + NativeMapView.ENTRIES) == memStart;
+        hasZero = Unsafe.getLong(address + NativeMapView.HAS_ZERO) != 0;
+        free = (int) Unsafe.getLong(address + NativeMapView.FREE);
+        size = (int) Unsafe.getLong(address + NativeMapView.SIZE);
+        assert free > 0 && size >= 0;
+    }
+
+    @Override
+    public void growNative(NativeRehash rehash) {
+        rehash((long) keyCapacity << 1, rehash);
     }
 
     private static void validateBatchAddressable(long sizeBytes) {
@@ -744,6 +780,10 @@ public class Unordered4Map implements Map, Reopenable {
     }
 
     private void rehash(long newKeyCapacity) {
+        rehash(newKeyCapacity, null);
+    }
+
+    private void rehash(long newKeyCapacity, NativeRehash nativeRehash) {
         if (nResizes == maxResizes) {
             throw LimitOverflowException.instance().put("limit of ").put(maxResizes).put(" resizes exceeded in unordered map");
         }
@@ -762,20 +802,29 @@ public class Unordered4Map implements Map, Reopenable {
         Vect.memset(newMemStart, newSizeBytes, 0);
         final int newMask = (int) newKeyCapacity - 1;
 
-        for (long addr = memStart; addr < memLimit; addr += entrySize) {
-            int key = Unsafe.getInt(addr);
-            if (key == 0) {
-                continue;
-            }
+        try {
+            if (nativeRehash != null) {
+                nativeRehash.rehash(memStart, keyCapacity, newMemStart, newKeyCapacity, entrySize);
+            } else {
+                for (long addr = memStart; addr < memLimit; addr += entrySize) {
+                    int key = Unsafe.getInt(addr);
+                    if (key == 0) {
+                        continue;
+                    }
 
-            long newAddr = getStartAddress(newMemStart, Hash.hashInt64(key) & newMask);
-            while (Unsafe.getInt(newAddr) != 0) {
-                newAddr += entrySize;
-                if (newAddr >= newMemLimit) {
-                    newAddr = newMemStart;
+                    long newAddr = getStartAddress(newMemStart, Hash.hashInt64(key) & newMask);
+                    while (Unsafe.getInt(newAddr) != 0) {
+                        newAddr += entrySize;
+                        if (newAddr >= newMemLimit) {
+                            newAddr = newMemStart;
+                        }
+                    }
+                    Unsafe.copyMemory(addr, newAddr, entrySize);
                 }
             }
-            Unsafe.copyMemory(addr, newAddr, entrySize);
+        } catch (Throwable th) {
+            Unsafe.free(newMemStart, newSizeBytes, memoryTag, memoryTracker);
+            throw th;
         }
 
         // Copy the zero key entry to the new end-of-buffer slot.

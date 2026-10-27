@@ -91,6 +91,23 @@ class SelectedRecordCursor implements RecordCursor {
     }
 
     @Override
+    public boolean selectSortedRows(io.questdb.std.DirectLongLongSortedList sorted, io.questdb.std.DirectLongList rows, long skip, long take) {
+        return baseCursor.selectSortedRows(sorted, rows, skip, take);
+    }
+
+    @Override
+    public boolean selectRows(io.questdb.std.DirectLongList rows, long skip, long take) {
+        return baseCursor.selectRows(rows, skip, take);
+    }
+
+    @Override
+    public boolean sortLong(io.questdb.std.DirectLongList entries, io.questdb.std.DirectLongList scratch,
+                            int columnIndex, boolean ascending, long maxEntries) {
+        int baseColumn = columnCrossIndex.getQuick(columnIndex);
+        return baseColumn >= 0 && baseCursor.sortLong(entries, scratch, baseColumn, ascending, maxEntries);
+    }
+
+    @Override
     public void longTopK(DirectLongLongSortedList list, int columnIndex) {
         baseCursor.longTopK(list, columnCrossIndex.getQuick(columnIndex));
     }

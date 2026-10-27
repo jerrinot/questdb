@@ -33,6 +33,7 @@ import io.questdb.cairo.map.MapRecord;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
+import io.questdb.griffin.engine.groupby.GroupByKernel;
 import io.questdb.std.MemoryTracker;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
@@ -64,6 +65,7 @@ public class GroupByMapFragment implements QuietCloseable {
     private final ObjList<GroupByMapStats> shardStats;
     private final ObjList<Map> shards; // this.map split into shards
     private final ColumnTypes valueTypes;
+    private GroupByKernel.Updater compiledUpdater;
     private final int workerCount;
     boolean sharded;
     long totalFunctionCardinality;
@@ -148,6 +150,9 @@ public class GroupByMapFragment implements QuietCloseable {
         if (!map.isOpen()) {
             final boolean owner = slotId == -1;
             int keyCapacity = targetKeyCapacity(configuration, workerCount, ownerStats, owner);
+            if (compiledUpdater != null && compiledUpdater.localMapCapacity() > 0) {
+                keyCapacity = compiledUpdater.localMapCapacity();
+            }
             long heapSize = targetHeapSize(configuration, workerCount, ownerStats, owner);
             map.setMemoryTracker(memoryTracker);
             map.reopen(keyCapacity, heapSize);
@@ -166,14 +171,22 @@ public class GroupByMapFragment implements QuietCloseable {
         this.memoryTracker = tracker;
     }
 
+    void setCompiledUpdater(GroupByKernel.Updater updater) {
+        compiledUpdater = updater;
+    }
+
     public void shard() {
+        shard(null);
+    }
+
+    void shard(Runnable checkpoint) {
         if (sharded) {
             return;
         }
 
         reopenShards();
 
-        if (map.size() > 0) {
+        if (map.size() > 0 && (compiledUpdater == null || !compiledUpdater.shard(map, shards, checkpoint))) {
             RecordCursor cursor = map.getCursor();
             MapRecord record = map.getRecord();
             while (cursor.hasNext()) {

@@ -37,6 +37,8 @@ import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.PriorityMetadata;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.CompiledProjection;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.columns.ColumnFunction;
 import io.questdb.griffin.engine.functions.memoization.MemoizerFunction;
 import io.questdb.std.Misc;
@@ -44,6 +46,7 @@ import io.questdb.std.ObjList;
 import org.jetbrains.annotations.NotNull;
 
 public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
+    private CompiledProjection projection;
     private RecordCursorFactory base;
     private VirtualFunctionRecordCursor cursor;
     private ObjList<Function> functions;
@@ -58,7 +61,21 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
             @NotNull RecordCursorFactory base,
             int virtualColumnReservedSlots
     ) {
+        this(virtualMetadata, priorityMetadata, functions, base, virtualColumnReservedSlots, null, null);
+    }
+
+    public VirtualRecordCursorFactory(RecordMetadata virtualMetadata, PriorityMetadata priorityMetadata,
+                                     ObjList<Function> functions, RecordCursorFactory base, int reservedSlots,
+                                     QueryCodeGenerator compiler) {
+        this(virtualMetadata, priorityMetadata, functions, base, reservedSlots, compiler, null);
+    }
+
+    private VirtualRecordCursorFactory(RecordMetadata virtualMetadata, PriorityMetadata priorityMetadata,
+                                      ObjList<Function> functions, RecordCursorFactory base, int virtualColumnReservedSlots,
+                                      QueryCodeGenerator compiler,
+                                      CompiledProjection projection) {
         super(virtualMetadata);
+        this.projection = projection;
         this.base = base;
         this.functions = functions;
         try {
@@ -81,12 +98,16 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
                 }
             }
             this.supportsRandomAccess = supportsRandomAccess && randomCount == 0;
+            if (projection == null && compiler != null && this.supportsRandomAccess) {
+                this.projection = compiler.compileProjection(base.getMetadata(), virtualColumnReservedSlots, functions);
+            }
             this.cursor = new VirtualFunctionRecordCursor(
                     priorityMetadata,
                     functions,
                     memoizedFunctions,
                     this.supportsRandomAccess,
-                    virtualColumnReservedSlots
+                    virtualColumnReservedSlots,
+                    this.projection
             );
             this.internalSymbolTableSource = new VirtualRecordCursorFactorySymbolTableSource(cursor, virtualColumnReservedSlots);
             this.priorityMetadata = priorityMetadata;
@@ -95,6 +116,8 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
             throw th;
         }
     }
+
+    public long getProjectedRows() { return projection == null ? 0 : projection.getNativeRows(); }
 
     @Override
     public boolean canPeelForTopK() {
@@ -131,7 +154,7 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
         try {
             internalSymbolTableSource.of(cursor);
             Function.init(functions, internalSymbolTableSource, executionContext, null);
-            this.cursor.of(cursor);
+            this.cursor.of(cursor, executionContext.getCircuitBreaker());
             return this.cursor;
         } catch (Throwable th) {
             cursor.close();
@@ -181,6 +204,40 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public boolean prepareRowLimit() { return base.prepareRowLimit(); }
+
+    @Override
+    public boolean prepareSortedRowLimit() { return base.prepareSortedRowLimit(); }
+
+    @Override
+    public boolean prepareLongSort(int columnIndex) {
+        int baseColumn = cursor.getLongTopKColumnIndex(columnIndex);
+        return baseColumn >= 0 && base.prepareLongSort(baseColumn);
+    }
+
+    @Override
+    public boolean recordCursorSupportsCompiledLongTopK(int columnIndex) {
+        int baseColumnIndex = cursor.getLongTopKColumnIndex(columnIndex);
+        return baseColumnIndex >= 0 && base.recordCursorSupportsCompiledLongTopK(baseColumnIndex);
+    }
+
+    @Override
+    public void prepareLongTopK(int columnIndex) {
+        final int baseColumnIndex = cursor.getLongTopKColumnIndex(columnIndex);
+        if (baseColumnIndex != -1) {
+            base.prepareLongTopK(baseColumnIndex);
+        }
+    }
+
+    @Override
+    public void prepareLongTopK(int columnIndex, boolean ascending, int limit) {
+        final int baseColumnIndex = cursor.getLongTopKColumnIndex(columnIndex);
+        if (baseColumnIndex != -1) {
+            base.prepareLongTopK(baseColumnIndex, ascending, limit);
+        }
+    }
+
+    @Override
     public boolean recordCursorSupportsLongTopK(int columnIndex) {
         final int baseColumnIndex = cursor.getLongTopKColumnIndex(columnIndex);
         if (baseColumnIndex != -1) {
@@ -200,12 +257,16 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
         // Shares functions and priorityMetadata with the orphaned wrapper. Per the
         // RecordCursorFactory.rewrapOverTopK contract, the caller must not close the orphan;
         // its state has transferred here. Same precedent as the AsOf and LatestBy peels.
+        final var transferredProjection = projection;
+        projection = null;
         return new VirtualRecordCursorFactory(
                 orderedMetadata,
                 priorityMetadata,
                 functions,
                 rewrappedBase,
-                priorityMetadata.getVirtualColumnReservedSlots()
+                priorityMetadata.getVirtualColumnReservedSlots(),
+                null,
+                transferredProjection
         );
     }
 
@@ -217,6 +278,7 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("VirtualRecord");
+        if (projection != null) sink.attr("compiledProjection").val(projection.getName());
         sink.optAttr("functions", functions, true);
         sink.child(base);
     }
@@ -256,6 +318,8 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
         this.functions = null;
 
         Throwable cleanupFailure = Misc.freeObjListBestEffort(null, functions);
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, projection);
+        projection = null;
         cleanupFailure = Misc.freeBestEffort(cleanupFailure, base);
         CairoException.rethrowCleanupFailure(cleanupFailure);
     }

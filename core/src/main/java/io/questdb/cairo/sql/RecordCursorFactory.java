@@ -408,6 +408,26 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
         return null;
     }
 
+    /** Optional generated full sort of one resolved LONG output. */
+    /** Optional bounded selection over finalized native state; preserves ordinary cursor order. */
+    default boolean prepareRowLimit() { return false; }
+
+    /** Prepare selection from borrowed sorted (value, row ID) pairs. */
+    default boolean prepareSortedRowLimit() { return false; }
+
+    default boolean prepareLongSort(int columnIndex) { return false; }
+
+    /** Generated collection/merge can supply the bounded sort for a static OFFSET window. */
+    default boolean recordCursorSupportsCompiledLongTopK(int columnIndex) { return false; }
+
+    default void prepareLongTopK(int columnIndex) {
+    }
+
+    /** Ordering and retained prefix length are fixed; older compilers retain generic preparation. */
+    default void prepareLongTopK(int columnIndex, boolean ascending, int limit) {
+        prepareLongTopK(columnIndex);
+    }
+
     /**
      * Returns true when factory's record cursor supports optimized top K (ORDER BY + LIMIT N) loop
      * for the given LONG or TIMESTAMP column.

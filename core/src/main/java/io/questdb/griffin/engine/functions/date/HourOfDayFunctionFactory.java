@@ -49,7 +49,7 @@ public class HourOfDayFunctionFactory implements FunctionFactory {
         return new HourOfDayFunction(arg, ColumnType.getTimestampDriver(ColumnType.getTimestampType(arg.getType())));
     }
 
-    static final class HourOfDayFunction extends IntFunction implements UnaryFunction {
+    public static final class HourOfDayFunction extends IntFunction implements UnaryFunction {
 
         private final Function arg;
         private final TimestampDriver driver;

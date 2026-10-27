@@ -87,7 +87,7 @@ public class AndFunctionFactory implements FunctionFactory {
         return new AndBooleanFunction(leftFunc, rightFunc);
     }
 
-    private static class AndBooleanFunction extends BooleanFunction implements BinaryFunction {
+    public static class AndBooleanFunction extends BooleanFunction implements BinaryFunction {
         final Function left;
         final Function right;
 
@@ -121,7 +121,7 @@ public class AndFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class QuaternaryAndBooleanFunction extends BooleanFunction implements QuaternaryFunction {
+    public static class QuaternaryAndBooleanFunction extends BooleanFunction implements QuaternaryFunction {
         final Function func0;
         final Function func1;
         final Function func2;
@@ -173,7 +173,7 @@ public class AndFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class TernaryAndBooleanFunction extends BooleanFunction implements TernaryFunction {
+    public static class TernaryAndBooleanFunction extends BooleanFunction implements TernaryFunction {
         final Function center;
         final Function left;
         final Function right;

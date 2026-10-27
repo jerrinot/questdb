@@ -181,11 +181,17 @@ final class AsyncHashJoinGroupByRecordCursor implements RecordCursor {
             try {
                 circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
                 AsyncHashJoinGroupByAtom atom = frameSequence.getAtom();
+                long phaseStart = atom.collectExecutionTimings ? System.nanoTime() : 0;
                 // The build runs here, on first demand for a result, rather than when the cursor
                 // opens. It completes on this thread before the first probe task is published,
                 // which is what publishes the frozen build and the slots' probes to the reducers.
                 // A failure closes the cursor below, and with it the build.
                 atom.build(circuitBreaker);
+                if (atom.collectExecutionTimings) {
+                    long now = System.nanoTime();
+                    atom.buildNanos = now - phaseStart;
+                    phaseStart = now;
+                }
                 if (atom.isProbeNeeded()) {
                     frameSequence.prepareForDispatch();
                     long probeRows = 0;
@@ -197,6 +203,11 @@ final class AsyncHashJoinGroupByRecordCursor implements RecordCursor {
                     frameSequence.dispatchAndAwait();
                 }
                 circuitBreaker.statefulThrowExceptionIfTrippedNoThrottle();
+                if (atom.collectExecutionTimings) {
+                    long now = System.nanoTime();
+                    atom.probeNanos = now - phaseStart;
+                    phaseStart = now;
+                }
                 if (functions.isKeyed()) {
                     final GroupByShardingContext sharding = atom.getShardingContext();
                     if (sharding.isSharded()) {
@@ -224,6 +235,9 @@ final class AsyncHashJoinGroupByRecordCursor implements RecordCursor {
                 // Observe cancellation during the last frame or merge before exposing output.
                 circuitBreaker.statefulThrowExceptionIfTrippedNoThrottle();
                 isBuilt = true;
+                if (atom.collectExecutionTimings) {
+                    atom.mergeNanos = System.nanoTime() - phaseStart;
+                }
             } catch (Throwable th) {
                 Misc.free(this, th);
                 throw th;

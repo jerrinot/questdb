@@ -39,6 +39,7 @@ import io.questdb.cairo.sql.AtomicBooleanCircuitBreaker;
 import io.questdb.cairo.sql.BindVariableService;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.VirtualRecord;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.rnd.SharedRandom;
 import io.questdb.griffin.engine.window.WindowContext;
 import io.questdb.griffin.engine.window.WindowContextImpl;
@@ -95,6 +96,7 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
     private boolean clockUseNow = false;
     private boolean cloneSymbolTables;
     private boolean containsSecret;
+    private @Nullable QueryCodeGenerator queryCodeGenerator;
     private int intervalFunctionType;
     private long intervalPlanGeneration;
     private long intervalPlanGenerationCounter;
@@ -313,6 +315,11 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
     @Override
     public @Nullable ExecutionState getExecutionState() {
         return executionState;
+    }
+
+    @Override
+    public @Nullable QueryCodeGenerator getQueryCodeGenerator() {
+        return queryCodeGenerator;
     }
 
     @Override
@@ -635,6 +642,10 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
     @Override
     public void setCloneSymbolTables(boolean cloneSymbolTables) {
         this.cloneSymbolTables = cloneSymbolTables;
+    }
+
+    public void setQueryCodeGenerator(@Nullable QueryCodeGenerator queryCodeGenerator) {
+        this.queryCodeGenerator = queryCodeGenerator;
     }
 
     @Override

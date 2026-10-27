@@ -41,6 +41,9 @@ import io.questdb.std.Numbers;
 import org.jetbrains.annotations.Nullable;
 
 public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
+    // Bound materialization to 8 MiB; larger or dynamic limits keep the streaming cursor.
+    private static final long MAX_COMPILED_ROWS = 1L << 20;
+    private final boolean compiled;
     private final RecordCursorFactory base;
     private final LimitRecordCursor cursor;
 
@@ -52,7 +55,11 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
     ) {
         super(base.getMetadata());
         this.base = base;
-        this.cursor = new LimitRecordCursor(loFunction, hiFunction, argPos);
+        long left = loFunction.isConstant() ? loFunction.getLong(null) : -1;
+        long right = hiFunction == null ? 0 : hiFunction.isConstant() ? hiFunction.getLong(null) : -1;
+        compiled = left >= 0 && right >= 0 && Math.abs(left - right) <= MAX_COMPILED_ROWS
+                && base.recordCursorSupportsRandomAccess() && base.prepareRowLimit();
+        this.cursor = new LimitRecordCursor(loFunction, hiFunction, argPos, compiled);
     }
 
     @Override
@@ -117,6 +124,7 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("Limit");
+        if (compiled) sink.attr("compiledSelection").val(true);
         Function leftFunc = cursor.leftFunction;
         Function rightFunc = cursor.rightFunction;
         boolean isCursorOpen = cursor.base != null;
@@ -175,11 +183,15 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
 
     @Override
     protected void _close() {
+        cursor.closeCompiledRows();
         base.close();
     }
 
     private static class LimitRecordCursor implements RecordCursor {
         private final int argPos;
+        private final io.questdb.std.DirectLongList compiledRows;
+        private boolean selected;
+        private long selectedPosition;
         private final RecordCursor.Counter counter = new Counter();
         private final Function leftFunction;
         private final Function rightFunction;
@@ -193,7 +205,8 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
         private long remaining;
         private long size;
 
-        public LimitRecordCursor(Function leftFunction, Function rightFunction, int argPos) {
+        public LimitRecordCursor(Function leftFunction, Function rightFunction, int argPos, boolean compiled) {
+            compiledRows = compiled ? new io.questdb.std.DirectLongList(0, io.questdb.std.MemoryTag.NATIVE_RECORD_CHAIN, true) : null;
             this.leftFunction = leftFunction;
             this.rightFunction = rightFunction;
             this.argPos = argPos;
@@ -217,6 +230,7 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
 
         @Override
         public void close() {
+            closeCompiledRows();
             base = Misc.free(base);
         }
 
@@ -241,6 +255,11 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
             ensureReadyToConsume();
             if (remaining <= 0) {
                 return false;
+            }
+            if (compiledRows != null) {
+                base.recordAt(base.getRecord(), compiledRows.get(selectedPosition++));
+                remaining--;
+                return true;
             }
             if (base.hasNext()) {
                 remaining--;
@@ -287,6 +306,13 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
         @Override
         public void skipRows(Counter skipCounter, long maxRowsAfterSkip) {
             ensureReadyToConsume();
+            if (compiledRows != null) {
+                long skipped = Math.min(skipCounter.get(), remaining);
+                selectedPosition += skipped;
+                remaining -= skipped;
+                skipCounter.dec(skipped);
+                return;
+            }
             long rowsToSkip = skipCounter.get();
             long excessCount = Math.max(0, rowsToSkip - remaining);
             rowsToSkip -= excessCount;
@@ -312,6 +338,19 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
         public void toTop() {
             ensureBoundsResolved();
             base.toTop();
+            if (compiledRows != null) {
+                if (!selected) {
+                    compiledRows.clear();
+                    if (baseRowsToTake > 0 && !base.selectRows(compiledRows, baseRowsToSkip, baseRowsToTake)) {
+                        throw new IllegalStateException("Prepared native LIMIT declined selection");
+                    }
+                    selected = true;
+                }
+                size = remaining = compiledRows.size();
+                baseSize = base.size();
+                selectedPosition = 0;
+                return;
+            }
             counter.set(baseRowsToSkip);
             // Unconditional call: even with baseRowsToSkip == 0, this pushes
             // baseRowsToTake as the post-skip cap so the base can clamp
@@ -319,6 +358,12 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
             base.skipRows(counter, baseRowsToTake);
             remaining = baseRowsToTake;
             counter.clear();
+        }
+
+        private void closeCompiledRows() {
+            if (compiledRows != null) compiledRows.close();
+            selected = false;
+            selectedPosition = 0;
         }
 
         private boolean areBoundsResolved() {
@@ -405,6 +450,9 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
 
         void of(RecordCursor base, SqlExecutionContext executionContext) throws SqlException {
             this.base = base;
+            selected = false;
+            selectedPosition = 0;
+            if (compiledRows != null) compiledRows.setMemoryTracker(executionContext.getMemoryTracker());
             this.circuitBreaker = executionContext.getCircuitBreaker();
 
             leftFunction.init(base, executionContext);

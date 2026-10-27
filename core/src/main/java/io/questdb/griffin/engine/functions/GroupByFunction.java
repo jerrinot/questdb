@@ -320,6 +320,16 @@ public interface GroupByFunction extends Function, Mutable {
         return false;
     }
 
+    /**
+     * Whether output getters may run concurrently on this function after aggregation and merge
+     * have completed. Each reader must own its record; computation, merge, reset and close must
+     * not overlap these reads. This does not make the aggregate's mutation methods thread-safe.
+     * The default preserves the existing, stronger thread-safety requirement.
+     */
+    default boolean isReadThreadSafe() {
+        return isThreadSafe();
+    }
+
     default boolean isScalar() {
         return true;
     }

@@ -93,6 +93,15 @@ public class GroupByLongHashSet {
         return ptr != 0 ? Unsafe.getInt(ptr) : 0;
     }
 
+    /** Allocated slot count for a new set, after load-factor adjustment and rounding. */
+    public int getInitialCapacity() {
+        return initialCapacity;
+    }
+
+    public double getLoadFactor() {
+        return loadFactor;
+    }
+
     public long keyAt(long index) {
         return Unsafe.getLong(ptr + HEADER_SIZE + 8L * index);
     }

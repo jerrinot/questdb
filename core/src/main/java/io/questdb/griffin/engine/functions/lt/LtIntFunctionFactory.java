@@ -58,7 +58,7 @@ public class LtIntFunctionFactory implements FunctionFactory {
         return new LtIntFunction(args.getQuick(0), args.getQuick(1));
     }
 
-    private static class LtIntFunction extends NegatableBooleanFunction implements BinaryFunction {
+    public static class LtIntFunction extends NegatableBooleanFunction implements BinaryFunction {
         private final Function left;
         private final Function right;
 

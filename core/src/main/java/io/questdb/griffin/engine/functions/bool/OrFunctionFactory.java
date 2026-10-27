@@ -74,7 +74,7 @@ public class OrFunctionFactory implements FunctionFactory {
         return new MyBooleanFunction(leftFunc, rightFunc);
     }
 
-    private static class MyBooleanFunction extends BooleanFunction implements BinaryFunction {
+    public static class MyBooleanFunction extends BooleanFunction implements BinaryFunction {
         final Function left;
         final Function right;
 
