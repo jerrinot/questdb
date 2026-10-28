@@ -58,12 +58,13 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
 
 ## Coverage and semantic boundaries confirmed 2026-10-28
 
-- [ ] Bind ordinary aggregation without GROUP BY. `AsyncGroupByNotKeyedAtom` and
-  its factory currently receive a compiled filter but no `QueryCodeGenerator`
-  aggregate kernel. Supported aggregate emitters alone do not close this gap.
-  Preserve existing vector/metadata specializations and empty-input semantics;
-  reuse worker state and merging. Final COUNT reduction and fused join aggregates
-  are separate supported paths.
+- [x] Bind ordinary aggregation without GROUP BY for existing scalar COUNT and
+  integer SUM/MIN/MAX emitters. The async factory retains vector/metadata
+  specializations and uses generated reduction for its row-update paths. Existing
+  worker state, merge order and empty-input semantics remain; generated copying
+  and merging consume native or Java partials. Broader aggregate types and the
+  mixed-coordinate late-materialization boundary remain separate gaps. See the
+  2026-10-28 scalar-reduction entry in PROGRESS.md; performance is not measured.
 - [ ] Investigate LONG SUM overflow into the reserved NULL sentinel before making
   broader equivalence claims. Both `SumLongGroupByFunction` and `Pipeline.Sum`
   interpret `Long.MIN_VALUE` as empty state. For example, the non-null sequence

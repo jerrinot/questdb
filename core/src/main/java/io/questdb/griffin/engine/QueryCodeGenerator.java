@@ -40,6 +40,10 @@ import org.jetbrains.annotations.Nullable;
 
 /** Optional compilation of resolved operators. Core has no dependency on a backend. */
 public interface QueryCodeGenerator {
+    /** Borrows resolved functions and the actual unkeyed state layout during compilation only. */
+    default @Nullable CompiledScalarAggregate compileScalarAggregate(ColumnTypes inputs, ColumnTypes values,
+            ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue layout) { return null; }
+
     /** Only bind inputs whose calculateSize supplies bulk counts, without enumerating rows. */
     default @Nullable CompiledCounter compileCounter(@Transient RecordCursorFactory input) { return null; }
 

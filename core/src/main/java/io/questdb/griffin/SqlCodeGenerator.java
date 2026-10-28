@@ -11375,7 +11375,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                 outerProjectionMetadata,
                                 groupByFunctions0,
                                 perWorkerGroupByFunctions0,
-                                valueTypesCopy.getColumnCount(),
+                                valueTypesCopy,
                                 compiledFilter,
                                 bindVarMemory,
                                 bindVarFunctions,
@@ -11383,7 +11383,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                 filterUsedColumnIndexes,
                                 perWorkerFilters0,
                                 executionContext.getSharedQueryWorkerCount(),
-                                sharedOuterProjectionFunctions0
+                                sharedOuterProjectionFunctions0,
+                                executionContext.getQueryCodeGenerator()
                         );
                     }
 

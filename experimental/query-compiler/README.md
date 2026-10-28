@@ -34,6 +34,7 @@ Unsupported plans keep ordinary execution.
 | SQL binding and capability checks | [ResolvedQueryCompiler](src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java) |
 | Shared expression and input binding | [ResolvedInputs](src/main/java/org/questdb/experimental/codegen/ResolvedInputs.java), [ResolvedVarchar](src/main/java/org/questdb/experimental/codegen/ResolvedVarchar.java) |
 | Aggregate initialization, update, merge and finalization | [AggregateUpdates](src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java) |
+| Unkeyed reduction and worker-state merge | [ResolvedScalarAggregate](src/main/java/org/questdb/experimental/codegen/ResolvedScalarAggregate.java) |
 | Kernel preparation and ownership | [ResolvedAggregateKernel.Prepared](src/main/java/org/questdb/experimental/codegen/ResolvedAggregateKernel.java) |
 | Acquired-slot scratch, resumable calls and publication | [AggregateSlot](src/main/java/org/questdb/experimental/codegen/AggregateSlot.java) |
 | Existing map representation and generated probing | [NativeMapView](../../core/src/main/java/io/questdb/cairo/map/NativeMapView.java), [QuestMapProbe](src/main/java/org/questdb/experimental/codegen/QuestMapProbe.java) |
@@ -76,6 +77,9 @@ The binders and focused tests are authoritative. Current families include:
   using existing map encodings. NULL and empty strings remain distinct.
 - Resolved COUNT, integer SUM/MIN/MAX, LONG DISTINCT, SHORT AVG and VARCHAR MIN/MAX
   implementations. Supported overloads depend on the selected map/update path.
+- Unkeyed COUNT and integer SUM/MIN/MAX reductions over filtered frames and
+  unfiltered expressions whose plan uses row-by-row updates. Existing vector and
+  metadata specializations retain priority. Worker-state copying/merging is generated.
 - Numeric projection, final COUNT reduction, LONG full sort and Top-K, and positive
   LIMIT/OFFSET selection over supported generated results.
 - INT inner-join probe pipelines with supported COUNT/integer SUM/MIN/MAX, post-join
@@ -85,8 +89,12 @@ The binders and focused tests are authoritative. Current families include:
 
 Integer MIN/MAX accepts LONG, INT and SHORT inputs and preserves the ordinary
 8-byte LONG or 4-byte INT state. Generated ordering still requires a LONG result.
-Ordinary aggregation without GROUP BY has no generated-update hook; final COUNT
-reduction and fused join aggregation have separate generated paths.
+Unkeyed kernels bind the actual 32-byte-spaced SimpleMapValue slots, promote
+supported aggregate updates to SSA accumulators, and publish state once per frame.
+Column tops, lazy conversions and mixed-coordinate late materialization can fall
+back before mutation; native and ordinary updates share the same worker state.
+`compiledScalarAggregate` in EXPLAIN identifies this binding; drained native-row
+counters distinguish execution from runtime fallback.
 
 Generic string construction, general string ordering and unsupported function
 implementations retain ordinary execution. `compiledAggregateBatches` in EXPLAIN

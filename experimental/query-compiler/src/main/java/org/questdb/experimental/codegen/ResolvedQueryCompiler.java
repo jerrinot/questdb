@@ -32,6 +32,7 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.engine.CompiledCounter;
 import io.questdb.griffin.engine.CompiledProjection;
+import io.questdb.griffin.engine.CompiledScalarAggregate;
 import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
@@ -109,6 +110,14 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
 
     static long[] topKCounters(Updater updater) {
         return updater instanceof AggregateSlot slot ? slot.topKCounters() : new long[2];
+    }
+
+    @Override
+    public CompiledScalarAggregate compileScalarAggregate(ColumnTypes inputs, ColumnTypes values,
+            ObjList<GroupByFunction> functions, MapValue layout) {
+        if (handwritten) return null;
+        try { return ResolvedScalarAggregate.compile(inputs, values, functions, layout, backend, artifacts); }
+        catch (IOException failure) { throw CairoException.nonCritical().put("Scalar aggregate compilation failed: ").put(failure.getMessage()); }
     }
 
     @Override

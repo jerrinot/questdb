@@ -30,6 +30,7 @@ import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.griffin.TextPlanSink;
 import io.questdb.griffin.engine.CompiledProjection;
 import io.questdb.griffin.engine.CompiledCounter;
+import io.questdb.griffin.engine.CompiledScalarAggregate;
 import io.questdb.griffin.engine.groupby.CountRecordCursorFactory;
 import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
@@ -820,8 +821,7 @@ public class ResolvedSqlAggregateTest {
     public void integerExtremaPreserveEmptyInputsTopsAndOrdering() throws Exception {
         assertMatches("select k,min(v+1),max(w-1),min(s),max(s) from t where k>=0 group by k", true);
         assertMatches("select k,min(v),max(w),min(s) from t where k<0 group by k", true);
-        // The ordinary unkeyed aggregation factory has no generated-update hook yet.
-        assertMatches("select min(v),max(w),min(s),max(s) from t where k<0", false);
+        assertScalarMatches("select min(v),max(w),min(s),max(s) from t where k<0", true);
         engine.execute("alter table t add column absent long", context);
         assertMatches("select k,min(absent),max(absent) from t where k>=0 group by k", true);
         engine.execute("insert into t(k,v,w,s,absent) values (0,-7,-9,-32768,42)", context);
@@ -830,6 +830,79 @@ public class ResolvedSqlAggregateTest {
         assertMatches("select k,min(v) m from t where k>=0 group by k order by m desc limit 5", true);
         assertTrue("LONG extrema retain generated Top-K", compiler.topKRows.get() > before);
         assertMatches("select k,max(v) m from t where k>=0 group by k order by m", true);
+    }
+
+    @Test
+    public void scalarAggregatesUseExistingWorkerStateAndGeneratedMerge() throws Exception {
+        long rows = compiler.scalarRows.get();
+        assertScalarMatches("select count(),count(v),sum(v),min(w),max(v),min(s),max(s),sum(w) from t where k>=0", true);
+        assertEquals("Each of two executions reduces every selected row once", 20000, compiler.scalarRows.get() - rows);
+        assertScalarMatches("select sum(v+1),min(w-1),max(s),count(v) from t where w<1000", true);
+        assertScalarMatches("select min(v+1),max(w-1) from t", true);
+        assertScalarMatches("select min(v),sum(w),count(v),min(s) from t where k<0", true);
+        engine.execute("create table empty_scalar (v long,w int,s short)", context);
+        assertScalarMatches("select min(v+1),max(w-1),sum(s),count() from empty_scalar where v>0", true);
+        // Existing vector and metadata specializations retain priority, and unsupported functions decline.
+        assertScalarMatches("select min(v),max(w),sum(s) from t", false);
+        assertScalarMatches("select sum(v+1) from t", false);
+        assertScalarMatches("select count() from t", false);
+        assertScalarMatches("select avg(v) from t where k>=0", false);
+        assertTrue(compiler.scalarRows.get() > rows);
+    }
+
+    @Test
+    public void scalarAggregatesKeepFallbackParquetAndReopenSemantics() throws Exception {
+        engine.execute("create table scalar_frames as (select x v,cast(x%13 as int) k,"
+                + "timestamp_sequence('2024-01-01',1000000L) ts from long_sequence(10003)) "
+                + "timestamp(ts) partition by day bypass wal", context);
+        engine.execute("alter table scalar_frames add column w int", context);
+        assertScalarMatches("select min(w),max(w),count(w),sum(v) from scalar_frames where k>=0", true);
+        engine.execute("insert into scalar_frames(v,k,ts,w) values (-7,1,'2024-01-02',42)", context);
+        assertScalarMatches("select min(w),max(w),count(w),sum(v) from scalar_frames where k>=0", true);
+        engine.execute("alter table scalar_frames convert partition to parquet list '2024-01-01'", context);
+        long rows = compiler.scalarRows.get();
+        assertScalarMatches("select min(v),max(v),sum(v),count(v) from scalar_frames where k>=0", true);
+        assertTrue("Parquet slices reach native reduction", compiler.scalarRows.get() > rows);
+        engine.execute("alter table scalar_frames alter column k type long", context);
+        assertScalarMatches("select min(k),max(k),sum(v) from scalar_frames where v>0", true);
+
+        context.setQueryCodeGenerator(compiler);
+        String sql = "select count(),sum(v),min(w) from t where k>=0";
+        long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            long calls = compiler.calls.get();
+            try (var ignored = factory.getCursor(context)) { }
+            assertEquals("Opening remains lazy", calls, compiler.calls.get());
+            compiler.failUpdate = true;
+            try { assertThrows(CairoException.class, () -> Demo.readSql(factory, context, 3)); }
+            finally { compiler.failUpdate = false; }
+            var actual = Demo.readSql(factory, context, 3);
+            context.setQueryCodeGenerator(null);
+            try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                assertEquals(Demo.readSql(baseline, context, 3), actual);
+            }
+            try (var cursor = factory.getCursor(context)) {
+                assertTrue(cursor.hasNext());
+                long count = cursor.getRecord().getLong(0);
+                cursor.toTop();
+                assertTrue(cursor.hasNext());
+                assertEquals(count, cursor.getRecord().getLong(0));
+            }
+        }
+        assertEquals(before, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        context.setQueryCodeGenerator(compiler);
+        compiler.failSlot = (int) compiler.slots.get() + 2;
+        try {
+            assertThrows(IllegalStateException.class, () -> {
+                try (var ignored = Demo.compileSql(engine, context, sql, true)) { }
+            });
+        } finally {
+            compiler.failSlot = 0;
+        }
+        assertEquals(before, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        assertEquals(compiler.created.get(), compiler.closed.get());
+        assertEquals(compiler.slots.get(), compiler.closedSlots.get());
+        assertEquals(0, engine.getBusyReaderCount());
     }
 
     @Test
@@ -1767,6 +1840,11 @@ public class ResolvedSqlAggregateTest {
         assertEquals(0, engine.getBusyReaderCount());
     }
 
+    private void assertScalarMatches(String sql, boolean compiled) throws Exception {
+        assertMatches(sql, false);
+        assertEquals(lastPlan, compiled, lastPlan.contains("compiledScalarAggregate"));
+    }
+
     private void assertMatches(String sql, boolean compiled) throws Exception {
         context.setQueryCodeGenerator(null);
         try (var baseline = Demo.compileSql(engine, context, sql, true)) {
@@ -1790,6 +1868,7 @@ public class ResolvedSqlAggregateTest {
     }
 
     private static final class TrackingCompiler implements QueryCodeGenerator {
+        final AtomicLong scalarRows = new AtomicLong();
         final AtomicLong parallelUnionTasks = new AtomicLong();
         final AtomicLong sharedFinishes = new AtomicLong();
         final AtomicLong parallelZeroTasks = new AtomicLong();
@@ -1821,6 +1900,40 @@ public class ResolvedSqlAggregateTest {
         @Override
         public CompiledCounter compileCounter(RecordCursorFactory input) {
             return delegate.compileCounter(input);
+        }
+
+        @Override
+        public CompiledScalarAggregate compileScalarAggregate(ColumnTypes inputs, ColumnTypes values,
+                ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue layout) {
+            var code = delegate.compileScalarAggregate(inputs, values, functions, layout);
+            if (code == null) return null;
+            created.incrementAndGet();
+            return new CompiledScalarAggregate() {
+                @Override public CharSequence getName() { return code.getName(); }
+                @Override public void merge(io.questdb.cairo.map.MapValue source, io.questdb.cairo.map.MapValue destination) {
+                    code.merge(source, destination);
+                }
+                @Override public void close() { closed.incrementAndGet(); code.close(); }
+                @Override public Updater newUpdater() {
+                    if (failSlot > 0 && slots.get() + 1 == failSlot) throw new IllegalStateException("slot preparation");
+                    var update = code.newUpdater();
+                    slots.incrementAndGet();
+                    return new Updater() {
+                        @Override public long getNativeRows() { return update.getNativeRows(); }
+                        @Override public void close() { closedSlots.incrementAndGet(); update.close(); }
+                        @Override public boolean update(PageFrameMemoryRecord record, long count, long rowIds,
+                                io.questdb.cairo.map.MapValue value, SqlExecutionCircuitBreaker breaker) {
+                            boolean accepted = update.update(record, count, rowIds, value, breaker);
+                            if (accepted && count > 0) {
+                                scalarRows.addAndGet(count);
+                                calls.incrementAndGet();
+                                if (failUpdate) throw CairoException.nonCritical().put("injected after update");
+                            }
+                            return accepted;
+                        }
+                    };
+                }
+            };
         }
 
         @Override

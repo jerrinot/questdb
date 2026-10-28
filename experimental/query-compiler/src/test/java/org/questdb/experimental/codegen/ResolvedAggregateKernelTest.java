@@ -44,6 +44,7 @@ import io.questdb.griffin.engine.functions.groupby.*;
 import io.questdb.griffin.engine.groupby.FastGroupByAllocator;
 import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
 import io.questdb.griffin.engine.groupby.GroupByLongHashSet;
+import io.questdb.griffin.engine.groupby.SimpleMapValue;
 import io.questdb.griffin.engine.table.AsyncGroupByRecordCursorFactory;
 import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.MemoryTag;
@@ -74,6 +75,84 @@ public class ResolvedAggregateKernelTest {
     public static List<Object[]> parameters() {
         return List.of(new Object[]{"llvm", new LlvmBackend()}, new Object[]{"asmjit", new AsmJitBackend()},
                 new Object[]{"c", new NativeBackend()});
+    }
+
+    @Test
+    public void scalarReductionUsesActualSlotsSelectionsMergeAndCancellation() throws Exception {
+        var functions = new ObjList<GroupByFunction>();
+        functions.add(new CountLongConstGroupByFunction());
+        functions.add(new MinIntGroupByFunction(IntColumn.newInstance(1)));
+        functions.add(new SumLongGroupByFunction(LongColumn.newInstance(0)));
+        functions.add(new MaxShortGroupByFunction(ShortColumn.newInstance(2)));
+        functions.add(new CountLongGroupByFunction(LongColumn.newInstance(0)));
+        var types = new ArrayColumnTypes();
+        for (int i = 0; i < functions.size(); i++) functions.getQuick(i).initValueTypes(types);
+        var inputs = new ArrayColumnTypes().add(ColumnType.LONG).add(ColumnType.INT).add(ColumnType.SHORT);
+        try (var engine = new CairoEngine(new DefaultCairoConfiguration(temporary.newFolder().toString()));
+             var nativeValue = new SimpleMapValue(types.getColumnCount());
+             var expected = new SimpleMapValue(types.getColumnCount());
+             var merged = new SimpleMapValue(types.getColumnCount());
+             var code = ResolvedScalarAggregate.compile(inputs, types, functions, nativeValue, backend, temporary.newFolder().toPath());
+             var slot = code.newUpdater(); var arena = Arena.ofConfined()) {
+            var noop = io.questdb.cairo.sql.SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER;
+            for (int i = 0; i < functions.size(); i++) {
+                functions.getQuick(i).setEmpty(nativeValue);
+                functions.getQuick(i).setEmpty(expected);
+                functions.getQuick(i).setEmpty(merged);
+            }
+            nativeValue.setNew(true);
+            merged.setNew(true);
+            int rows = 3001;
+            long longs = arena.allocate(rows * 8L, 8).address();
+            long ints = arena.allocate(rows * 4L, 4).address();
+            long shorts = arena.allocate(rows * 2L, 2).address();
+            long selection = arena.allocate(rows * 8L, 8).address();
+            for (int i = 0; i < rows; i++) {
+                Unsafe.putLong(longs + i * 8L, i % 7 == 0 ? Long.MIN_VALUE : i - 1500);
+                Unsafe.putInt(ints + i * 4L, i % 11 == 0 ? Integer.MIN_VALUE : i - 1000);
+                Unsafe.putShort(shorts + i * 2L, (short) (i * 37));
+                Unsafe.putLong(selection + i * 8L, rows - 1L - i / 2); // reverse and repeat
+            }
+            var record = new TestRecord(longs, ints, shorts);
+            assertTrue(slot.update(record, 0, 0, nativeValue, noop));
+            assertTrue(nativeValue.isNew());
+            assertFalse(slot.update(new PageFrameFilteredMemoryRecord(), rows, selection, nativeValue, noop));
+            assertFalse(slot.update(new TestRecord(0, ints, shorts), rows, selection, nativeValue, noop));
+            assertTrue(nativeValue.isNew());
+            for (long selected : new long[]{0, selection}) {
+                assertTrue(slot.update(record, rows, selected, nativeValue, noop));
+                assertFalse(nativeValue.isNew());
+                for (int r = 0; r < rows; r++) {
+                    record.setRowIndex(selected == 0 ? r : Unsafe.getLong(selection + r * 8L));
+                    for (int f = 0; f < functions.size(); f++) functions.getQuick(f).computeNext(expected, record, r);
+                }
+                assertScalarValues(types, expected, nativeValue);
+            }
+            code.merge(nativeValue, merged);
+            assertScalarValues(types, expected, merged);
+            merged.setNew(false);
+            code.merge(nativeValue, merged);
+            for (int f = 0; f < functions.size(); f++) functions.getQuick(f).merge(expected, nativeValue);
+            assertScalarValues(types, expected, merged);
+            var breaker = new AtomicBooleanCircuitBreaker(engine) {
+                int polls;
+                @Override public void statefulThrowExceptionIfTrippedNoThrottle() {
+                    if (++polls == 3) cancel();
+                    super.statefulThrowExceptionIfTrippedNoThrottle();
+                }
+            };
+            assertThrows(CairoException.class, () -> slot.update(record, rows, 0, nativeValue, breaker));
+            assertEquals(2L * rows, slot.getNativeRows());
+            assertTrue(slot.update(record, rows, 0, nativeValue, noop));
+            assertEquals(3L * rows, slot.getNativeRows());
+        }
+    }
+
+    private static void assertScalarValues(ArrayColumnTypes types, SimpleMapValue expected, SimpleMapValue actual) {
+        for (int i = 0; i < types.getColumnCount(); i++) {
+            if (types.getColumnType(i) == ColumnType.INT) assertEquals(expected.getInt(i), actual.getInt(i));
+            else assertEquals(expected.getLong(i), actual.getLong(i));
+        }
     }
 
     @Test

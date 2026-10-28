@@ -3726,3 +3726,27 @@ The extreme-value fixture also exposes the existing LONG SUM sentinel/merge-orde
 issue, recorded separately in TODO.md. Evidence: `/tmp/query-integer-extrema-20261028`.
 These are small correctness fixtures, not performance experiments; profiling
 remains paused and no speedup or additional ClickBench coverage is claimed.
+
+## 2026-10-28: generated scalar aggregation reaches ordinary SQL
+
+The async unkeyed factory now binds COUNT and integer SUM/MIN/MAX on its
+row-update paths. Existing vector/metadata choices remain authoritative, including
+the optimizer's rewrite of SUM(column + constant). Kernels borrow original frame
+or selection-vector coordinates and the existing 32-byte-spaced SimpleMapValue
+layout. Workers, locks, empty-state handling and merge order remain engine-owned.
+Native copying/merging accepts ordinary or generated partials. Unsupported frame
+representations decline before mutation; execution failure drains and resets.
+
+The compiler promotes the existing aggregate update IR to scalar accumulators;
+it does not duplicate their definitions. A four-aggregate optimized LLVM sample
+has four final state stores and none inside its row loops. Cancellation polls
+occur between 1024-row chunks. This establishes code structure, not throughput.
+
+The old compiler fails the six new SQL coverage checks. The implementation passes
+30 focused SQL checks across all backends/both worker modes, three direct kernel
+checks, and three existing unkeyed memory/lifecycle checks. These cover native row
+counts, selected/repeated rows, mixed-width values in actual scalar slots, empty
+inputs, column tops, lazy conversion, Parquet, cancellation, reopen and partial
+slot-construction cleanup. Main sources and changed tests compile. Evidence and
+LLVM dumps: `/tmp/query-scalar-aggregate-20261028`. Profiling remains paused;
+no new performance or ClickBench coverage claim.
