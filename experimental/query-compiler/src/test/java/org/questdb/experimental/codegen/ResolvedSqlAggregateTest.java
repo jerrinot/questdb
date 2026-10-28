@@ -29,6 +29,8 @@ import io.questdb.cairo.sql.*;
 import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.griffin.TextPlanSink;
 import io.questdb.griffin.engine.CompiledProjection;
+import io.questdb.griffin.engine.CompiledCounter;
+import io.questdb.griffin.engine.groupby.CountRecordCursorFactory;
 import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
@@ -114,6 +116,86 @@ public class ResolvedSqlAggregateTest {
         if (pool != null) pool.halt();
         if (context != null) context.close();
         if (engine != null) engine.close();
+    }
+
+    @Test
+    public void compiledCountReducesFramesAndShardsAndReopens() throws Exception {
+        shardingThreshold = 2;
+        engine.execute("create table counts as (select x,cast(x%1009 as int) k from long_sequence(70001))", context);
+        long memoryBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        for (String sql : List.of(
+                "select count() from counts where k>=0",
+                "select count() from counts where k>2000",
+                "select count() from (select distinct k from counts where k>=0)",
+                "select count() from (select distinct k from counts where k>2000)")) {
+            context.setQueryCodeGenerator(null);
+            List<CompiledGroupBy.ResultRow> expected;
+            try (var stock = Demo.compileSql(engine, context, sql, true)) {
+                expected = Demo.readSql(stock, context, 1);
+            }
+            context.setQueryCodeGenerator(compiler.delegate);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                RecordCursorFactory countFactory = factory;
+                while (countFactory != null && !(countFactory instanceof CountRecordCursorFactory)) {
+                    countFactory = countFactory.getBaseFactory();
+                }
+                assertNotNull(plan(factory), countFactory);
+                var counter = ((CountRecordCursorFactory) countFactory).getCompiledCounter();
+                assertNotNull(plan(factory), counter);
+                assertTrue(plan(factory).contains("compiledCount"));
+                for (int execution = 0; execution < 2; execution++) {
+                    assertEquals(expected, Demo.readSql(factory, context, 1));
+                    if (!sql.contains(">2000")) assertTrue(counter.getNativePartials() > 0);
+                }
+                try (var cursor = factory.getCursor(context)) {
+                    assertTrue(cursor.hasNext());
+                    long value = cursor.getRecord().getLong(0);
+                    long partials = counter.getNativePartials();
+                    assertFalse(cursor.hasNext());
+                    cursor.toTop();
+                    assertTrue(cursor.hasNext());
+                    assertEquals(value, cursor.getRecord().getLong(0));
+                    assertEquals(partials, counter.getNativePartials());
+                    assertFalse(cursor.hasNext());
+                }
+                // Counter arithmetic is wrapping LONG, with no SQL NULL sentinel semantics.
+                counter.clear();
+                long total = 0;
+                for (int i = 0; i < 1027; i++) {
+                    long value = i % 2 == 0 ? Long.MAX_VALUE : Long.MIN_VALUE;
+                    counter.add(value);
+                    total += value;
+                }
+                assertEquals(total, counter.get());
+                assertEquals(1027, counter.getNativePartials());
+                counter.add(123); // set discards an unconsumed partial batch.
+                counter.set(Long.MIN_VALUE);
+                counter.dec(Long.MIN_VALUE);
+                counter.inc();
+                counter.dec();
+                assertEquals(0, counter.get());
+            }
+        }
+        assertEquals(memoryBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
+    public void compiledCountDeclinesMetadataAndLimitCursors() throws Exception {
+        for (String sql : List.of("select count() from t",
+                "select count() from (select * from t where k>=0 limit 5)",
+                "select count() from (select * from t where k>=0 limit -5)")) {
+            context.setQueryCodeGenerator(null);
+            List<CompiledGroupBy.ResultRow> expected;
+            try (var stock = Demo.compileSql(engine, context, sql, true)) {
+                expected = Demo.readSql(stock, context, 1);
+            }
+            context.setQueryCodeGenerator(compiler.delegate);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                assertFalse(plan(factory), plan(factory).contains("compiledCount"));
+                assertEquals(expected, Demo.readSql(factory, context, 1));
+            }
+        }
     }
 
     @Test
@@ -751,6 +833,174 @@ public class ResolvedSqlAggregateTest {
     }
 
     @Test
+    public void stagedFiltersPreserveFrameCoordinatesAndEmptyChunks() throws Exception {
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(1, 32771);
+            mapEntrySize = 64;
+            engine.execute("create table staged as (select cast(x%5003 as int) k,"
+                    + "case when x%13=0 then null else x*3 end v,"
+                    + "cast(x%31-15 as short) s,"
+                    + "cast(case when (x-1)%49152<16384 then null else x%127 end as int) p "
+                    + "from long_sequence(65539))", context);
+            for (String key : List.of("k", "k,s")) {
+                long before = compiler.stagedRows.get();
+                assertMatches("select " + key + ",count(),count(v),sum(v),sum(s) from staged where p>=0 group by " + key, true);
+                assertEquals("Use staged execution across odd frame tails", 2 * 65539, compiler.stagedRows.get() - before);
+            }
+            for (String predicate : List.of("p<0", "p=126", "p=null or p=126")) {
+                assertMatches("select k,count(),sum(v) from staged where " + predicate + " group by k", true);
+            }
+        } finally {
+            System.clearProperty("query.codegen.localCapacity");
+        }
+    }
+
+    @Test
+    public void inputPartitionsAdaptAcrossFramesAndPreserveReopen() throws Exception {
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(64, 2048);
+            mapEntrySize = 64;
+            engine.execute("create table changing as (select "
+                    + "cast(case when x%8192<4096 then x%17 else x%3001 end as int) k,"
+                    + "case when x%11=0 then null else x end v,"
+                    + "cast(case when x%13=0 then null else x%101 end as int) w,"
+                    + "cast(x%31-15 as short) s from long_sequence(32768))", context);
+            for (String key : List.of("k", "k,s")) {
+                long before = compiler.inputPartitionRows.get();
+                assertMatches("select " + key + ",count(),count(v),sum(v),sum(w),sum(s) from changing "
+                        + "where v>100 group by " + key, true);
+                assertTrue("Exercise compact records: " + key, compiler.inputPartitionRows.get() > before);
+            }
+            long before = compiler.inputPartitionRows.get();
+            assertMatches("select k,count(),sum(v),sum(w),sum(s) from changing where k<17 group by k", true);
+            assertEquals("Keep combining cache-resident groups", before, compiler.inputPartitionRows.get());
+
+            // A repeated-key prefix must not hide the remainder of every frame.
+            engine.execute("create table late_groups as (select "
+                    + "cast(case when x%2048<128 then x%17 else x%3001 end as int) k,x v "
+                    + "from long_sequence(8192))", context);
+            before = compiler.inputPartitionRows.get();
+            assertMatches("select k,count(),sum(v) from late_groups where k>=0 group by k", true);
+            assertTrue("Reconsider when the map fills after a misleading prefix", compiler.inputPartitionRows.get() > before);
+
+            // Both partial formats survive until the query owner frees their pages.
+            // Abort after a frame has mutated state, then execute the same factory again.
+            String sql = "select k,count(),sum(v),sum(w),sum(s) from changing where k>=0 group by k";
+            context.setQueryCodeGenerator(compiler);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                compiler.failInputPartition = true;
+                try { assertThrows(CairoException.class, () -> Demo.readSql(factory, context, 5)); }
+                finally { compiler.failInputPartition = false; }
+                var actual = Demo.readSql(factory, context, 5);
+                context.setQueryCodeGenerator(null);
+                try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                    assertEquals(Demo.readSql(baseline, context, 5), actual);
+                }
+            }
+        } finally {
+            System.clearProperty("query.codegen.localCapacity");
+        }
+    }
+
+    @Test
+    public void partitionTopKRetainsCompleteGroupsAndOwnsOutputRows() throws Exception {
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(64, 2048);
+            mapEntrySize = 64;
+            engine.execute("create table ranked_partitions as (select "
+                    + "cast(case when x%17=0 then null else x-2048 end as int) k,"
+                    + "case when x=2048 then 1000000000000 else x*x end v,"
+                    + "case when x=2048 or x%11=0 then null else x*3 end w,"
+                    + "cast(x%31-15 as short) s from long_sequence(8195))", context);
+            for (String keys : List.of("k", "k,s")) {
+                for (String direction : List.of("asc", "desc")) {
+                    for (int limit : new int[]{1, 17}) {
+                        long input = compiler.partitionTopKInput.get(), output = compiler.partitionTopKOutput.get();
+                        assertMatches("select " + keys + ",sum(v) total,count() n,sum(w),avg(s) "
+                                + "from ranked_partitions where v>=0 group by " + keys
+                                + " order by total " + direction + " limit " + limit, true);
+                        long inputs = compiler.partitionTopKInput.get() - input;
+                        long outputs = compiler.partitionTopKOutput.get() - output;
+                        assertTrue("Complete groups must reach partition selection", inputs > 0);
+                        assertTrue("Output maps must retain fewer groups", outputs > 0 && outputs < inputs);
+                    }
+                }
+            }
+            String grouped = "select k,sum(v) total,count() n,sum(w),avg(s) from ranked_partitions where v>=0 group by k";
+            long input = compiler.partitionTopKInput.get();
+            assertMatches(grouped + " order by total desc limit 73", true);
+            assertMatches("select * from (" + grouped + ") where n=1 order by total desc limit 10", true);
+            assertEquals("Large K and HAVING must preserve the existing path", input, compiler.partitionTopKInput.get());
+
+            String sql = grouped + " order by total desc limit 10";
+            context.setQueryCodeGenerator(null);
+            java.util.List<CompiledGroupBy.ResultRow> expected;
+            try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                expected = Demo.readSql(baseline, context, 1);
+            }
+            context.setQueryCodeGenerator(compiler);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                compiler.declineTopK = true;
+                long fallbacks = compiler.topKFallbacks.get();
+                try { assertEquals(expected, Demo.readSql(factory, context, 1)); }
+                finally { compiler.declineTopK = false; }
+                assertTrue("Ordinary final collection can read retained output maps", compiler.topKFallbacks.get() > fallbacks);
+                compiler.failPartitionSelection = true;
+                try { assertThrows(CairoException.class, () -> Demo.readSql(factory, context, 1)); }
+                finally { compiler.failPartitionSelection = false; }
+                assertEquals(expected, Demo.readSql(factory, context, 1));
+            }
+            assertEquals(0, engine.getBusyReaderCount());
+        } finally {
+            System.clearProperty("query.codegen.localCapacity");
+        }
+    }
+
+    @Test
+    public void cacheSizedPartitionMergePreservesRawStatesAndReopens() throws Exception {
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(64, 2048);
+            compiler.partitionCacheBytes = 4096;
+            topKThreshold = 1;
+            engine.execute("create table cache_partitions as (select "
+                    + "cast(case when x%17=0 then null else x%65537-2048 end as int) k,"
+                    + "cast((x%65537)%7 as int) j,x*x v,"
+                    + "case when x%11=0 then null else x*3 end w,"
+                    + "cast(case when x%13=0 then null else x%31-15 end as short) s "
+                    + "from long_sequence(131075))", context);
+            String sql = "select k,j,sum(v) total,count() n,sum(w),avg(s) from cache_partitions "
+                    + "where v>=0 group by k,j order by total desc limit 17";
+            assertMatches(sql, true);
+            assertTrue("Subpartition survivors must exceed one prefix per outer shard",
+                    compiler.partitionTopKOutput.get() > 2 * 17L * io.questdb.griffin.engine.table.GroupByMapFragment.NUM_SHARDS);
+            context.setQueryCodeGenerator(null);
+            java.util.List<CompiledGroupBy.ResultRow> expected;
+            try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                expected = Demo.readSql(baseline, context, 2);
+            }
+            context.setQueryCodeGenerator(compiler);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                compiler.failPartitionSelection = true;
+                try {
+                    assertThrows(CairoException.class, () -> Demo.readSql(factory, context, 2));
+                } finally {
+                    compiler.failPartitionSelection = false;
+                }
+                for (int i = 0; i < 2; i++) {
+                    assertEquals(expected, Demo.readSql(factory, context, 2));
+                }
+            }
+            assertEquals(0, engine.getBusyReaderCount());
+        } finally {
+            System.clearProperty("query.codegen.localCapacity");
+        }
+    }
+
+    @Test
     public void boundedPartialStatesPreserveKeysAndReopen() throws Exception {
         System.setProperty("query.codegen.bounded", "true");
         System.setProperty("query.codegen.localCapacity", "64");
@@ -824,6 +1074,77 @@ public class ResolvedSqlAggregateTest {
         }
         assertTrue(compiler.merges.get() > 0);
         assertTrue(compiler.redistributions.get() > 0);
+    }
+
+    @Test
+    public void literalSubstringFiltersShareFrameSemanticsAndReopen() throws Exception {
+        context.setJitMode(io.questdb.cairo.SqlJitMode.JIT_MODE_ENABLED);
+        engine.execute("create table literals as (select x v,cast(x%7 as int) k,"
+                + "cast(case when x%11=0 then null when x%5=0 then '' when x%3=0 then 'needle' "
+                + "else 'prefix-ž-needle-abcdefghijklmnopqrstuvw' end as varchar) s,"
+                + "timestamp_sequence('2024-01-01',1000000) ts from long_sequence(193)) timestamp(ts) partition by day", context);
+        var nativeCompiler = new ResolvedQueryCompiler(backend, temporary.newFolder().toPath());
+        for (boolean parquet : new boolean[]{false, true}) {
+            context.setQueryCodeGenerator(null);
+            if (parquet) engine.execute("alter table literals convert partition to parquet list '2024-01-01'", context);
+            for (String predicate : List.of("s like '%needle%'", "k<5 and s like '%ž%' and s is not null", "s like '%abcdefgh%'")) {
+                for (String output : List.of("count()", "v,k")) {
+                    String sql = "select " + output + " from literals where " + predicate;
+                    context.setQueryCodeGenerator(null);
+                    try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                        var expected = Demo.readSql(baseline, context, baseline.getMetadata().getColumnCount());
+                        context.setQueryCodeGenerator(nativeCompiler);
+                        try (var candidate = Demo.compileSql(engine, context, sql, true)) {
+                            RecordCursorFactory current = candidate;
+                            while (current != null && !(current instanceof io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory))
+                                current = current.getBaseFactory();
+                            assertNotNull(plan(candidate), current);
+                            var filtered = (io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory) current;
+                            assertEquals(backend.name(), filtered.getCompiledFilter().getBackendName());
+                            assertEquals(expected, Demo.readSql(candidate, context, candidate.getMetadata().getColumnCount()));
+                            assertEquals(expected, Demo.readSql(candidate, context, candidate.getMetadata().getColumnCount()));
+                            assertEquals(386, output.equals("count()") ? filtered.getCompiledCountOnlyFilter().getNativeInputRows()
+                                    : filtered.getCompiledFilter().getNativeInputRows());
+                        }
+                    }
+                }
+            }
+            for (String predicate : List.of("s ilike '%NEEDLE%'", "s like '%n_edle%'", "s like '%abcdefghijkl%'")) {
+                String sql = "select count() from literals where " + predicate;
+                context.setQueryCodeGenerator(null);
+                try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                    var expected = Demo.readSql(baseline, context, 1);
+                    context.setQueryCodeGenerator(nativeCompiler);
+                    try (var candidate = Demo.compileSql(engine, context, sql, true)) {
+                        assertFalse(plan(candidate).contains("compiledFilter:"));
+                        assertEquals(expected, Demo.readSql(candidate, context, 1));
+                    }
+                }
+            }
+        }
+        context.setQueryCodeGenerator(null);
+        engine.execute("alter table literals add column top varchar", context);
+        String sql = "select count() from literals where top is null and s like '%needle%'";
+        try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+            var expected = Demo.readSql(baseline, context, 1);
+            context.setQueryCodeGenerator(nativeCompiler);
+            try (var candidate = Demo.compileSql(engine, context, sql, true)) {
+                assertEquals(expected, Demo.readSql(candidate, context, 1));
+            }
+        }
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
+    public void literalSubstringResidualsFeedGeneratedAggregation() throws Exception {
+        engine.execute("create table literals as (select x v,cast(x%7 as int) k,"
+                + "cast(case when x%11=0 then null when x%5=0 then '' when x%3=0 then 'needle' "
+                + "else 'prefix-ž-needle-abcdefghijklmnopqrstuvw' end as varchar) s from long_sequence(10003))", context);
+        for (String predicate : List.of("s like '%needle%'", "k<5 and s like '%ž%' and s is not null", "s like '%abcdefgh%'")) {
+            long before = compiler.filterRows.get();
+            assertMatches("select k,count(),sum(v) from literals where " + predicate + " group by k", true);
+            assertEquals(20006, compiler.filterRows.get() - before);
+        }
     }
 
     @Test
@@ -1030,6 +1351,151 @@ public class ResolvedSqlAggregateTest {
             assertEquals(actual, Demo.readSql(factory, context, 5));
             assertEquals(20_000, compiler.rows.get());
         }
+    }
+
+    @Test
+    public void partitionRankingDefersIndependentStringAggregatesAndReopens() throws Exception {
+        String previous = System.getProperty("query.codegen.localCapacity");
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(64, 2048);
+            engine.execute("create table late_values as (select "
+                    + "case when x%17=0 then null else x%65537-2048 end k,"
+                    + "cast((x%65537)%7 as int) j,x*100000000000000000 v,"
+                    + "cast(case when x%19=0 then null when x%13=0 then '' "
+                    + "else '中-common-prefix-longer-than-sixteen-'||cast(x as string) end as varchar) s "
+                    + "from long_sequence(131075))", context);
+            for (int entrySize : new int[]{16, 64}) {
+                mapEntrySize = entrySize;
+                for (String order : List.of("asc", "desc")) {
+                    long before = compiler.partitionTopKInput.get();
+                    assertMatches("select k,min(s),max(s),count() n,sum(v) score from late_values "
+                            + "where j>=0 group by k order by score " + order + " limit 3", true);
+                    assertTrue("Complete groups must pass through partition ranking", compiler.partitionTopKInput.get() > before);
+                }
+            }
+            // K exceeds the sampled lower bound, retaining ordinary aggregate updates.
+            assertMatches("select k,min(s),max(s),count(),sum(v) score from late_values "
+                    + "group by k order by score desc limit 64", true);
+            // A post-aggregation filter consumes extrema before ranking and blocks pushdown.
+            assertMatches("select * from (select k,min(s) lo,max(s) hi,count(),sum(v) score "
+                    + "from late_values group by k) where lo is not null order by score desc limit 3", true);
+            compiler.partitionCacheBytes = 4096;
+            String sql = "select k,j,min(s),max(s),count(),sum(v) score from late_values "
+                    + "group by k,j order by score desc limit 3";
+            assertMatches(sql, true);
+            context.setQueryCodeGenerator(null);
+            java.util.List<CompiledGroupBy.ResultRow> expected;
+            try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                expected = Demo.readSql(baseline, context, 2);
+            }
+            context.setQueryCodeGenerator(compiler);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                compiler.failPartitionSelection = true;
+                try { assertThrows(CairoException.class, () -> Demo.readSql(factory, context, 2)); }
+                finally { compiler.failPartitionSelection = false; }
+                for (int i = 0; i < 2; i++) assertEquals(expected, Demo.readSql(factory, context, 2));
+            }
+            assertEquals(0, engine.getBusyReaderCount());
+        } finally {
+            if (previous == null) System.clearProperty("query.codegen.localCapacity");
+            else System.setProperty("query.codegen.localCapacity", previous);
+        }
+    }
+
+    @Test
+    public void partitionedStringArgumentsRetainPayloadsAndReopen() throws Exception {
+        String previous = System.getProperty("query.codegen.localCapacity");
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            engine.execute("create table vp as (select cast(x%1009 as int) k,"
+                    + "cast(case when x%17=0 then null when x%13=0 then '' else '中-long-common-prefix-'||cast(x as string) end as varchar) s,"
+                    + "x d,cast(x%29 as int) w,timestamp_sequence('2024-01-01',60000000L) ts from long_sequence(10003)) timestamp(ts) partition by day bypass wal", context);
+            for (boolean parquet : new boolean[]{false, true}) {
+                if (parquet) engine.execute("alter table vp convert partition to parquet list '2024-01-01'", context);
+                for (int entrySize : new int[]{16, 64}) {
+                    mapEntrySize = entrySize;
+                    for (String value : List.of("s", "case when d<5000 then s else 'literal-ž-that-outlives-the-frame' end")) {
+                        String sql = "select k,min(" + value + "),max(" + value + "),count() n,sum(d) score,count(d),sum(w) "
+                                + "from vp where k>=0 group by k order by score desc limit 25";
+                        long before = compiler.inputPartitionRows.get();
+                        assertMatches(sql, true);
+                        assertTrue("Compact string records must be consumed", compiler.inputPartitionRows.get() > before);
+                    }
+                }
+            }
+            long compositeBefore = compiler.inputPartitionRows.get();
+            assertMatches("select k,w,min(s),max(s),count(),sum(d),count(d),sum(w) from vp group by k,w", true);
+            assertTrue(compiler.inputPartitionRows.get() > compositeBefore);
+            // Wide raw inputs must not force repeated allocations into retained partial states.
+            long narrowBefore = compiler.inputPartitionRows.get();
+            assertMatches("select k,min(s),count() from vp group by k", true);
+            assertEquals(narrowBefore, compiler.inputPartitionRows.get());
+            engine.execute("alter table vp add column extra varchar", context);
+            long before = compiler.inputPartitionRows.get();
+            assertMatches("select k,min(extra),max(extra),count(),sum(d) from vp group by k", true);
+            assertTrue(compiler.inputPartitionRows.get() > before);
+            assertEquals(0, engine.getBusyReaderCount());
+        } finally {
+            if (previous == null) System.clearProperty("query.codegen.localCapacity");
+            else System.setProperty("query.codegen.localCapacity", previous);
+        }
+    }
+
+    @Test
+    public void varcharExtremaKeepJavaSinkLayoutAcrossKeysFramesAndMerge() throws Exception {
+        mapEntrySize = 64;
+        engine.execute("create table extrema as (select cast(x%31 as int) k,"
+                + "cast(case when x%17=0 then null when x%13=0 then '' else 'ž-key-'||cast(x%1009 as string) end as varchar) label,"
+                + "cast(case when x%31=0 or x%11=0 then null when x%7=0 then '' when x%5=0 then '中-aaaaaaaa-long-prefix-'||cast(x as string) "
+                + "else 'abcdef-long-common-prefix-'||cast(x as string) end as varchar) value,x d,"
+                + "timestamp_sequence('2024-01-01',1000000L) ts from long_sequence(10003)) timestamp(ts) partition by day bypass wal", context);
+        for (boolean parquet : new boolean[]{false, true}) {
+            if (parquet) engine.execute("alter table extrema convert partition to parquet list '2024-01-01'", context);
+            for (int threshold : new int[]{2, Integer.MAX_VALUE}) {
+                shardingThreshold = threshold;
+                for (String key : List.of("k", "label", "k,label")) {
+                    long before = compiler.mapRows.get();
+                    assertMatches("select " + key + ",min(value),max(value),count(),sum(d),count_distinct(d) "
+                            + "from extrema where k>=0 group by " + key, true);
+                    assertTrue("String updates must run against native maps", compiler.mapRows.get() > before);
+                }
+            }
+            assertMatches("select k,min(case when k<10 then value else 'constant-ž' end),max(cast('literal' as varchar)),count() from extrema group by k", true);
+        }
+        engine.execute("alter table extrema add column top varchar", context);
+        assertMatches("select k,min(top),max(top),count() from extrema group by k", true);
+        assertTrue("String pointers must survive native merge", compiler.merges.get() > 0);
+        assertEquals(compiler.slots.get(), compiler.closedSlots.get());
+    }
+
+    @Test
+    public void varcharExtremaGrowAndReopenAfterMemoryFailure() throws Exception {
+        engine.execute("create table extrema (k int, value varchar)", context);
+        engine.execute("insert into extrema values (1,'z'),(1,'abcdef-longer-value'),(1,'a'),(1,''),(1,null),"
+                + "(2,'a'),(2,'z-longer-than-original'),(2,'zz'),(3,null),(4,'中'),(4,'ž')", context);
+        assertMatches("select k,min(value),max(value),count() from extrema group by k", true);
+        shardingThreshold = 2;
+        engine.execute("insert into extrema select cast(x%2003 as int),cast('long-value-'||cast(x as string) as varchar) from long_sequence(10003)", context);
+        String sql = "select k,min(value),max(value),count() from extrema group by k";
+        context.setQueryCodeGenerator(compiler);
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            long failuresBefore = compiler.nativeMemoryFailures.get();
+            for (long limit = 4096; limit <= (1 << 20) && compiler.nativeMemoryFailures.get() == failuresBefore; limit *= 2) {
+                queryMemoryLimit = limit;
+                try { Demo.readSql(factory, context, 4); }
+                catch (CairoException failure) { assertTrue(failure.isOutOfMemory()); }
+            }
+            assertTrue("Exercise native string allocation failure", compiler.nativeMemoryFailures.get() > failuresBefore);
+            queryMemoryLimit = 0;
+            var actual = Demo.readSql(factory, context, 4);
+            context.setQueryCodeGenerator(null);
+            try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                assertEquals(Demo.readSql(baseline, context, 4), actual);
+            }
+            assertEquals(actual, Demo.readSql(factory, context, 4));
+        }
+        assertEquals(0, engine.getBusyReaderCount());
     }
 
     @Test
@@ -1286,14 +1752,25 @@ public class ResolvedSqlAggregateTest {
         private final AtomicLong topKRows = new AtomicLong(), topKMerges = new AtomicLong(), topKFallbacks = new AtomicLong();
         private volatile boolean declineTopK;
         private volatile boolean failTopK;
+        private volatile boolean failPartitionSelection;
+        private long partitionCacheBytes = -1;
+        private final AtomicLong partitionTopKInput = new AtomicLong(), partitionTopKOutput = new AtomicLong();
         private final AtomicLong mapRows = new AtomicLong();
+        private final AtomicLong inputPartitionRows = new AtomicLong();
+        private final AtomicLong stagedRows = new AtomicLong();
         private final AtomicLong rows = new AtomicLong(), calls = new AtomicLong(), declines = new AtomicLong(), nativeMemoryFailures = new AtomicLong();
         private int failSlot;
         private boolean failClose;
         private final java.util.Map<Updater, Updater> delegates = new java.util.IdentityHashMap<>();
         private volatile boolean failUpdate;
+        private volatile boolean failInputPartition;
 
         private TrackingCompiler(QueryCodeGenerator delegate) { this.delegate = delegate; }
+
+        @Override
+        public CompiledCounter compileCounter(RecordCursorFactory input) {
+            return delegate.compileCounter(input);
+        }
 
         @Override
         public CompiledProjection compileProjection(ColumnTypes inputs, int offset, ObjList<Function> functions) {
@@ -1349,6 +1826,36 @@ public class ResolvedSqlAggregateTest {
                     var update = code.newUpdater(allocator);
                     slots.incrementAndGet();
                     Updater wrapped = new Updater() {
+                        private void recordUpdate(long beforeInputs, long count) {
+                            if (update instanceof AggregateSlot slot) inputPartitionRows.addAndGet(slot.inputPartitionRows() - beforeInputs);
+                            if (failInputPartition && update instanceof AggregateSlot slot && slot.inputPartitionRows() > beforeInputs) {
+                                throw CairoException.queryCancelled();
+                            }
+                            calls.incrementAndGet();
+                            rows.addAndGet(count);
+                            mapRows.addAndGet(count);
+                            if (failUpdate) throw CairoException.nonCritical().put("injected after update");
+                        }
+                        @Override public boolean hasFusedFilter() { return update.hasFusedFilter(); }
+                        @Override public long updateFiltered(PageFrameMemoryRecord record, long count,
+                                io.questdb.cairo.map.Map map, ObjList<io.questdb.cairo.map.Map> shards,
+                                int batchSize, io.questdb.std.DirectLongList scratch, SqlExecutionCircuitBreaker breaker) {
+                            long beforeInputs = update instanceof AggregateSlot slot ? slot.inputPartitionRows() : 0;
+                            long selected;
+                            try {
+                                selected = update.updateFiltered(record, count, map, shards, batchSize, scratch, breaker);
+                            } catch (CairoException failure) {
+                                if (failure.isOutOfMemory()) nativeMemoryFailures.incrementAndGet();
+                                throw failure;
+                            }
+                            if (selected >= 0) {
+                                filterRows.addAndGet(count);
+                                filterSelected.addAndGet(selected);
+                                stagedRows.addAndGet(count);
+                                if (selected > 0) recordUpdate(beforeInputs, selected);
+                            }
+                            return selected;
+                        }
                         @Override public boolean initSharedMaps(java.util.function.IntFunction<io.questdb.cairo.map.Map> maps) { return update.initSharedMaps(maps); }
                         @Override public void finishSharedMap(int shard, Runnable checkpoint) {
                             update.finishSharedMap(shard, checkpoint);
@@ -1356,6 +1863,21 @@ public class ResolvedSqlAggregateTest {
                         }
                         @Override public int localMapCapacity() { return update.localMapCapacity(); }
                         @Override public boolean hasPartitions() { return update.hasPartitions(); }
+                        @Override public boolean hasPartitionTopK() { return update.hasPartitionTopK(); }
+                        @Override public void mergeTopKPartition(io.questdb.cairo.map.Map working,
+                                io.questdb.cairo.map.Map destination, ObjList<Updater> sources,
+                                int partition, Runnable checkpoint) {
+                            var inputs = new ObjList<Updater>(sources.size());
+                            for (int i = 0; i < sources.size(); i++) inputs.add(delegates.get(sources.getQuick(i)));
+                            AggregateSlot slot = (AggregateSlot) update;
+                            long before = slot.topKCounters()[0];
+                            if (partitionCacheBytes >= 0) slot.mergeTopKPartition(working, destination, inputs,
+                                    partition, partitionCacheBytes, checkpoint);
+                            else slot.mergeTopKPartition(working, destination, inputs, partition, checkpoint);
+                            partitionTopKInput.addAndGet(slot.topKCounters()[0] - before);
+                            partitionTopKOutput.addAndGet(destination.size());
+                            if (failPartitionSelection) throw CairoException.queryCancelled();
+                        }
                         @Override public void clear() { update.clear(); }
                         @Override public void partition(io.questdb.cairo.map.Map source, Runnable checkpoint) {
                             update.partition(source, checkpoint); redistributions.incrementAndGet();
@@ -1430,6 +1952,7 @@ public class ResolvedSqlAggregateTest {
                         @Override public boolean updateMap(PageFrameMemoryRecord record, long count, long rowIds,
                                 io.questdb.cairo.map.Map map, int batchSize, SqlExecutionCircuitBreaker breaker) {
                             boolean accepted;
+                            long beforeInputs = update instanceof AggregateSlot slot ? slot.inputPartitionRows() : 0;
                             try {
                                 accepted = update.updateMap(record, count, rowIds, map, batchSize, breaker);
                             } catch (CairoException failure) {
@@ -1437,10 +1960,7 @@ public class ResolvedSqlAggregateTest {
                                 throw failure;
                             }
                             if (accepted) {
-                                calls.incrementAndGet();
-                                rows.addAndGet(count);
-                                mapRows.addAndGet(count);
-                                if (failUpdate) throw CairoException.nonCritical().put("injected after update");
+                                recordUpdate(beforeInputs, count);
                             }
                             return accepted;
                         }

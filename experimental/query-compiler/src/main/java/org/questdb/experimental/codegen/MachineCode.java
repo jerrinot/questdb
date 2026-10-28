@@ -36,10 +36,10 @@ import static org.questdb.experimental.codegen.Ir.*;
 /** Backend-neutral register/label stream. No SQL operators or query shapes reach the native bridge. */
 final class MachineCode {
     // Wire ABI shared with asmjit_backend.cpp. A version guards mismatched native builds.
-    static final int MAGIC=0x51444952, VERSION=6, HEADER_BYTES=24, INSTRUCTION_BYTES=24;
+    static final int MAGIC=0x51444952, VERSION=8, HEADER_BYTES=24, INSTRUCTION_BYTES=24;
     static final int CONST=1,MOVE=2,ADD=3,SUB=4,MUL=5,AND=6,XOR=7,USHR=8,
             EQ=9,NE=10,LT=11,GE=12,LOAD=13,STORE=14,LABEL=15,JUMP=16,
-            BR_FALSE=17,ALLOC=18,FREE=19,POLL=20,RETURN=21,COMPARE_BRANCH=22,BR_TRUE=23,CTZ=24,PREFETCH=25,FADD=26,FSUB=27,FMUL=28,FDIV=29,TO_DOUBLE=30,SDIV=31,ATOMIC_LOAD=32,COMPARE_EXCHANGE=33,ATOMIC_STORE=34,ATOMIC_ADD=35;
+            BR_FALSE=17,ALLOC=18,FREE=19,POLL=20,RETURN=21,COMPARE_BRANCH=22,BR_TRUE=23,CTZ=24,PREFETCH=25,FADD=26,FSUB=27,FMUL=28,FDIV=29,TO_DOUBLE=30,SDIV=31,ATOMIC_LOAD=32,COMPARE_EXCHANGE=33,ATOMIC_STORE=34,ATOMIC_ADD=35,BYTE_EQ_MASK=36,REALLOC=37;
     private record Instruction(int op,int dst,int a,int b,long immediate) { }
     private final List<Instruction> code=new ArrayList<>();
     private final Map<Integer,Integer> variables=new HashMap<>(Map.of(0,0,1,1,2,2));
@@ -131,7 +131,7 @@ final class MachineCode {
             case Offset o -> {int address=expression(o.address()),offset=expression(o.bytes()),result=reg();emit(ADD,result,address,offset,0);yield result;}
             case PopulationCount ignored -> throw new IllegalArgumentException("Population count requires portable lowering");
             case TrailingZeros z -> { int input=expression(z.value()),result=reg();emit(CTZ,result,input,0,0);yield result; }
-            case VectorMask ignored -> throw new IllegalArgumentException("Vector mask requires portable lowering");
+            case VectorMask mask -> byteMask(mask.predicate(), mask.lanes());
             case AtomicLoad l -> {int address=expression(l.address()),result=reg();emit(ATOMIC_LOAD,result,address,0,0);yield result;}
             case AtomicAdd a -> {int address=expression(a.address()),value=expression(a.value()),result=reg();emit(ATOMIC_ADD,result,address,value,0);yield result;}
             case CompareExchange c -> {int address=expression(c.address()),expected=expression(c.expected()),value=expression(c.value()),result=reg();emit(COMPARE_EXCHANGE,result,address,expected,value);yield result;}
@@ -139,7 +139,55 @@ final class MachineCode {
             case Select s -> select(s.condition(),s.yes(),s.no());
             case ToDouble c -> {int input=expression(c.value()),result=reg();emit(TO_DOUBLE,result,input,0,0);yield result;}
             case Allocate a -> {int bytes=expression(a.bytes()),result=reg();emit(ALLOC,result,bytes,0,0);yield result;}
+            case Reallocate r -> {int address=expression(r.address()),oldBytes=expression(r.oldBytes()),newBytes=expression(r.newBytes()),result=reg();emit(REALLOC,result,address,oldBytes,newBytes);yield result;}
         };
+    }
+    // The IR guarantees every lane is readable. Unsupported predicates retain scalar lowering.
+    static boolean supportsByteMask(VectorMask mask) {
+        int lanes = mask.lanes();
+        return (lanes == 8 || lanes == 16 || lanes == 32 || lanes == 64) && supportsBytePredicate(mask.predicate());
+    }
+
+    private static boolean supportsBytePredicate(Expr predicate) {
+        if (predicate instanceof Binary b && b.op() == Op.BOTH)
+            return supportsBytePredicate(b.left()) && supportsBytePredicate(b.right());
+        return byteComparison(predicate) != null;
+    }
+
+    private record ByteComparison(Expr address, int value, boolean invert) { }
+
+    private static ByteComparison byteComparison(Expr predicate) {
+        if (!(predicate instanceof Binary b) || (b.op() != Op.EQ && b.op() != Op.NE)) return null;
+        Expr input = b.left(), other = b.right();
+        if (input instanceof Literal) { input = b.right(); other = b.left(); }
+        if (!(other instanceof Literal constant)) return null;
+        boolean unsigned = false;
+        if (input instanceof Binary mask && mask.op() == Op.AND) {
+            if (mask.right().equals(i64(255))) { input = mask.left(); unsigned = true; }
+            else if (mask.left().equals(i64(255))) { input = mask.right(); unsigned = true; }
+        }
+        if (!(input instanceof Load load) || load.width() != MemoryType.I8) return null;
+        long value = constant.value();
+        if (unsigned ? value < 0 || value > 255 : value < -128 || value > 127) return null;
+        return new ByteComparison(load.address(), (int) value & 255, b.op() == Op.NE);
+    }
+
+    private int byteMask(Expr predicate, int lanes) {
+        if (predicate instanceof Binary b && b.op() == Op.BOTH) {
+            int left = byteMask(b.left(), lanes), right = byteMask(b.right(), lanes), result = reg();
+            emit(AND, result, left, right, 0);
+            return result;
+        }
+        ByteComparison comparison = byteComparison(predicate);
+        if (comparison == null) throw new IllegalArgumentException("Byte mask requires portable lowering");
+        int base = expression(comparison.address()), result = reg();
+        emit(BYTE_EQ_MASK, result, base, lanes, comparison.value());
+        if (comparison.invert()) {
+            int inverted = reg();
+            emit(XOR, inverted, result, constant(lanes == 64 ? -1L : (1L << lanes) - 1), 0);
+            return inverted;
+        }
+        return result;
     }
     private record Address(int base,int offset) { }
     private Address address(Expr expression) {

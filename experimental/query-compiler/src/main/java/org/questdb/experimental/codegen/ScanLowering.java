@@ -68,20 +68,38 @@ final class ScanLowering {
         return selection(plan, null, false, countOnly, sourceIndexes);
     }
 
+    /** Frame descriptors with the same residual semantics for selection and count-only consumers. */
+    static Program selection(ScanPlan plan, RowPredicate residual, boolean countOnly) {
+        return selection(plan, residual, false, countOnly, null);
+    }
+
+    /** ROWS is the exclusive frame-row end; output IDs retain the frame's coordinates. */
+    static Program selectionRange(ScanPlan plan, RowPredicate residual, long beginOffset) {
+        return selection(plan, residual, true, false, null, new Load(MemoryType.I64, at(COLUMNS, beginOffset)));
+    }
+
     private static Program selection(ScanPlan plan, RowPredicate residual, boolean cancellable,
                                      boolean countOnly, int[] sourceIndexes) {
+        return selection(plan, residual, cancellable, countOnly, sourceIndexes, i64(0));
+    }
+
+    private static Program selection(ScanPlan plan, RowPredicate residual, boolean cancellable,
+                                     boolean countOnly, int[] sourceIndexes, Expr begin) {
         // Row IDs are 64-bit: keep each predicate mask at the output-vector width.
         final int selectionLanes = countOnly ? 64 : 8;
         Builder b = new Builder();
         Var count = b.let(i64(0));
         if (cancellable) b.poll();
         emit(plan, b, (selected, row, index) -> {
-            if (countOnly) selected.assign(count, add(count, i64(1)));
-            else if (residual == null) selectRow(selected, count, index);
-            else selected.when(residual.emit(selected, index), accepted -> selectRow(accepted, count, index));
+            java.util.function.Consumer<Builder> accept = accepted -> {
+                if (countOnly) accepted.assign(count, add(count, i64(1)));
+                else selectRow(accepted, count, index);
+            };
+            if (residual == null) accept.accept(selected);
+            else selected.when(residual.emit(selected, index), accept);
         }, Mode.MASKED, cancellable, selectionLanes, residual != null ? null : (selected, index, mask) -> selected.assign(count, add(count,
                 countOnly ? new PopulationCount(mask)
-                        : new SelectRows(selectionLanes, mask, index, new Offset(STATE, binary(Op.MUL, count, i64(8)))))), sourceIndexes);
+                        : new SelectRows(selectionLanes, mask, index, new Offset(STATE, binary(Op.MUL, count, i64(8)))))), sourceIndexes, begin);
         b.exit(count);
         return new Program(b.block());
     }
@@ -103,12 +121,17 @@ final class ScanLowering {
 
     private static void emit(ScanPlan plan, Builder b, RowConsumer consume, Mode mode, boolean cancellable,
                              int lanes, MaskConsumer consumeMask, int[] sourceIndexes) {
+        emit(plan, b, consume, mode, cancellable, lanes, consumeMask, sourceIndexes, i64(0));
+    }
+
+    private static void emit(ScanPlan plan, Builder b, RowConsumer consume, Mode mode, boolean cancellable,
+                             int lanes, MaskConsumer consumeMask, int[] sourceIndexes, Expr begin) {
         List<Var> addresses = new ArrayList<>();
         for (Column column : plan.input()) {
             int source = sourceIndexes == null ? column.index() : sourceIndexes[column.index()];
             addresses.add(b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, source * 8L))));
         }
-        Var index = b.let(i64(0));
+        Var index = b.let(begin);
         if (!(plan.predicate() instanceof All) && mode == Mode.MASKED) {
             Expr present = bool(true);
             var columns = plan.predicateColumns();

@@ -6,6 +6,11 @@ production competitor to Umbra. The north star is to compile QuestDB's proven
 physical algorithms with their semantics and lifecycle intact, achieving robust
 execution across data distributions while controlling compilation latency.
 
+The original implementation sequence below is historical. The integrated path now
+uses core page-frame workers, slot ownership and native map views. The
+[2026-10-27 literature reassessment](#literature-reassessment-2026-10-27) separates
+the remaining gaps from infrastructure already implemented.
+
 ## Evidence and assumptions checked in code
 
 The 500M-row selective case takes 117.1 ms in LLVM P8 versus 26.1 ms in SQL8.
@@ -43,7 +48,7 @@ Current code contracts:
 | --- | --- | --- |
 | [Neumann, VLDB 2011](https://www.vldb.org/pvldb/vol4/p539-neumann.pdf) | Data-centric compilation removes tuple dispatch and can keep values in registers across operators. | Keep fused consumers and dependency-ordered pipelines; compilation is useful only when the emitted execution strategy is good. |
 | [Kersten et al., VLDB 2018](https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf) | Under matched algorithms, compiled and vectorized execution have different strengths; instruction count and latency hiding both matter. | Treat fusion and batching as physical choices. Compare with identical state algorithms, and do not equate fewer instructions with less elapsed time. |
-| [Menon et al., VLDB 2018](https://www.vldb.org/pvldb/vol11/p1-menon.pdf) | Relaxed operator fusion introduces bounded staging to expose SIMD and independent memory work. | Separate a pure filter stage from stateful consumers. Do not add speculative prefetching or change hash algorithms without a separate study. |
+| [Menon et al., PVLDB 2017 / conference 2018](https://www.vldb.org/pvldb/vol11/p1-menon.pdf) | Relaxed operator fusion introduces bounded staging to expose SIMD and independent memory work. | Separate a pure filter stage from stateful consumers. Do not add speculative prefetching or change hash algorithms without a separate study. |
 | [Kersten, Leis, Neumann, VLDBJ 2021](https://link.springer.com/article/10.1007/s00778-020-00643-4) | Tidy Tuples, Umbra IR and Flying Start address code-generation structure and total query latency, with a fast backend plus LLVM. | Keep one semantic source and multiple backends. Retain AsmJit as the fast path; measure compilation as well as execution. |
 | [Kohn et al., ICDE 2018](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf) | Execution modes can switch at morsel boundaries when they share state and calling conventions. | Keep the existing kernel ABI and aggregate layouts. Tier switching belongs at a joined runtime boundary, not within an aggregate update. Background compilation is a subsequent runtime change. |
 | [Jungmair et al., VLDB 2022](https://www.vldb.org/pvldb/vol15/p2389-jungmair.pdf), [MLIR rationale](https://mlir.llvm.org/docs/Rationale/Rationale/) | Multiple abstraction levels preserve information until the appropriate optimization phase. | Add a small explicit scan-stage representation before scalar IR. Adopting the whole MLIR dependency stack is unnecessary for this prototype. |
@@ -280,3 +285,309 @@ outlive all native calls, and failed optimization must retain the existing kerne
 Runtime measurements may inform tier choice, but must not reorder rows or change
 semantic eligibility. These are explicit remaining runtime projects, not hidden
 claims of this scan-pipeline implementation.
+
+## Literature reassessment: 2026-10-27
+
+Reviewed the primary papers' design, evaluation and limitations against commit
+`4cc95d1e96`. This is a research synthesis and a proposed experiment sequence;
+no execution or compilation improvement was measured during this review. Earlier
+measurements are identified separately. Paper results describe their versions,
+hardware and workloads, not present-day performance guarantees for QuestDB.
+
+### Findings that change the architectural recommendation
+
+The objective is to compile a resolved query into an efficient parallel program,
+including its intermediate representations and state access. Generating a larger
+fraction of instructions is not itself an objective. The most promising gains
+remove repeated work, unnecessary materialization or expensive dependencies.
+
+Umbra provides two distinct lessons that should not be conflated. Tidy Tuples
+organizes code generators into layers but emits one compact SSA IR in a single
+pass. Its layers are not a stack of materialized intermediate programs. Separately,
+Umbra's low-level plan operators expose reusable buffers and their physical
+properties. We can adopt a small amount of that planning structure without
+replacing our backend, scheduler or SQL optimizer. Multi-level IRs remain an
+alternative with their own costs, rather than a prerequisite for a serious compiler.
+
+### Primary sources and their boundaries
+
+| Paper and sections studied | Mechanism relevant to this prototype | Scope and implication |
+| --- | --- | --- |
+| [Neumann, *Efficiently Compiling Efficient Query Plans for Modern Hardware*, PVLDB 2011, §§3–4](https://www.vldb.org/pvldb/vol4/p539-neumann.pdf) | Compile-time producer/consumer calls construct fused runtime loops between materialization points. Generated code interoperates with precompiled C++ for complex engine operations. | A pipeline need not contain the entire query or regenerate every helper. Keep abstraction overhead out of the row loop while retaining runtime infrastructure. |
+| [Kersten, Leis, Neumann, *Tidy Tuples and Flying Start*, VLDB Journal 2021, §§2–4](https://mediatum.ub.tum.de/doc/1638236/1638236.pdf) | SQL values, tuple operations and data structures compose through a typed API into compact SSA. Contiguous IR storage, direct SSA construction and a fast native backend reduce preparation cost. Selected host-language calls can be inlined by the optimizing backend. | Logical code-generation layers do not require multiple lowering passes. Helper reuse and specialization coexist. The published backend timings cannot be transferred to our JVM/FFM pipeline. |
+| [Neumann, *Evolution of a Compiling Query Engine*, PVLDB 2021, §§2–5](https://www.vldb.org/pvldb/vol14/p3207-neumann.pdf) | Pipeline functions form a resumable dependency/state-machine structure. Value placement considers late loading and register pressure. The fast native backend makes LLVM an optional higher tier. | A single enormous function is not the destination. Preserve scheduling, suspension and code-size boundaries. |
+| [Kersten et al., *Everything You Always Wanted to Know About Compiled and Vectorized Queries*, PVLDB 2018, §§3–7,10](https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf) | A matched implementation holds algorithms, structures and parallelization constant. Compiled execution reduces instructions; vectorized execution can expose more independent memory accesses. | Neither strategy dominates the tested workloads. Lower instruction counts or higher IPC alone do not establish a better execution strategy. Use the same-algorithm control alongside stock QuestDB. |
+| [Menon, Mowry, Pavlo, *Relaxed Operator Fusion*, PVLDB 2017, §§3–5](https://www.vldb.org/pvldb/vol11/p1-menon.pdf) | Cache-resident tuple-ID buffers split fused pipelines into stages. Staging enables SIMD predicates and grouped prefetching ahead of dependent accesses. | Their placement heuristics use SIMD eligibility and estimated state size; they discuss runtime variants and code growth. Initial sensitivity studies are single-threaded on Broadwell. Stage placement and size still need validation on our hardware. |
+| [Leis et al., *Morsel-Driven Parallelism*, SIGMOD 2014, §§2–4](https://15721.courses.cs.cmu.edu/spring2016/papers/p743-leis.pdf) | Dynamically scheduled pipeline work combines with local state and explicit merge phases. Aggregation uses bounded preaggregation and partition-wise completion; joins use a different state organization. | Morsel scheduling, vector batching and state ownership are separate decisions. Reuse core scheduling; do not derive aggregation ownership from the join algorithm or copy their morsel-size constants. |
+| [Kohn, Leis, Neumann, *Adaptive Execution of Compiled Queries*, ICDE 2018, §III](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf) | Identical worker state allows execution modes to change between morsels without replay. Compilation admission estimates remaining work, compile time, speedup and workers consumed by compilation. | Remaining input is known at the considered pipeline boundary. Estimates can be wrong. Our current eager alternative compilation is not this tiering mechanism. |
+| [Kohn, Leis, Neumann, *Building Advanced SQL Analytics From Low-Level Plan Operators*, SIGMOD 2021, §§3–4](https://zenodo.org/records/5779772/files/loleops.pdf) | Plans describe both streams and reusable buffers, including partitioning and ordering. Several aggregates can share preparation and select compatible hash or ordered processing. | Studied implementations are non-spilling and focus on complex analytics. Reuse requires matching keys, expressions and semantic properties; it is not permission to change aggregate semantics. |
+| [Jungmair, Kohn, Giceva, *Designing an Open Framework for Query Optimization and Compilation*, PVLDB 2022, §§4–7](https://www.vldb.org/pvldb/vol15/p2389-jungmair.pdf) | MLIR dialects retain relational and scalar information at different abstraction levels, allowing staged transformations and cross-domain optimization. | Useful evidence for delayed lowering. Adopting MLIR or moving QuestDB's entire optimizer is a separate engineering decision, unsupported by our current measurements. |
+| [Jungmair, Giceva, *Declarative Sub-Operators for Universal Data Processing*, PVLDB 2023, §§3,5–6](https://www.vldb.org/pvldb/vol16/p3461-jungmair.pdf) | Explicit state, references and accesses permit dependency analysis and transformations for local state, merging or synchronization. Navigation is separated from updating an entry. | Automatic parallelization needs a semantic conflict model. Our raw memory effects do not establish those properties; existing aggregate merge contracts remain authoritative. |
+| [Wagner et al., *Incremental Fusion*, ICDE 2024, §§IV–VII](https://ir.cwi.nl/pub/34359/34359.pdf) | A finite set of suboperators generates both precompiled vector primitives and fused query code. Shared state permits switching between them. Hash collision resolution resides in runtime structures. | InkFuse's evaluation uses eight manually planned TPC-H queries and no SQL frontend. Enumerability constrains representation; its generic key-packing approach is not automatically the best layout for us. |
+| [Gubner, Boncz, *Excalibur*, PVLDB 2023, §§3,5–7](https://www.vldb.org/pvldb/vol16/p829-boncz.pdf) | Cached fragments support changes in fusion, vectorization and other execution choices. Exploration has a budget tied to query progress. | The authors acknowledge limited functionality, high compilation latency and complexity relative to gains. Start with a few measured alternatives rather than importing the whole search system. |
+| [Beischl et al., *Profiling Dataflow Systems on Multiple Abstraction Levels*, EuroSys 2021, §4 and evaluation](https://db.in.tum.de/~beischl/papers/Profiling_Dataflow_Systems_on_Multiple_Abstraction_Levels.pdf) | Code-generation lineage plus debug information maps native samples to IR, operators and pipelines. Shared helpers require caller attribution, addressed through stacks or register tagging. | This is more than symbol naming. The paper reports material sampling overhead, including 38% for its highlighted configuration; profiling machinery needs its own perturbation check. |
+| [Neumann, Freitag, *Umbra: A Disk-Based System with In-Memory Performance*, CIDR 2020, §3](https://vldb.org/cidrdb/papers/2020/p29-neumann-cidr20.pdf) | String representations encode lifetime distinctions; pipeline setup, work, merge and cleanup are explicit execution steps. | Borrowed values cannot outlive storage ownership. Keep QuestDB page-frame and allocator contracts; this paper does not justify replacing its storage manager. |
+| [Kuiper, Boncz, Mühleisen, *Robust External Hash Aggregation in the Solid State Age*, ICDE 2024, §§V–VI](https://duckdb.org/pdf/ICDE2024-kuiper-boncz-muehleisen-out-of-core.pdf) | Bounded preaggregation uses compact salted pointer slots and places new entries directly in partition storage. Temporary pages share buffer management with persistent data. | A bounded lookup table can still produce intermediates proportional to input size. The memory budget must cover all live pages and concurrent partition completion, not just hash slots. |
+| [Xue, Marcus, *Global Hash Tables Strike Back!*, PVLDB 19(3), 2025, §§2–4](https://www.vldb.org/pvldb/vol19/p523-marcus.pdf) | Specialized concurrent ticket assignment separates group identification from aggregate updates, offering alternatives to partitioning and replicated state. | Main experiments use 100M synthetic pairs, SUM and perfect presizing, with resizing studied separately. Neither ownership model wins universally. Our 500M-row, dynamic-growth, mixed-state controls are still required. |
+
+### What is already present, and what the code does not yet express
+
+The compiler is not starting from scratch. These are current code observations,
+not inferred deficiencies from comparing feature lists:
+
+| Current implementation | Consequence for the next design |
+| --- | --- |
+| [`PlanCompiler`](src/main/java/org/questdb/experimental/codegen/PlanCompiler.java), `CompiledPlan` and [`ScanPlan`](src/main/java/org/questdb/experimental/codegen/ScanPlan.java) already describe dependency-ordered phases and scan/filter/project bindings in the standalone path. | Reuse this work. The missing step is a coherent integrated contract, not another standalone executor. |
+| [`ResolvedQueryCompiler`](src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java) binds resolved core operators through separate hooks. [`ResolvedAggregateKernel.prepareFilter`](src/main/java/org/questdb/experimental/codegen/ResolvedAggregateKernel.java) adds a fused variant explicitly for the experiment. | LLVM sees the emitted kernel, not the whole set of runtime boundaries. Cross-kernel materialization decisions must happen before lowering. |
+| `AggregateSlot.updateFiltered` now consumes numeric selections in 16K-row stages for bounded fixed-width aggregates, using the executor's existing selection buffer. `ScanLowering.selectionRange` retains original frame row IDs. | Storage/task frames and cache working sets are separate. Adaptive compact-record mode persists until frame completion; a stage boundary must not restart the aggregation policy. Compacted Parquet coordinates still decline. |
+| [`ResolvedAggregateKernel.emitPrefetched`](src/main/java/org/questdb/experimental/codegen/ResolvedAggregateKernel.java) already stages keys and candidate entries. `QuestPartitions` already supplies bounded-state flush/merge kernels. | Staging and bounded aggregation are implemented. Improve their composition and admission; do not present them as new missing algorithms. |
+| [`AggregateUpdates`](src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java) binds exact core function implementations, state offsets and lifecycle operations. | Preserve these as the semantic source for compilation. General sharing/reordering needs additional proven contracts, especially for nulls, overflow, DISTINCT and floating reductions. |
+| [`AggregateSlot.canUpdate`](src/main/java/org/questdb/experimental/codegen/AggregateSlot.java) declines `PageFrameFilteredMemoryRecord`; ordinary filtering can use original row coordinates while decoded payloads are compacted. | A batch contract must identify each column's row coordinates and lifetime. Removing the guard without that contract is incorrect. |
+| [`AdaptiveKernel.compile`](src/main/java/org/questdb/experimental/codegen/AdaptiveKernel.java) eagerly compiles distinct alternatives before its execution-time policy selects them. | This explores execution strategies but does not hide compilation or budget it against remaining work. |
+| [`LlvmBackend.compile`](src/main/java/org/questdb/experimental/codegen/LlvmBackend.java) lowers structured IR to SSA, emits text, copies it through FFM, and the [native bridge](src/main/c/llvm_backend.cpp) parses, verifies and optimizes under a shared mutex. | Measure time and allocation by compilation stage. Text parsing and Java IR allocation are candidates, not established bottlenecks; backend optimization may dominate. |
+| [`LlvmEmitter`](src/main/java/org/questdb/experimental/codegen/LlvmEmitter.java) marks every IR helper `noinline`. Ordinary memory accesses carry `align 1` and integer-derived addresses. | Current helpers deliberately control code growth. Any richer inlining or memory policy must preserve that win and prove its facts; neither blanket inlining nor speculative `noalias` is justified. |
+| The [LLVM bridge](src/main/c/llvm_backend.cpp) dumps objects, optimized IR and numbered native symbols. | Instruction-level inspection exists. Operator lineage and time-aware code-lifetime registration remain missing from this path. |
+
+### Proposed compiler boundary
+
+The smallest useful common representation should retain:
+
+- Typed values and their null/overflow behavior, including which resolved
+  function supplied the semantics.
+- Sources, consumers and dependencies, with dense ranges, lane masks or selected
+  row IDs at their boundaries. A materialized projection may change row coordinates.
+- State schema, physical properties, ownership, lifetime and legal update/merge
+  operations. A borrowed pointer and a query-owned value are different contracts.
+- Explicit places where execution may suspend or switch code, without replaying
+  an update or retaining pointers invalidated by map growth or page release.
+
+Initially this can be an extension of the existing planning/binding objects.
+Introduce a new IR only when a concrete transformation needs a representation
+that those objects cannot express cleanly. Keep the resolved SQL frontend and
+core worker, map, allocator and cancellation owners.
+
+Separate mechanism from policy. The representation makes fusion, bounded staging
+and state reuse legal to express. A later measured policy chooses among a small
+set of alternatives. The papers do not supply a universally correct cost model.
+
+### First-principles checks before selecting an experiment
+
+Our completed [filter-fusion experiment](FILTER_FUSION_EXPERIMENT.md) provides a
+specific example. With 500M rows and 50% accepted rows, an eight-byte selection
+vector accounts for 2 GB of writes and 2 GB of subsequent reads at the logical
+level. Eight workers each holding selections for a 1M-row frame have about 32 MB
+of live row IDs, competing with other data in a 32 MiB shared LLC. Reducing frame
+size removed most of the measured fusion advantage. Logical bytes are not DRAM
+bytes, and that experiment did not establish DRAM saturation.
+
+For a future staged implementation, budget the full simultaneously live set:
+
+`live bytes ~= workers * (batch rows * scratch bytes per row + local state bytes)`
+
+Account for which workers actually share a cache. Include keys, hashes, candidate
+pointers, payloads and any nested DISTINCT state. A batch size alone is not a
+working-set budget. Small intermediates may improve independent memory access;
+large ones may evict useful input and state.
+
+Likewise, replicated aggregation consumes at least `workers * groups * state
+bytes` when each worker sees every group, before keys, spare capacity and merge
+buffers. A shared table trades that replication for synchronization and coherence.
+Neither side is free. The old raw-partition counterfactual already lost through
+extra traffic; literature does not override that result.
+
+Compilation has a separate break-even test. For repeated execution, a simplified
+necessary comparison is `reuse count * execution saving > extra compile cost`.
+For illustration only, 200 ms of extra compilation and 20 ms saved per execution
+require more than ten executions to improve total latency. For background tiering,
+include work completed during compilation, the worker it consumes, remaining
+input, and any cache/bandwidth interference. Report both first-execution latency
+and warmed reuse.
+
+### Sequence of falsifiable experiments
+
+The following was the initial research shortlist. The active order and detailed
+experiment cards now live in [FOUNDATIONS_PLAN.md](FOUNDATIONS_PLAN.md), which
+prioritizes compiler-owned state layout and ownership after a matched headroom
+comparison. Use that plan for execution; the list below records the narrower
+questions raised by this literature review. Each execution comparison uses at
+least 500M input rows, stock and same-checkout Java controls, exact semantic checks,
+and held-out inputs.
+
+1. **Make the existing evidence easier to attribute.** Add compilation-stage
+   timings and carry pipeline/operation identity through existing IR/object dumps.
+   Extend native registration to preserve code lifetimes before using long-lived
+   processes with address reuse. Use debug information for instruction provenance
+   where possible. Verify profiling perturbation; do not build a new profiler or
+   reserve a tagging register merely because a paper did so.
+2. **Unify one integrated source-to-sink region.** Start with the existing
+   scan/filter/group-by family and its current map algorithm. Represent its row
+   coordinates and bounded intermediates explicitly. Compare full-frame selection,
+   bounded selection and fused masks while holding state ownership and scheduling
+   constant. Prediction: cache-pressure cases reduce controller traffic and
+   cycles; cache-resident controls should have much less benefit. A gain explained
+   only by changing global frame configuration does not validate the compiler.
+3. **Improve load scheduling inside that representation.** The retained IBS data
+   points to aggregate-input and key loads, not primarily the small group map.
+   Test issuing aggregate-input prefetches in the existing preparation pass before
+   proposing another hash table. Prediction: lower demand-load stall cost at
+   comparable useful work. Unchanged stalls, extra traffic or sparse-input losses
+   falsify the proposed benefit. Keep this separate from the boundary experiment.
+4. **Make reusable state a planning property.** Identify a real query family where
+   multiple consumers repeat partitioning, ordering or deduplication. Compare
+   independent existing algorithms with a shared intermediate using the same
+   semantics. Prediction: remove a complete pass or structure, measurable in
+   input visits, allocations and bytes. Longer state lifetimes and lost parallelism
+   can erase the saving. Do not add operators solely to manufacture a demonstration.
+5. **Make AsmJit-to-LLVM tiering economical.** Use shared state and existing safe
+   checkpoints, with code leases covering running workers. First measure the
+   current fast-backend quality and per-phase compilation costs. Compile only when
+   remaining work or reuse can repay it. Compare short, medium, long and concurrent
+   workloads; the success metric is complete latency, including losing exploration.
+
+Bounded versus shared aggregation ownership remains a separate subsequent study,
+using the implementations and controls already present. It should follow evidence
+of replication, merge traffic or coherence costs in the selected workload.
+Similarly, compact IR storage, direct SSA construction and stronger proven memory
+facts are compiler experiments to prioritize from profiles, not a blanket rewrite.
+
+The moonshot acceptance criterion is substantial end-to-end improvement across
+operator families and distributions, including compilation and cleanup. Supporting
+LLVM for at least half of ClickBench and producing major gains for at least half
+are different targets. Preserve both coverage and time-weighted reporting; neither
+a higher compilation coverage count nor one large synthetic win satisfies that goal.
+
+### Resolved short-literal substring filtering (2026-10-28)
+
+The stock LIKE implementation already resolves case-sensitive `%literal%` patterns
+of 1–8 UTF-8 bytes to `ConstContainsSwarVarcharFunction`. Bind that exact resolved
+function and copy its literal bytes; do not parse SQL, reinterpret escaping, accept
+ILIKE, or substitute semantics for arbitrary functions. Share conjunction binding
+and string lowering between standalone selection/count and aggregate filtering.
+Numeric leaves remain eligible for existing masks before pure string residuals.
+
+Hardware evidence: roughly 2.7 branch misses and 344 instructions/input row, with
+24–26% bad-speculation slots and 37% frontend underdelivery. Most samples are in
+the existing row filter with inlined SWAR search. Specializing SWAR alone saves
+instructions but scarcely changes branch misses. A 32-byte candidate mask followed
+by exact bounded verification reaches about 195ms instead of 330ms, at 57–58GB/s
+versus a measured 60.4GB/s read ceiling. The detailed gate is
+`/tmp/query-moonshot-actual-20261028/string-study.json`.
+
+Use the first byte and the last byte differing from it, following the same
+non-degenerate probe principle in [Rust's substring implementation](https://doc.rust-lang.org/stable/src/core/str/pattern.rs.html#1833-1850)
+and [Muła's SIMD search](https://github.com/WojciechMula/sse4-strstr).
+Blind first/last probing regressed repeated-text controls and is rejected.
+One-byte literals need only one mask. Repeated-byte literals intersect shifted
+byte-match masks to detect complete runs; the block stride overlaps by the literal
+length minus one. Their SWAR fallback regressed a 500M-row control and is rejected
+for long slices. Short slices still use specialized SWAR. The final vector overlaps the
+previous vector within the slice; exact 8/4/2/1-byte verification never overreads.
+A 64-byte policy loses on shorter strings; no hardware or SQL-name tuning surface
+is introduced. Guard-page checks cover all three backends.
+
+The existing standalone JIT ABI carries data and auxiliary pointers but omits the
+native/Parquet frame representation. Add a Java overload carrying the borrowed
+`PageFrameMemory`; existing JIT implementations delegate to their unchanged native
+ABI. All engine call sites supply their already-pinned frame, including latest-by
+slices. The LLVM adapter builds the same bounded VARCHAR descriptors used by
+aggregate filtering, using the caller's shifted auxiliary pointers and row count.
+A small per-frame allocation initially owns this adapter storage and is freed in
+`finally`; it is included in timing. Do not add thread-local ownership or a second
+workspace pool without evidence that this allocation matters.
+
+Try resolved compilation before the legacy serializer. Only a declined resolved
+predicate needs legacy serialization and bind-variable link functions. Preserve
+all existing factory adoption, failure cleanup, Java fallback and frame-level
+cancellation. Count-only residuals must be tested before incrementing the count;
+selection preserves source row order. Native coverage and exact results are
+required for both paths, mixed numeric/string conjunctions, NULLs, column tops,
+Parquet slices and reopening.
+
+
+### String-state ownership and representation experiments (2026-10-28)
+
+[Umbra's storage paper, section 3.1](https://www.cidrdb.org/cidr2020/papers/p29-neumann-cidr20.pdf)
+distinguishes persistent, transient and temporary strings; materializing transient
+strings requires copying. This matters more than merely adopting its 16-byte
+header. QuestDB already exposes the needed lifetime fact:
+`Utf8Sequence.isStable()` promises immutable bytes for the query lifetime, and
+`PageFrameMemoryRecord.writeNativeVarcharView()` exports the native/Parquet
+stability distinction. `Pipeline.Utf8Value` carries it. Preserve that contract.
+
+A future compact MIN/MAX state may borrow stable payloads and own unstable ones,
+but today's LONG value slot names a GroupByUtf8Sink. Ordinary Java readers and
+fallback updates require that exact layout. A new physical state therefore needs
+an explicit reader/fallback or final-materialization boundary; replacing the
+pointer silently is invalid. The 500M control currently spends ~238GB/query on
+memory traffic in the original sink-per-partial implementation and creates ~67M
+worker-local groups. Typed input partitions subsequently reduce traffic to ~153GB;
+representation and replication deserve a larger experiment than another
+instruction-only reduction.
+
+[Schmidt's Umbra thesis, section 4.5.3](https://db.in.tum.de/~schmidt/papers/master-thesis.pdf)
+describes a small lookup table referencing partitioned output streams, followed
+by a partition-local merge. This supports testing compact materialization and
+cache-sized ownership; it does not prove that unconditional partitioning wins.
+Our prior raw-partition regression remains a counterexample. Extend existing
+QuestPartitionInputs/QuestPartitions if the measured payload/lifetime model fits,
+rather than introducing a separate scheduler or buffering framework.
+
+[Optimistically Compressed Hash Tables and Strings, ICDE 2020](https://ir.cwi.nl/pub/30644/30644.pdf)
+separates frequently accessed state from exceptions and describes a bounded
+dynamic string dictionary. The relevant lesson here is to distinguish hot bytes
+from total allocation size and account for the work needed to achieve locality.
+Its domain compression requires valid bounds; its dictionary benefits depend on
+repetition. Neither is an unconditional policy for our inputs.
+
+The isolated 24-byte borrowed-view experiment was rejected: it replaces copies
+with dependent reads of scattered winning payloads and increases complete-query
+latency. Keeping a longer prefix recovers only part of the loss. More aggressive
+subdivision also loses because it copies more records. Ordinary sink layouts and
+the existing cache policy remain unchanged; see PROGRESS for measured outcomes.
+
+### Rank before independent output aggregates, 2026-10-28
+
+The retained experiment changes the schedule at an existing materialization
+boundary. For bounded fixed-width group keys with a direct, known small LONG
+Top-K consumer, compute numeric aggregates exactly for every complete group.
+Initialize string MIN/MAX slots to NULL without updating them. Existing generated
+Top-K selects each partition's exact candidates into ordinary destination maps.
+Replay the same partial-state and compact-input pages, using read-only probes of
+those selected keys, and update MIN/MAX only on matches. Final output uses the
+normal GroupByUtf8Sink layout. The union of local Top-K sets contains the global
+Top-K; no approximate rank, sign assumption or inferred key bound is involved.
+
+The consumer contract matters: a post-aggregation filter boundary does not forward this
+Top-K preparation, and finalized/deferred rank fields are excluded. Only bound
+VARCHAR MIN/MAX updates are delayed. Input expressions were already evaluated
+into page records or partial states, so replay does not re-evaluate expressions
+or rescan the base table. Source allocators, retained transient payloads and
+snapshot-stable input bytes remain alive. Subdivision replays only each child's
+own records. Existing cancellation, memory accounting and cleanup still apply.
+
+Each occupied register in the existing sampled cardinality sketch establishes a
+lower bound of one distinct sampled group. Enable replay only when this lower
+bound exceeds K; otherwise use ordinary merge kernels. This conservative guard
+avoids an extra pass for small partitions without a new setting or hardware
+constant. It is not a guarantee of row selectivity under skew. Optional kernels
+compile only when used, and their cost remains inside first-result latency.
+
+[Selective Late Materialization, PVLDB 2025](https://www.vldb.org/pvldb/vol18/p4616-liu.pdf)
+motivates choosing materialization points from attribute dependencies and access
+costs. [Cache-Efficient Top-k Aggregation, PVLDB 2023](https://www.vldb.org/pvldb/vol17/p644-siddiqui.pdf)
+studies candidate reduction with safe bounds. This experiment retains exact
+ranking of all groups and delays only independent output work; it does not import
+that paper's sampling or pruning assumptions. Local 500M-row results support the
+schedule, but skew sensitivity and other CPU architectures remain open.
+
+### Optional code ownership, 2026-10-28
+
+Partition operators retain pure IR builders until their first invocation. A
+factory-owned `CompiledKernel` publishes compiled code once under synchronization;
+its backend remains reachable until that factory closes. The existing worker join
+still precedes resource release. This preserves the same typed IR, state ABI and
+operator semantics while omitting unused compiler work. Factory preparation time
+alone is no longer total compilation cost: first-result latency includes lazy
+compilation inside execution. This is demand-driven preparation, not background
+tiering or a prediction of future query benefit. The measured tradeoffs are in
+[PROGRESS.md](PROGRESS.md).

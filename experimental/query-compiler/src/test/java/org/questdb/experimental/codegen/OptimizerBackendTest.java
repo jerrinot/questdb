@@ -155,6 +155,71 @@ public class OptimizerBackendTest {
             }
         }
     }
+    @Test public void reallocatesInPlaceOrCopiesThroughTheQueryAllocator() throws Exception {
+        Builder b = new Builder();
+        Var original = b.let(new Allocate(i64(64)));
+        b.when(eq(original, nil()), failed -> failed.exit(2));
+        b.store(original, i64(0x123456789abcdefL));
+        b.store(at(original, 56), i64(-37));
+        Var grown = b.let(new Reallocate(original, i64(64), i64(128)));
+        b.when(eq(grown, nil()), failed -> failed.exit(2));
+        b.let(new Allocate(i64(8))); // Prevent the next growth from extending the latest allocation.
+        Var copied = b.let(new Reallocate(grown, i64(128), i64(256)));
+        b.when(eq(copied, nil()), failed -> failed.exit(2));
+        b.let(new Reallocate(copied, i64(256), i64(128))); // Unused reallocation is still observable.
+        b.store(MemoryType.ADDRESS, STATE, original);
+        b.store(MemoryType.ADDRESS, at(STATE, 8), grown);
+        b.store(MemoryType.ADDRESS, at(STATE, 16), copied);
+        b.exit(0);
+        try (var kernel = backend.compile(new Program(b.block()), temporary.getRoot().toPath()); Arena arena = Arena.ofConfined()) {
+            long output = arena.allocate(24, 8).address();
+            var allocator = new FastGroupByAllocator(1024, 1048576) {
+                int reallocations;
+                @Override public long realloc(long address, long oldBytes, long newBytes) {
+                    reallocations++;
+                    return super.realloc(address, oldBytes, newBytes);
+                }
+            };
+            try (var memory = KernelMemory.open(allocator)) {
+                assertEquals(0, kernel.run(0, 0, output)); memory.throwIfFailed();
+                long first = Unsafe.getUnsafe().getLong(output), grownAddress = Unsafe.getUnsafe().getLong(output + 8);
+                long copiedAddress = Unsafe.getUnsafe().getLong(output + 16);
+                assertEquals(first, grownAddress);
+                assertNotEquals(grownAddress, copiedAddress);
+                assertEquals(0x123456789abcdefL, Unsafe.getUnsafe().getLong(copiedAddress));
+                assertEquals(-37, Unsafe.getUnsafe().getLong(copiedAddress + 56));
+                assertEquals(3, allocator.reallocations);
+            }
+        }
+    }
+
+    @Test public void failedReallocationPreservesThePublishedPointer() throws Exception {
+        Builder b = new Builder();
+        Var old = b.let(new Load(MemoryType.ADDRESS, STATE)), grown = b.let(new Reallocate(old, i64(64), i64(128)));
+        b.when(eq(grown, nil()), failed -> failed.exit(2));
+        b.store(MemoryType.ADDRESS, STATE, grown);
+        b.exit(0);
+        Builder caller = new Builder();
+        caller.call(new Helper("grow", List.of(COLUMNS, ROWS, STATE), b.block()), List.of(COLUMNS, ROWS, STATE));
+        caller.exit(0);
+        try (var kernel = backend.compile(new Program(caller.block()), temporary.getRoot().toPath()); Arena arena = Arena.ofConfined()) {
+            long output = arena.allocate(8, 8).address();
+            var injected = new OutOfMemoryError("reallocation test");
+            var allocator = new FastGroupByAllocator(1024, 1048576) {
+                @Override public long realloc(long address, long oldBytes, long newBytes) { throw injected; }
+            };
+            try (var memory = KernelMemory.open(allocator)) {
+                long oldAddress = allocator.malloc(64);
+                Unsafe.getUnsafe().putLong(oldAddress, 117);
+                Unsafe.getUnsafe().putLong(output, oldAddress);
+                assertEquals(2, kernel.run(0, 0, output));
+                assertSame(injected, assertThrows(OutOfMemoryError.class, memory::throwIfFailed));
+                assertEquals(oldAddress, Unsafe.getUnsafe().getLong(output));
+                assertEquals(117, Unsafe.getUnsafe().getLong(oldAddress));
+            }
+        }
+    }
+
     @Test public void preservesParallelPhiCopiesThroughNestedLoops() throws Exception {
         Builder b = new Builder();
         Var a = b.let(load(COLUMNS)), c = b.let(load(at(COLUMNS, 8)));

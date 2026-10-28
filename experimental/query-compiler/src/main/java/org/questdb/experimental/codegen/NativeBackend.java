@@ -59,8 +59,8 @@ public final class NativeBackend implements Backend {
         Path source = directory.resolve("query.c");
         Path library = directory.resolve("query.so");
         Path log = directory.resolve("compiler.log");
-        Files.writeString(source, preamble() + "int64_t query(uint64_t v0, int64_t v1, uint64_t v2, uint64_t alloc_fn, uint64_t free_fn, uint64_t poll_fn) {\n"
-                + "    (void)v0; (void)v1; (void)v2; (void)alloc_fn; (void)free_fn; (void)poll_fn;\n"
+        Files.writeString(source, preamble() + "int64_t query(uint64_t v0, int64_t v1, uint64_t v2, uint64_t alloc_fn, uint64_t free_fn, uint64_t poll_fn, uint64_t realloc_fn) {\n"
+                + "    (void)v0; (void)v1; (void)v2; (void)alloc_fn; (void)free_fn; (void)poll_fn; (void)realloc_fn;\n"
                 + (prepared.ssa() == null ? new Emitter().body(prepared.structured()) : new Emitter().body(prepared.ssa())) + "}\n");
         Files.writeString(directory.resolve("query.ir"), prepared.dump());
         List<String> command = List.of(compiler, "-std=c11", "-O3", "-ffp-contract=off", "-fwrapv", "-fPIC", "-shared",
@@ -160,6 +160,9 @@ public final class NativeBackend implements Backend {
         String store(MemoryType width, String address, String value) { return "store_" + width + "(" + address + ", " + value + ")"; }
         @Override
         String allocate(String bytes) { return "((uint64_t (*)(int64_t))(uintptr_t)alloc_fn)(" + bytes + ")"; }
+        String reallocate(String address, String oldBytes, String newBytes) {
+            return "((uint64_t (*)(uint64_t, int64_t, int64_t))(uintptr_t)realloc_fn)(" + address + ", " + oldBytes + ", " + newBytes + ")";
+        }
         @Override
         String free(String address, String bytes) { return "((void (*)(uint64_t, int64_t))(uintptr_t)free_fn)(" + address + ", " + bytes + ")"; }
         @Override

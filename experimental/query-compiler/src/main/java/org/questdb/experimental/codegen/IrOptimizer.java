@@ -136,6 +136,7 @@ public final class IrOptimizer {
             case AtomicAdd a -> new AtomicAdd(simplify(a.address(), facts), simplify(a.value(), facts));
             case CompareExchange c -> new CompareExchange(simplify(c.address(), facts), simplify(c.expected(), facts), simplify(c.value(), facts));
             case Allocate a -> new Allocate(simplify(a.bytes(), facts));
+            case Reallocate r -> new Reallocate(simplify(r.address(), facts), simplify(r.oldBytes(), facts), simplify(r.newBytes(), facts));
             case ToDouble c -> {
                 Expr value = simplify(c.value(), facts);
                 yield value instanceof Literal l ? f64((double) l.value()) : new ToDouble(value);
@@ -263,6 +264,7 @@ public final class IrOptimizer {
             case PopulationCount z -> discardable(z.value());
             case TrailingZeros z -> discardable(z.value());
             case Allocate ignored -> false;
+            case Reallocate ignored -> false;
             case ToDouble c -> discardable(c.value());
             case Binary b -> discardable(b.left()) && discardable(b.right());
             case Offset o -> discardable(o.address()) && discardable(o.bytes());
@@ -302,6 +304,7 @@ public final class IrOptimizer {
             case AtomicAdd a -> { collectReads(a.address(), reads); collectReads(a.value(), reads); }
             case CompareExchange c -> { collectReads(c.address(), reads); collectReads(c.expected(), reads); collectReads(c.value(), reads); }
             case Allocate a -> collectReads(a.bytes(), reads);
+            case Reallocate r -> { collectReads(r.address(), reads); collectReads(r.oldBytes(), reads); collectReads(r.newBytes(), reads); }
             case ToDouble c -> collectReads(c.value(), reads);
             case VectorMask m -> collectReads(m.predicate(), reads);
             case SelectRows s -> { collectReads(s.mask(), reads); collectReads(s.base(), reads); collectReads(s.destination(), reads); }

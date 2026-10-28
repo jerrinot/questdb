@@ -49,6 +49,8 @@ import static org.questdb.experimental.codegen.ResolvedAggregateKernel.prefetchS
 
 /** Slot-local scratch, reused across batches. The caller owns map and frame lifetimes. */
 public final class AggregateSlot implements GroupByKernel.Updater {
+    // 128KiB of row IDs bounds the stage independently of frame/task scheduling.
+    private static final int FILTER_STAGE_ROWS = 16 * 1024;
     private static final boolean PROFILE = Boolean.getBoolean("query.codegen.profile");
     private final Prepared prepared;
     private final long addressBytes;
@@ -61,21 +63,33 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private long fusedSelectedRows;
     private long sharedRows;
     private long finalizedRows;
+    private int sampledGroupLowerBound;
     private long sortedRows;
     private long limitedRows;
     private long unionTasks;
     private long rankScratch;
+    private long partitionTopK;
+    private long partitionSketch;
+    private long mergedSketch;
+    private long estimatedGroups;
+    private long splitStates;
+    private long splitInputs;
+    private final io.questdb.griffin.engine.groupby.hyperloglog.HyperLogLogDenseRepresentation estimator =
+            new io.questdb.griffin.engine.groupby.hyperloglog.HyperLogLogDenseRepresentation(QuestPartitionSketch.PRECISION);
     private long rankScratchCapacity;
     private long mapRows;
     private long mapCalls;
     private long newGroups;
     private long partitionRows;
+    private long inputPartitionRows;
+    private long localRows;
     private long topKRows;
     private long topKMergeRows;
     private final Map.NativeRehash rehash;
     private final long relocationScratch;
     private final ResolvedFilter.Slot filter;
     private final long partitions;
+    private final long inputPartitions;
     private final long sharedScratch;
     private boolean partitioned;
     private boolean parallelMerge;
@@ -90,16 +104,18 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         }
         memory = prepared.binding.allocates || prepared.mapCode != null ? KernelMemory.reusable(allocator) : null;
         // Cardinality and deferred-merge words precede STATE; fusion adds an accepted-row count.
-        columnBytes = (prepared.binding.sourceIndexes.length + 4L + (prepared.fusedFilterCode != null ? 1 : 0)) * 8;
+        columnBytes = prepared.binding.inputs.bytes() + 32 + (prepared.fusedFilterCode != null ? 8 : 0);
         relocationScratch = columnBytes + (prepared.mapCode != null
                 ? prefetchScratch(prepared.probe) + (long) Math.max(1, prepared.binding.prefetchRows) * prepared.probe.prefetchRowBytes() : 0);
         addressBytes = relocationScratch + 128 + (prepared.probe != null && prepared.probe.variable() ? prepared.probe.variableKey().descriptorBytes() : 0) + (prepared.probe != null && prepared.probe.varchar() ? 48 : 0) + (prepared.probe != null && prepared.probe.fixedKey() != null ? prepared.probe.fixedKey().columns().length * 8L : 0)
                 + (prepared.localCapacity > 0 ? QuestPartitions.STATE_BYTES : 0)
+                + (prepared.inputPartitionCode != null ? QuestPartitions.STATE_BYTES : 0)
                 + (prepared.sharedMaps != null ? QuestSharedVarchar.SCRATCH_BYTES : 0);
         addresses = Unsafe.malloc(addressBytes, MemoryTag.NATIVE_JIT);
         long sharedBytes = prepared.sharedMaps != null ? QuestSharedVarchar.SCRATCH_BYTES : 0;
         sharedScratch = sharedBytes != 0 ? addresses + addressBytes - sharedBytes : 0;
         partitions = prepared.localCapacity > 0 ? addresses + addressBytes - sharedBytes - QuestPartitions.STATE_BYTES : 0;
+        inputPartitions = prepared.inputPartitionCode != null ? partitions - QuestPartitions.STATE_BYTES : 0;
         clear();
         try { filter = prepared.filter != null ? prepared.filter.newSlot() : null; }
         catch (Throwable failure) { Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); throw failure; }
@@ -152,14 +168,18 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     public void clear() {
         if (prepared.sharedMaps != null) prepared.sharedMaps.clear();
         rankScratch = 0;
+        partitionTopK = 0;
+        partitionSketch = mergedSketch = splitStates = splitInputs = 0;
         rankScratchCapacity = 0;
         partitioned = false;
+        localRows = 0;
         parallelMerge = false;
         mergePreparationStage = 0;
         finalizeDeferred = false;
         Unsafe.putLong(addresses + columnBytes + DeferredDistinct.CONTROL, 0);
         Unsafe.putLong(addresses + columnBytes + DeferredDistinct.CONTROL + 8, 0);
         if (partitions != 0) io.questdb.std.Vect.memset(partitions, QuestPartitions.STATE_BYTES, 0);
+        if (inputPartitions != 0) io.questdb.std.Vect.memset(inputPartitions, QuestPartitions.STATE_BYTES, 0);
     }
 
     @Override
@@ -171,6 +191,12 @@ public final class AggregateSlot implements GroupByKernel.Updater {
 
     private void flush(Map source) {
         if (source.size() == 0) return;
+        if (prepared.partitionSelectCode != null && partitionSketch == 0) {
+            partitionSketch = KernelMemory.allocator().malloc(QuestPartitionSketch.BYTES);
+            io.questdb.std.Vect.memset(partitionSketch, QuestPartitionSketch.BYTES, 0);
+            Unsafe.putLong(partitions + QuestPartitionSketch.OFFSET, partitionSketch);
+            if (inputPartitions != 0) Unsafe.putLong(inputPartitions + QuestPartitionSketch.OFFSET, partitionSketch);
+        }
         long descriptor = addresses + relocationScratch + 32;
         source.writeNativeMutationView(descriptor);
         long rows = Unsafe.getLong(descriptor + NativeMapView.MASK) + (prepared.probe.varchar() ? 1 : 2);
@@ -180,18 +206,171 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         partitioned = true;
         partitionRows += source.size();
         source.clear();
+        localRows = 0;
     }
 
     @Override
     public void mergePartition(Map destination, GroupByKernel.Updater sourceUpdater, int partition, Runnable checkpoint) {
+        mergePartition(destination, sourceUpdater, partition, checkpoint, prepared.partitionMergeCode, prepared.inputPartitionMergeCode);
+    }
+
+    private void mergePartition(Map destination, GroupByKernel.Updater sourceUpdater, int partition, Runnable checkpoint,
+                                CompiledKernel stateCode, CompiledKernel inputCode) {
         AggregateSlot source = (AggregateSlot) sourceUpdater;
         long page = Unsafe.getLong(source.partitions + 16L * partition);
-        if (page == 0) return;
+        long inputPage = source.inputPartitions != 0 ? Unsafe.getLong(source.inputPartitions + 16L * partition) : 0;
+        if (page == 0 && inputPage == 0) return;
         writeViews(destination, null);
         memory.enterCheckpoint(checkpoint);
         try {
             while (page != 0) {
-                runMutable(prepared.partitionMergeCode, page + 16, Unsafe.getLong(page + 8), destination, null, false);
+                runMutable(stateCode, page + 16, Unsafe.getLong(page + 8), destination, null, false);
+                page = Unsafe.getLong(page);
+            }
+            while (inputPage != 0) {
+                runMutable(inputCode, inputPage + 16, Unsafe.getLong(inputPage + 8), destination, null, false);
+                inputPage = Unsafe.getLong(inputPage);
+            }
+        } finally {
+            try { publishViews(destination, null); } finally { memory.close(); }
+        }
+    }
+
+    @Override
+    public boolean hasPartitionTopK() { return prepared.partitionSelectCode != null; }
+
+    private void selectPartitionTopK(Map source, Map destination, Runnable checkpoint) {
+        if (source.size() == 0) return;
+        long descriptor = addresses + relocationScratch, state = descriptor + NativeMapView.MUTATION_BYTES;
+        memory.enterCheckpoint(checkpoint);
+        try {
+            if (partitionTopK == 0) partitionTopK = KernelMemory.allocator().malloc(prepared.partitionTopKLimit * 16L);
+            source.writeNativeMutationView(descriptor);
+            Unsafe.putLong(state, partitionTopK);
+            Unsafe.putLong(state + 8, 0);
+            Unsafe.putLong(state + 16, prepared.partitionTopKLimit);
+            Unsafe.putLong(state + 24, 0);
+            Unsafe.putLong(state + 32, prepared.topKOrder);
+            Unsafe.putLong(state + 40, prepared.partitionTopKOffset + prepared.probe.keyBytes());
+            long status = prepared.topKCode.run(descriptor, 0, state);
+            memory.throwIfFailed();
+            if (status != 0) throw new IllegalStateException("Partition Top-K failed: " + status);
+            topKRows += source.size();
+            long count = Unsafe.getLong(state + 8);
+            writeViews(destination, null);
+            try { runMutable(prepared.partitionSelectCode, partitionTopK, count, destination, null, false); }
+            finally { publishViews(destination, null); }
+        } finally { memory.close(); }
+    }
+
+    long estimatedGroups() { return estimatedGroups; }
+
+    private long estimatePartition(ObjList<GroupByKernel.Updater> sources, int partition, Runnable checkpoint) {
+        memory.enterCheckpoint(checkpoint);
+        try {
+            if (mergedSketch == 0) mergedSketch = KernelMemory.allocator().malloc(QuestPartitionSketch.HEADER_BYTES + QuestPartitionSketch.REGISTERS);
+            sampledGroupLowerBound = 0;
+            for (int r = 0; r < QuestPartitionSketch.REGISTERS; r++) {
+                byte maximum = 0;
+                for (int i = 0; i < sources.size(); i++) {
+                    long sketch = ((AggregateSlot) sources.getQuick(i)).partitionSketch;
+                    if (sketch != 0) maximum = (byte) Math.max(maximum,
+                            Unsafe.getByte(sketch + (long) partition * QuestPartitionSketch.REGISTERS + r));
+                }
+                Unsafe.putByte(mergedSketch + QuestPartitionSketch.HEADER_BYTES + r, maximum);
+                if (maximum != 0) sampledGroupLowerBound++;
+            }
+            return estimator.of(mergedSketch).computeCardinality() * QuestPartitionSketch.SAMPLE_RATE;
+        } finally { memory.close(); }
+    }
+
+    @Override
+    public void mergeTopKPartition(Map working, Map destination, ObjList<GroupByKernel.Updater> sources,
+                                  int partition, Runnable checkpoint) {
+        mergeTopKPartition(working, destination, sources, partition, CacheSizing.perWorker(sources.size()), checkpoint);
+    }
+
+    // The resource budget is explicit here so focused tests can exercise subdivision on small inputs.
+    void mergeTopKPartition(Map working, Map destination, ObjList<GroupByKernel.Updater> sources,
+                           int partition, long cacheBytes, Runnable checkpoint) {
+        long groups = estimatePartition(sources, partition, checkpoint);
+        // Each occupied sample register proves at least one distinct group. Only
+        // replay payloads when even the sampled subset exceeds the retained prefix.
+        boolean late = prepared.lateStateCode != null && sampledGroupLowerBound > prepared.partitionTopKLimit;
+        CompiledKernel stateCode = late ? prepared.rankStateCode : prepared.partitionMergeCode;
+        CompiledKernel inputCode = late ? prepared.rankInputCode : prepared.inputPartitionMergeCode;
+        estimatedGroups += groups;
+        long groupBytes = (prepared.partitionRowBytes + 7) & ~7L;
+        long groupLimit = cacheBytes / (2 * groupBytes);
+        // Leave a margin for estimation error and the extra partition pass. A mildly
+        // oversized map can be cheaper than copying every record again.
+        if (groupLimit == 0 || groups <= 4 * groupLimit) {
+            for (int i = 0; i < sources.size(); i++) mergePartition(working, sources.getQuick(i), partition, checkpoint, stateCode, inputCode);
+            selectPartitionTopK(working, destination, checkpoint);
+            if (late) {
+                for (int i = 0; i < sources.size(); i++) {
+                    mergePartition(destination, sources.getQuick(i), partition, checkpoint, prepared.lateStateCode, prepared.lateInputCode);
+                }
+            }
+            return;
+        }
+        int parts = 2;
+        while (parts < QuestRepartition.PARTS && groupLimit * parts < groups) parts *= 2;
+        long shift = io.questdb.griffin.engine.table.GroupByMapFragment.NUM_SHARDS_SHR - Integer.numberOfTrailingZeros(parts);
+        memory.enterCheckpoint(checkpoint);
+        try {
+            if (splitStates == 0) {
+                splitStates = KernelMemory.allocator().malloc(2L * QuestRepartition.STATE_BYTES);
+                splitInputs = splitStates + QuestRepartition.STATE_BYTES;
+                io.questdb.std.Vect.memset(splitStates, 2L * QuestRepartition.STATE_BYTES, 0);
+            }
+            Unsafe.putLong(splitStates + QuestRepartition.PARTS * 16L, parts - 1);
+            Unsafe.putLong(splitInputs + QuestRepartition.PARTS * 16L, parts - 1);
+            Unsafe.putLong(splitStates + QuestRepartition.PARTS * 16L + 8, shift);
+            Unsafe.putLong(splitInputs + QuestRepartition.PARTS * 16L + 8, shift);
+            for (int i = 0; i < parts; i++) {
+                Unsafe.putLong(splitStates + i * 16L + 8, 0);
+                Unsafe.putLong(splitInputs + i * 16L + 8, 0);
+            }
+            for (int i = 0; i < sources.size(); i++) {
+                AggregateSlot source = (AggregateSlot) sources.getQuick(i);
+                splitPages(prepared.splitStateCode, Unsafe.getLong(source.partitions + 16L * partition), splitStates);
+                if (source.inputPartitions != 0) splitPages(prepared.splitInputCode,
+                        Unsafe.getLong(source.inputPartitions + 16L * partition), splitInputs);
+            }
+        } finally { memory.close(); }
+        for (int i = 0; i < parts; i++) {
+            mergeSplitPages(working, stateCode, splitStates + i * 16L, checkpoint);
+            if (inputCode != null) mergeSplitPages(working,
+                    inputCode, splitInputs + i * 16L, checkpoint);
+            selectPartitionTopK(working, destination, checkpoint);
+            if (late) {
+                mergeSplitPages(destination, prepared.lateStateCode, splitStates + i * 16L, checkpoint);
+                if (prepared.lateInputCode != null) mergeSplitPages(destination, prepared.lateInputCode, splitInputs + i * 16L, checkpoint);
+            }
+            if (i + 1 < parts) working.clear();
+        }
+    }
+
+    private void splitPages(CompiledKernel code, long page, long state) {
+        while (page != 0) {
+            long status = code.run(page + 16, Unsafe.getLong(page + 8), state);
+            memory.throwIfFailed();
+            if (status != 0) throw new IllegalStateException("Split records failed: " + status);
+            page = Unsafe.getLong(page);
+        }
+    }
+
+    private void mergeSplitPages(Map destination, CompiledKernel code, long bucket, Runnable checkpoint) {
+        long tail = Unsafe.getLong(bucket + 8);
+        if (tail == 0) return;
+        long page = Unsafe.getLong(bucket);
+        writeViews(destination, null);
+        memory.enterCheckpoint(checkpoint);
+        try {
+            while (true) {
+                runMutable(code, page + 16, Unsafe.getLong(page + 8), destination, null, false);
+                if (page == tail) break;
                 page = Unsafe.getLong(page);
             }
         } finally {
@@ -294,6 +473,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     @Override
     public long getNativeMapRows() { return mapRows; }
     long partitionRows() { return partitionRows; }
+    long inputPartitionRows() { return inputPartitionRows; }
 
     long[] profileCounters() {
         return new long[]{mapCalls, newGroups, prepared.mapCode == null ? 0 : Unsafe.getLong(addresses + columnBytes + 40),
@@ -507,9 +687,6 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         final long state = addresses + columnBytes;
         Unsafe.putLong(state + 8, rowIdsAddress);
         Unsafe.putLong(state + 16, record.getPageAddress(probe.column()));
-        for (int i = 0; i < prepared.binding.sourceIndexes.length; i++) {
-            Unsafe.putLong(addresses + (i + 1L) * 8, record.getPageAddress(prepared.binding.sourceIndexes[i]));
-        }
         for (int i = 0; i < shards.size(); i++) {
             shards.getQuick(i).writeNativeProbeView(state + QuestMapProbe.CONTROL_BYTES + (long) i * QuestMapProbe.VIEW_BYTES);
         }
@@ -564,20 +741,51 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     long fusedInputRows() { return fusedInputRows; }
 
     @Override
-    public boolean hasFusedFilter() { return prepared.fusedFilterCode != null; }
+    public boolean hasFusedFilter() {
+        return prepared.fusedFilterCode != null || (filter != null && prepared.filter.fusedPlan() != null
+                && prepared.localCapacity > 0 && prepared.sharedMaps == null && prepared.probe.mutable()
+                && !prepared.probe.varchar() && !prepared.probe.variable());
+    }
 
     @Override
     public long updateFiltered(PageFrameMemoryRecord record, long rowCount, Map map, ObjList<Map> shards,
-                                  int batchSize, SqlExecutionCircuitBreaker circuitBreaker) {
+                               int batchSize, DirectLongList rows, SqlExecutionCircuitBreaker circuitBreaker) {
         if (!hasFusedFilter() || !canUpdate(record) || !prepareKeyColumns(record)) return -1;
         long predicates = filter.prepare(record);
         if (predicates == 0) return -1;
         long state = addresses + columnBytes;
-        Unsafe.putLong(state + 8, predicates);
-        long before = fusedSelectedRows;
-        runMap(record, rowCount, map, shards, batchSize, circuitBreaker, prepared.fusedFilterCode);
-        fusedInputRows += rowCount;
-        return fusedSelectedRows - before;
+        if (prepared.fusedFilterCode != null) {
+            Unsafe.putLong(state + 8, predicates);
+            long before = fusedSelectedRows;
+            runMap(rowCount, map, shards, batchSize, circuitBreaker, prepared.fusedFilterCode);
+            fusedInputRows += rowCount;
+            return fusedSelectedRows - before;
+        }
+        prepareMap(map, shards, batchSize);
+        long groupsBefore = PROFILE ? groupCount(map, shards) + partitionRows : 0;
+        long accepted = 0;
+        // Compact mode lasts for the frame, not just one selection chunk.
+        boolean compact = false;
+        memory.enter(circuitBreaker);
+        try {
+            for (long begin = 0; begin < rowCount;) {
+                long end = Math.min(rowCount, begin + FILTER_STAGE_ROWS);
+                long selected = filter.filterRange(begin, end, rows, circuitBreaker);
+                if (selected > 0) {
+                    Unsafe.putLong(state + 8, rows.getAddress());
+                    if (compact) partitionInputs(0, selected);
+                    else compact = runMutable(prepared.mapCode, addresses, selected, map, shards, true, 0, accepted > 0);
+                    accepted += selected;
+                }
+                begin = end;
+            }
+            return accepted;
+        } finally {
+            try {
+                publishViews(map, shards);
+                if (PROFILE) newGroups += groupCount(map, shards) + partitionRows - groupsBefore;
+            } finally { memory.close(); }
+        }
     }
 
     @Override
@@ -617,22 +825,23 @@ public final class AggregateSlot implements GroupByKernel.Updater {
             } finally { memory.close(); }
             return true;
         }
-        runMap(record, rowCount, map, shards, batchSize, circuitBreaker, prepared.mapCode);
+        runMap(rowCount, map, shards, batchSize, circuitBreaker, prepared.mapCode);
         return true;
     }
 
-    private void runMap(PageFrameMemoryRecord record, long rowCount, Map map, ObjList<Map> shards,
-                        int batchSize, SqlExecutionCircuitBreaker circuitBreaker, CompiledKernel kernel) {
+    private void prepareMap(Map map, ObjList<Map> shards, int batchSize) {
         long state = addresses + columnBytes;
         QuestMapProbe probe = prepared.probe;
-        for (int i = 0; i < prepared.binding.sourceIndexes.length; i++) {
-            Unsafe.putLong(addresses + (i + 1L) * 8, record.getPageAddress(prepared.binding.sourceIndexes[i]));
-        }
         Unsafe.putLong(addresses, batchSize);
-        long groupsBefore = PROFILE ? groupCount(map, shards) + partitionRows : 0;
         writeViews(map, shards);
         if (probe.variable()) ((io.questdb.cairo.map.OrderedMap) (shards == null ? map : shards.getQuick(0)))
                 .writeNativeKeyStagingView(state + 64, 64);
+    }
+
+    private void runMap(long rowCount, Map map, ObjList<Map> shards,
+                        int batchSize, SqlExecutionCircuitBreaker circuitBreaker, CompiledKernel kernel) {
+        prepareMap(map, shards, batchSize);
+        long groupsBefore = PROFILE ? groupCount(map, shards) + partitionRows : 0;
         memory.enter(circuitBreaker);
         try {
             runMutable(kernel, addresses, rowCount, map, shards, true);
@@ -641,6 +850,26 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 publishViews(map, shards);
                 if (PROFILE) newGroups += groupCount(map, shards) + partitionRows - groupsBefore;
             } finally { memory.close(); }
+        }
+    }
+
+    private void partitionInputs(long begin, long rows) {
+        long batchSize = Unsafe.getLong(addresses);
+        Unsafe.putLong(addresses, inputPartitions);
+        Unsafe.putLong(addresses + columnBytes, begin);
+        try {
+            long status = prepared.inputPartitionCode.run(addresses, rows, addresses + columnBytes);
+            memory.throwIfFailed();
+            if (status != 0) throw new IllegalStateException("Input partition failed: " + status);
+            long accepted = rows - begin;
+            updatedRows += accepted;
+            mapRows += accepted;
+            partitionRows += accepted;
+            inputPartitionRows += accepted;
+            partitioned = true;
+            if (PROFILE) mapCalls++;
+        } finally {
+            Unsafe.putLong(addresses, batchSize);
         }
     }
 
@@ -750,6 +979,12 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     }
 
     private void runMutable(CompiledKernel kernel, long input, long rows, Map map, ObjList<Map> shards, boolean update, long begin) {
+        runMutable(kernel, input, rows, map, shards, update, begin, false);
+    }
+
+    /** Return whether the remainder of this frame should use compact input records. */
+    private boolean runMutable(CompiledKernel kernel, long input, long rows, Map map, ObjList<Map> shards,
+                               boolean update, long begin, boolean frameHasRows) {
         long state = addresses + columnBytes;
         long position = begin;
         if (prepared.probe.varchar()) Unsafe.putLong(state + 80, -1);
@@ -769,13 +1004,24 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 updatedRows += accepted;
                 mapRows += accepted;
                 if (kernel == prepared.fusedFilterCode) fusedSelectedRows += accepted;
+                if (kernel == prepared.mapCode) localRows += accepted;
             }
             position = end;
-            if (status == 0) return;
+            if (status == 0) return false;
             if (status == QuestPartitions.NEED_FLUSH) {
                 map.publishNativeMutationView(view(0));
+                // The full-map window supplies actual combining effectiveness. A
+                // misleading frame prefix cannot suppress later reassessment.
+                // Return to local aggregation on the next frame to detect reuse.
+                boolean compact = inputPartitions != 0 && kernel == prepared.mapCode && update
+                        && (position > begin || frameHasRows) && localRows >= map.size()
+                        && map.size() * prepared.partitionRowBytes > localRows * prepared.inputPartitionRowBytes;
                 flush(map);
                 writeViews(map, null);
+                if (compact) {
+                    partitionInputs(position, rows);
+                    return true;
+                }
                 continue;
             }
             if (status == QuestVariableKey.NEED_STAGING) {
@@ -804,27 +1050,25 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 target.writeNativeMutationView(view(shard));
             }
         }
+        return false;
     }
 
     @Override
     public long getCardinalityStat() {
         if (closed) throw new IllegalStateException("Aggregate slot is closed");
-        return Unsafe.getLong(addresses + (prepared.binding.sourceIndexes.length + 1L) * 8);
+        return Unsafe.getLong(addresses + 8 + prepared.binding.inputs.bytes());
     }
 
     @Override
     public void resetStats() {
         if (closed) throw new IllegalStateException("Aggregate slot is closed");
-        Unsafe.putLong(addresses + (prepared.binding.sourceIndexes.length + 1L) * 8, 0);
+        Unsafe.putLong(addresses + 8 + prepared.binding.inputs.bytes(), 0);
     }
 
     public boolean canUpdate(PageFrameMemoryRecord record) {
         if (closed) throw new IllegalStateException("Aggregate slot is closed");
         if (record instanceof PageFrameFilteredMemoryRecord) return false;
-        for (int index : prepared.binding.sourceIndexes) {
-            if (record.getPageAddress(index) == 0) return false;
-        }
-        return true;
+        return prepared.binding.inputs.prepare(record, addresses + 8);
     }
 
     public boolean update(PageFrameMemoryRecord record, long baseValueAddress, long batchAddress, long rows) {
@@ -844,16 +1088,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
             return false;
         }
         Unsafe.putLong(addresses, batchAddress);
-        int[] indexes = prepared.binding.sourceIndexes;
-        for (int i = 0; i < indexes.length; i++) {
-            long address = record.getPageAddress(indexes[i]);
-            // Zero also denotes lazy type conversion, not just a column top. Let the
-            // original record accessors handle the whole batch before mutating state.
-            if (address == 0) {
-                return false;
-            }
-            Unsafe.putLong(addresses + (i + 1L) * 8, address);
-        }
+        if (!prepared.binding.inputs.prepare(record, addresses + 8)) return false;
         long status;
         if (memory == null) {
             status = prepared.code.run(addresses, rows, baseValueAddress);

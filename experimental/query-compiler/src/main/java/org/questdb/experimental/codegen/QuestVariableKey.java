@@ -31,7 +31,6 @@ import io.questdb.cairo.map.OrderedMap;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.std.ObjList;
-import io.questdb.std.Unsafe;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -39,7 +38,7 @@ import java.util.List;
 import static org.questdb.experimental.codegen.Ir.*;
 
 /** OrderedMap.VarSizeKey encoding: total byte length, then RecordSink-ordered fields. */
-record QuestVariableKey(int[] numericColumns, List<Pipeline.Column> numericInputs, List<Part> parts, int[] varcharColumns, byte[] literals) {
+record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
     static final int NEED_STAGING = 8;
     record Part(MemoryType width, Pipeline.Scalar scalar, ResolvedVarchar.Expression varchar) { }
 
@@ -84,32 +83,19 @@ record QuestVariableKey(int[] numericColumns, List<Pipeline.Column> numericInput
             }
         }
         if (!variable) return null;
-        return new QuestVariableKey(resolved.indexes(), resolved.columns(), List.copyOf(parts),
-                strings.columns(), strings.literals());
+        return new QuestVariableKey(strings.binding(), List.copyOf(parts));
     }
 
-    long descriptorBytes() { return (numericColumns.length * 8L + varcharColumns.length * 48L + literals.length + 7) & -8L; }
+    long descriptorBytes() { return inputs.bytes(); }
 
     boolean prepare(PageFrameMemoryRecord record, long descriptor) {
-        for (int i = 0; i < numericColumns.length; i++) {
-            long page = record.getPageAddress(numericColumns[i]);
-            if (page == 0) return false;
-            Unsafe.putLong(descriptor + i * 8L, page);
-        }
-        long strings = descriptor + numericColumns.length * 8L;
-        for (int i = 0; i < varcharColumns.length; i++) {
-            if (!record.writeNativeVarcharView(varcharColumns[i], strings + i * 48L)) return false;
-        }
-        long constants = strings + varcharColumns.length * 48L;
-        for (int i = 0; i < literals.length; i++) Unsafe.getUnsafe().putByte(constants + i, literals[i]);
-        return true;
+        return inputs.prepare(record, descriptor);
     }
 
     Var stage(Builder b, Expr row) {
         Var descriptors = b.let(new Load(MemoryType.ADDRESS, at(STATE, 16)));
-        var source = ResolvedInputs.loadFrameRow(b, numericInputs, descriptors, row);
-        Expr views = at(descriptors, numericColumns.length * 8L);
-        var frame = new ResolvedVarchar.Frame(source, row, views, at(views, varcharColumns.length * 48L));
+        var source = ResolvedInputs.loadFrameRow(b, inputs.numericInputs(), descriptors, row);
+        var frame = inputs.frame(source, row, descriptors);
         var strings = new ArrayList<Pipeline.Utf8Value>();
         Expr bytes = i64(4);
         for (Part part : parts) {

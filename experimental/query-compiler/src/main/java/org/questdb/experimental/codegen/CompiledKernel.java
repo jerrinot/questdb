@@ -24,8 +24,10 @@
 
 package org.questdb.experimental.codegen;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /** Owns code and callbacks. Concurrent calls require independent state and must finish before close. */
 public final class CompiledKernel implements Kernel, AutoCloseable {
@@ -42,7 +44,13 @@ public final class CompiledKernel implements Kernel, AutoCloseable {
     }
 
     public Path artifacts() { return artifacts; }
-    public long compilationNanos() { return compilationNanos; }
+    public long compilationNanos() { return compilationNanos + (resource instanceof Deferred deferred ? deferred.compilationNanos : 0); }
+
+    /** Compiles an optional operator on its first invocation; the ordinary query owner retains it. */
+    static CompiledKernel defer(Backend backend, Supplier<Ir.Program> program, Path artifacts) {
+        Deferred deferred = new Deferred(backend, program, artifacts);
+        return new CompiledKernel(deferred, deferred, artifacts, 0);
+    }
 
     static CompiledKernel handwritten(Kernel kernel) {
         return new CompiledKernel(kernel, () -> { }, null, 0);
@@ -78,4 +86,52 @@ public final class CompiledKernel implements Kernel, AutoCloseable {
             }
         }
     }
+    private static final class Deferred implements Kernel, AutoCloseable {
+        private final Backend backend;
+        private final Path artifacts;
+        private Supplier<Ir.Program> program;
+        private volatile CompiledKernel compiled;
+        private volatile long compilationNanos;
+        private boolean closed;
+
+        private Deferred(Backend backend, Supplier<Ir.Program> program, Path artifacts) {
+            this.backend = backend;
+            this.program = program;
+            this.artifacts = artifacts;
+        }
+
+        @Override public long run(long columns, long rows, long state) {
+            CompiledKernel code = compiled;
+            if (code == null) code = prepare();
+            return code.run(columns, rows, state);
+        }
+
+        private synchronized CompiledKernel prepare() {
+            if (closed) throw new IllegalStateException("Deferred kernel is closed");
+            if (compiled == null) {
+                try {
+                    CompiledKernel code;
+                    // Planning previously called the backend serially. Preserve that contract
+                    // when distinct optional operators first become necessary on worker threads.
+                    synchronized (backend) { code = backend.compile(program.get(), artifacts); }
+                    compilationNanos = code.compilationNanos();
+                    compiled = code;
+                    program = null;
+                } catch (IOException failure) {
+                    throw io.questdb.cairo.CairoException.nonCritical()
+                            .put("Deferred operator compilation failed: ").put(failure.getMessage());
+                }
+            }
+            return compiled;
+        }
+
+        @Override public synchronized void close() {
+            if (!closed) {
+                closed = true;
+                program = null;
+                if (compiled != null) compiled.close();
+            }
+        }
+    }
+
 }

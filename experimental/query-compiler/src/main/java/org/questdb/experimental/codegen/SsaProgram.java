@@ -86,6 +86,7 @@ final class SsaProgram {
             case AtomicAdd a -> new AtomicAdd(map(a.address(), leaf), map(a.value(), leaf));
             case CompareExchange c -> new CompareExchange(map(c.address(), leaf), map(c.expected(), leaf), map(c.value(), leaf));
             case Allocate a -> new Allocate(map(a.bytes(), leaf));
+            case Reallocate r -> new Reallocate(map(r.address(), leaf), map(r.oldBytes(), leaf), map(r.newBytes(), leaf));
             case ToDouble c -> new ToDouble(map(c.value(), leaf));
             case VectorMask m -> new VectorMask(m.lanes(), map(m.predicate(), leaf));
             case PopulationCount z -> new PopulationCount(map(z.value(), leaf));
@@ -259,6 +260,7 @@ final class SsaProgram {
                 case AtomicAdd a -> new AtomicAdd(emit(a.address()), emit(a.value()));
                 case CompareExchange c -> new CompareExchange(emit(c.address()), emit(c.expected()), emit(c.value()));
                 case Allocate a -> new Allocate(emit(a.bytes()));
+                case Reallocate r -> new Reallocate(emit(r.address()), emit(r.oldBytes()), emit(r.newBytes()));
                 case ToDouble c -> new ToDouble(emit(c.value()));
                 // Keep the lane region intact. Extracting its loads here would turn
                 // them into scalar, eager reads outside the vector operation.

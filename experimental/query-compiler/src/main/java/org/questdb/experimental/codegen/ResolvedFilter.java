@@ -29,9 +29,12 @@ import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameFilteredMemoryRecord;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
+import io.questdb.cairo.sql.PageFrameMemory;
+import io.questdb.cairo.sql.PartitionFormat;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.engine.functions.columns.VarcharColumn;
 import io.questdb.griffin.engine.functions.eq.EqVarcharFunctionFactory;
+import io.questdb.griffin.engine.functions.regex.AbstractLikeVarcharFunctionFactory;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
@@ -41,7 +44,7 @@ import java.nio.file.Path;
 
 import static org.questdb.experimental.codegen.Ir.*;
 
-/** Resolved integer predicates and direct VARCHAR NULL checks, using the engine's borrowed selection-vector storage. */
+/** Resolved predicates shared by standalone filtering and aggregate selection. */
 final class ResolvedFilter implements AutoCloseable {
     private final CompiledKernel code;
     private final ScanPlan plan;
@@ -57,46 +60,95 @@ final class ResolvedFilter implements AutoCloseable {
     }
 
     static ResolvedFilter compile(ColumnTypes types, Function function, Backend backend, Path artifacts) throws IOException {
+        Binding binding = bind(types, function);
+        if (binding == null) return null;
+        var program = ScanLowering.selectionRange(binding.plan(), binding.residual(), binding.bytes());
+        var code = backend.compile(program, artifacts);
+        try { return new ResolvedFilter(code, binding.sourceIndexes(), binding.varcharColumns(), binding.plan()); }
+        catch (Throwable failure) { code.close(); throw failure; }
+    }
+
+    static Binding bind(ColumnTypes types, Function function) {
         var inputs = new ResolvedInputs(types);
         var leaves = new java.util.ArrayList<Function>();
         if (!conjuncts(function, leaves, 0)) return null;
         var strings = new java.util.ArrayList<Integer>();
-        var nullChecks = new java.util.ArrayList<Boolean>();
+        var tests = new java.util.ArrayList<StringPredicate>();
         Pipeline.Predicate numeric = new Pipeline.All();
         for (Function leaf : leaves) {
             if (leaf != null && leaf.getClass() == EqVarcharFunctionFactory.NullCheckFunc.class) {
                 var check = (EqVarcharFunctionFactory.NullCheckFunc) leaf;
-                if (check.getArg().getClass() != VarcharColumn.class) return null;
-                int column = ((VarcharColumn) check.getArg()).getColumnIndex();
-                if (column < 0 || column >= types.getColumnCount() || types.getColumnType(column) != ColumnType.VARCHAR) return null;
+                int column = varcharColumn(types, check.getArg());
+                if (column < 0) return null;
                 strings.add(column);
-                nullChecks.add(!check.isNegated());
+                boolean wantNull = !check.isNegated();
+                tests.add((builder, descriptor, row) -> eq(ne(binary(Op.AND,
+                        QuestVarchar.header(builder, descriptor, row), i64(4)), i64(0)), bool(wantNull)));
+            } else if (leaf != null && leaf.getClass() == AbstractLikeVarcharFunctionFactory.ConstContainsSwarVarcharFunction.class) {
+                var contains = (AbstractLikeVarcharFunctionFactory.ConstContainsSwarVarcharFunction) leaf;
+                int column = varcharColumn(types, contains.getArg());
+                if (column < 0) return null;
+                strings.add(column);
+                var literal = contains.getPattern();
+                byte[] pattern = new byte[literal.size()];
+                for (int i = 0; i < pattern.length; i++) pattern[i] = literal.byteAt(i);
+                tests.add((builder, descriptor, row) -> {
+                    var value = QuestVarchar.decode(builder, descriptor, row);
+                    Var found = builder.let(bool(false));
+                    builder.when(eq(value.isNull(), bool(false)), present ->
+                            present.assign(found, ByteSequences.contains(present, value.address(), value.size(), pattern)));
+                    return found;
+                });
             } else {
                 var predicate = inputs.predicate(leaf);
                 if (predicate == null) return null;
                 numeric = numeric instanceof Pipeline.All ? predicate : new Pipeline.And(numeric, predicate);
             }
         }
-        // All admitted leaves are total and side-effect free. Numeric rejection may precede
-        // string checks regardless of their SQL spelling; descriptors remain frame-owned.
+        // Admitted leaves are total and side-effect free. Reject numeric rows before decoding strings.
         long stringOffset = inputs.columns().size() * 8L;
         ScanLowering.RowPredicate residual = strings.isEmpty() ? null : (builder, row) -> {
             Var accepted = builder.let(bool(true));
             for (int i = 0; i < strings.size(); i++) {
                 long offset = stringOffset + i * 48L;
-                boolean wantNull = nullChecks.get(i);
-                builder.when(accepted, check -> {
-                    Expr isNull = ne(binary(Op.AND, QuestVarchar.header(check, at(COLUMNS, offset), row), i64(4)), i64(0));
-                    check.assign(accepted, eq(isNull, bool(wantNull)));
-                });
+                StringPredicate test = tests.get(i);
+                builder.when(accepted, check -> check.assign(accepted, test.emit(check, at(COLUMNS, offset), row)));
             }
             return accepted;
         };
-        var plan = ScanPlan.of(inputs.columns(), numeric);
-        var program = ScanLowering.selection(plan, residual);
-        var code = backend.compile(program, artifacts);
-        try { return new ResolvedFilter(code, inputs.indexes(), strings.stream().mapToInt(Integer::intValue).toArray(), plan); }
-        catch (Throwable failure) { code.close(); throw failure; }
+        return new Binding(ScanPlan.of(inputs.columns(), numeric), inputs.indexes(),
+                strings.stream().mapToInt(Integer::intValue).toArray(), residual);
+    }
+
+    private static int varcharColumn(ColumnTypes types, Function function) {
+        if (function.getClass() != VarcharColumn.class) return -1;
+        int column = ((VarcharColumn) function).getColumnIndex();
+        return column >= 0 && column < types.getColumnCount() && types.getColumnType(column) == ColumnType.VARCHAR ? column : -1;
+    }
+
+    @FunctionalInterface
+    private interface StringPredicate {
+        Expr emit(Builder builder, Expr descriptor, Expr row);
+    }
+
+    record Binding(ScanPlan plan, int[] sourceIndexes, int[] varcharColumns, ScanLowering.RowPredicate residual) {
+        long bytes() { return sourceIndexes.length * 8L + varcharColumns.length * 48L; }
+
+        void prepare(PageFrameMemory frame, long data, long aux, long rows, long addresses) {
+            for (int i = 0; i < sourceIndexes.length; i++)
+                Unsafe.putLong(addresses + i * 8L, Unsafe.getLong(data + sourceIndexes[i] * 8L));
+            for (int i = 0; i < varcharColumns.length; i++) {
+                int column = varcharColumns[i];
+                long descriptor = addresses + sourceIndexes.length * 8L + i * 48L;
+                // Latest-by can supply a shifted aux vector for a bounded row slice.
+                Unsafe.putLong(descriptor, Unsafe.getLong(aux + column * 8L));
+                Unsafe.putLong(descriptor + 8, Unsafe.getLong(data + column * 8L));
+                Unsafe.putLong(descriptor + 16, rows * 16L);
+                Unsafe.putLong(descriptor + 24, frame.getPageSize(column));
+                Unsafe.putLong(descriptor + 32, frame.getFrameFormat() == PartitionFormat.PARQUET ? 1 : 0);
+                Unsafe.putLong(descriptor + 40, 0); // predicates never retain input pointers
+            }
+        }
     }
 
     private static boolean conjuncts(Function function, java.util.List<Function> leaves, int depth) {
@@ -123,7 +175,7 @@ final class ResolvedFilter implements AutoCloseable {
 
     final class Slot implements AutoCloseable {
         private final KernelMemory memory = KernelMemory.reusable((Runnable) null);
-        private final long bytes = Math.max(8, sourceIndexes.length * 8L + varcharColumns.length * 48L);
+        private final long bytes = sourceIndexes.length * 8L + varcharColumns.length * 48L + 8;
         private long addresses = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
         private long inputRows;
         private long selectedRows;
@@ -141,21 +193,29 @@ final class ResolvedFilter implements AutoCloseable {
             for (int i = 0; i < varcharColumns.length; i++) {
                 if (!record.writeNativeVarcharView(varcharColumns[i], addresses + sourceIndexes.length * 8L + i * 48L)) return 0;
             }
+            Unsafe.putLong(addresses + bytes - 8, 0);
             return addresses;
         }
 
         boolean filter(PageFrameMemoryRecord record, long rowCount, DirectLongList rows, SqlExecutionCircuitBreaker breaker) {
             if (prepare(record) == 0) return false;
-            rows.clearAndEnsureCapacity(rowCount);
+            filterRange(0, rowCount, rows, breaker);
+            return true;
+        }
+
+        /** Reuse prepared frame pointers and the caller's bounded selection scratch. */
+        long filterRange(long begin, long end, DirectLongList rows, SqlExecutionCircuitBreaker breaker) {
+            rows.clearAndEnsureCapacity(end - begin);
+            Unsafe.putLong(addresses + bytes - 8, begin);
             memory.enter(breaker);
             try {
-                long count = code.run(addresses, rowCount, rows.getAddress());
+                long count = code.run(addresses, end, rows.getAddress());
                 memory.throwIfFailed();
-                if (count < 0 || count > rowCount) throw new IllegalStateException("Invalid native filter count: " + count);
+                if (count < 0 || count > end - begin) throw new IllegalStateException("Invalid native filter count: " + count);
                 rows.setPos(count);
-                inputRows += rowCount;
+                inputRows += end - begin;
                 selectedRows += count;
-                return true;
+                return count;
             } finally { memory.close(); }
         }
 

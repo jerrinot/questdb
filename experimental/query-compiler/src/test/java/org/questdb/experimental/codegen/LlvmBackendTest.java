@@ -74,7 +74,7 @@ public class LlvmBackendTest {
     }
     @Test public void rejectsInvalidModulesAndRecoversWithoutLeakingCode() throws Exception {
         long before = LlvmBackend.liveFunctions();
-        String signature = "define i64 @query(i64 %a, i64 %b, i64 %c, i64 %d, i64 %e, i64 %f)";
+        String signature = "define i64 @query(i64 %a, i64 %b, i64 %c, i64 %d, i64 %e, i64 %f, i64 %g)";
         for (String source : new String[]{"", "not llvm", "define i32 @query() { ret i32 0 }",
                 signature + " { entry: %x = add i64 %y, 1\n %y = add i64 %b, 2\n ret i64 %x }",
                 "declare i64 @questdb_missing_llvm_test_symbol()\n" + signature + " { %x = call i64 @questdb_missing_llvm_test_symbol()\n ret i64 %x }"}) {

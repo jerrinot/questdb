@@ -24,6 +24,7 @@
 
 package io.questdb.jit;
 
+import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.SqlException;
 import io.questdb.std.MemoryTag;
@@ -53,6 +54,19 @@ public class CompiledCountOnlyFilter implements Closeable {
     private long fnAddress;
 
     public long getNativeInputRows() { return 0; }
+
+    /** Borrowed frame metadata for backends that decode variable-length values. */
+    public long call(
+            long dataAddress,
+            long dataSize,
+            long varSizeAuxAddress,
+            long varsAddress,
+            long varsSize,
+            long rowsCount,
+            PageFrameMemory frameMemory
+    ) {
+        return call(dataAddress, dataSize, varSizeAuxAddress, varsAddress, varsSize, rowsCount);
+    }
 
     /**
      * Executes the compiled count-only filter function on the given data.

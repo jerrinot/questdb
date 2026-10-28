@@ -29,6 +29,8 @@ import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.griffin.engine.CompiledCounter;
 import io.questdb.griffin.engine.CompiledProjection;
 import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
@@ -107,6 +109,13 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
 
     static long[] topKCounters(Updater updater) {
         return updater instanceof AggregateSlot slot ? slot.topKCounters() : new long[2];
+    }
+
+    @Override
+    public CompiledCounter compileCounter(RecordCursorFactory input) {
+        if (handwritten) return null;
+        try { return ResolvedCounter.compile(input, backend, artifacts); }
+        catch (IOException failure) { throw CairoException.nonCritical().put("COUNT compilation failed: ").put(failure.getMessage()); }
     }
 
     @Override

@@ -452,7 +452,8 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
                         auxAddresses.getAddress(),
                         atom.bindVarMemory.getAddress(),
                         atom.bindVarFunctions.size(),
-                        frameRowCount
+                        frameRowCount,
+                        frameMemory
                 );
                 task.setFilteredRowCount(filteredRowCount);
             } else { // normal filter task
@@ -463,7 +464,8 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
                         atom.bindVarMemory.getAddress(),
                         atom.bindVarFunctions.size(),
                         rows.getAddress(),
-                        frameRowCount
+                        frameRowCount,
+                        frameMemory
                 );
 
                 rows.setPos(filteredRowCount);

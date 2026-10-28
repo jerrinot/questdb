@@ -148,3 +148,30 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
   fixed-work latency and coherence events together, at physical-core and SMT counts.
   Keep private maps as a control: on96 physical EC2 cores they beat shared maps
   (137ms versus182ms), while shared wins with SMT. Evidence:`/tmp/query-ec2`.
+
+
+## String-state footprint and scheduling
+
+- [x] `AggregateSlot.mergeTopKPartition()` currently estimates group bytes from
+  `partitionRowBytes`, covering keys and inline aggregate slots. VARCHAR MIN/MAX
+  slots contain pointers; their allocator-owned sink capacity/header is additional
+  live state. Measure this footprint and test subdivision sensitivity before
+  changing the policy. The retained 500M-row / 8.39M-group string case still spends
+  ~66% of dispatch slots in backend-memory stalls and moves ~153GB/query.
+  Use the existing second-level partition implementation as the counterfactual;
+  compare its extra copying against fewer state misses, with a fixed-width
+  control and identical final output. Do not infer a cache-capacity bottleneck
+  merely from the estimated footprint.
+  The 2026-10-28 experiment rejects more aggressive subdivision: 500M-row
+  execution rises ~3.1 -> 3.56s, with traffic 153 -> 172GB/query. The missing
+  allocation bytes are real, but this counterfactual does not establish a
+  profitable cache-capacity policy. Keep the current policy. Borrowed winning
+  string representations were also tested and rejected; dependent payload reads
+  offset the allocation saving.
+- [x] Schedule independent VARCHAR MIN/MAX after exact partition ranking, replaying
+  existing records only into selected keys. Preserve ordinary state layouts and
+  use the existing sampled cardinality sketch to decline small partitions.
+- [ ] When profiling is resumed, complete final-build balanced measurements for
+  this schedule, including cross-cache placement, skew and other architectures.
+  Earlier accepted profiles and one/four-core checks are encouraging; subsequent
+  contaminated/interrupted desktop runs are excluded. No new coverage claim.

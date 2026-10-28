@@ -60,7 +60,7 @@ public final class Ir {
 
     public enum Op { ADD, SUB, MUL, AND, XOR, USHR, EQ, NE, LT, GE, BOTH, EITHER, FADD, FSUB, FMUL, FDIV, SDIV }
 
-    public sealed interface Expr permits Var, Literal, Binary, Load, Offset, Select, Allocate, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, AtomicLoad, CompareExchange, AtomicAdd {
+    public sealed interface Expr permits Var, Literal, Binary, Load, Offset, Select, Allocate, Reallocate, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, AtomicLoad, CompareExchange, AtomicAdd {
         Type type();
     }
 
@@ -216,6 +216,13 @@ public final class Ir {
     /** Runtime allocation; emit into a local and check for nil before accessing it. */
     public record Allocate(Expr bytes) implements Expr {
         public Allocate { require(bytes, Type.I64); }
+        @Override
+        public Type type() { return Type.ADDRESS; }
+    }
+
+    /** Preserves the old allocation on failure; check for nil before publishing the result. */
+    public record Reallocate(Expr address, Expr oldBytes, Expr newBytes) implements Expr {
+        public Reallocate { require(address, Type.ADDRESS); require(oldBytes, Type.I64); require(newBytes, Type.I64); }
         @Override
         public Type type() { return Type.ADDRESS; }
     }
@@ -430,6 +437,7 @@ public final class Ir {
             case AtomicAdd a -> { verify(a.address(), scope); verify(a.value(), scope); }
             case CompareExchange c -> { verify(c.address(), scope); verify(c.expected(), scope); verify(c.value(), scope); }
             case Allocate a -> verify(a.bytes(), scope);
+            case Reallocate r -> { verify(r.address(), scope); verify(r.oldBytes(), scope); verify(r.newBytes(), scope); }
             case ToDouble c -> verify(c.value(), scope);
             case VectorMask m -> verify(m.predicate(), scope);
             case PopulationCount z -> verify(z.value(), scope);

@@ -64,6 +64,7 @@ public class CompiledAggregateOwnershipTest {
             assertEquals(backend.totalNanos, prepared.compilationNanos());
             assertThrows(IllegalStateException.class, prepared::close);
             assertEquals(backend.created, backend.closed);
+            assertEquals(backend.totalNanos, prepared.compilationNanos());
             prepared.close();
             assertEquals(backend.created, backend.closed);
         }

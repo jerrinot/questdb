@@ -145,9 +145,9 @@ EXPORTED void* query_llvm_compile(const char* ir, uint64_t length, int32_t level
         verify(*module);
         Function* query = module->getFunction("query");
         if (!query || query->isDeclaration() || !query->hasExternalLinkage() || query->isVarArg()
-                || query->arg_size() != 6 || !query->getReturnType()->isIntegerTy(64)
+                || query->arg_size() != 7 || !query->getReturnType()->isIntegerTy(64)
                 || query->getCallingConv() != CallingConv::C)
-            throw std::invalid_argument("Expected external i64 query(i64, i64, i64, i64, i64, i64)");
+            throw std::invalid_argument("Expected external i64 query(i64, i64, i64, i64, i64, i64, i64)");
         for (const auto& arg : query->args()) if (!arg.getType()->isIntegerTy(64)) throw std::invalid_argument("Invalid query parameter type");
         if (!engines[level]) engines[level] = std::make_unique<Engine>(level);
         auto& engine = *engines[level];

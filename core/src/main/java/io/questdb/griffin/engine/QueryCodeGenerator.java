@@ -29,6 +29,7 @@ import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.engine.CompiledProjection;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.groupby.GroupByKernel;
@@ -39,6 +40,9 @@ import org.jetbrains.annotations.Nullable;
 
 /** Optional compilation of resolved operators. Core has no dependency on a backend. */
 public interface QueryCodeGenerator {
+    /** Only bind inputs whose calculateSize supplies bulk counts, without enumerating rows. */
+    default @Nullable CompiledCounter compileCounter(@Transient RecordCursorFactory input) { return null; }
+
     /** Resolved selection/count kernels using the existing filter ABI and cursor ownership. */
     default @Nullable CompiledFilters compileFilters(ColumnTypes inputs, Function predicate) { return null; }
 

@@ -14,7 +14,7 @@ namespace {
 struct Header { uint32_t magic,version,registers,labels,count,reserved; };
 struct Instruction { int32_t op,dst,a,b; int64_t immediate; };
 static_assert(sizeof(Header)==24 && sizeof(Instruction)==24);
-enum Opcode { Const=1,Move,Add,Sub,Mul,And,Xor,Ushr,Eq,Ne,Lt,Ge,Load,Store,Bind,Jump,BranchFalse,Allocate,Free,Poll,Return,CompareBranch,BranchTrue,Ctz,Prefetch,FAdd,FSub,FMul,FDiv,ToDouble,SDiv,AtomicLoad,CompareExchange,AtomicStore,AtomicAdd };
+enum Opcode { Const=1,Move,Add,Sub,Mul,And,Xor,Ushr,Eq,Ne,Lt,Ge,Load,Store,Bind,Jump,BranchFalse,Allocate,Free,Poll,Return,CompareBranch,BranchTrue,Ctz,Prefetch,FAdd,FSub,FMul,FDiv,ToDouble,SDiv,AtomicLoad,CompareExchange,AtomicStore,AtomicAdd,ByteEqMask,Reallocate };
 JitRuntime runtime;
 std::atomic<int64_t> live_functions{0};
 struct Errors : ErrorHandler {
@@ -23,7 +23,7 @@ struct Errors : ErrorHandler {
 };
 void require(bool condition,const char* message) { if(!condition)throw std::invalid_argument(message); }
 void validate(const Header& h,const Instruction* code) {
-    require(h.magic==0x51444952 && h.version==6 && h.reserved==0,"incompatible query IR ABI");
+    require(h.magic==0x51444952 && h.version==8 && h.reserved==0,"incompatible query IR ABI");
     require(h.registers>=3 && h.registers<=1000000 && h.labels<=1000000 && h.count>0 && h.count<=1000000,"invalid IR dimensions");
     std::vector<bool> bound(h.labels),referenced(h.labels);
     auto reg=[&](int id){require(id>=0 && uint32_t(id)<h.registers,"invalid register");};
@@ -31,10 +31,15 @@ void validate(const Header& h,const Instruction* code) {
     for(uint32_t n=0;n<h.count;n++) {
         const auto& i=code[n];
         switch(i.op) {
+            case ByteEqMask:
+                reg(i.dst);reg(i.a);
+                require(i.b==8||i.b==16||i.b==32||i.b==64,"invalid byte mask lanes");
+                require(i.immediate>=0&&i.immediate<=255,"invalid byte mask constant");break;
             case Const:reg(i.dst);break;
             case AtomicLoad:case Move:case Load:case Allocate:case Ctz:case ToDouble:reg(i.dst);reg(i.a);break;
             case AtomicAdd:case SDiv:case FAdd:case FSub:case FMul:case FDiv:case Add:case Sub:case Mul:case And:case Xor:case Ushr:case Eq:case Ne:case Lt:case Ge:reg(i.dst);reg(i.a);reg(i.b);break;
             case CompareExchange:reg(i.dst);reg(i.a);reg(i.b);require(i.immediate>=0&&uint64_t(i.immediate)<h.registers,"invalid CAS value");break;
+            case Reallocate:reg(i.dst);reg(i.a);reg(i.b);require(i.immediate>=0&&uint64_t(i.immediate)<h.registers,"invalid reallocation size register");break;
             case AtomicStore:case Store:case Free:reg(i.a);reg(i.b);break;
             case Bind:label(i.dst);require(!bound[i.dst],"duplicate label");bound[i.dst]=true;break;
             case CompareBranch:reg(i.b);require(i.immediate>=Eq&&i.immediate<=Ge,"invalid branch comparison");[[fallthrough]];
@@ -54,13 +59,13 @@ void* compile(const Header& h,const Instruction* instructions) {
     CodeHolder code;code.init(runtime.environment());
     Errors errors;code.set_error_handler(&errors);
     x86::Compiler c(&code);
-    auto* fn=c.add_func(FuncSignature::build<int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t>());
+    auto* fn=c.add_func(FuncSignature::build<int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t>());
     require(fn!=nullptr,"could not create generated function");
     std::vector<x86::Gp> r; r.reserve(h.registers);
     for(uint32_t n=0;n<h.registers;n++)r.push_back(c.new_gp64());
     for(uint32_t n=0;n<3;n++)fn->set_arg(n,r[n]);
-    auto alloc=c.new_gp64(),release=c.new_gp64(),poll=c.new_gp64();
-    fn->set_arg(3,alloc);fn->set_arg(4,release);fn->set_arg(5,poll);
+    auto alloc=c.new_gp64(),release=c.new_gp64(),poll=c.new_gp64(),realloc=c.new_gp64();
+    fn->set_arg(3,alloc);fn->set_arg(4,release);fn->set_arg(5,poll);fn->set_arg(6,realloc);
     std::vector<Label> labels;labels.reserve(h.labels);
     for(uint32_t n=0;n<h.labels;n++)labels.push_back(c.new_label());
     // Constants with one definition can be rematerialized at their use. This also
@@ -71,7 +76,7 @@ void* compile(const Header& h,const Instruction* instructions) {
     definitions[0]=definitions[1]=definitions[2]=1;
     for(uint32_t n=0;n<h.count;n++) {
         const auto& i=instructions[n];
-        if((i.op>=Const&&i.op<=Load)||i.op==Allocate||i.op==Ctz||i.op==AtomicAdd||(i.op>=FAdd&&i.op<=CompareExchange)) {
+        if((i.op>=Const&&i.op<=Load)||i.op==Allocate||i.op==Reallocate||i.op==Ctz||i.op==AtomicAdd||i.op==ByteEqMask||(i.op>=FAdd&&i.op<=CompareExchange)) {
             definitions[i.dst]++;if(i.op==Const){constant[i.dst]=true;value[i.dst]=i.immediate;}
         }
     }
@@ -130,6 +135,24 @@ void* compile(const Header& h,const Instruction* instructions) {
                     case Ge:c.setge(r[i.dst].r8());break;
                 }
                 c.movzx(r[i.dst],r[i.dst].r8());break;
+            case ByteEqMask: {
+                // SSE2 is baseline on x86-64. Eight lanes must not read sixteen bytes.
+                auto base=source(i.a), repeated=c.new_gp64();
+                auto needle=c.new_xmm();
+                c.mov(repeated,uint64_t(i.immediate)*0x0101010101010101ULL);
+                c.movq(needle,repeated);c.punpcklqdq(needle,needle);
+                for(int offset=0;offset<i.b;offset+=16) {
+                    auto bytes=c.new_xmm();
+                    if(i.b==8)c.movq(bytes,x86::qword_ptr(base));
+                    else c.movdqu(bytes,x86::ptr(base,offset));
+                    c.pcmpeqb(bytes,needle);
+                    auto bits=offset==0?r[i.dst]:c.new_gp64();
+                    c.pmovmskb(bits.r32(),bytes);
+                    if(i.b==8)c.and_(bits,255);
+                    if(offset!=0){c.shl(bits,offset);c.or_(r[i.dst],bits);}
+                }
+                break;
+            }
             case Ctz: {
                 auto input=c.new_gp64();move(input,i.a);
                 auto zero=c.new_gp64();c.mov(zero,64);
@@ -187,6 +210,12 @@ void* compile(const Header& h,const Instruction* instructions) {
                 InvokeNode* call=nullptr;
                 require(c.invoke(Out(call),alloc,FuncSignature::build<int64_t,int64_t>())==Error::kOk && call,"could not emit allocation call");
                 call->set_arg(0,bytes);call->set_ret(0,r[i.dst]);break;
+            }
+            case Reallocate: {
+                auto address=source(i.a),oldBytes=source(i.b),newBytes=source(int(i.immediate));
+                InvokeNode* call=nullptr;
+                require(c.invoke(Out(call),realloc,FuncSignature::build<int64_t,int64_t,int64_t,int64_t>())==Error::kOk && call,"could not emit reallocation call");
+                call->set_arg(0,address);call->set_arg(1,oldBytes);call->set_arg(2,newBytes);call->set_ret(0,r[i.dst]);break;
             }
             case Free: {
                 auto address=source(i.a),bytes=source(i.b);

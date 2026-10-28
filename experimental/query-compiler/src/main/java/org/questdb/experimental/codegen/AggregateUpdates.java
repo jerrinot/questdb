@@ -35,6 +35,8 @@ import io.questdb.griffin.engine.functions.groupby.CountDistinctLongGroupByFunct
 import io.questdb.griffin.engine.functions.groupby.CountIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongConstGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MaxVarcharGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MinVarcharGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.SumIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.SumLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.SumShortGroupByFunction;
@@ -48,7 +50,11 @@ import java.util.function.IntToLongFunction;
 import static org.questdb.experimental.codegen.Ir.*;
 
 /** Bound aggregate lifecycles. All dispatch here emits IR during compilation. */
-record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List<AggregateUpdates.Update> updates) {
+record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Update> updates) {
+    List<Pipeline.Column> columns() { return inputs.numericInputs(); }
+    int[] sourceIndexes() { return inputs.numericColumns(); }
+    long cardinalityOffset() { return 8 + inputs.bytes(); }
+
     /** Shared resolved-function binding; state offsets come from the owning engine value layout. */
     static AggregateUpdates bind(ColumnTypes inputTypes, ColumnTypes valueTypes, ObjList<GroupByFunction> functions,
                            IntToLongFunction offsets, boolean allowDistinct) {
@@ -62,11 +68,12 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
 
     static AggregateUpdates bind(ColumnTypes valueTypes, ObjList<GroupByFunction> functions,
                                    IntToLongFunction offsets, boolean allowDistinct, ResolvedInputs inputs,
-                                   boolean allowFinalization) {
+                                   boolean mutableMap) {
         if (functions.size() == 0) {
             return null;
         }
         var updates = new ArrayList<Update>();
+        var strings = new ResolvedVarchar(inputs.types(), inputs);
         var assignedSlots = new HashSet<Integer>();
         for (int i = 0; i < functions.size(); i++) {
             GroupByFunction function = functions.getQuick(i);
@@ -83,9 +90,12 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
             } else if (implementation == CountIntGroupByFunction.class || implementation == SumIntGroupByFunction.class) {
                 argumentType = ColumnType.INT;
                 sum = implementation == SumIntGroupByFunction.class;
-            } else if (implementation == SumShortGroupByFunction.class || (allowFinalization && implementation == AvgShortGroupByFunction.class)) {
+            } else if (implementation == SumShortGroupByFunction.class || (mutableMap && implementation == AvgShortGroupByFunction.class)) {
                 argumentType = ColumnType.SHORT;
                 sum = true;
+            } else if (mutableMap && (implementation == MinVarcharGroupByFunction.class || implementation == MaxVarcharGroupByFunction.class)) {
+                argumentType = ColumnType.VARCHAR;
+                sum = false;
             } else {
                 return null;
             }
@@ -97,6 +107,12 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
             CountDistinctLongGroupByFunction distinct = implementation == CountDistinctLongGroupByFunction.class
                     ? (CountDistinctLongGroupByFunction) function : null;
             if (distinct != null && !allowDistinct) return null;
+            if (argumentType == ColumnType.VARCHAR) {
+                var expression = strings.bind(((UnaryFunction) function).getArg());
+                if (expression == null) return null;
+                updates.add(new VarcharExtremum(expression, offsets.applyAsLong(valueIndex), implementation == MinVarcharGroupByFunction.class));
+                continue;
+            }
             boolean average = implementation == AvgShortGroupByFunction.class;
             if ((distinct != null || average) && (valueIndex + 1 >= valueTypes.getColumnCount()
                     || valueTypes.getColumnType(valueIndex + 1) != ColumnType.LONG || !assignedSlots.add(valueIndex + 1)
@@ -122,7 +138,7 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
             }
             updates.add(new ScalarUpdate(operation, offsets.applyAsLong(valueIndex)));
         }
-        return new AggregateUpdates(inputs.columns(), inputs.indexes(), List.copyOf(updates));
+        return new AggregateUpdates(strings.binding(), List.copyOf(updates));
     }
 
     /** Frame loading is one producer; joined or computed values use emit directly. */
@@ -131,6 +147,7 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
     }
 
     private Pipeline.Row loadFrameRow(Builder b, Var rowIndex, List<Var> addresses, java.util.BitSet required) {
+        var columns = columns();
         var values = new ArrayList<Pipeline.Value>();
         for (int i = 0; i < columns.size(); i++) {
             if (required != null && !required.get(i)) { values.add(null); continue; }
@@ -151,7 +168,17 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
     }
 
     void emit(Builder b, Pipeline.Row row, Expr destination, Expr cardinalityAddress) {
-        for (var update : updates) update.emit(b, row, destination, cardinalityAddress);
+        var frame = new ResolvedVarchar.Frame(row, i64(0), nil(), nil());
+        emit(b, frame, destination, cardinalityAddress);
+    }
+
+    void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+        for (var update : updates) update.emit(b, frame, destination, cardinalityAddress);
+    }
+
+    void emitFrame(Builder b, Var row, List<Var> addresses, Expr destination, Expr cardinalityAddress) {
+        var frame = inputs.frame(loadFrameRow(b, row, addresses), row, at(COLUMNS, 8));
+        for (var update : updates) update.emit(b, frame, destination, cardinalityAddress);
     }
 
     void finish(Builder b, Expr destination, boolean deferred) {
@@ -160,7 +187,7 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
 
     void prefetch(Builder b, Var row, List<Var> addresses, Expr destination) {
         for (var update : updates) update.prefetch(b, argument -> {
-            var required = ScanPlan.of(columns, new Pipeline.IsNotNull(argument)).predicateColumns();
+            var required = ScanPlan.of(columns(), new Pipeline.IsNotNull(argument)).predicateColumns();
             return argument.emit(loadFrameRow(b, row, addresses, required));
         }, destination);
     }
@@ -169,10 +196,11 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
         return function.getClass() == AvgShortGroupByFunction.class
                 ? DoubleColumn.newInstance(((GroupByFunction) function).getValueIndex()) : function;
     }
-    sealed interface Update permits ScalarUpdate, DistinctUpdate, AverageUpdate {
+    sealed interface Update permits ScalarUpdate, DistinctUpdate, AverageUpdate, VarcharExtremum {
+        long offset();
         void initialize(Builder b, Expr destination);
         void merge(Builder b, Expr source, Expr destination);
-        void emit(Builder builder, Pipeline.Row row, Expr destination, Expr cardinalityAddress);
+        void emit(Builder builder, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress);
         default boolean allocates() { return false; }
         default boolean finalizesResult() { return false; }
         default boolean deferredMerge() { return false; }
@@ -188,8 +216,8 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
             operation.merge(b, at(source, offset), at(destination, offset));
         }
         @Override
-        public void emit(Builder builder, Pipeline.Row row, Expr destination, Expr cardinalityAddress) {
-            operation.emit(builder, row, at(destination, offset));
+        public void emit(Builder builder, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            operation.emit(builder, frame.numeric(), at(destination, offset));
         }
     }
 
@@ -201,10 +229,10 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
             b.store(at(destination, offset + 8), i64(0));
         }
         @Override
-        public void emit(Builder b, Pipeline.Row row, Expr destination, Expr cardinalityAddress) {
+        public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
             Expr sumAddress = at(destination, offset), countAddress = at(destination, offset + 8);
             Var count = b.let(load(countAddress));
-            Expr value = argument.emit(row).data();
+            Expr value = argument.emit(frame.numeric()).data();
             b.store(sumAddress, new Select(eq(count, i64(0)), value, add(load(sumAddress), value)));
             b.store(countAddress, add(count, i64(1)));
         }
@@ -248,10 +276,10 @@ record AggregateUpdates(List<Pipeline.Column> columns, int[] sourceIndexes, List
             NestedDistinct.prefetch(b, input.apply(argument), at(destination, offset));
         }
         @Override
-        public void emit(Builder builder, Pipeline.Row row, Expr destination, Expr cardinalityAddress) {
+        public void emit(Builder builder, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
             Expr countAddress = at(destination, offset);
             Var before = builder.let(load(countAddress));
-            NestedDistinct.emitWithCapacity(builder, argument.emit(row), countAddress, initialCapacity, loadFactor);
+            NestedDistinct.emitWithCapacity(builder, argument.emit(frame.numeric()), countAddress, initialCapacity, loadFactor);
             builder.when(ne(before, load(countAddress)), changed ->
                     changed.store(cardinalityAddress, add(load(cardinalityAddress), i64(1))));
         }

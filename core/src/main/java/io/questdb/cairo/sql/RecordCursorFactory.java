@@ -423,7 +423,11 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
     default void prepareLongTopK(int columnIndex) {
     }
 
-    /** Ordering and retained prefix length are fixed; older compilers retain generic preparation. */
+    /**
+     * Ordering and retained prefix length are fixed by the consuming Top-K factory.
+     * Compilers may discard complete groups outside that prefix within disjoint
+     * partitions. Older compilers retain generic preparation.
+     */
     default void prepareLongTopK(int columnIndex, boolean ascending, int limit) {
         prepareLongTopK(columnIndex);
     }

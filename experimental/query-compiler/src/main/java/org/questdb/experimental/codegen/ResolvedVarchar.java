@@ -27,10 +27,12 @@ package org.questdb.experimental.codegen;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.griffin.engine.functions.columns.VarcharColumn;
 import io.questdb.griffin.engine.functions.conditional.CaseFunctionFactory;
 import io.questdb.griffin.engine.functions.conditional.VarcharCaseFunction;
 import io.questdb.griffin.engine.functions.constants.StrConstant;
+import io.questdb.std.Unsafe;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
@@ -58,8 +60,35 @@ final class ResolvedVarchar {
     }
 
     Expression bind(Function function) { return bind(function, 0); }
-    int[] columns() { return columns.stream().mapToInt(Integer::intValue).toArray(); }
-    byte[] literals() { return literals.toByteArray(); }
+    Binding binding() {
+        return new Binding(numeric.indexes(), numeric.columns(), columns.stream().mapToInt(Integer::intValue).toArray(), literals.toByteArray());
+    }
+
+    /** Numeric page pointers, then pinned UTF-8 views, then slot-owned literal bytes. */
+    record Binding(int[] numericColumns, List<Pipeline.Column> numericInputs, int[] varcharColumns, byte[] literals) {
+        long bytes() { return (numericColumns.length * 8L + varcharColumns.length * 48L + literals.length + 7) & -8L; }
+
+        boolean prepare(PageFrameMemoryRecord record, long descriptor) {
+            for (int i = 0; i < numericColumns.length; i++) {
+                long page = record.getPageAddress(numericColumns[i]);
+                // Zero also denotes lazy type conversion: fall back before mutating aggregate state.
+                if (page == 0) return false;
+                Unsafe.putLong(descriptor + i * 8L, page);
+            }
+            long strings = descriptor + numericColumns.length * 8L;
+            for (int i = 0; i < varcharColumns.length; i++) {
+                if (!record.writeNativeVarcharView(varcharColumns[i], strings + i * 48L)) return false;
+            }
+            long constants = strings + varcharColumns.length * 48L;
+            for (int i = 0; i < literals.length; i++) Unsafe.getUnsafe().putByte(constants + i, literals[i]);
+            return true;
+        }
+
+        Frame frame(Pipeline.Row numeric, Expr row, Expr descriptor) {
+            Expr views = at(descriptor, numericColumns.length * 8L);
+            return new Frame(numeric, row, views, at(views, varcharColumns.length * 48L));
+        }
+    }
 
     private Expression bind(Function function, int depth) {
         if (depth > 64 || (function.getType() != ColumnType.VARCHAR && function.getClass() != StrConstant.class)) return null;
@@ -86,7 +115,18 @@ final class ResolvedVarchar {
         return null;
     }
 
-    record Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals) { }
+    record Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals,
+                 java.util.Map<Expression, Pipeline.Utf8Value> materialized) {
+        Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals) {
+            this(numeric, row, columns, literals, null);
+        }
+        Pipeline.Utf8Value value(Builder b, Expression argument) {
+            if (materialized == null) return argument.emit(b, this);
+            Pipeline.Utf8Value value = materialized.get(argument);
+            if (value == null) throw new IllegalArgumentException("Unmaterialized string argument");
+            return value;
+        }
+    }
 
     sealed interface Expression permits Column, Literal, Conditional {
         Pipeline.Utf8Value emit(Builder builder, Frame frame);

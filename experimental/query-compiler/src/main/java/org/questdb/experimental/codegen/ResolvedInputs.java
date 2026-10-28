@@ -75,6 +75,8 @@ final class ResolvedInputs {
         this.columnOffset = columnOffset;
     }
 
+    ColumnTypes types() { return types; }
+
     static Pipeline.Row loadFrameRow(Ir.Builder b, List<Pipeline.Column> columns, Ir.Expr pointers, Ir.Expr row) {
         var values = new ArrayList<Pipeline.Value>();
         for (int i = 0; i < columns.size(); i++) {

@@ -1,703 +1,667 @@
-# Query compiler foundations and complete LLVM coverage
+# Compiler experiment plan: own the parallel program
 
-Updated 2026-10-27. The target is at least 22 of the 43 local QuestDB ClickBench
-queries, numbered Q0–Q42, with **every data-processing operator generated**, including
-merge, sorting, projection and LIMIT. Java continues to own storage, allocation,
-scheduling, cancellation and cursor lifetimes. A compiled aggregate update under a
-Java map/filter/sort does not count as a compiled query.
+Updated 2026-10-28 against `4cc95d1e96` plus the working changes. This is the active experiment plan,
+replacing the completed coverage slices and helper experiments previously listed
+here. E0 now has fresh 500M-row measurements, and E1's first adaptive partial-record
+representation and E3's first bounded filter stage are implemented; see [PROGRESS.md](PROGRESS.md).
+Older timings below still require a fresh matched control before another
+optimization claim. Research and its limitations are in
+[PIPELINE_DESIGN.md](PIPELINE_DESIGN.md#literature-reassessment-2026-10-27).
 
-ClickBench is the acceptance workload, not the compiler's programming model.
-Binding uses resolved functions, physical layouts and operator contracts; no query
-names, SQL text recognition, fixed data ranges or assumed cardinalities. Maintain
-a small breakthrough log in [PROGRESS.md](PROGRESS.md), with temporary raw evidence
-outside the repository. Keep LLVM and AsmJit and the C reference; no JVM backend.
+## North star and success criteria
 
-## Current checkpoint
+Compile a resolved SQL query into a specialized parallel program whose state
+representation, intermediate buffers and memory-access schedule fit the work and
+hardware. LLVM should optimize code after those decisions have made the work
+small. Generating instructions around a fixed general-purpose state representation
+leaves a large part of this opportunity unexplored.
 
-Generated-operator coverage now reaches 28/43 shapes: Q1,Q4,Q5,Q7-Q19,
-Q30-Q41. The latest slice adds searched-CASE VARCHAR keys and explicitly generated
-LIMIT/OFFSET over the sorted Top-K buffer. The stricter audit found that earlier
-coverage counts had included native sorting while overlooking Java OFFSET
-iteration; the new sorted-window bridge closes that boundary for Q38-Q41.
-Actual-data group equality and generated row counters validate the new paths.
+The architectural bet is **compiler-owned data structures and data movement**.
+Java retains storage snapshots, allocation accounting, worker scheduling,
+cancellation and lifetime management. Existing map layouts remain useful controls
+and fallbacks; they need not be the permanent ABI of every generated operator.
 
-Coverage remains separate from performance. A fresh local eight-core comparison
-with three complete repository-protocol passes per mode gives21 generated queries
-at least1.5x faster by process-median warm results;20 clear that threshold across
-all measured process ranges. The43-query warm ClickBench score is1.455x; the first
-execution score is1.040x. The28-shape coverage target is met, but the22-query major
-performance-gain target is not. These are local results, not a refresh of the
-deleted EC2 instance. The retained radix helper reduces compilation. The finalized
-reader scheduling gap is now closed through the aggregate's read-safety contract,
-including ordinary getter fallback. Three refreshed LLVM suites retain21 major
-wins against the earlier full-suite stock baseline; fresh matched-prefix Q13
-medians are546ms clean stock,505ms current Java and366ms LLVM. The shared scheduling
-improvement is distinct from generated-code gains.
-See PROGRESS.md and TODO.md for measured scope and limits.
+Hardware generality is an acceptance requirement. Do not turn this Ryzen host's
+cache capacity, prefetch distance or core count into a universal policy. Prefer
+reducing bytes, dependent accesses and redundant work; obtain resource budgets
+from the execution environment where a budget is needed. Test retained mechanisms
+across core counts, cache-domain placements, state sizes and input distributions,
+with portable backend correctness checks. These local sensitivity tests can
+falsify overfitting, but cannot establish performance on other CPU families,
+NUMA servers or architectures. Actual cross-machine validation remains required.
 
-## Initial coverage target and order
+Our stretch target is another **2x over today's LLVM execution in substantial
+families with measured headroom**, including complete build/merge/output/cleanup.
+This is an experiment target, not a forecast or a requirement for bandwidth-floor
+scans. For generated kernels using the same algorithm and layout, target within
+10% of the best measured handwritten control. That control is an attainable
+reference, not proof of an optimal algorithm or a hardware lower bound.
 
-Source: `/home/jara/devel/oss/ClickBench/questdb/{create,queries}.sql`. The refreshed
-ordinary-SQL audit compiled/drained all 43 queries against the actual schema with
-no errors; 21 reached generated aggregate updates. After the variable OrderedMap
-slice, **nine complete shapes qualify: Q8, Q12, Q13, Q14, Q15, Q16, Q33, Q36 and Q37**. Every
-selected input row reaches generated map/update code, supported predicates are
-generated, and native bounded ordering visits every result group. The prior five
-and Q14 match the ordinary engine's result hashes on the fixture.
-Q16's tied cutoff can return different valid keys; exact full-group comparison and
-validation of the ordered Top-K count multiset establish its correctness separately.
-Q17 still has an ordinary unordered LIMIT, and Q34 has a Java constant VirtualRecord
-projection, so both are excluded. The target remains 22/43.
+Keep the existing acceptance targets separately visible:
 
-The original seven also pass exact ordered-result comparison against clean stock on the
-actual local ClickBench database (99,997,497 rows, 22 partitions), using three HTTP
-executions per query under the local runner's cache protocol. Native counters
-confirm all admitted map rows and result groups. Their hot geometric-mean speedup
-is 1.13×, with Q13 measuring 2.5% slower; see the actual-data milestone in PROGRESS.md.
+- At least 22/43 local ClickBench queries have every data-processing operator
+  generated through LLVM, including merge, sorting, projection and LIMIT.
+- At least 22/43 have repeatable warm speedups of at least 1.5x versus clean stock
+  under the repository protocol. Report first-use latency and regressions too.
+- Report time-weighted savings and performance across operator families and
+  held-out distributions. Crossing 22 by tuning a borderline short query is not
+  the architectural breakthrough. Compilation must eventually pay for itself
+  on ordinary first use, as well as repeated execution.
 
-That small fixture establishes binding/plans, not performance; the shared phase
-paths are exercised separately at 500M rows. Q41's two-SHORT-key aggregation is
-native, but its OFFSET/encoded sort remains ordinary. Remaining queries must not
-be counted from an update marker. Order-sensitive fixture hashes for other
-queries are not a full correctness oracle. Exact byte/result comparisons and
-ownership/merge cases are covered separately by the focused tests.
+The latest clean 2026-10-28 stock/LLVM/LLVM/stock refresh meets the original
+combined gate: **22/43** queries have every data-processing operator generated
+and at least 1.5x warm speedup across both process ranges. There are 30/43 complete
+generated pipelines and 23/43 robust major wins overall. Generated final COUNT
+reduction closes Q1/Q4/Q5/Q20; Q19 and Q40 exceed 1.5x at medians only.
+All 516 responses validate, including independent stock checks of tied output
+groups. Summed warm times are 22.533/10.437s; first-request sums, including
+compilation once, are 34.076/27.106s under the repository's lukewarm protocol.
+Compiler-timer sums are 0.168/3.959s; optional operator compilation now occurs
+inside execution when needed, so use the complete first-request totals.
+Q2/Q7/Q24/Q25/Q42 regress over 3%, by 0.264/0.709/0.039/2.607/0.180ms.
+Q32 supplies 22.9% of saved time. All four processes pass the host gate. An entire
+preceding refresh was excluded because unrelated JetBrains Toolbox CPU activity
+overlapped its final stock pass. Stock settings remain unchanged. These local
+eight-core results do not establish performance on the deleted EC2 machine.
 
-A first target of 23 queries leaves one query of margin above 50%:
+The independent 500M-row string-state experiment reduces 8.39M-group execution
+from 4.67 to 3.14s and memory traffic from 237 to 153GB by changing intermediate
+representation and ownership. Optional-kernel deferral then removes ~90–100ms
+from new small-state query latency without changing its warm loop. This clears
+the initial coverage gate, not the stretch target of another 2x over LLVM.
+The cache-footprint experiment confirms substantial state behind aggregate
+pointers, but rejects more aggressive subdivision: its extra copying increases
+traffic and complete latency. Compact winning-string references also lose: fewer
+allocations introduce scattered dependent payload reads. Exact ranking before
+independent string MIN/MAX is retained instead. Earlier accepted eight-core
+profiles reduce this 500M-row family from ~3.1 to ~1.7s and controller traffic
+150 to 86GB/query; guarded one/four-core checks show 1.66x/1.77x gains.
+This schedule adds no ClickBench coverage and is not a cross-machine result.
 
-| Shared capability family | Zero-based queries |
+This checkpoint completes the current experiment for the requested commit.
+Wall-clock profiling is paused at the user's request while the desktop is in use. Later contaminated
+and interrupted timing runs are excluded. Before making a broader claim, resume
+controlled final-build measurements, including cross-cache placement, skew and
+other architectures. Do not start another experiment as part of this checkpoint.
+See [PROGRESS.md](PROGRESS.md).
+
+## What the evidence makes worth trying
+
+| Retained observation | Implication for the experiment order |
 | --- | --- |
-| Filtered scalar COUNT, key-only DISTINCT, filtered projection | Q1, Q4, Q5, Q19, Q24 |
-| Fixed-width/SYMBOL grouping and numeric ordering | Q7, Q8, Q10, Q11, Q15, Q35, Q40, Q41 |
-| VARCHAR/composite grouping with numeric ordering/LIMIT | Q12, Q13, Q14, Q16, Q17, Q33, Q34, Q36, Q37, Q38 |
-
-Execute one slice at a time:
-
-1. **Generated fixed-key map mutation, redistribution and merge** over existing
-   Unordered4Map/Unordered8Map. Implemented and tested; the experiment shows modest, workload-dependent changes,
-   not a broad performance breakthrough. Details below and in PROGRESS.md.
-2. **First complete grouping → numeric Top-K → output composition.** Bind ordinary
-   Long Top K's sorted-buffer algorithm, including local collection and final merge,
-   to actual aggregate values and stable map row IDs. The bounded numeric Top-K
-   collection and merge are now generated for the existing unordered INT/LONG maps;
-   see the second slice below. Reuse current worker dispatch and cursor ownership.
-   Q15 is a useful vertical acceptance shape, but vary keys,
-   aggregates, K, ordering direction and cardinality independently.
-3. **General fixed-width keys and expressions.** Add SHORT/BYTE/TIMESTAMP/IPv4 and
-   SYMBOL representations with their actual null/translation semantics; support
-   composite key encoding and OrderedMap mutation/growth/merge. Bind resolved
-   filter/projection operations to the shared IR; reuse the existing filter compiler's
-   semantics rather than building another SQL front end.
-4. **VARCHAR values and keys.** Borrow QuestDB's UTF-8 representations with explicit
-   lifetime; reuse native map hashing, equality and ownership rules. Support both
-   UnorderedVarcharMap and composite OrderedMap encoding. Symbol IDs alone are not
-   a general VARCHAR representation.
-5. **Key-only grouping, scalar consumers and bounded output.** Accept resolved
-   GROUP BY with no aggregate functions; support COUNT over that phase, filtered
-   projection and LIMIT/OFFSET. Preserve storage order where it already satisfies
-   ORDER BY. Borrow or reserve bounded output storage through existing owners;
-   don't return an unbounded boxed result list.
-6. **Finish the ordering family and verify the coverage count.** Q7 needs complete
-   numeric sorting without LIMIT, and OFFSET cases need correct retained ranks.
-   Existing encoded sorting/Top-K provide algorithms and storage; calling their
-   current C++ implementation is not generated LLVM sorting. Count a query only
-   after every actual data-processing phase passes the generated-path check.
-
-Floating AVG, LIKE/regex, string ordering, CASE and timestamp bucketing can follow
-this first coverage target. Existing joined-value work remains usable but joins
-are absent from this workload; do not expand joins at the expense of these gaps.
-
-## First slice: actual unordered-map mutation
-
-### Verified contracts
-
-- `MapFactory.createUnorderedMap` chooses the implementation from key and value
-  widths. The server's maximum unordered entry size defaults to 32 bytes; the
-  test configuration defaults to 16. Wider states use OrderedMap. Do not alter
-  these defaults to claim coverage or speed.
-- Unordered4Map aligns entries to **four** bytes; Unordered8Map to **eight**.
-  Both keep zero keys in an extra end-of-buffer entry. `size` counts nonzero keys,
-  `hasZero` is separate, and `free` controls growth.
-- Their hash functions, linear probing, load factor, capacity limits and memory
-  tracking already define the algorithm. Reuse them. No new map or executor.
-- `GroupByShardingContext` already acquires slots, dispatches/drains parallel merge
-  work and retains source allocators until destination state is finished. This is
-  required when DISTINCT merges adopt or mutate source set pointers.
-
-### Design and implementation
-
-`Map.writeNativeMutationView` borrows an exclusive 64-byte snapshot: the existing
-48-byte probe view followed by free slots and nonzero-key count. Generated code
-inserts and updates values in the map's existing allocation. The slot publishes
-counters in `finally` before returning control to Java. A borrow expires on return
-or growth; no other map operation may overlap it.
-
-`QuestMapProbe` shares hashing/probing with the previous read-only path and emits
-insertion for mutable unordered views. New values initialize from the same resolved
-COUNT/SUM/DISTINCT descriptions used for updates. No callback on a new group.
-Before an insertion would consume the final permitted free slot, save the current
-position/shard and return without committing that row. The owner allocates growth,
-invokes the generated rehash, publishes new backing, and resumes the same row once.
-Prepared candidate pointers are rebuilt after every growth return.
-
-The unsharded loop also preserves Java's `reserveCapacity(batchRows)` policy at
-**every configured batch boundary**. It checks free slots in generated code and
-returns `NEED_CAPACITY` only when reservation needs growth; the existing owner
-calculates capacity and invokes generated relocation through `reserveNative`.
-A prefetch window ends at a reservation boundary, including non-power-of-two batch
-sizes. Omitting this policy produced denser maps and a measurable DISTINCT
-regression in the first experiment; retaining the nominal load factor alone did
-not preserve the existing execution algorithm.
-
-`Map.growNative` reuses capacity checks, query accounting, allocation, zeroing and
-publication. The rehash callback receives the **actual entry stride from the map**.
-Failure frees the new allocation and leaves the old backing valid. Primitive
-allocation/zeroing and zero-entry copying remain owner operations.
-
-`QuestMapMutation` emits relocation and physical-entry iteration for merge/sharding.
-New groups copy state; existing groups invoke the shared aggregate merge definitions.
-Redistribution uses the same high hash bits and preserves the current 256-shard
-policy. The normal SQL factory attempts a generated whole-frame update before
-Java's packed-batch path. The existing fragments and sharding context invoke the
-same slot updater for redistribution and merge; queues, worker budget, presizing
-and planner decisions are unchanged.
-
-Unsupported layouts retain their existing path before mutation. Native errors
-propagate; they never request replay or Java fallback after partial mutation.
-The read-only probe ABI remains unchanged for joined aggregation and the handwritten
-reference. Joined group insertion is not migrated by this slice.
-
-### Checks and experiment
-
-Focused checks cover both key widths, NULL/negative/zero keys, collisions and growth
-inside prepared batches, filtered tails, COUNT/SUM/DISTINCT, source-pointer lifetimes,
-cancellation, failed rehash allocation cleanup, Java readers, and reopen. Test-only
-layout settings exercise wider states on unordered maps; performance runs preserve
-server defaults and their real OrderedMap fallbacks.
-
-Measure at least 500M rows per workload, eight total execution slots, five warmups,
-three measured executions, exact result comparisons and full result consumption.
-Keep clean stock, disabled candidate and generated paths separate. Freeze the prior
-prototype for before/after comparison. Vary aggregate width, group cardinality and
-skew independently; report compilation separately and preserve within-process
-ranges. Native map row/call counts prove the executed path. PMU collection excludes
-setup and warmup using the existing harness handshake.
-
-This is an exploratory capability experiment. Removing crossings predicts fewer
-calls and instructions; it does not prove a CPU bottleneck or a performance gain.
-No breakthrough claim without elapsed-time improvement, correct results and
-counterfactual evidence. The earlier tight 3% disabled-path neutrality target was
-unresolved across JVMs and must not be silently treated as passed.
-
-## Second slice: generated bounded numeric Top-K
-
-The ordinary planner still selects `LongTopKRecordCursorFactory`. Its planning hook
-asks the aggregate factory to prepare the optional kernel **before dispatch**. Queries
-without this operator do not compile it. Binding admits only the exact aggregate
-implementations already resolved by the update compiler and their assigned value
-indices/offsets; their `getLong` methods expose the stored result directly. No SQL
-spelling, fixed K, domain assumption or query identifier participates.
-
-`QuestLongTopK` emits the actual `DirectLongLongAscList`/`DescList` algorithm: full-buffer
-cutoff, binary search down to the existing 65-entry threshold, linear search and tie
-handling, backward overlapping pair copy, insertion and bounded size. Direction and
-source kind dispatch before their scan loops. It reads the existing map probe view,
-visits the separate zero entry first, then physical occupied slots, and stores the
-same raw map row IDs as the ordinary map Top-K cursor. LONG_NULL is ordered by the
-same signed comparison; SUM needs no separate finalization. The same insertion
-emitter merges worker lists. Both selection and movement compile through the shared
-IR to LLVM/AsmJit/C; there is no call to Java `add` or an external sorting algorithm.
-
-The existing lists expose an exclusive borrow of their pair allocation, plus a size
-publication operation. Existing slot scratch holds the map view and list descriptor;
-no new result allocation, map, queue or executor is introduced. Completed insertions
-publish size into scratch, and `finally` publishes it to the owning list on success
-or cancellation. The existing callback checks cancellation every 1024 visited slots
-or source pairs. Failure propagates without fallback/replay.
-
-`AsyncGroupByRecordCursor` retains the configured choice between sequential and
-parallel collection. `GroupByLongTopKJob` acquires the same worker slots and writes
-the same worker buffers; the owner merges them only after the existing drain.
-The ordinary output cursor reads the resulting bounded row-ID list and exposes
-stored map fields. It owns rewind, random access, close and reopen. Unsupported
-layouts/readers retain ordinary collection before mutation.
-
-This closes **bounded, single-column LONG aggregate ordering** on Unordered4Map and
-Unordered8Map. It does not claim general generated projection, filters, key ordering,
-OrderedMap/string/composite keys, multi-column ordering, unlimited sorting or OFFSET.
-The strict complete-LLVM ClickBench coverage count remains unaudited after this slice;
-do not increment the previous zero merely because the sort is now generated.
-
-Focused checks compare values **and exact row IDs/ties** with the engine lists for
-both key widths, directions, K=1/10/65/66/128/5000, NULL keys/results and extremes.
-They cover merge, cancellation, reuse and Java cursor consumption. Ordinary SQL checks
-exercise both dispatcher modes, sharded/unsharded and parallel/sequential collection,
-ordered output, rewind, reopen and OrderedMap fallback. Performance uses unchanged
-server defaults, 500M input rows and independently varied cardinality/K/direction.
-`TopKPhaseExperiment` can additionally keep the fully built maps alive and time only
-collection/merge, explicitly excluding aggregation and cleanup; report those phase
-times separately from complete queries. Raw evidence stays in `/tmp/query-topk`.
-
-## Third slice: resolved integer filters through shared IR
-
-`AsyncGroupByAtom` now offers its resolved filter to the same optional compiler
-before creating worker slots. `ResolvedInputs` binds exact integer comparison,
-NULL-test and Boolean implementations to the existing `Pipeline` predicates.
-It admits BYTE/SHORT/INT/LONG columns, widening reads, integer constants,
-equality/inequality, ordered comparisons and AND/OR/NOT. It reads the actual
-resolved constant from `EqIntStrCFunctionFactory.Func`; NULL equality may resolve
-through that factory or `EqSymLongFunctionFactory`, despite their names.
-There is no SQL-text matching. Runtime binds, arithmetic and other unsupported
-functions retain the ordinary filter; mutable functions are never frozen.
-
-`ScanLowering.selection` generates the existing ordered row-ID selection contract
-through the shared vector-mask IR, with bounded eight-row reads and a scalar tail.
-The `SelectRows` IR operation compacts row IDs in ascending lane order and returns
-the count. It is a memory-write effect even when its result is unused. LLVM lowers
-it to masked vector compress-stores and population counts, following the same
-selection-vector compaction principle as QuestDB's existing AVX2 filter. C and
-AsmJit use the existing portable lowering pass for a scalar implementation. This
-avoids enumerating every selected bit in the LLVM path without a dense-data guard
-or query-specific strategy.
-Each acquired slot borrows the engine's `DirectLongList`, reserves its capacity
-once per frame, and publishes its count only after successful native execution.
-The slot owns only reusable input-address scratch. Cancellation is polled before
-execution and at bounded intervals; failure propagates without replay.
-
-This preserves the engine's filter-then-aggregate phases, full configured map
-batches, Parquet selectivity tracking and late materialization. It is two generated
-kernels per supported frame, not single-loop filter/aggregate fusion. Column tops
-and lazy type casts retain ordinary filtering before any native mutation. The
-existing aggregate compiler and fallback rules still govern the second phase.
-No scheduler, map, selection allocation or SQL resolver is duplicated.
-
-Planning exposes `compiledAggregateFilter`; diagnostics report input and selected
-rows after workers drain. `query.codegen.filter=false` isolates the old filtering
-path while keeping generated aggregation and Top-K identical. This is an optional
-prototype switch, not a stock QuestDB configuration change.
-
-Focused checks compare native row IDs with the resolved Java functions, including
-NULLs, widening, extremes, Boolean combinations, vector tails, cancellation and
-slot reuse. Ordinary SQL checks run all three backends and both dispatcher modes,
-including unsupported arithmetic/bind fallback and existing Parquet/cast cases.
-Performance varies selectivity independently at 500M rows under unchanged server
-defaults; temporary evidence is in `/tmp/query-llvm-filter`.
-
-This closes the integer-filter binding gap for eligible keyed aggregations.
-Scalar aggregation, broader expressions/types, general projection and ordering
-still need work. Complete ClickBench coverage needs a fresh operator-by-operator
-audit; this slice alone does not establish the 50% target. Deferred aggregation
-algorithm experiments are tracked in [TODO.md](TODO.md).
-
-## Fourth slice: fixed-width OrderedMap execution
-
-The compiler now borrows the resolved direct key column list, in the order of the
-existing `RecordSink`. `QuestFixedKey` admits BYTE/SHORT/INT/LONG columns only when
-their types match input metadata and their total packed width matches the actual
-OrderedMap key size. Computed keys, SYMBOL translation and variable-width keys
-retain the ordinary path. The existing single INT/LONG unordered path is unchanged.
-
-Keys are staged once per prepared row into slot-owned scratch, without field padding.
-Hashing reproduces `Hash.hashMem64`: eight-byte words, a signed four-byte tail,
-signed byte tails, the existing multiplier and avalanche. Equality compares exactly
-those key bytes. Prepared batches reuse the existing prefetch schedule; they retain
-both the staged key and candidate address. Every return for growth rebuilds the
-remaining prepared rows, since heap relocation invalidates candidate pointers.
-
-OrderedMap retains both allocations and its insertion-order heap. Its 64-byte
-mutation view holds heap base, offset table, mask, aligned entry stride, append
-pointer, heap limit, free slots and size. Generated probing reads the packed
-unsigned biased offset plus cached low hash. Misses initialize/copy keys and values
-in the existing heap and publish the packed slot and counters. Growth returns
-before committing the pending row. The owner applies existing memory accounting,
-heap limits and resize policy, then resumes that same row. Unsharded batch boundaries
-reserve worst-case heap bytes exactly as the ordinary fixed-key batch probe does;
-offset-table growth remains insertion-driven.
-
-Offset-table rehash copies occupied packed slots with their cached hashes into the
-owner's new allocation. Failure frees that allocation and retains the old table.
-The owner may have successfully relocated the heap before rehash fails, so its view
-is refreshed in `finally` before outer publication. No exception requests fallback
-or replay after mutation.
-
-Generated merge scans source hash slots in the ordinary merge order and reuses
-cached low hashes. Redistribution scans the source heap in cursor insertion order
-and computes the full hash for the existing shard selection. Aggregate initialization,
-copy and merge reuse the existing resolved definitions, including DISTINCT allocator
-ownership. Existing worker slots, sharding jobs, cancellation and drain remain owners.
-Generated Top-K scans the heap in insertion order and stores the same raw row IDs
-as the Java cursor, preserving tie behavior and the existing bounded-list algorithm.
-
-Checks exercise odd packed key widths, negative/zero/NULL keys, growth, Java reads,
-native merge and redistribution, exact Top-K row IDs/ties, cancellation/reuse,
-high-bit compressed offsets and failed relocation ownership. Experiments retain
-stock defaults and compare `query.codegen.ordered=false` against the new path on
-500M rows, varying cardinality, skew and value width. Raw evidence stays in
-`/tmp/query-ordered`; the experiment log records the outcome. This does not by itself
-complete additional ClickBench queries: their remaining type, expression, VARCHAR
-or ordering gaps still apply.
-
-## Fifth slice: shared resolved integer expressions
-
-`ResolvedInputs.scalar` now binds exact resolved integer addition/subtraction and
-BYTE/SHORT/INT widening implementations, alongside columns and constants. Filters,
-aggregate arguments and grouping keys use this same compiler-time binding. No
-mutable Function survives compilation. Unsupported children decline the whole
-binding before execution. Core changes expose the admitted implementation classes;
-the ordinary functions' evaluation is unchanged.
-
-Each arithmetic node retains its resolved INT or LONG result type. INT operations
-wrap at 32 bits and sign-extend before a wider parent reads them; NULL propagation
-includes a computed result landing on the type's sentinel. The existing I64 IR
-can express this without new backend operations. BYTE/SHORT NULL getters return
-zero; widening follows the resolved cast's actual source getter width. SUM, COUNT and LONG DISTINCT
-consume scalar expressions. DISTINCT's prepared lookup hint reads only the source
-columns needed by its expression. Ordinary query optimization still applies:
-`SUM(v + 1)` can become SUM/COUNT plus a Java output expression, so generated
-argument tests and measurements use column-plus-column expressions as well.
-
-The optional compiler borrows key functions in RecordSink order: direct columns,
-then computed keys. The same fixed-key descriptor lowers expressions into either
-the existing INT/LONG scalar key or packed OrderedMap bytes, including each key's
-storage NULL sentinel. It reads required frame columns only after validating all
-pages; column tops/conversions retain ordinary access. Existing map selection,
-growth, sharding and merge algorithms remain unchanged. Projection wrappers now
-forward Top-K preparation through their existing column-index translations, just
-as they already forward its capability check and execution.
-
-Filtering still fills the existing selection vector. This slice does not fuse the
-filter and aggregation loops or add general output-expression lowering. It also
-does not add VARCHAR, SYMBOL, timestamp or IPv4 semantics. The diagnostic switch
-`query.codegen.expressions=false` retains earlier arithmetic/cast admission and
-computed-key fallback. The ordinary SQL benchmark can read SQL from
-`query.codegen.sqlFile`; handwritten-reference modes reject that override so their
-fixed physical plans cannot silently benchmark a different query.
-
-## Sixth slice: single VARCHAR keys in the existing unordered map
-
-The first string boundary is `Pipeline.Utf8Value`: address, byte length, NULL,
-ASCII and stability. It is separate from integer `Value`; there is no boxed string
-or implicit integer-to-string conversion in generated execution. `QuestVarchar`
-lowers that view into the shared IR, so LLVM, AsmJit and the C reference use the
-same storage and key semantics.
-
-`PageFrameMemoryRecord.writeNativeVarcharView` borrows the existing pinned frame's
-aux/data vectors, bounds, split/slice format and stability. Inline values (up to
-nine bytes) live in aux; longer native values are contiguous in data, with a
-redundant prefix in aux. Parquet slice entries supply a pointer and length. The
-emitted decoder checks bounds, retains column-top NULLs and does not overread a
-hash/equality tail. Lazy type conversions decline before any update. Filtered
-Parquet records explicitly decline this descriptor: their filter and payload
-columns use different row spaces, which this boundary cannot yet express.
-
-The planner still selects the map. Only a single direct VARCHAR key in
-`UnorderedVarcharMap` qualifies; mixed keys and wider states that select OrderedMap
-retain the ordinary path. The generated implementation follows `Hash.hashMem64`
-(signed 8/4/1-byte chunks and its avalanche), cached low-hash/size/flags comparison,
-byte equality and linear probing. ASCII is ignored for equality, but occupancy
-must be tested first because an empty string's comparable packed header is zero.
-NULL and empty remain distinct. Prepared candidates keep their full hash for
-shard selection; merge and rehash use cached low bits where the Java algorithm does.
-
-Native table pointers retain the same borrowed lifetime as the ordinary map.
-For a new unstable key, generated code yields **before insertion or aggregate
-update**. The owner copies into that destination map's existing tracked arena,
-then resumes the pending row with the copied pointer. Only new unstable groups
-cross this slow path. Redistribution/merge copy owned keys into the destination
-arena just as `UnorderedVarcharMap.merge` does. This avoids introducing another
-allocator or transferring a pointer whose arena can close first. Growth uses the
-existing native relocation callback; failure frees the replacement allocation and
-keeps the old map valid. A VARCHAR-specific control extension leaves the existing
-integer and handwritten kernel ABI unchanged.
-
-Generated code covers insertion, updates, rehash, redistribution, merge and LONG
-aggregate Top-K over physical VARCHAR map slots. Existing workers, allocation,
-slot ownership, sharding decisions and output cursors remain in charge. Exact
-resolved VARCHAR `IS NULL` / `IS NOT NULL` checks produce the existing selection
-vector from aux headers; compound string predicates are still outside this slice.
-
-The ordinary SQL fixture option `query.codegen.varcharKeys=inline|prefix|mixed`
-varies byte length, shared prefixes and UTF-8 content independently of cardinality
-and skew, includes NULL/empty keys, and uses server defaults. It is rejected by
-fixed-shape handwritten/legacy benchmark paths. Result validation compares exact
-UTF-8 bytes, not only a hash. Performance evidence and remaining boundaries are
-recorded in the simple progress log.
-
-## Seventh slice: VARCHAR-bearing OrderedMap keys
-
-`QuestVariableKey` binds direct VARCHAR fields alongside supported integer fields
-and resolved integer expressions in RecordSink order. It emits the actual
-`OrderedMap.VarSizeKey` format: a four-byte total key length, then packed fields;
-each VARCHAR contributes a four-byte length (-1 for NULL) and its UTF-8 bytes.
-ASCII is deliberately erased, as `appendPlainValue(..., true)` does. Hashing
-excludes the total-length header and uses the existing `Hash.hashMem64` algorithm.
-Equality first checks total length, then compares the encoded bytes. This preserves
-field boundaries, NULL versus empty, integer widths and arithmetic NULL sentinels.
-
-Prepared keys occupy the existing `OrderedMap.ProbeView` staging buffer. An optional
-map-owned view lends its tracked buffer for the generated window and closes with
-the map, before the query tracker is released. Each window checks required bytes
-before writing. Growth yields the first unconsumed row, enlarges the buffer through
-its existing capacity mechanism, and rebuilds that window. No truncated key or
-invalidated candidate survives growth; no committed aggregate update is replayed.
-
-The generated OrderedMap path now obtains the value address from each entry's
-length rather than a constant key width. Insertion copies the encoded key into
-the owner's append heap and advances by align8(header + key + values). Growth
-reserves the pending entry through the existing heap limit/resize path and reuses
-the existing generated cached-hash offset-table relocation. Failure refreshes the
-borrowed map view even when the heap moved before offset-table allocation failed.
-
-Final merge preserves hash-slot traversal. Redistribution and LONG aggregate
-Top-K preserve the variable-size cursor's insertion order and aligned dynamic
-stride. Redistribution saves its source byte offset across a destination growth
-return. Existing aggregate initialization/merge, including LONG DISTINCT, is reused.
-Java still owns maps, query memory, workers, slot acquisition, cancellation and
-result cursors; it does not serialize/probe keys or merge values on admitted paths.
-Parquet keys are copied into the map's heap, matching ordinary OrderedMap ownership.
-
-A diagnostic `query.codegen.variableKeys=false` retains the preceding compiler's
-eligibility without altering stock configuration. The SQL fixture's
-`query.codegen.varcharLayout=wide|composite|strings` varies state width and key
-composition independently of its length distribution and logical cardinality.
-These are fixture/compiler diagnostics, not SQL recognition or execution defaults.
-Computed VARCHAR expressions, SYMBOL fields, string ordering, general projection
-and Parquet late-materialized row spaces remain separate gaps. The existing safe
-fallbacks continue to apply before mutation.
-
-## Later foundation work remains
-
-The existing joined-value compiler supports integer payloads, predicates and keyed
-COUNT/SUM; join → DISTINCT still needs an allocator-owning aggregation boundary.
-General phase composition should use existing `UnorderedPageFrameSequence`
-non-frame dispatch and explicit borrowed batches, not another DAG scheduler.
-`RecordArray` currently reserves one row at a time and clear releases its backing;
-it needs a verified bulk reservation/reuse contract before serving as output storage.
-Compilation admission, concurrent code leasing, broader numeric IR and sustained
-shared-worker fairness remain separate gaps, not prerequisites for declaring the
-current map experiment correct and narrowly useful.
-
-## Next slice: resolved VARCHAR expressions in grouping keys
-
-Code inspection identifies the boundary in `QuestVariableKey.bind`: direct VARCHAR
-columns bind, but a VARCHAR field from `keyFunctions` immediately declines. The
-existing variable-key path already owns staging, exact key encoding, map growth,
-redistribution, merge and generated numeric ordering. Extend that binding rather
-than adding a second map or execution path.
-
-A searched CASE needs explicit resolved branches. `CaseFunctionFactory` currently
-captures casted values in its picker, while `VarcharCaseFunction.args()` retains
-original arguments for lifecycle management. `SwitchFunctionFactory` also returns
-VarcharCaseFunction. Reading `args()` as a searched CASE would therefore confuse
-resolved casts and switch semantics. Replace only the searched-CASE picker lambda
-with a small inspectable picker; keep its first-true evaluation and lifecycle list.
-
-Bind VARCHAR columns, immutable UTF-8 constants and nested searched CASE into a
-shared expression lowering. Conditions reuse ResolvedInputs' resolved integer
-predicates. Each result remains a borrowed address/length/null/ASCII/stability view.
-Generate branch-local string decoding; only the selected branch produces a view.
-Copy literal bytes into existing slot descriptors and selected values into the
-existing tracked key staging buffer. No per-row JNI call, Java callback, allocation,
-new scheduler or map. Preserve the distinction between NULL and empty strings.
-Unsupported predicates, dynamic strings and simple CASE/SWITCH keep fallback.
-
-Acceptance: ordinary SQL equality plus actual generated map/merge/sort counters;
-multiple/nested branches, casts, Unicode, empty/NULL values, long literals, column
-tops and Parquet; repeat cursor opens. Use all three backends for focused checks.
-Then measure a general 500M-row fixture locally and verify actual-data Q39 coverage.
-This is a capability experiment; the retired EC2 cannot support new EC2 performance
-claims, and adding coverage alone does not establish the performance target.
-
-The composition audit also found that LongTopKRecordCursor inherited Java OFFSET
-iteration. Its factory now requests an explicit sorted-window capability, separate
-from unordered map selection. The existing QuestRowLimit kernel consumes the
-borrowed (value, row ID) buffer and copies only the requested window into LIMIT's
-tracked output. It uses existing slot scratch, polling and lifecycle. Ordinary
-execution and older compiler implementations do not advertise this capability.
-
-## Next experiments: compilation cost, specialization and generated helpers
-
-Design recorded 2026-10-27. Direction specialization (B) and small-capacity
-specialization (the retained part of C, K<=64) are automatic compiler decisions;
-their experiment toggles have been removed. Large-capacity specialization failed
-the isolated execution regression gate and is not selected. Measurements are in
-PROGRESS.md. D/E are complete: the always-inline helper reproduces B's compiled
-shape and timing, while the outlined helper cuts warm native Top-K compilation
-from157 to56ms and improves isolated collection/merge. Whole-query execution is
-essentially unchanged. The typed helper is now automatic; there is no experiment
-toggle. The design below records the controlled comparisons and acceptance gates.
-Objective: substantially reduce preparation while preserving or improving warmed
-execution. Run one comparison at a time; keep algorithms, memory layout, polling,
-worker scheduling, O2 optimization and CPU target identical.
-
-### Source contracts and available controls
-
-- `LongTopKRecordCursorFactory` passes constant `lo` and `ascending` through the
-  existing Selected/Virtual/Async factory and atom/compiler hooks. Column
-  translations and generic callers are preserved. `lo` is the retained prefix
-  length, including OFFSET, rather than the number of returned rows.
-- Generic `QuestLongTopK.program` emits both directions and small/large algorithms,
-  with the existing capacity threshold of 64. B removes the unused direction;
-  retained C removes the large algorithm for small K. `QuestLargeTopK.emit` emits
-  three source modes and a final radix sort per direction. `QuestRadixSort.emit`
-  originally expanded each body directly into the caller: eight radix bodies in A,
-  four in B, and none in the retained small-capacity C. The retained implementation
-  emits calls to one direction-specific radix body instead.
-- Source kind is genuinely dynamic: `AsyncGroupByRecordCursor` can collect from
-  a map array, individual shards, and then merge worker pair lists. Preserve all
-  required routes. Actual cardinality/sharding is not a planning constant.
-- `Ir.Program` retains its single entry body and now supports typed helper calls.
-  Helpers declare their inputs and return a failure status; LLVM emits one native
-  body per reachable helper in the existing query module. C/AsmJit expand helpers
-  before their existing lowering. There is no separate cache, runtime owner or
-  public backend-selection policy for helpers.
-- Reuse `TopKPhaseExperiment` for collection/merge on already-built maps and
-  `ResolvedBatchMatrix` for full 500M-row SQL runs. Separate parallel map builds
-  can change traversal even when aggregate values match. C's temporary phase
-  harness switches compiled kernels only after workers drain, holding maps,
-  destination addresses and scratch fixed, and validates exact value/row-ID
-  sequences. Preserve this control for D/E. Existing focused Top-K tests cover
-  ordering, ties, merge, cancellation and reopen; add only new boundary cases.
-
-### Sequential comparisons
-
-| Variant | Change from its control | Question and expected evidence |
-| --- | --- | --- |
-| A | Current inline, multi-mode O2 kernel | Reproduce compilation and execution baseline. |
-| B vs A | Emit only the resolved sort direction; retain inline bodies and both capacity paths | Does eliminating unused structure reduce IR, native code, compilation instructions and time without an execution penalty? |
-| C vs B | Select small/large algorithm using resolved capacity; retain runtime capacity arithmetic | Does removing the unreachable algorithm help independently of direction? Check 64/65 and generic preparation fallback. |
-| D vs retained inline control | Express radix sorting as a same-module helper marked `alwaysinline` | Control for helper representation, parameterization and compiler pass ordering. Large K uses B because C was rejected there. Confirm calls disappear before interpreting E. |
-| E vs D | Change only that helper to `noinline` | Measure the actual call-boundary tradeoff: lower duplication/compile work versus call overhead, spills and lost cross-boundary optimization. |
-
-Compile D/E with the same helper body and signature, constant sort direction,
-memory-effect information, calling convention, O2 passes and target. Use a direct
-internal native call, explicit buffer/count arguments, and the existing polling
-callback. Keep the helper in the query's existing ORC resource tracker; no separate
-symbol lifetime, process cache, Java transition or extra allocation. Return and
-propagate cancellation status before callers publish size or resume processing.
-Only assert aliasing/alignment attributes proved by the existing scratch contract,
-and apply them identically to both controls. `noinline` must not imply `optnone`:
-the helper's own loops remain optimized. Inspect final IR/disassembly to establish
-the experiment actually retained or removed calls. Attribute reference:
-https://llvm.org/docs/LangRef.html#function-attributes
-
-D need not compile to exactly the same instructions as its inline control: the preparation schedule
-can change. If their execution differs materially, report that representation
-effect separately and compare E with both D and that control. If E is promising, a later
-variant can remove the inline attribute and measure LLVM's ordinary heuristic.
-Do not change radix width, unrolling, buffer capacity, algorithm thresholds, or
-cross-query caching during these comparisons. These are separate experiments.
-
-### Three measurement layers
-
-1. **Preparation only.** Reuse the temporary compile-cost harness and timing
-   breakdown. Three fresh processes per variant; in each, record first compile
-   separately, then five forced recompilations after initialization. Do not let
-   the SQL factory cache bypass compilation. Close factories between samples.
-   Record whole SQL preparation, Java lowering/emission, native parse/verify,
-   optimization, machine-code materialization, compiler-thread CPU time/cycles/
-   instructions, and pre/post-optimization IR and native code sizes. Kernel code
-   sizes must include all helpers. Compare default uninstrumented elapsed time
-   too; dump/profiling output belongs outside the timed run. Current Q39 native
-   Top-K is about308ms; whole warm preparation about442ms. Treat these as reference
-   figures to reproduce on the current host, not immutable thresholds.
-2. **Execution isolation.** Reuse live, finalized engine maps and existing slots,
-   then measure Top-K collection plus worker-list merge. Clear destination/scratch
-   state consistently. Compare identical map traversal and candidate values. Also
-   exercise the radix body at final-buffer sizes 0/1/16/64/512 and full-buffer sizes
-   4096/16384 to expose call overhead and cache-footprint sensitivity. These small
-   kernel diagnostics do not represent 500M-row query performance. Keep input
-   preparation/reset outside kernel timings and report it separately; include all
-   normal reset/allocation work in full queries. Count helper calls, pairs sorted,
-   compactions, polls and scanned/merged groups in a separate diagnostic run so
-   instrumentation does not alter the primary performance comparison.
-3. **Complete SQL.** Run Q39 on the actual 99,997,497-row ClickBench dataset as the
-   motivating case, plus general fixtures with at least500M source rows. Measure
-   first-use latency, warm execution with cached factory, and prepare-plus-execute
-   totals. Include ordinary current-core Java as a control; clean stock remains a
-   separately labelled binary. Preserve default server execution settings. All
-   variants must perform the same native operators and drain equivalent results.
-
-### Small, staged workload selection
-
-Start B/C on Q39 and one fixed-width SUM grouping with 500M source rows. Then screen
-D/E on phase-isolated outputs before promoting the winner to complete-query runs.
-Use three representative full-query shapes: fixed-width key/SUM with many distinct
-scores; VARCHAR or composite-key/COUNT with many cutoff ties; selective grouping
-with a small final buffer. Vary input order (random, already favorable, improving
-scores) in the phase diagnostics, since threshold rejection changes compaction
-frequency. These distributions are controlled fixture data, never planner rules.
-
-Use a compact boundary sweep rather than a Cartesian product: K=1/64/65/1024/2048/
-8192, both directions on the main case, and group counts below K, near4096 and
-large enough for repeated compaction and the normal parallel Top-K route. Record
-actual groups and pair counts; 500M scanned rows does not mean 500M sort entries.
-Exercise single-map, map-array and worker-list merge paths explicitly. Repeat
-finalist whole-query runs at one and eight physical cores, without SMT siblings.
-Retain only cases needed to discriminate mechanisms or expose regressions.
-
-For identical map/pair traversal compare exact `(value,row ID)` sequences, including
-cutoff ties, signed extremes and LONG_NULL, against the current implementation and
-engine list oracle. Across independent parallel SQL executions, compare complete
-aggregate results and legal ordered results with tie-aware validation; raw row IDs
-and unspecified tie order need not match. Focused cancellation/reuse checks must
-cancel inside the helper and verify subsequent cleanup/reopen behavior. Use the
-existing memory/lifecycle checks; no duplicate infrastructure.
-
-### Hardware evidence and run discipline
-
-The available host is a Ryzen9950X (16 cores/32 threads, two L3 domains). Record
-actual topology/affinity, boost/frequency, thermal/throttling state, background
-load, quotas, page faults/I/O, reclaim, GC and compiler-lock wait. Use the same
-eight-physical-core JVM affinity for both variants and measure the native compiler
-thread separately: pinning the whole JVM to one core caused compiler-thread
-scheduling delays in B. Keep query worker counts and placement equal. Complete
-the USE preflight and distinguish compiler resource pressure from query resource
-pressure before attributing a mechanism.
-
-For execution use at least three warmups and five balanced paired samples, with
-A/B/B/A ordering across process blocks. Extend only noisy or close comparisons.
-Report individual cases, medians and paired uncertainty, not just an aggregate.
-Collect counters in matched separate runs with small non-multiplexed groups:
-cycles/instructions per compile, per scanned group and per sorted pair; branches/
-misses; thread CPU versus wall time; code bytes; disassembly/stack accesses around
-calls. Local perf lists `ic_tag_hit_miss.instruction_cache_miss`,
-`ic_cache_fill_l2`, `ic_cache_fill_sys`,
-`de_no_dispatch_per_slot.no_ops_from_frontend`, and instruction-TLB events.
-Validate scheduling and counts before use. Event availability alone is not proof
-of reliable attribution. Separate compiler-thread counters from execution workers.
-
-Predictions: B/C should remove IR/native blocks and compiler work while leaving
-sorting work/traffic unchanged. E should reduce duplicated code and preparation;
-it adds native calls and may change spills or frontend pressure. If claiming an
-instruction-cache benefit, require reduced instruction-fetch cost/stalls together
-with fewer execution cycles per fixed unit. Smaller text alone proves no speedup.
-If slower, inspect call counts, spills and lost specialization before proposing a
-policy. Unknown hardware evidence permits a qualified timing result, not an
-invented microarchitectural explanation. Run the skill's study validator before
-promoting an implementation optimization beyond the exploratory prototype.
-
-### Decision rules and stopping point
-
-- Every candidate must preserve results, cancellation/lifetime contracts and
-  generated coverage. A failed correctness check ends its performance evaluation.
-- Experimental target: reduce native Top-K preparation from about308ms to100ms
-  or less, and whole warm preparation to about250ms or less. This is a target,
-  not a prediction. Unchanged surrounding work already costs roughly134ms;
-  eliminating Top-K compilation cannot eliminate all SQL preparation.
-- Compare helper gains to the best fully-inline specialization, not only A.
-  Treat a repeatable execution slowdown above3% in either the isolated phase or
-  an affected complete-query family as a failure for default adoption. Report
-  smaller slowdowns too; an uncertainty band crossing that margin is inconclusive.
-  Require a material preparation saving (initial threshold25% for the affected
-  kernel) to justify new helper machinery. Thresholds are experiment decisions,
-  not production admission policies.
-- Publish `C + N * E` for N=1/10/100/1000, where C is measured preparation and E
-  measured warm execution; report measured first-use latency separately. When
-  the candidate executes slower, calculate where its preparation saving is
-  exhausted. Do not hide a long-lived-query regression behind amortization.
-- If specialization wins and outlining loses, keep specialization. If outlining
-  only wins for large batches, scope any subsequent policy to measured batch/work
-  properties. Do not introduce query IDs, data-specific constants or caching to
-  rescue the result. Broaden to affected generated-ordering queries only after a
-  candidate passes, then record a concise finding in PROGRESS.md. Temporary
-  diagnostic artifacts stay outside the checkout; no results archive is needed.
+| A 500M-row, 8.39M-group experiment created roughly 66M worker-local groups. For COUNT+SUM alone, 16 bytes of values per group means 128 MiB per worker, or 1 GiB across eight, before keys and capacity overhead. | Measure current replication and partial-state traffic, then attack representation and ownership. Bounded aggregation has since been added; do not assume the old amplification is unchanged. |
+| On 500M dispersed VARCHAR rows with 20M groups, private LLVM took 5305ms and the adaptive shared path 2486ms. But shared execution remained about 10% slower on tiny state. Uncombined shared atomics were disastrous on skew. | Ownership can matter much more than instruction count. Existing shared and bounded paths are controls, not missing inventions. |
+| A raw-partition experiment increased traffic from 43.0 to 51.8GB and execution from 696 to 848ms on the actual URL grouping workload. | Partitioning every row is not automatically an improvement. Compare bytes of partial states, lookup metadata and key ownership, not algorithm names. |
+| Filter fusion improved 175.95 to 148.20ms on 500M rows, but the advantage largely vanished with smaller frames or a second LLC domain. | Buffer placement and cache residency are compiler decisions. Full fusion is one schedule, not the universal destination. |
+| After the scheduling fix, actual grouped DISTINCT spent roughly 260ms in scan and 92ms in merge; parallel Top-K was about 10ms. | Another small-K sorting optimization cannot deliver a large whole-query gain there. Scan/state/merge deserve the experiment budget. |
+| The backend has object dumps and native symbols; several paths eagerly compile alternatives, helpers are uniformly noinline, and the LLVM bridge serializes compilation. | We can inspect generated code now. First-use latency needs a separate measured compilation strategy, not an assumption that text parsing dominates. |
+
+## Minimum compiler contract, introduced by experiments
+
+Extend existing [PlanCompiler](src/main/java/org/questdb/experimental/codegen/PlanCompiler.java)
+and [ScanPlan](src/main/java/org/questdb/experimental/codegen/ScanPlan.java) concepts
+through the integrated [ResolvedQueryCompiler](src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java)
+hooks. The standalone phase planner already exists; a second executor or a wholesale
+MLIR migration is not a prerequisite. Add only facts used by the active experiment:
+
+| Contract | Why a transformation needs it |
+| --- | --- |
+| Logical aggregate fields and init/update/merge/finalize semantics, independent of physical offsets | Compare layouts without inventing different SUM/COUNT/null behavior. Start from AggregateUpdates and the resolved core functions. |
+| State schema, owner, lifetime and physical properties | Choose private/shared/partitioned storage; preserve allocator ownership, stable references and final-reader semantics. |
+| Batch columns with explicit row coordinates, selection and lifetime | Compose filters with original or compacted payload columns without reading the wrong row. |
+| Memory regions with proven alignment, alias and mutation facts | Allow legal load hoisting/vectorization. Never manufacture noalias, inbounds, overflow or floating-point guarantees. |
+| Phase dependencies and safe resume points | Switch code only after committed work; map growth, page release and cancellation cannot invalidate borrowed pointers silently. |
+
+[Tidy Tuples](https://mediatum.ub.tum.de/doc/1638236/1638236.pdf) motivates a typed
+code-generation API and compact SSA. [Low-Level Plan Operators](https://zenodo.org/records/5779772/files/loleops.pdf)
+motivates explicit streams, reusable state and physical properties. These are
+design mechanisms to test, not a requirement to reproduce either engine.
+
+## Experiment sequence
+
+Run one numbered experiment at a time. Within it, change one mechanism per arm.
+The default sequence is E0 → E1 → E2 → E3 → E4 → E5 → E6. Reorder only when the
+measured headroom or a failed experiment justifies it; record that reason briefly.
+A failed bet should save implementation work, not generate another configuration
+flag. E0's matched probe/update comparison found no material C-versus-LLVM gap.
+Generated-PC profiling instead put about 35% of samples in partition flushing,
+so the first E1 representation experiment targets intermediate records before
+replacing the final map. Adaptive input partitioning now retains the dispersed-case
+gain and local combining on the tiny-domain control. Next establish its sensitivity
+to record widths, short frames and compilation/page-allocation costs before the
+final-map representation experiments.
+
+### E0 — Establish where the compiler leaves performance on the table
+
+**Question.** Is the current gap caused by generated machine code, the state
+algorithm/layout, or surrounding engine work?
+
+Start with the existing 500M-row fixed-width fixture and its five aggregates:
+`count(), count(v), sum(v), sum(w), sum(s)`, grouped by a LONG key with `k >= 0`.
+Use a dispersed large group domain, initially 8.39M groups, without giving its
+cardinality to the implementation. Consume every result. Use a tiny-domain control
+only after the principal case is understood.
+
+Compare clean stock, same-checkout Java, current LLVM and the independent
+[HandwrittenCountSum](src/main/java/org/questdb/experimental/codegen/HandwrittenCountSum.java)
+loop through the same integrated execution boundary where supported. Verify that
+map type, growth policy, batching, null semantics and worker placement match;
+otherwise report a phase comparison, not a compiler-quality ratio. Reuse
+[ResolvedBatchMatrix](src/main/java/org/questdb/experimental/codegen/ResolvedBatchMatrix.java)
+and its profile handshake.
+
+The existing [CountSumPaths](src/main/java/org/questdb/experimental/codegen/CountSumPaths.java)
+Rosti/direct-array reference is a second, algorithm-level control. It has a separate
+native scheduler and restricted input support. Its timing cannot establish an
+integrated engine win. Include discovery, initialization and output in its own
+accounting; do not mistake its best result for an unconditional floor.
+
+Measure complete latency plus scan/update, flush/redistribution, merge, final read
+and cleanup; physical/partial groups created, bytes allocated/zeroed/copied,
+controller bytes, cycles per input row and code size. Inspect the exact generated
+objects. Use separate diagnostics for intrusive counters.
+
+**Decision.** If matched C is materially faster, inspect its disassembly and data
+flow before replacing the map. If both are close but a different state representation
+wins, proceed to E1. If engine work dominates, target that measured phase instead.
+No new compiler framework is required to answer this question.
+
+### E1 — Generate a data structure for the query
+
+**Hypothesis.** A query-specific state layout and probe loop can eliminate metadata,
+padding, pointer chasing or unnecessary state loads that general maps retain.
+
+**Initial experiment.** On 500M dispersed rows, the bounded local map creates
+500M partial states: it combines nothing. Storing fixed-width aggregate inputs
+instead of expanded per-row aggregate states reduces the tested record from
+48 to 24 bytes. With the existing LLVM emitter, final maps, workers and allocators,
+complete latency improves from 2.52–2.56s to 1.77s. With 1,024 groups, however,
+the same change regresses 0.474s to 1.151s. This is an exploratory implementation,
+not a default policy or a general breakthrough.
+
+**Adaptive slice implemented.** The existing full-map boundary now compares bytes
+of aggregate states with bytes of inputs for the observed aggregation window.
+Unproductive combining switches to compact records for the rest of the frame;
+the next frame starts locally again. A fixed-prefix sampler was rejected after a
+misleading-prefix test exposed its blind spot. Both formats retain separate page
+chains in the existing slot allocator and merge through the existing shard owner.
+No new configuration switch or core scheduling infrastructure is involved.
+
+Fresh 500M-row comparisons: dispersed 2.553 -> 1.752s; alternating low/high domains
+1.675 -> 1.319s; tiny-domain reversed-order medians 0.480 / 0.479s. All results
+match clean-stock oracles. Fourteen focused checks cover multiple key widths,
+selective filters, mixed formats, misleading prefixes, cancellation, reuse and
+both worker modes across the three backends. Details are in [PROGRESS.md](PROGRESS.md).
+
+The automatic policy is now part of the experimental compiler for eligible
+bounded fixed-width aggregates. Narrow COUNT/SUM controls also pass: with the
+ordinary Unordered8Map choice, 24-byte states become 16-byte inputs and execution
+improves from 1.89–1.92s to 1.38s on 500M dispersed rows. Smaller frames retain the
+gain. An empty-filter control exposes about 10ms of extra preparation with no
+execution benefit; partly filled pages add only about 1.3% to compact payload in
+the large-domain case. These controls do not close every distribution or workload
+case. Resampling occurs at frame boundaries after compact mode starts. This
+intermediate-layout slice precedes the final-map layout/probe comparisons below
+because of the measured phase budget; it does not establish an optimal hash table
+or finish E1.
+
+Moving active page counts into dense metadata removed the dependent header load
+but did not improve complete or scan-phase latency; discard that experiment.
+The smaller-frame control reduces traffic in both arms and motivates E3 next:
+bound filter/consumer intermediates inside the existing frame rather than change
+server frame settings. Keep the winning state representation fixed for that test.
+
+Start with fixed-width COUNT/SUM and unchanged ownership/scheduling. First compare
+current LLVM with matched handwritten code on the existing map. Then prototype a
+compiler-owned layout with the same hash/probe algorithm and load policy. Only
+then compare a tagged/control-byte probe algorithm, using the existing
+[Rosti primitives](../../core/src/main/c/share/rosti.h) as the semantic/algorithm
+reference. Keeping these steps separate distinguishes layout gains from SIMD/probe
+gains. Key width, null representation and aggregate fields specialize the layout;
+SQL text, known fixture ranges and query numbers never do.
+
+[AggregateUpdates](src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java)
+currently binds concrete map offsets. Separate its logical field requirements from
+field placement for this slice. Allocation, memory limits and cancellation stay
+with existing owners. A generated final reader must expose the same SQL values.
+If the prototype first converts to ordinary final maps, charge that entire pass;
+a kernel-only gain that disappears at this boundary fails integration. Preserve
+pointer validity on growth and keep unsupported states on their current path.
+
+Next, and separately, compare current conservative LLVM memory operations with
+proven region/alignment facts. Inspect optimized IR and assembly for the expected
+removed reloads, vectorization or spills. Blanket alias promises or inlining do
+not count as an optimization experiment.
+
+**Prediction.** Fewer bytes per live group and dependent loads should reduce
+allocation/zeroing, cache misses or demand-load stalls, with lower complete cycles
+per row. A cache-resident small-domain control should show a different mechanism
+from the large-domain case. SIMD control-byte probes must reduce examined payload
+cache lines enough to pay for their extra instructions.
+
+**Reject or narrow** if the best integrated result is within noise, new layout
+conversion erases it, or lower instruction counts leave the limiting resource
+unchanged. The stretch target is 2x on a state-dominated family; if the measured
+phase budget makes that impossible, explicitly lower the local target and move
+the architectural bet to E2 rather than polishing instructions indefinitely.
+
+### E2 — Stop storing and merging the same groups repeatedly
+
+**Hypothesis.** High-cardinality execution can approach one durable state per group,
+without paying a full raw-row partition pass or a global atomic update per row.
+
+Start from the winning E1 layout, or unchanged LLVM if E1 loses. Compare the
+existing private/bounded algorithms before changing ownership. There are two
+sequential alternatives, not a combined rewrite:
+
+1. **Partition-resident entries with a bounded lookup directory.** Allocate new
+   partial states directly in the existing partition pages, so directory reset
+   does not copy every state out of a local map. This changes the copy boundary in
+   [QuestPartitions](src/main/java/org/questdb/experimental/codegen/QuestPartitions.java).
+   Preserve local combining; measure duplicate partial groups and final merge.
+   A bounded directory does not bound all pages or prevent O(input rows) state.
+2. **Shared group identification with local combining.** Generalize the existing
+   [SharedVarcharMaps](src/main/java/org/questdb/experimental/codegen/SharedVarcharMaps.java)
+   / QuestSharedVarchar experiment to fixed-width COUNT/SUM, only after matching its
+   narrow COUNT control. Compare ticket assignment separately from counter storage
+   and combining. Reuse worker slots, shards and allocators; include dynamic growth.
+
+The first follows the placement mechanism in
+[DuckDB's aggregation paper, §§V–VI](https://duckdb.org/pdf/ICDE2024-kuiper-boncz-muehleisen-out-of-core.pdf).
+The second tests the specialized ownership argument in
+[Global Hash Tables Strike Back!](https://www.vldb.org/pvldb/vol19/p523-marcus.pdf).
+Neither paper establishes a universally winning ownership model.
+
+**Prediction.** The partition variant removes local-map-to-page copying; the shared
+variant reduces physical group replication, initialization and merge traffic.
+Both may lose through extra indirection or synchronization. Collect bytes/input
+row, partial groups/final group, merge work, coherence traffic, retries and worker
+imbalance. Compare one CCD with the same number of cores split across CCDs; vary
+uniform/skewed and clustered/dispersed data before widening key/state support.
+
+**Reject or narrow** if raw/partial-state traffic grows without a compensating
+critical-path reduction, or shared coherence costs erase the savings. Exact group
+counts are not free presizing inputs. No unlimited-memory or skew-free winner
+qualifies for automatic selection.
+
+### E3 — Compile the memory-access schedule across operators
+
+**Hypothesis.** Keeping intermediates within cache and overlapping independent loads
+can beat both whole-frame materialization and an entirely scalar fused loop.
+
+**First slice retained, 2026-10-28.** Numeric filtering of eligible bounded
+fixed-width aggregates now feeds 16K-row stages using the executor's existing
+selection buffer. Frames, worker scheduling and final maps are unchanged.
+Selection IDs remain in frame coordinates, compact mode persists across stages
+until the frame ends, and the existing failure/ownership contracts remain in use.
+On 500M dispersed rows, COUNT/SUM improves from 1.38–1.40s to 1.16–1.18s with
+roughly unchanged instructions; controller traffic falls about 54 -> 39GB/query.
+Sparse/empty controls do not show a meaningful regression, and wider states and
+changing distributions also improve. Twenty-three focused checks pass across the
+three backends and both worker modes. This closes the first bounded-intermediate
+slice; it does not complete cross-operator load scheduling or Parquet coordinates.
+
+**Compact-record merge retained, 2026-10-28.** Actual-data profiling exposed a
+serial probe loop when replaying compact inputs into final maps. Reusing the
+existing staged probe operations and slot scratch reduces Q32 warm execution
+from 1.22–1.25s to 1.09–1.11s, with lower directory-load latency and cycles despite
+more instructions. The 500M-row single-key control is neutral; twelve focused
+checks pass. This extends the access-schedule experiment to a pipeline breaker,
+without new ownership, map algorithms or tuning switches. See the measured scope
+and rejected first-row initialization experiment in [PROGRESS.md](PROGRESS.md).
+
+Use the retained [FilterFusionExperiment](src/main/java/org/questdb/experimental/codegen/FilterFusionExperiment.java)
+as the starting point. Hold the state implementation fixed. Compare whole-frame
+selection, existing fused masks and bounded staged selection. Then, separately,
+issue aggregate-input loads/prefetches during the existing key-preparation stage
+in ResolvedAggregateKernel; sweep only a few justified distances/batch sizes.
+A 64-row mask is not proof of 64 hardware SIMD lanes or vector aggregate updates.
+
+Extend the integrated batch contract to support per-column row coordinates before
+admitting compacted Parquet payloads. AggregateSlot currently rejects
+PageFrameFilteredMemoryRecord, and the core fused route excludes late
+materialization. Removing those guards or disabling late materialization would
+change the work and can be incorrect. Native pages are the first performance case;
+compacted/mixed pages are a separate integration case with decode costs included.
+
+[Relaxed Operator Fusion](https://www.vldb.org/pvldb/vol11/p1-menon.pdf) motivates
+bounded staging. Budget scratch and state together per cache-sharing domain.
+Predict lower cache-eviction traffic for boundary changes, or shorter exposed
+load stalls at similar bytes for load scheduling. Inspect register spills and code
+size; lane conflicts in aggregate updates still require correct serialization.
+
+**Reject or narrow** if prefetches merely add traffic, sparse inputs slow down,
+or a gain comes only from changing server frame settings. Include sparse/half/dense
+selection and one-/two-CCD placement as mechanism controls. The retained small-map
+profile implicated input loads; it does not justify changing that map.
+
+### E4 — Remove hashing when the domain permits it, safely
+
+**Hypothesis.** Generated guarded direct addressing can make dense-domain aggregation
+close to its input/update cost without requiring a wasteful unconditional range scan.
+
+Reuse the existing direct-array reference and its discovery-inclusive measurements.
+Compare hashing, full range-discovery plus arrays, and an online guarded array.
+Use trusted domain metadata only where the code actually proves its meaning; a
+sample cannot prove a min/max bound. A speculative domain checks every key before
+indexing. An out-of-range key triggers migration of already-committed state and
+resumes at the uncommitted row; it cannot replay the frame or lose prior updates.
+Migration and initialization are part of query latency and the memory budget.
+
+Start with integer keys and COUNT/SUM. Exercise late outliers, a domain that grows
+throughout execution, sparse extremes, nulls and skew. A failed speculation should
+fall back once rather than oscillate. Never allocate `max-min+1` without overflow
+and total-worker memory checks. A range of 8.39M values is already 128 MiB of
+COUNT+SUM values per worker, before occupancy and merge state.
+
+**Prediction.** Removing hashes/probes reduces dependent loads and instructions;
+state initialization and random updates may still dominate. At 500M LONG keys,
+a preliminary key scan reads at least 4GB logically: about 67ms at an illustrative
+60GB/s before other work. Online admission must repay its guards and migration.
+
+**Reject or narrow** if sparse/outlier costs consume the dense-case saving under
+honest admission, or the direct-array control is already at the measured resource
+floor. No special knowledge of ClickBench key ranges enters planning.
+
+### E5 — Remove complete passes through shared intermediate state
+
+**Measured reprioritization, 2026-10-28: partition-local Top-K.** Q32's remaining
+cost includes roughly 1.75M minor faults and 2.3 CPU-seconds in the kernel per
+warm query. Retaining every final map creates this cost even though only ten rows
+escape. An isolated fused prototype reaches 0.65–0.68s versus 1.09–1.11s; kernel
+CPU falls to 0.2–0.3s and controller traffic from about 48 to 36GB/query. User-mode
+cycles do not improve. This evidence moves state lifetime/consumer fusion ahead
+of further instruction tuning. A 500M-row/8.39M-group control gains only 2–3%.
+
+The concrete design uses existing owners and algorithms:
+
+1. `LongTopKRecordCursorFactory` is the sole origin of the static ordering/prefix
+   preparation, forwarded through column-only projections. Bind that demand to
+   the aggregate compiler. Admit bounded fixed-width states, a small known K,
+   and a ranking field that needs no deferred finalization. Variable/allocating
+   states and unknown/large K keep their existing paths. HAVING filters do not
+   forward the Top-K capability, so pruning cannot move before a HAVING predicate.
+2. `GroupByShardingContext.mergeShard` already executes under a worker-slot lock.
+   After `shardAll` flushes and closes the local maps, reopen that slot's existing
+   fragment map as its merge workspace. Merge every source for this shard in the
+   current order. Do not prune incomplete groups or assume a skewed distribution.
+3. Run the existing generated Top-K against the completed workspace, then copy
+   surviving keys and raw aggregate fields into the ordinary destination shard.
+   Generate the copy/probe loop too. Borrow the existing slot allocator for the
+   small pair buffer; its address is forgotten at clear before allocator release.
+4. Finalize only the copied destination states, then clear the workspace while
+   retaining its capacity for the next shard. The normal global Top-K consumes
+   at most `NUM_SHARDS * K` rows without subdivision, or that bound multiplied by
+   the chosen subpartition count. Its row addresses refer to destination maps that
+   remain owned until cursor close, never to the workspace that will be reused.
+
+Correctness follows from the existing disjoint-key partitioning: a group outside
+its partition's top K cannot be required for a valid global top K under the same
+ordering. Equal ranks permit any tied group, as SQL already does. No monotonic
+aggregate or skew assumption is needed because each group is complete first.
+Copy AVG's raw sum/count before finalizing once. Preserve map growth/resume,
+query memory accounting, failure draining and factory/cursor reuse. Destination
+presizing must describe retained rows, not pre-pruning cardinality.
+
+**Retained after integration.** Actual-data ranking/payload checks, 500M unique
+and repeated-group controls, a tiny-domain control, ascending/descending ordering,
+null/zero keys and payloads, cancellation after copying and ordinary Top-K fallback
+all pass. The final integrated Q32 comparison is 1,089–1,099 -> 664–671ms. The
+500M unique composite-group control is 6.25 -> 4.40s; tiny-state execution stays
+neutral. Twenty-four focused parameterized checks pass. Evidence and the validated
+hardware study are under `/tmp/query-moonshot-actual-20261028`; see PROGRESS.md.
+The matched full suite subsequently validated all 516 responses and 22 median
+1.5x wins, with 21 robust across process ranges; Q40 remains borderline.
+
+**Cache-sized merge follow-up.** The retained workspace still exceeds cache on
+large partitions. Blanket global fan-out and an unread-row-based subdivision
+policy both fail repeated-key controls. The replacement estimates distinct groups
+with a 32KiB slot-local sampled HLL, merged after all scans join. It reuses
+QuestDB's estimator; sampled hashes need a stronger finalizer because the map hash
+alone biases dense domains. Estimates control execution only, never results.
+
+For eligible partition-local Top-K, compare estimated state footprint with a
+conservative per-worker share of the detected last-level data cache. Subdivide
+only beyond a fourfold margin, into at most 64 suffix-hash buckets. Every source
+contributes before selecting complete groups. Page reservation, query allocators,
+map algorithms and merge workers remain shared with the existing path; page
+chains are reused within the query and consumed only through their current tails.
+Missing cache metadata keeps the unsplit path. The Linux cache topology and CPU
+allow-list are sampled once; live affinity changes are not tracked by this prototype.
+
+Normalized L3 misses fall 4.82 -> 2.59-2.61/input row and controller traffic
+244 -> 120GB per 500M unique rows. The integrated actual-data comparison is
+653-677 -> 328-334ms. Held-out 67.1M groups improve 2.25-2.28 -> 1.73-1.75s;
+8.39M/16.77M groups remain within about 1%. Four-core unique-group execution
+improves about 5.36 -> 3.76-3.78s. Eighteen focused generated-helper and SQL
+lifecycle cases pass across LLVM, AsmJit and C. The fresh suite validates 516
+responses: 28 generated shapes, 22 median 1.5x wins, 21 across process ranges.
+The next measured family is VARCHAR substring filtering. The resolved compiler
+now precedes the legacy serializer and shares bounded literal-search lowering
+between standalone filtering and aggregate residuals. A 32-byte discriminating
+pair reduces branch misses; equal-byte literals use exact run masks. First/last
+probing and the equal-byte SWAR fallback both failed 500M-row adversarial controls
+and were replaced. Protected-page, NULL, Parquet and lifecycle checks pass.
+Actual count/filter execution reaches 192–193ms versus 326–337ms stock, with
+57–58GB/s controller traffic against a 60.4GB/s read ceiling. The final full suite
+must pass before expanding coverage claims; see PROGRESS.md.
+
+**Hypothesis.** A compiler can save more by sharing an expensive preparation across
+compatible consumers than by making each independent operator slightly faster.
+
+Begin with an actual grouped-DISTINCT family already supported by
+[DeferredDistinct](src/main/java/org/questdb/experimental/codegen/DeferredDistinct.java)
+and AggregateUpdates. Audit what expression/hash/state sharing already happens.
+Then prototype one compatible partition/dedup stream shared by outer grouping and
+distinct-state processing, or by multiple DISTINCT consumers with proven identical
+keys and equality semantics. Non-distinct COUNT/SUM must retain row multiplicity;
+deduplicating their input changes the answer. Existing observations that flat
+DISTINCT can lose near unique-pair cardinality are required counterexamples.
+
+Use existing group/merge tasks and query-owned pages. Compare pass counts, bytes,
+set allocations and group visits with the independent algorithms. Include the
+longer intermediate lifetime and any lost parallelism. Keep states with incompatible
+null/equality semantics separate. After finalization, test direct consumption by
+Top-K only if its avoided result scan has material measured cost; do not select
+unfinalized partial aggregates or assume LIMIT permits early scan termination.
+
+**Prediction.** A successful transformation removes a measured pass or structure,
+not merely a function call. Require a real admitted SQL example and a held-out
+combination. If current bindings cannot express a useful legal shared consumer,
+report that result and defer this bet; do not add unrelated operators solely to
+manufacture a demonstration. General reusable buffers are justified by a winning
+transformation, not by a feature checklist.
+
+### E6 — Make specialization economical on first use
+
+**Hypothesis.** Fast initial native code plus selective optimizing compilation can
+retain warm execution gains without charging every query for all LLVM alternatives.
+
+**First experiments completed, 2026-10-28.** Instrumented fresh preparation shows
+LLVM optimization/emission dominate, not text parsing or serial mutex wait. A
+smaller DISTINCT merge representation is retained; the production path remains
+synchronous LLVM O2. Temporary balanced fresh-compilation experiments give:
+
+| Pipeline family | Mode | Preparation, ms | Execution, ms | Complete request, ms |
+| --- | --- | ---: | ---: | ---: |
+| Filtered grouped DISTINCT | LLVM O2 | 232–235 | 67–70 | ~302 |
+| Filtered grouped DISTINCT | LLVM O0 | 33–35 | 90–93 | ~125 |
+| Filtered grouped DISTINCT | AsmJit | 12–13 | 80–81 | 92–93 |
+| Short-literal substring/count | LLVM O2 | ~29 | 194–196 | 223–226 |
+| Short-literal substring/count | LLVM O0 | ~10 | 278–281 | 288–291 |
+| Short-literal substring/count | AsmJit | ~4 | 716–723 | 719–727 |
+
+These are warmed-service, warm-data requests with fresh code each time on the
+actual 99,997,497 rows. Complete request includes compilation once. They are
+diagnostic compiler comparisons, not a new stock suite or a general backend policy.
+LLVM O1 saves little on these two families. A global fast-backend switch fails.
+
+A forced handoff experiment lets one existing worker compile O2 while others use
+the initial kernel. Publication happens between native calls; old code remains
+owned until all workers join. No new pool or asynchronous code cache is needed for
+this experiment. LLVM O0→O2 gives substring/count ~214–216ms versus ~225ms O2, but
+grouped DISTINCT ~266–270ms versus ~125ms O0 alone. AsmJit→O2 is ~240–253ms for
+grouped DISTINCT versus ~93ms AsmJit alone. Promoting every used phase wastes work.
+This forced policy is **not retained**. Mixed AsmJit/LLVM input counters do not
+establish strict LLVM coverage. The LLVM-only comparison remains mandatory.
+
+**Fast compiler correction, retained.** The initial AsmJit string result above
+included scalar lane-mask expansion. Native SSE2 lowering reduces that execution
+to 199–204ms and fresh complete requests to 198–202ms in a later balanced run;
+preparation stays ~3.8ms. Eight 500M string controls improve, with exact results.
+Forced AsmJit→O2 promotion then takes 205–208ms and loses to staying in AsmJit.
+The remaining LLVM execution advantage is too small at the bandwidth floor.
+This changes the admission evidence, not the selected LLVM production backend.
+Do not add a tiering framework merely because fast publication works.
+
+**Next admission experiment.** Expose explicit work progress at the existing
+operator boundaries before introducing a policy. `Kernel.run`'s second argument
+is not uniformly a row count: merge, Top-K and union kernels also use it for
+control. A generic backend must not infer remaining work from that argument.
+`PageFrameSequence` already caches frame row counts before dispatch; use this
+snapshot for scan/filter work. A merge phase must supply its own entries/pages,
+and a tiny finalization phase must not inherit the original table's row count.
+
+First use measured initial-tier throughput and remaining work to reject promotion
+whose compilation cost cannot plausibly be repaid. Include the lost worker during
+compilation in that bound. Retain both tiers through query close, publish once,
+preserve resumable status/state on map growth, and reset execution progress on
+reopen. Measure compiler interference and early cancellation, not just function
+pointer publication. Validate the mechanism with a 500M-row fixture before adding
+automatic admission to the engine. Avoid a global executor, concurrent cache or
+new user setting until an experiment demonstrates the need.
+
+Extend the measured compilation stages to further families: binding/IR, SSA, text emission/copy,
+parse/verify, optimization, code emission/linking, and mutex wait. Record both CPU
+and elapsed time, instruction/block counts and emitted bytes. Current
+[AdaptiveKernel](src/main/java/org/questdb/experimental/codegen/AdaptiveKernel.java)
+compiles alternatives eagerly; [KernelCache](src/main/java/org/questdb/experimental/codegen/KernelCache.java)
+is explicitly serial-use. They are not an existing concurrent tiering system.
+
+Run the same IR/state through AsmJit-only, LLVM-only and AsmJit→LLVM at safe joined
+frame boundaries. Initially switch code without changing state representation;
+layout migration belongs to a separate experiment. The optimized tier is admitted
+only when remaining work/reuse can repay compilation and resource interference.
+Benchmark the compiler worker competing with query workers, queueing and cancellation.
+Concurrent code leases and publication must cover every executing worker before
+retirement; do not just call the serial cache from another thread.
+Report rows and phases executed by each tier. An AsmJit-only or mixed-tier run is
+not evidence that LLVM processed the entire query; retain the LLVM-only arm for
+the strict coverage comparison.
+
+Profile-directed follow-ups are separate arms: compact/direct SSA if frontend
+construction dominates; selective helper inlining/reuse if duplicated optimizer
+work dominates; compiler concurrency if mutex wait dominates. Preserve the retained
+radix-helper benefit. Do not assume that bypassing LLVM text parsing fixes hundreds
+of milliseconds of optimization work. [Adaptive Execution of Compiled Queries](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf)
+provides the remaining-work model, not a ready-made threshold.
+
+**Prediction.** First-use latency and wasted compiler CPU fall while long-running
+execution approaches LLVM-only. Include cases too short to repay compilation,
+cancellation before tier completion, repeated runs and competing queries. A
+500M-row table with different selected work can test admission; smaller latency
+controls are useful but do not satisfy the 500M-row execution-performance gate.
+Reject tiering if its interference or state/lease machinery costs more than it saves.
+
+## Napkin math before implementation
+
+For each active query, write down its measured work and an optimistic bound:
+
+- **Amdahl:** if a candidate affects fraction `f` of baseline critical-path time,
+  infinite speedup there gives at most `1/(1-f)` overall. Eliminating a 10ms phase
+  from a 366ms query gives only about 1.028x. Overlapping phase CPU times cannot
+  simply be added as elapsed time.
+- **Traffic:** `T >= controller_bytes / attainable_bandwidth` for the same core
+  placement and read/write mix. Subtract/qualify system-wide background traffic.
+  Reducing 43GB to 28GB at an illustrative 63GB/s removes about 238ms of traffic
+  service, not a guaranteed 238ms of elapsed time. Bus activity and a counterfactual
+  must establish saturation; matching a streaming rate alone did not do so in E3.
+- **Memory-level parallelism:** `bandwidth <= outstanding_lines * 64 / latency`.
+  For illustration, 60GB/s at 100ns requires roughly 94 outstanding cache lines
+  system-wide, about 12 per core at eight cores. Measure latency/concurrency rather
+  than assuming DRAM latency from every sampled cache miss.
+- **Cache/state budget:** sum simultaneously live scratch, keys, lookup metadata,
+  aggregates and partial pages for workers sharing each LLC. Worker count times
+  state size is a lower bound only when all workers see all groups.
+- **Compilation:** compare `C + N*E`, then account for overlap, remaining work and
+  compiler contention in tiering. A 200ms compile premium for 20ms/run savings
+  needs more than ten uses. Compilation that finishes after the query does not help.
+
+## Measurement, correctness and generalization
+
+Use the current Ryzen 9950X first: 16 physical cores, two 32MiB LLC domains. Start
+with eight physical cores on one CCD, then use the same core count spread across
+both CCDs to distinguish cache/coherence effects. Confirm topology, SMT siblings,
+frequency and thermal behavior live. Scale finalists to one and sixteen physical
+cores. The deleted EC2 instance is unavailable; many-core/high-bandwidth validation
+remains a later portability check, not evidence already established locally.
+
+Reuse the existing harnesses, native object/IR dumps, symbol maps and perf handshake.
+Those symbols support fixed-lifetime captures now. Long-lived captures with address
+reuse need timed load/unload registration; detailed operator lineage can be added
+when attribution requires it. Full DWARF instrumentation is not a prerequisite for
+E0. Measure profiling perturbation and report counters from separate matched runs.
+
+Before a production-path optimization, complete the hardware-first skill's USE
+inventory and validated bottleneck study: CPU, memory capacity, storage, network,
+interconnect and imposed limits, with utilization/saturation/errors or explicit
+irrelevance/unknowns. Require independent signals and a falsifying counterfactual
+for the limiting resource. An exploratory prototype may test a hypothesis before
+that diagnosis is complete; it must remain labelled as exploratory.
+
+Execution-performance fixtures have at least 500M input rows. Start with one query
+and one causal change; screen the handful of controls needed to discriminate it.
+Then test changed seeds/order, skew, cardinality, key/aggregate widths and a different
+query shape. Freeze a proposed selection rule before held-out validation. Reserve
+expensive full-suite runs for accepted architectural changes, not every code edit.
+Detailed hardware studies must eventually cover at least 80% of baseline runtime
+and a representative of every family before a broad engine claim.
+
+Keep clean stock, candidate Java and LLVM as distinct arms. Use identical affinity,
+worker budget, data, server configuration and result consumption. Diagnostic frame,
+layout or algorithm overrides must appear in both matched arms and be labelled;
+stock defaults remain unchanged in acceptance runs. Include initialization,
+discovery, growth, redistribution, merge, output and cleanup. Report compilation
+separately and in first-use end-to-end latency. Distinguish client/network overhead
+when showing HTTP timings. Faster candidate Java is a shared-core gain, not an
+LLVM instruction-selection result.
+
+Use at least three comparable baseline executions; normally three warmups and five
+balanced paired samples for the active experiment, across fresh process blocks.
+Extend only ambiguous comparisons. Normalize counters by input rows and relevant
+work (groups, probes, selected rows); ensure event groups actually schedule and
+report their running fraction. Inspect distributions, not just minima or IPC.
+
+For ClickBench acceptance, keep its actual 99,997,497-row dataset and repository
+protocol: one cache drop followed by three requests per query, server left running,
+with separate complete process passes. Do not call the first request true-cold.
+Run correctness/coverage counters separately if they perturb that protocol. The
+500M-row mechanism experiments supplement this standard dataset; they do not
+redefine it or turn a small synthetic test into a scale claim.
+
+Correctness work stays proportional: exact complete aggregate comparison, with
+SQL-aware tie/null/overflow/floating rules; focused tests for the changed ownership
+or boundary contract, especially growth, cancellation, reopen and partially
+committed state. Small correctness fixtures are appropriate. Do not build a giant
+test matrix for every exploratory arm. Native counters verify all relevant data
+processing; a plan marker alone does not establish complete LLVM coverage.
+
+## Retention and stopping rules
+
+Each experiment ends with one decision: retain, reject, or a precisely bounded
+inconclusive result. A default candidate needs reproducible end-to-end benefit and
+a mechanism consistent with the counters. A repeatable regression above 3% in an
+affected family blocks unconditional adoption; smaller regressions remain reported.
+A proven property-based admission rule can scope a win, but must survive held-out
+inputs and include its decision cost. No query-name exceptions or new user toggles.
+
+The moonshot bar concerns architecture. A small isolated win can remain if simple,
+but it does not justify expanding a framework. If a mechanism has no substantial
+headroom, stop polishing it and move to the next bet. Implement the minimum
+integration needed to find out; delete failed experimental code when its finding
+has been recorded.
+
+Keep a short breakthrough/rejection entry in [PROGRESS.md](PROGRESS.md) and update
+this plan's next action. Temporary profiles, object files and raw counters remain
+outside the checkout, with reproduction commands and an evidence path in the log.
+No new result archive, generic experiment platform or permanent tuning surface.

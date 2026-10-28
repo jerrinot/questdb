@@ -5373,21 +5373,21 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                     // has to free them, like the compiled filters above.
                     final ObjList<Function> bindVarFunctions = new ObjList<>();
                     try {
-                        int jitOptions;
                         Throwable jitScratchFailure = null;
                         try {
-                            try (PageFrameCursor cursor = factory.getPageFrameCursor(executionContext, ORDER_ANY)) {
-                                final boolean forceScalar = executionContext.getJitMode() == SqlJitMode.JIT_MODE_FORCE_SCALAR;
-                                jitIRSerializer.of(jitIRMem, executionContext, factory.getMetadata(), cursor, bindVarFunctions);
-                                jitOptions = jitIRSerializer.serialize(filterExpr, forceScalar, enableJitDebug, enableJitNullChecks);
-                            }
-
                             var compiler = executionContext.getQueryCodeGenerator();
                             var generated = compiler == null ? null : compiler.compileFilters(factory.getMetadata(), filter);
                             if (generated != null) {
                                 compiledFilter = generated.rows();
                                 compiledCountOnlyFilter = generated.count();
                             } else {
+                                int jitOptions;
+                                try (PageFrameCursor cursor = factory.getPageFrameCursor(executionContext, ORDER_ANY)) {
+                                    final boolean forceScalar = executionContext.getJitMode() == SqlJitMode.JIT_MODE_FORCE_SCALAR;
+                                    jitIRSerializer.of(jitIRMem, executionContext, factory.getMetadata(), cursor, bindVarFunctions);
+                                    jitOptions = jitIRSerializer.serialize(filterExpr, forceScalar, enableJitDebug, enableJitNullChecks);
+                                }
+
                                 compiledFilter = new CompiledFilter();
                                 compiledFilter.compile(jitIRMem, jitOptions);
                                 compiledCountOnlyFilter = new CompiledCountOnlyFilter();
@@ -10919,7 +10919,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                     final RecordMetadata metadata = isCountKeyword(columnName)
                             ? CountRecordCursorFactory.DEFAULT_COUNT_METADATA :
                             new GenericRecordMetadata().add(new TableColumnMetadata(SqlUtil.toColumnName(columnName), LONG));
-                    return new CountRecordCursorFactory(metadata, generateSubQuery(model, executionContext));
+                    factory = generateSubQuery(model, executionContext);
+                    return new CountRecordCursorFactory(metadata, factory, executionContext.getQueryCodeGenerator());
                 }
             }
 
