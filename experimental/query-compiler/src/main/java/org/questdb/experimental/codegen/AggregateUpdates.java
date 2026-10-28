@@ -35,7 +35,13 @@ import io.questdb.griffin.engine.functions.groupby.CountDistinctLongGroupByFunct
 import io.questdb.griffin.engine.functions.groupby.CountIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongConstGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MaxIntGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MaxLongGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MaxShortGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxVarcharGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MinIntGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MinLongGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MinShortGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MinVarcharGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.SumIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.SumLongGroupByFunction;
@@ -79,8 +85,19 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             GroupByFunction function = functions.getQuick(i);
             Class<?> implementation = function.getClass();
             int argumentType;
+            int stateType = ColumnType.LONG;
             boolean sum;
-            if (implementation == CountLongConstGroupByFunction.class) {
+            boolean minimum = implementation == MinLongGroupByFunction.class || implementation == MinIntGroupByFunction.class
+                    || implementation == MinShortGroupByFunction.class;
+            boolean extremum = minimum || implementation == MaxLongGroupByFunction.class || implementation == MaxIntGroupByFunction.class
+                    || implementation == MaxShortGroupByFunction.class;
+            if (extremum) {
+                argumentType = implementation == MinLongGroupByFunction.class || implementation == MaxLongGroupByFunction.class
+                        ? ColumnType.LONG : implementation == MinIntGroupByFunction.class || implementation == MaxIntGroupByFunction.class
+                        ? ColumnType.INT : ColumnType.SHORT;
+                stateType = argumentType == ColumnType.LONG ? ColumnType.LONG : ColumnType.INT;
+                sum = false;
+            } else if (implementation == CountLongConstGroupByFunction.class) {
                 argumentType = ColumnType.UNDEFINED;
                 sum = false;
             } else if (implementation == CountLongGroupByFunction.class || implementation == SumLongGroupByFunction.class
@@ -101,8 +118,8 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             }
             int valueIndex = function.getValueIndex();
             if (valueIndex < 0 || valueIndex >= valueTypes.getColumnCount()
-                    || valueTypes.getColumnType(valueIndex) != ColumnType.LONG || !assignedSlots.add(valueIndex)) {
-                throw new IllegalArgumentException("Resolved aggregate state does not match its assigned LONG slot");
+                    || valueTypes.getColumnType(valueIndex) != stateType || !assignedSlots.add(valueIndex)) {
+                throw new IllegalArgumentException("Resolved aggregate state does not match its assigned slot");
             }
             CountDistinctLongGroupByFunction distinct = implementation == CountDistinctLongGroupByFunction.class
                     ? (CountDistinctLongGroupByFunction) function : null;
@@ -126,6 +143,11 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
                 Function argument = ((UnaryFunction) function).getArg();
                 Pipeline.Scalar expression = inputs.scalar(argument, argumentType);
                 if (expression == null) return null;
+                if (extremum) {
+                    updates.add(new IntegerExtremum(expression, offsets.applyAsLong(valueIndex),
+                            stateType == ColumnType.LONG ? MemoryType.I64 : MemoryType.I32, minimum));
+                    continue;
+                }
                 if (average) {
                     updates.add(new AverageUpdate(expression, offsets.applyAsLong(valueIndex)));
                     continue;
@@ -196,7 +218,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         return function.getClass() == AvgShortGroupByFunction.class
                 ? DoubleColumn.newInstance(((GroupByFunction) function).getValueIndex()) : function;
     }
-    sealed interface Update permits ScalarUpdate, DistinctUpdate, AverageUpdate, VarcharExtremum {
+    sealed interface Update permits ScalarUpdate, IntegerExtremum, DistinctUpdate, AverageUpdate, VarcharExtremum {
         long offset();
         void initialize(Builder b, Expr destination);
         void merge(Builder b, Expr source, Expr destination);
@@ -218,6 +240,35 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         @Override
         public void emit(Builder builder, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
             operation.emit(builder, frame.numeric(), at(destination, offset));
+        }
+    }
+
+    /** Existing MIN/MAX state: LONG for LONG input, INT for INT/SHORT input. */
+    record IntegerExtremum(Pipeline.Scalar argument, long offset, MemoryType width, boolean minimum) implements Update {
+        private long nullValue() { return width == MemoryType.I64 ? Long.MIN_VALUE : Integer.MIN_VALUE; }
+
+        @Override public void initialize(Builder b, Expr destination) {
+            b.store(width, at(destination, offset), i64(nullValue()));
+        }
+
+        @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            var value = argument.emit(frame.numeric());
+            combine(b, destination, new Select(value.isNull(), i64(nullValue()), value.data()));
+        }
+
+        @Override public void merge(Builder b, Expr source, Expr destination) {
+            combine(b, destination, new Load(width, at(source, offset)));
+        }
+
+        private void combine(Builder b, Expr destination, Expr value) {
+            Var incoming = b.let(value);
+            Expr address = at(destination, offset);
+            Var current = b.let(new Load(width, address));
+            Expr replace = minimum
+                    ? binary(Op.BOTH, ne(incoming, i64(nullValue())), binary(Op.EITHER,
+                            eq(current, i64(nullValue())), binary(Op.LT, incoming, current)))
+                    : binary(Op.LT, current, incoming);
+            b.store(width, address, new Select(replace, incoming, current));
         }
     }
 

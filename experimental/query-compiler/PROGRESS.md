@@ -3708,3 +3708,21 @@ Checkpoint validation: native bridges, touched core classes, and all prototype
 main/test sources build; 24 focused SQL cases and 130 ownership/IR/backend/page
 checks pass. Full-suite evidence above predates this final scheduling change;
 final-build controlled timing remains pending while profiling is paused.
+
+## 2026-10-28: integer MIN/MAX use the existing generated aggregate lifecycle
+
+Bind the exact LONG, INT and SHORT MIN/MAX implementations through one typed
+update/merge emitter. Preserve LONG's 8-byte state, INT/SHORT's 4-byte state,
+NULL/empty semantics and the existing map/partition/join owners. No core changes
+or new switches. LONG results retain generated sort/Top-K; INT ordering remains
+ordinary. Generic aggregation without GROUP BY still lacks an update hook.
+
+The previous build rejects the added MIN/MAX kernel check. The new build passes
+9 kernel, 24 SQL aggregate and 4 SQL join checks across LLVM/AsmJit/C, including
+both worker modes. Cases cover explicit NULL flags, packed mixed-width state,
+Java/native merging, bounded partitions, VARCHAR/composite keys, Parquet, column
+tops, ordering and reopening. All prototype main sources and changed tests compile.
+The extreme-value fixture also exposes the existing LONG SUM sentinel/merge-order
+issue, recorded separately in TODO.md. Evidence: `/tmp/query-integer-extrema-20261028`.
+These are small correctness fixtures, not performance experiments; profiling
+remains paused and no speedup or additional ClickBench coverage is claimed.

@@ -74,14 +74,19 @@ The binders and focused tests are authoritative. Current families include:
   direct VARCHAR null and literal substring predicates; searched CASE string values.
 - Direct and computed fixed-width keys, SYMBOL IDs, VARCHAR keys and composite keys
   using existing map encodings. NULL and empty strings remain distinct.
-- Resolved COUNT, integer SUM, LONG DISTINCT, SHORT AVG and VARCHAR MIN/MAX
+- Resolved COUNT, integer SUM/MIN/MAX, LONG DISTINCT, SHORT AVG and VARCHAR MIN/MAX
   implementations. Supported overloads depend on the selected map/update path.
 - Numeric projection, final COUNT reduction, LONG full sort and Top-K, and positive
   LIMIT/OFFSET selection over supported generated results.
-- INT inner-join probe pipelines with supported COUNT/integer SUM, post-join
+- INT inner-join probe pipelines with supported COUNT/integer SUM/MIN/MAX, post-join
   predicates and direct INT/LONG grouping. They borrow the existing frozen join;
   Java retains build and runtime ownership. Outer joins and general join-to-DISTINCT
   remain outside this binding.
+
+Integer MIN/MAX accepts LONG, INT and SHORT inputs and preserves the ordinary
+8-byte LONG or 4-byte INT state. Generated ordering still requires a LONG result.
+Ordinary aggregation without GROUP BY has no generated-update hook; final COUNT
+reduction and fused join aggregation have separate generated paths.
 
 Generic string construction, general string ordering and unsupported function
 implementations retain ordinary execution. `compiledAggregateBatches` in EXPLAIN

@@ -83,6 +83,8 @@ public class ResolvedAggregateKernelTest {
         functions.add(new CountLongConstGroupByFunction());
         functions.add(new CountLongGroupByFunction(LongColumn.newInstance(0)));
         functions.add(new SumLongGroupByFunction(LongColumn.newInstance(0)));
+        functions.add(new MinLongGroupByFunction(LongColumn.newInstance(0)));
+        functions.add(new MaxLongGroupByFunction(LongColumn.newInstance(0)));
         var types = new ArrayColumnTypes();
         for (int i = 0; i < functions.size(); i++) functions.getQuick(i).initValueTypes(types);
         var layout = new FlyweightPackedMapValue(types);
@@ -105,6 +107,8 @@ public class ResolvedAggregateKernelTest {
             assertEquals(100, layout.getLong(0));
             assertEquals(50, layout.getLong(1));
             assertEquals(2850, layout.getLong(2));
+            assertEquals(8, layout.getLong(3));
+            assertEquals(106, layout.getLong(4));
         }
     }
 
@@ -118,6 +122,12 @@ public class ResolvedAggregateKernelTest {
         functions.add(new CountIntGroupByFunction(IntColumn.newInstance(1)));
         functions.add(new SumIntGroupByFunction(IntColumn.newInstance(1)));
         functions.add(new SumShortGroupByFunction(ShortColumn.newInstance(2)));
+        functions.add(new MinIntGroupByFunction(IntColumn.newInstance(1)));
+        functions.add(new MinLongGroupByFunction(LongColumn.newInstance(0)));
+        functions.add(new MaxShortGroupByFunction(ShortColumn.newInstance(2)));
+        functions.add(new MaxLongGroupByFunction(LongColumn.newInstance(0)));
+        functions.add(new MinShortGroupByFunction(ShortColumn.newInstance(2)));
+        functions.add(new MaxIntGroupByFunction(IntColumn.newInstance(1)));
         // A preceding INT makes the LONG value slots unaligned: offsets must come from core.
         var types = new ArrayColumnTypes().add(ColumnType.INT);
         for (int i = 0; i < functions.size(); i++) functions.getQuick(i).initValueTypes(types);
@@ -253,6 +263,10 @@ public class ResolvedAggregateKernelTest {
         functions.add(new SumLongGroupByFunction(LongColumn.newInstance(0)));
         assertThrows(IllegalArgumentException.class, () -> ResolvedAggregateKernel.bind(inputs,
                 new ArrayColumnTypes().add(ColumnType.INT), functions));
+        functions.clear();
+        functions.add(new MinIntGroupByFunction(IntColumn.newInstance(0)));
+        assertThrows(IllegalArgumentException.class, () -> ResolvedAggregateKernel.bind(
+                new ArrayColumnTypes().add(ColumnType.INT), values, functions));
     }
 
     @Test

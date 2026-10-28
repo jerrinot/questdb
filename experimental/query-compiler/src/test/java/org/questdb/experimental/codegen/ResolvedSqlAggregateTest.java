@@ -782,6 +782,57 @@ public class ResolvedSqlAggregateTest {
     }
 
     @Test
+    public void integerExtremaPreservePackedStateNullsAndMerge() throws Exception {
+        mapEntrySize = 64;
+        engine.execute("create table extrema as (select cast(x%257 as int) k,"
+                + "cast(case when x%257=0 then null when x%257=1 then '' else 'ž-'||cast(x%257 as string) end as varchar) label,"
+                + "case when x%257=0 or x%13=0 then null when x%11=0 then 9223372036854775807L "
+                + "when x%7=0 then -9223372036854775807L else x-5000 end v,"
+                + "cast(case when x%257=0 or x%13=0 then null when x%11=0 then 2147483647 "
+                + "when x%7=0 then -2147483647 else x-5000 end as int) w,"
+                + "cast(x*37%65536-32768 as short) s,"
+                + "timestamp_sequence('2024-01-01',1000000L) ts from long_sequence(10003)) "
+                + "timestamp(ts) partition by day bypass wal", context);
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            for (boolean bounded : new boolean[]{false, true}) {
+                System.setProperty("query.codegen.bounded", Boolean.toString(bounded));
+                for (String key : List.of("k", "label", "k,label")) {
+                    long before = compiler.mapRows.get();
+                    // INT slots surround LONG slots; copying an 8-byte INT state corrupts its neighbour.
+                    assertMatches("select " + key + ",min(w),min(v),max(s),max(v),min(s),max(w),count(),sum(w) "
+                            + "from extrema where k>=0 group by " + key, true);
+                    assertTrue(lastPlan, compiler.mapRows.get() > before);
+                }
+            }
+            assertTrue("Generated merge must combine partial extrema", compiler.merges.get() > 0);
+            assertTrue("Exercise bounded state publication", compiler.redistributions.get() > 0);
+            engine.execute("alter table extrema convert partition to parquet list '2024-01-01'", context);
+            assertMatches("select k,min(w),max(v),min(s) from extrema where k>=0 group by k", true);
+            assertMatches("select label,min(w) from extrema where k>=0 group by label", true);
+        } finally {
+            System.clearProperty("query.codegen.bounded");
+            System.clearProperty("query.codegen.localCapacity");
+        }
+    }
+
+    @Test
+    public void integerExtremaPreserveEmptyInputsTopsAndOrdering() throws Exception {
+        assertMatches("select k,min(v+1),max(w-1),min(s),max(s) from t where k>=0 group by k", true);
+        assertMatches("select k,min(v),max(w),min(s) from t where k<0 group by k", true);
+        // The ordinary unkeyed aggregation factory has no generated-update hook yet.
+        assertMatches("select min(v),max(w),min(s),max(s) from t where k<0", false);
+        engine.execute("alter table t add column absent long", context);
+        assertMatches("select k,min(absent),max(absent) from t where k>=0 group by k", true);
+        engine.execute("insert into t(k,v,w,s,absent) values (0,-7,-9,-32768,42)", context);
+        assertMatches("select k,min(absent),max(absent),max(w) from t where k>=0 group by k", true);
+        long before = compiler.topKRows.get();
+        assertMatches("select k,min(v) m from t where k>=0 group by k order by m desc limit 5", true);
+        assertTrue("LONG extrema retain generated Top-K", compiler.topKRows.get() > before);
+        assertMatches("select k,max(v) m from t where k>=0 group by k order by m", true);
+    }
+
+    @Test
     public void averageFinalizesAfterEveryMergeAndReopens() throws Exception {
         mapEntrySize = 64;
         engine.execute("create table averages as (select cast(x%3001 as int) k,"

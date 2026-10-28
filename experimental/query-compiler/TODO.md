@@ -56,6 +56,23 @@ References: [experiment log](PROGRESS.md), [current coverage plan](FOUNDATIONS_P
 [shared versus partitioned aggregation study](https://www.vldb.org/pvldb/vol19/p523-marcus.pdf).
 Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-profile`.
 
+## Coverage and semantic boundaries confirmed 2026-10-28
+
+- [ ] Bind ordinary aggregation without GROUP BY. `AsyncGroupByNotKeyedAtom` and
+  its factory currently receive a compiled filter but no `QueryCodeGenerator`
+  aggregate kernel. Supported aggregate emitters alone do not close this gap.
+  Preserve existing vector/metadata specializations and empty-input semantics;
+  reuse worker state and merging. Final COUNT reduction and fused join aggregates
+  are separate supported paths.
+- [ ] Investigate LONG SUM overflow into the reserved NULL sentinel before making
+  broader equivalence claims. Both `SumLongGroupByFunction` and `Pipeline.Sum`
+  interpret `Long.MIN_VALUE` as empty state. For example, the non-null sequence
+  `[Long.MAX_VALUE, 1, 5]` produces 5 when updated serially, whereas merging
+  partials `[Long.MAX_VALUE]` and `[1, 5]` produces `Long.MIN_VALUE + 5`.
+  The integer-extrema SQL fixture exposed differing sums under different merge
+  orders; all extrema matched. Its companion SUM now uses INT input whose total
+  fits LONG. This existing semantic issue is separate from adding MIN/MAX.
+
 ## Closed scheduling gap: finalized aggregate read parallelism
 
 - [x] `GroupByFunction.isReadThreadSafe()` now describes concurrent finalized
