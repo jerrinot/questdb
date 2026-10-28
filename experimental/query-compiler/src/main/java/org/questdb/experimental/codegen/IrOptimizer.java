@@ -136,6 +136,7 @@ public final class IrOptimizer {
             case AtomicAdd a -> new AtomicAdd(simplify(a.address(), facts), simplify(a.value(), facts));
             case CompareExchange c -> new CompareExchange(simplify(c.address(), facts), simplify(c.expected(), facts), simplify(c.value(), facts));
             case Allocate a -> new Allocate(simplify(a.bytes(), facts));
+            case Reallocate r -> new Reallocate(simplify(r.address(), facts), simplify(r.oldBytes(), facts), simplify(r.newBytes(), facts));
             case ToDouble c -> {
                 Expr value = simplify(c.value(), facts);
                 yield value instanceof Literal l ? f64((double) l.value()) : new ToDouble(value);
@@ -263,6 +264,7 @@ public final class IrOptimizer {
             case PopulationCount z -> discardable(z.value());
             case TrailingZeros z -> discardable(z.value());
             case Allocate ignored -> false;
+            case Reallocate ignored -> false;
             case ToDouble c -> discardable(c.value());
             case Binary b -> discardable(b.left()) && discardable(b.right());
             case Offset o -> discardable(o.address()) && discardable(o.bytes());
@@ -277,40 +279,6 @@ public final class IrOptimizer {
             case While w -> collectWrites(w.body(), writes);
             default -> { }
         };
-    }
-    private static void collectReads(Block block, Set<Var> reads) {
-        for (Statement s : block.statements()) switch (s) {
-            case Call call -> call.arguments().forEach(argument -> collectReads(argument, reads));
-            case Define d -> collectReads(d.value(), reads);
-            case Assign a -> collectReads(a.value(), reads);
-            case AtomicStore atomic -> { collectReads(atomic.address(), reads); collectReads(atomic.value(), reads); }
-            case Store m -> {collectReads(m.address(), reads); collectReads(m.value(), reads);}
-            case Prefetch p -> collectReads(p.address(), reads);
-            case Free f -> {collectReads(f.address(), reads); collectReads(f.bytes(), reads);}
-            case Return r -> collectReads(r.value(), reads);
-            case If i -> {collectReads(i.condition(), reads); collectReads(i.body(), reads);}
-            case While w -> {collectReads(w.condition(), reads); collectReads(w.body(), reads);}
-            case Poll ignored -> { }
-        };
-    }
-    private static void collectReads(Expr expression, Set<Var> reads) {
-        switch (expression) {
-            case Var v -> reads.add(v);
-            case Binary b -> {collectReads(b.left(), reads); collectReads(b.right(), reads);}
-            case Load l -> collectReads(l.address(), reads);
-            case AtomicLoad l -> collectReads(l.address(), reads);
-            case AtomicAdd a -> { collectReads(a.address(), reads); collectReads(a.value(), reads); }
-            case CompareExchange c -> { collectReads(c.address(), reads); collectReads(c.expected(), reads); collectReads(c.value(), reads); }
-            case Allocate a -> collectReads(a.bytes(), reads);
-            case ToDouble c -> collectReads(c.value(), reads);
-            case VectorMask m -> collectReads(m.predicate(), reads);
-            case SelectRows s -> { collectReads(s.mask(), reads); collectReads(s.base(), reads); collectReads(s.destination(), reads); }
-            case PopulationCount z -> collectReads(z.value(), reads);
-            case TrailingZeros z -> collectReads(z.value(), reads);
-            case Offset o -> {collectReads(o.address(), reads); collectReads(o.bytes(), reads);}
-            case Select s -> {collectReads(s.condition(), reads); collectReads(s.yes(), reads); collectReads(s.no(), reads);}
-            case Literal ignored -> { }
-        }
     }
     private static void collectRetainedAssignments(Block block, Set<Var> reads, Set<Var> targets) {
         for (Statement s : block.statements()) switch (s) {

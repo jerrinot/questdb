@@ -25,6 +25,7 @@
 package io.questdb.griffin.engine.groupby;
 
 import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.TableColumnMetadata;
@@ -37,16 +38,34 @@ import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.CompiledCounter;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.std.Misc;
 
 public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
     public static final GenericRecordMetadata DEFAULT_COUNT_METADATA = new GenericRecordMetadata();
     private final RecordCursorFactory base;
-    private final CountRecordCursor cursor = new CountRecordCursor();
+    private final CountRecordCursor cursor;
+    private final CompiledCounter compiledCounter;
 
     public CountRecordCursorFactory(RecordMetadata metadata, RecordCursorFactory base) {
+        this(metadata, base, null);
+    }
+
+    public CountRecordCursorFactory(RecordMetadata metadata, RecordCursorFactory base, QueryCodeGenerator compiler) {
         super(metadata);
         this.base = base;
+        compiledCounter = compiler == null ? null : compiler.compileCounter(base);
+        try {
+            cursor = new CountRecordCursor(compiledCounter);
+        } catch (Throwable failure) {
+            Misc.freeBestEffort(failure, compiledCounter);
+            throw failure;
+        }
+    }
+
+    public CompiledCounter getCompiledCounter() {
+        return compiledCounter;
     }
 
     @Override
@@ -74,6 +93,7 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("Count");
+        if (compiledCounter != null) sink.meta("compiledCount").val(compiledCounter.getName());
         sink.child(base);
     }
 
@@ -89,16 +109,24 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
 
     @Override
     protected void _close() {
-        base.close();
+        Throwable failure = Misc.freeBestEffort(null, base);
+        failure = Misc.freeBestEffort(failure, compiledCounter);
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     private static class CountRecordCursor implements NoRandomAccessRecordCursor {
         private final CountRecord countRecord = new CountRecord();
-        private final RecordCursor.Counter counter = new Counter();
+        private final RecordCursor.Counter counter;
+        private final boolean compiled;
         private RecordCursor baseCursor;
         private SqlExecutionCircuitBreaker circuitBreaker;
         private long count;
         private boolean hasNext = true;
+
+        private CountRecordCursor(CompiledCounter compiledCounter) {
+            compiled = compiledCounter != null;
+            counter = compiled ? compiledCounter : new Counter();
+        }
 
         @Override
         public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter counter) {
@@ -124,7 +152,8 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
                 circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
                 // recalculate state only when new query is executed and not after toTop() is called.
                 if (this.count == -1) {
-                    long size = baseCursor.size();
+                    // Compiled counts reduce individual frame/shard sizes, including known-size inputs.
+                    long size = compiled ? -1 : baseCursor.size();
                     if (size > -1) {
                         count = size;
                     } else {

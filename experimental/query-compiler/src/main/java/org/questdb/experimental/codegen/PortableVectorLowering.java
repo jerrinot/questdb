@@ -26,15 +26,21 @@ package org.questdb.experimental.codegen;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Predicate;
 import static org.questdb.experimental.codegen.Ir.*;
 
 /** Scalar implementation of lane masks, preserving lazy control flow and read effects. */
 final class PortableVectorLowering {
     private int next;
-    private PortableVectorLowering() { }
+    private final Predicate<VectorMask> nativeMask;
+    private PortableVectorLowering(Predicate<VectorMask> nativeMask) { this.nativeMask = nativeMask; }
 
     static Program lower(Program program) {
-        var lowering = new PortableVectorLowering();
+        return lower(program, ignored -> false);
+    }
+
+    static Program lower(Program program, Predicate<VectorMask> nativeMask) {
+        var lowering = new PortableVectorLowering(nativeMask);
         lowering.next = 3;
         lowering.findIds(program.body());
         return new Program(lowering.block(program.body()));
@@ -126,6 +132,13 @@ final class PortableVectorLowering {
             case AtomicAdd a -> new AtomicAdd(expr(a.address(), out), expr(a.value(), out));
             case CompareExchange c -> new CompareExchange(expr(c.address(), out), expr(c.expected(), out), expr(c.value(), out));
             case Allocate a -> new Allocate(expr(a.bytes(), out));
+            case Reallocate r -> {
+                Expr address = expr(r.address(), out);
+                if (contains(r.oldBytes()) || contains(r.newBytes())) address = let(out, address);
+                Expr oldBytes = expr(r.oldBytes(), out);
+                if (contains(r.newBytes())) oldBytes = let(out, oldBytes);
+                yield new Reallocate(address, oldBytes, expr(r.newBytes(), out));
+            }
             case ToDouble c -> new ToDouble(expr(c.value(), out));
             case PopulationCount z -> {
                 Var value = let(out, expr(z.value(), out));
@@ -146,9 +159,9 @@ final class PortableVectorLowering {
         out.add(new If(condition, new Block(y))); out.add(new If(eq(condition, bool(false)), new Block(n)));
         return result;
     }
-    private static boolean contains(Expr e) {
+    private boolean contains(Expr e) {
         return switch (e) {
-            case VectorMask ignored -> true;
+            case VectorMask mask -> !nativeMask.test(mask);
             case SelectRows ignored -> true;
             case Binary b -> contains(b.left()) || contains(b.right());
             case Select s -> contains(s.condition()) || contains(s.yes()) || contains(s.no());
@@ -158,6 +171,7 @@ final class PortableVectorLowering {
             case AtomicAdd a -> contains(a.address()) || contains(a.value());
             case CompareExchange c -> contains(c.address()) || contains(c.expected()) || contains(c.value());
             case Allocate a -> contains(a.bytes());
+            case Reallocate r -> contains(r.address()) || contains(r.oldBytes()) || contains(r.newBytes());
             case ToDouble c -> contains(c.value());
             case PopulationCount ignored -> true;
             case TrailingZeros z -> contains(z.value());

@@ -202,7 +202,8 @@ public class LatestByCompiledFilter extends BooleanFunction implements UnaryFunc
                 bindVarMemory.getAddress(),
                 bindVarFunctions.size(),
                 filteredRows.getAddress(),
-                rowCount
+                rowCount,
+                memory
         );
         filteredRows.setPos(hi);
     }

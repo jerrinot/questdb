@@ -61,6 +61,36 @@ public class VectorMaskTest {
             }
         }
     }
+    @Test public void byteEqualityMasksPreserveSignednessAndComposition() throws Exception {
+        Builder b = new Builder();
+        Expr signed = new Load(MemoryType.I8, COLUMNS);
+        Expr unsigned = binary(Op.AND, signed, i64(255));
+        Expr[] predicates = {eq(signed, i64(-1)), ne(i64(255), unsigned),
+                eq(signed, i64(255)), eq(unsigned, i64(-1)),
+                binary(Op.BOTH, ne(signed, i64(-128)), ne(unsigned, i64(127)))};
+        int[] lanes = {7, 8, 16, 32, 63, 64};
+        for (int i = 0; i < lanes.length; i++) for (int j = 0; j < predicates.length; j++)
+            b.store(at(STATE, (i * predicates.length + j) * 8L), new VectorMask(lanes[i], predicates[j]));
+        b.exit(0);
+        try (var kernel = backend.compile(new Program(b.block()), temporary.getRoot().toPath());
+             var arena = Arena.ofConfined()) {
+            long input = arena.allocate(64).address(), output = arena.allocate(lanes.length * predicates.length * 8L, 8).address();
+            byte[] values = {-128, -1, 0, 127, 1, -1, 126};
+            for (int i = 0; i < 64; i++) Unsafe.getUnsafe().putByte(input + i, values[i % values.length]);
+            assertEquals(0, kernel.run(input, 64, output));
+            for (int i = 0; i < lanes.length; i++) {
+                long[] expected = new long[predicates.length];
+                for (int lane = 0; lane < lanes[i]; lane++) {
+                    byte value = values[lane % values.length];
+                    if (value == -1) expected[0] |= 1L << lane;
+                    if ((value & 255) != 255) expected[1] |= 1L << lane;
+                    if (value != -128 && (value & 255) != 127) expected[4] |= 1L << lane;
+                }
+                for (int j = 0; j < predicates.length; j++)
+                    assertEquals(expected[j], Unsafe.getUnsafe().getLong(output + (i * predicates.length + j) * 8L));
+            }
+        }
+    }
     @Test public void wrappingArithmeticAndEagerSafeSelectsMatchScalarLanes() throws Exception {
         Builder b=new Builder();Expr value=new Load(MemoryType.I64,COLUMNS),sum=add(value,i64(Long.MAX_VALUE));
         Expr predicate=binary(Op.BOTH,ne(value,i64(Long.MIN_VALUE)),binary(Op.GE,new Select(binary(Op.LT,sum,i64(0)),sum,value),i64(-9)));

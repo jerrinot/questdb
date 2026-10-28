@@ -36,7 +36,7 @@ final class SsaOptimizer {
 
     static Effect effect(Statement s) {
         return switch (s) {
-            case Define d -> (d.value() instanceof AtomicLoad || d.value() instanceof CompareExchange || d.value() instanceof AtomicAdd) ? Effect.CALL : (d.value() instanceof Load || d.value() instanceof VectorMask) ? Effect.READ : d.value() instanceof Allocate ? Effect.CALL : d.value() instanceof SelectRows ? Effect.WRITE : Effect.PURE;
+            case Define d -> (d.value() instanceof AtomicLoad || d.value() instanceof CompareExchange || d.value() instanceof AtomicAdd) ? Effect.CALL : (d.value() instanceof Load || d.value() instanceof VectorMask) ? Effect.READ : (d.value() instanceof Allocate || d.value() instanceof Reallocate) ? Effect.CALL : d.value() instanceof SelectRows ? Effect.WRITE : Effect.PURE;
             case Store ignored -> Effect.WRITE;
             case AtomicStore ignored -> Effect.CALL;
             case Prefetch ignored -> Effect.READ;

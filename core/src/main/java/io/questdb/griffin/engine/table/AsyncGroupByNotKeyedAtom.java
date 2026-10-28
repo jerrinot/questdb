@@ -26,6 +26,7 @@ package io.questdb.griffin.engine.table;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.Reopenable;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
@@ -36,8 +37,10 @@ import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.Plannable;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.CompiledScalarAggregate;
 import io.questdb.griffin.engine.PerWorkerLockOwner;
 import io.questdb.griffin.engine.PerWorkerLocks;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.PerWorkerFunctionList;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
@@ -77,6 +80,8 @@ public class AsyncGroupByNotKeyedAtom implements StatefulAtom, PerWorkerLockOwne
     private final ObjList<ObjList<GroupByFunction>> perWorkerGroupByFunctions;
     private final PerWorkerLocks perWorkerLocks;
     private final ObjList<SimpleMapValue> perWorkerMapValues;
+    private CompiledScalarAggregate compiledAggregate;
+    private ObjList<CompiledScalarAggregate.Updater> compiledUpdaters;
     // Per-query native memory tracker captured from SqlExecutionContext on init.
     // Null when no per-query limit applies. Workers and operator code feed it to
     // tracker-aware Unsafe overloads to charge allocations to the active workload.
@@ -204,7 +209,12 @@ public class AsyncGroupByNotKeyedAtom implements StatefulAtom, PerWorkerLockOwne
                 }
             }
         }
-        Throwable cleanupFailure = null;
+        final CompiledScalarAggregate compiledAggregate = this.compiledAggregate;
+        this.compiledAggregate = null;
+        final ObjList<CompiledScalarAggregate.Updater> compiledUpdaters = this.compiledUpdaters;
+        this.compiledUpdaters = null;
+        Throwable cleanupFailure = Misc.freeObjListBestEffort(null, compiledUpdaters);
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, compiledAggregate);
         cleanupFailure = Misc.freeBestEffort(cleanupFailure, ownerAllocator);
         cleanupFailure = Misc.freeObjListBestEffort(cleanupFailure, perWorkerAllocators);
         cleanupFailure = Misc.freeBestEffort(cleanupFailure, ownerMapValue);
@@ -230,6 +240,44 @@ public class AsyncGroupByNotKeyedAtom implements StatefulAtom, PerWorkerLockOwne
 
     public int[] getBatchColumnIndexes() {
         return batchColumnIndexes;
+    }
+
+    // The factory/sequence owns this atom before compilation, including partial adoption.
+    void compileAggregate(QueryCodeGenerator compiler, ColumnTypes inputs, ColumnTypes values) {
+        compiledAggregate = compiler.compileScalarAggregate(inputs, values, ownerGroupByFunctions, ownerMapValue);
+        if (compiledAggregate != null) {
+            compiledUpdaters = new ObjList<>(perWorkerMapValues.size() + 1);
+            for (int i = -1; i < perWorkerMapValues.size(); i++) {
+                compiledUpdaters.add(compiledAggregate.newUpdater());
+            }
+        }
+    }
+
+    public CharSequence getCompiledAggregateName() {
+        return compiledAggregate != null ? compiledAggregate.getName() : null;
+    }
+
+    public long getCompiledAggregateNativeRows() {
+        long rows = 0;
+        if (compiledUpdaters != null) {
+            for (int i = 0; i < compiledUpdaters.size(); i++) rows += compiledUpdaters.getQuick(i).getNativeRows();
+        }
+        return rows;
+    }
+
+    @Nullable
+    public CompiledScalarAggregate.Updater getCompiledUpdater(int slotId) {
+        return compiledUpdaters != null ? compiledUpdaters.getQuick(slotId + 1) : null;
+    }
+
+    void merge(SimpleMapValue source, SimpleMapValue destination) {
+        if (compiledAggregate != null) {
+            compiledAggregate.merge(source, destination);
+        } else if (destination.isNew()) {
+            destination.copy(source);
+        } else {
+            ownerFunctionUpdater.merge(destination, source);
+        }
     }
 
     public AsyncFilterContext getFilterContext() {

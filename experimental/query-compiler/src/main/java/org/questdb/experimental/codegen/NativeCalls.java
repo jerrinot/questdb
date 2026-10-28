@@ -27,13 +27,13 @@ package org.questdb.experimental.codegen;
 import java.lang.foreign.*;
 import java.lang.invoke.*;
 
-/** Shared generated-kernel ABI: three arguments plus allocator, release and cancellation callbacks. */
+/** Shared generated-kernel ABI: three arguments plus allocation, release, cancellation and reallocation callbacks. */
 final class NativeCalls {
     private NativeCalls(){ }
     static Kernel bind(MemorySegment address,Arena arena)throws ReflectiveOperationException {
         MethodHandle function = Linker.nativeLinker().downcallHandle(address, FunctionDescriptor.of(
                 ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
-                ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
+                ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
         var lookup = MethodHandles.lookup();
         long allocate = Linker.nativeLinker().upcallStub(lookup.findStatic(KernelMemory.class, "malloc",
                 MethodType.methodType(long.class, long.class)), FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG), arena).address();
@@ -42,7 +42,10 @@ final class NativeCalls {
                 FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG), arena).address();
         long poll = Linker.nativeLinker().upcallStub(lookup.findStatic(KernelMemory.class, "poll",
                 MethodType.methodType(long.class)), FunctionDescriptor.of(ValueLayout.JAVA_LONG), arena).address();
-        MethodHandle bound = MethodHandles.insertArguments(function, 3, allocate, free, poll);
+        long reallocate = Linker.nativeLinker().upcallStub(lookup.findStatic(KernelMemory.class, "realloc",
+                MethodType.methodType(long.class, long.class, long.class, long.class)),
+                FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG), arena).address();
+        MethodHandle bound = MethodHandles.insertArguments(function, 3, allocate, free, poll, reallocate);
         return (columns, rows, state) -> invoke(bound, columns, rows, state);
     }
 

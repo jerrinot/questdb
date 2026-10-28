@@ -182,6 +182,8 @@ public class ResolvedSqlJoinTest {
             shardThreshold = threshold;
             buildThreshold = threshold == 4 ? 1 : Long.MAX_VALUE;
             matches("select p.k,count(),sum(d.v),sum(p.v) from p join d on p.k=d.k group by p.k", true, 1);
+            matches("select p.k,count(),min(p.w),max(d.v),min(p.v),max(p.w) from p join d on p.k=d.k group by p.k", true, 1);
+            matches("select count(),min(p.w),max(d.v),min(p.v),max(p.w) from p join d on p.k=d.k", true);
             matches("select d.v,count(),sum(p.v) from p join d on p.k=d.k group by d.v", true, 1);
             matches("select p.v,count(),sum(d.v) from p join d on p.k=d.k group by p.v", true, 1);
             matches("select d.v,count(),sum(p.w) from p join d on p.k=d.k where p.v>d.v group by d.v", true, 1);

@@ -133,14 +133,12 @@ final class NestedDistinct {
                     multiple.when(ne(dstCount, i64(1)), sets -> {
                         Var dstSet = sets.let(new Load(MemoryType.ADDRESS, at(destination, 8)));
                         Var intoDestination = sets.let(binary(Op.LT, binary(Op.USHR, intAt(srcSet, 4), i64(1)), intAt(dstSet, 4)));
-                        sets.when(intoDestination, forward -> {
-                            mergeSets(forward, dstSet, srcSet);
-                            writeSet(forward, destination, dstSet);
-                        });
-                        sets.when(eq(intoDestination, bool(false)), reverse -> {
-                            mergeSets(reverse, srcSet, dstSet);
-                            writeSet(reverse, destination, srcSet);
-                        });
+                        // Select ownership before lowering the union, so its probe/grow loops
+                        // occur once in the generated program. Growth updates the chosen target.
+                        Var target = sets.let(new Select(intoDestination, dstSet, srcSet));
+                        Var input = sets.let(new Select(intoDestination, srcSet, dstSet));
+                        mergeSets(sets, target, input);
+                        writeSet(sets, destination, target);
                     });
                 });
             });

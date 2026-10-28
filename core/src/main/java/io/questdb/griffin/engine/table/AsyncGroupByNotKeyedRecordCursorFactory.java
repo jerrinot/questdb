@@ -30,6 +30,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameAddressCache;
 import io.questdb.cairo.sql.PageFrameFilteredMemoryRecord;
@@ -47,6 +48,8 @@ import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.CompiledScalarAggregate;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.columns.ColumnFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxTimestampGroupByFunction;
@@ -92,7 +95,7 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
             @NotNull RecordMetadata groupByMetadata,
             @NotNull ObjList<GroupByFunction> groupByFunctions,
             @Nullable ObjList<ObjList<GroupByFunction>> perWorkerGroupByFunctions,
-            int valueCount,
+            @Transient @NotNull ColumnTypes valueTypes,
             @Nullable CompiledFilter compiledFilter,
             @Nullable MemoryCARW bindVarMemory,
             @Nullable ObjList<Function> bindVarFunctions,
@@ -100,7 +103,8 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
             @Nullable IntHashSet filterUsedColumnIndexes,
             @Nullable ObjList<Function> perWorkerFilters,
             int workerCount,
-            @Nullable ObjList<ObjList<Function>> sharedRecordFunctions
+            @Nullable ObjList<ObjList<Function>> sharedRecordFunctions,
+            @Nullable QueryCodeGenerator compiler
     ) {
         super(groupByMetadata);
         try {
@@ -146,7 +150,7 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
                     groupByFunctions,
                     perWorkerGroupByFunctions,
                     batchColumnIndexes,
-                    valueCount,
+                    valueTypes.getColumnCount(),
                     compiledFilter,
                     bindVarMemory,
                     bindVarFunctions,
@@ -176,6 +180,9 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
             );
             this.cursor = new AsyncGroupByNotKeyedRecordCursor(groupByFunctions);
             this.workerCount = workerCount;
+            if (compiler != null && !vectorized) {
+                atom.compileAggregate(compiler, baseMetadata, valueTypes);
+            }
         } catch (Throwable e) {
             Misc.free(this, e);
             throw e;
@@ -296,6 +303,7 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
         }
         sink.meta("workers").val(workerCount);
         sink.attr("vectorized").val(vectorized);
+        sink.optAttr("compiledScalarAggregate", frameSequence.getAtom().getCompiledAggregateName());
         sink.optAttr("values", groupByFunctions, true);
         sink.optAttr("filter", frameSequence.getAtom(), true);
         sink.child(base);
@@ -335,6 +343,11 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
         try {
             final PageFrameMemory frameMemory = frameMemoryPool.navigateTo(frameIndex);
             record.init(frameMemory);
+
+            final CompiledScalarAggregate.Updater compiled = atom.getCompiledUpdater(slotId);
+            if (compiled != null && compiled.update(record, frameRowCount, 0, value, circuitBreaker)) {
+                return;
+            }
 
             record.setRowIndex(0);
             long rowId = record.getRowId();
@@ -560,6 +573,10 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
                 record = filteredMemoryRecord;
             }
             long baseRowId = Rows.toRowID(frameIndex, 0);
+            final CompiledScalarAggregate.Updater compiled = atom.getCompiledUpdater(slotId);
+            if (compiled != null && compiled.update(record, rows.size(), rows.getAddress(), value, circuitBreaker)) {
+                return;
+            }
             aggregateFiltered(record, rows, baseRowId, value, functionUpdater);
         } finally {
             try {

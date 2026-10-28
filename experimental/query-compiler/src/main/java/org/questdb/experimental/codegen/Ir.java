@@ -60,7 +60,7 @@ public final class Ir {
 
     public enum Op { ADD, SUB, MUL, AND, XOR, USHR, EQ, NE, LT, GE, BOTH, EITHER, FADD, FSUB, FMUL, FDIV, SDIV }
 
-    public sealed interface Expr permits Var, Literal, Binary, Load, Offset, Select, Allocate, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, AtomicLoad, CompareExchange, AtomicAdd {
+    public sealed interface Expr permits Var, Literal, Binary, Load, Offset, Select, Allocate, Reallocate, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, AtomicLoad, CompareExchange, AtomicAdd {
         Type type();
     }
 
@@ -220,6 +220,13 @@ public final class Ir {
         public Type type() { return Type.ADDRESS; }
     }
 
+    /** Preserves the old allocation on failure; check for nil before publishing the result. */
+    public record Reallocate(Expr address, Expr oldBytes, Expr newBytes) implements Expr {
+        public Reallocate { require(address, Type.ADDRESS); require(oldBytes, Type.I64); require(newBytes, Type.I64); }
+        @Override
+        public Type type() { return Type.ADDRESS; }
+    }
+
     public sealed interface Statement permits Define, Assign, Store, AtomicStore, Prefetch, Free, Poll, Call, If, While, Return { }
 
     /** Naturally aligned 64-bit release store, publishing preceding payload writes. */
@@ -369,6 +376,46 @@ public final class Ir {
     public static Expr at(Expr address, long bytes) { return new Offset(address, i64(bytes)); }
     public static Expr load(Expr address) { return new Load(MemoryType.I64, address); }
 
+    // Variable-use analysis; rewriting and evaluation effects stay with their respective passes.
+    static void collectReads(Block block, Set<Var> reads) {
+        for (Statement statement : block.statements()) collectReads(statement, reads);
+    }
+    static void collectReads(Statement statement, Set<Var> reads) {
+        switch (statement) {
+            case Call call -> call.arguments().forEach(argument -> collectReads(argument, reads));
+            case Define d -> collectReads(d.value(), reads);
+            case Assign a -> collectReads(a.value(), reads);
+            case AtomicStore atomic -> { collectReads(atomic.address(), reads); collectReads(atomic.value(), reads); }
+            case Store m -> {collectReads(m.address(), reads); collectReads(m.value(), reads);}
+            case Prefetch p -> collectReads(p.address(), reads);
+            case Free f -> {collectReads(f.address(), reads); collectReads(f.bytes(), reads);}
+            case Return r -> collectReads(r.value(), reads);
+            case If i -> {collectReads(i.condition(), reads); collectReads(i.body(), reads);}
+            case While w -> {collectReads(w.condition(), reads); collectReads(w.body(), reads);}
+            case Poll ignored -> { }
+        }
+    }
+    static void collectReads(Expr expression, Set<Var> reads) {
+        switch (expression) {
+            case Var v -> reads.add(v);
+            case Binary b -> {collectReads(b.left(), reads); collectReads(b.right(), reads);}
+            case Load l -> collectReads(l.address(), reads);
+            case AtomicLoad l -> collectReads(l.address(), reads);
+            case AtomicAdd a -> { collectReads(a.address(), reads); collectReads(a.value(), reads); }
+            case CompareExchange c -> { collectReads(c.address(), reads); collectReads(c.expected(), reads); collectReads(c.value(), reads); }
+            case Allocate a -> collectReads(a.bytes(), reads);
+            case Reallocate r -> { collectReads(r.address(), reads); collectReads(r.oldBytes(), reads); collectReads(r.newBytes(), reads); }
+            case ToDouble c -> collectReads(c.value(), reads);
+            case VectorMask m -> collectReads(m.predicate(), reads);
+            case SelectRows s -> { collectReads(s.mask(), reads); collectReads(s.base(), reads); collectReads(s.destination(), reads); }
+            case PopulationCount z -> collectReads(z.value(), reads);
+            case TrailingZeros z -> collectReads(z.value(), reads);
+            case Offset o -> {collectReads(o.address(), reads); collectReads(o.bytes(), reads);}
+            case Select s -> {collectReads(s.condition(), reads); collectReads(s.yes(), reads); collectReads(s.no(), reads);}
+            case Literal ignored -> { }
+        }
+    }
+
     private static void require(Expr expression, Type type) {
         if (expression.type() != type) {
             throw new IllegalArgumentException("Expected " + type + ", got " + expression.type());
@@ -430,6 +477,7 @@ public final class Ir {
             case AtomicAdd a -> { verify(a.address(), scope); verify(a.value(), scope); }
             case CompareExchange c -> { verify(c.address(), scope); verify(c.expected(), scope); verify(c.value(), scope); }
             case Allocate a -> verify(a.bytes(), scope);
+            case Reallocate r -> { verify(r.address(), scope); verify(r.oldBytes(), scope); verify(r.newBytes(), scope); }
             case ToDouble c -> verify(c.value(), scope);
             case VectorMask m -> verify(m.predicate(), scope);
             case PopulationCount z -> verify(z.value(), scope);

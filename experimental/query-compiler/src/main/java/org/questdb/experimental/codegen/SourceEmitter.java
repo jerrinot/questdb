@@ -59,6 +59,7 @@ abstract class SourceEmitter {
             String load(MemoryType w, String a) { return "load." + w + "(" + a + ")"; }
             String store(MemoryType w, String a, String v) { return "store." + w + "(" + a + ", " + v + ")"; }
             String allocate(String b) { return "allocate(" + b + ")"; }
+            String reallocate(String a, String old, String size) { return "reallocate(" + a + ", " + old + ", " + size + ")"; }
             String free(String a, String b) { return "free(" + a + ", " + b + ")"; }
             String poll() { return "poll()"; }
             String type(Type t) { return t.name(); }
@@ -112,6 +113,7 @@ abstract class SourceEmitter {
             case AtomicAdd a -> atomicAdd(expression(a.address()), expression(a.value()));
             case CompareExchange c -> compareExchange(expression(c.address()), expression(c.expected()), expression(c.value()));
             case Allocate a -> allocate(expression(a.bytes()));
+            case Reallocate r -> reallocate(expression(r.address()), expression(r.oldBytes()), expression(r.newBytes()));
             case ToDouble c -> "((double)(" + expression(c.value()) + "))";
             case SelectRows s -> "selectRows[" + s.lanes() + "](" + expression(s.mask()) + ", " + expression(s.base()) + ", " + expression(s.destination()) + ")";
             case VectorMask m -> "mask[" + m.lanes() + "](" + expression(m.predicate()) + ")";
@@ -153,6 +155,7 @@ abstract class SourceEmitter {
     abstract String load(MemoryType width, String address);
     abstract String store(MemoryType width, String address, String value);
     abstract String allocate(String bytes);
+    abstract String reallocate(String address, String oldBytes, String newBytes);
     abstract String free(String address, String bytes);
     abstract String poll();
     abstract String type(Type type);

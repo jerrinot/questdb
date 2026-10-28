@@ -299,6 +299,44 @@ final class QuestMapProbe {
         return destination;
     }
 
+    /** Existing QuestDB probe, with an empty slot returning NULL instead of inserting. */
+    Var findExisting(Builder b, Var key) {
+        if (variable() || varchar()) throw new IllegalArgumentException("Fixed-width map required");
+        Lookup lookup = lookup(b, key, i64(0));
+        Var destination = b.let(nil()), done = b.let(bool(false));
+        Var slot = lookup.slot();
+        MemoryType width = keyType == ColumnType.INT ? MemoryType.I32 : MemoryType.I64;
+        if (orderedNative()) {
+            Var offsets = b.let(new Load(MemoryType.ADDRESS, at(lookup.view(), NativeMapView.OFFSETS)));
+            b.loop(binary(Op.BOTH, eq(destination, nil()), eq(done, bool(false))), next -> {
+                Var packed = next.let(load(new Offset(offsets, binary(Op.MUL, slot, i64(8)))));
+                Var raw = next.let(binary(Op.AND, packed, i64(0xffff_ffffL)));
+                next.assign(done, eq(raw, i64(0)));
+                next.when(binary(Op.BOTH, ne(raw, i64(0)), eq(binary(Op.USHR, packed, i64(32)),
+                        binary(Op.AND, lookup.hash(), i64(0xffff_ffffL)))), occupied -> {
+                    Var entry = occupied.let(new Offset(lookup.base(), binary(Op.MUL, binary(Op.SUB, raw, i64(1)), i64(8))));
+                    occupied.when(keysEqual(occupied, entry, key), hit -> hit.assign(destination, valueAddress(entry)));
+                });
+                next.assign(slot, binary(Op.AND, add(slot, i64(1)), lookup.mask()));
+            });
+        } else {
+            b.when(eq(key, i64(0)), zero -> {
+                zero.assign(done, bool(true));
+                zero.when(ne(load(at(lookup.view(), NativeMapView.HAS_ZERO)), i64(0)), hit -> hit.assign(destination,
+                        at(new Load(MemoryType.ADDRESS, at(lookup.view(), NativeMapView.ZERO_ENTRY)), width.bytes)));
+            });
+            Var stride = b.let(load(at(lookup.view(), NativeMapView.STRIDE)));
+            b.loop(binary(Op.BOTH, eq(destination, nil()), eq(done, bool(false))), next -> {
+                Var entry = next.let(new Offset(lookup.base(), binary(Op.MUL, slot, stride)));
+                Var stored = next.let(new Load(width, entry));
+                next.assign(done, eq(stored, i64(0)));
+                next.when(eq(stored, key), hit -> hit.assign(destination, at(entry, width.bytes)));
+                next.assign(slot, binary(Op.AND, add(slot, i64(1)), lookup.mask()));
+            });
+        }
+        return destination;
+    }
+
     private void prefetchEntry(Builder b, Var entry, long valueBytes) {
         if (variable()) {
             b.prefetch(entry, true);

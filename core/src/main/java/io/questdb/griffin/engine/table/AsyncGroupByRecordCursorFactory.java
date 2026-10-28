@@ -607,7 +607,7 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
                 boolean local = fragment.isNotSharded();
                 long selected = compiledUpdater.updateFiltered(record, frameRowCount,
                         local ? fragment.reopenMap() : null, local ? null : fragment.getShards(),
-                        atom.getBatchSize(), circuitBreaker);
+                        atom.getBatchSize(), rows, circuitBreaker);
                 if (selected >= 0) {
                     if (isParquetFrame) filterCtx.getSelectivityStats(slotId).update(selected, frameRowCount);
                     atom.maybeEnableSharding(fragment);

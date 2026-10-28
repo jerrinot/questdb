@@ -56,6 +56,24 @@ References: [experiment log](PROGRESS.md), [current coverage plan](FOUNDATIONS_P
 [shared versus partitioned aggregation study](https://www.vldb.org/pvldb/vol19/p523-marcus.pdf).
 Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-profile`.
 
+## Coverage and semantic boundaries confirmed 2026-10-28
+
+- [x] Bind ordinary aggregation without GROUP BY for existing scalar COUNT and
+  integer SUM/MIN/MAX emitters. The async factory retains vector/metadata
+  specializations and uses generated reduction for its row-update paths. Existing
+  worker state, merge order and empty-input semantics remain; generated copying
+  and merging consume native or Java partials. Broader aggregate types and the
+  mixed-coordinate late-materialization boundary remain separate gaps. See the
+  2026-10-28 scalar-reduction entry in PROGRESS.md; performance is not measured.
+- [ ] Investigate LONG SUM overflow into the reserved NULL sentinel before making
+  broader equivalence claims. Both `SumLongGroupByFunction` and `Pipeline.Sum`
+  interpret `Long.MIN_VALUE` as empty state. For example, the non-null sequence
+  `[Long.MAX_VALUE, 1, 5]` produces 5 when updated serially, whereas merging
+  partials `[Long.MAX_VALUE]` and `[1, 5]` produces `Long.MIN_VALUE + 5`.
+  The integer-extrema SQL fixture exposed differing sums under different merge
+  orders; all extrema matched. Its companion SUM now uses INT input whose total
+  fits LONG. This existing semantic issue is separate from adding MIN/MAX.
+
 ## Closed scheduling gap: finalized aggregate read parallelism
 
 - [x] `GroupByFunction.isReadThreadSafe()` now describes concurrent finalized
@@ -148,3 +166,30 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
   fixed-work latency and coherence events together, at physical-core and SMT counts.
   Keep private maps as a control: on96 physical EC2 cores they beat shared maps
   (137ms versus182ms), while shared wins with SMT. Evidence:`/tmp/query-ec2`.
+
+
+## String-state footprint and scheduling
+
+- [x] `AggregateSlot.mergeTopKPartition()` currently estimates group bytes from
+  `partitionRowBytes`, covering keys and inline aggregate slots. VARCHAR MIN/MAX
+  slots contain pointers; their allocator-owned sink capacity/header is additional
+  live state. Measure this footprint and test subdivision sensitivity before
+  changing the policy. The retained 500M-row / 8.39M-group string case still spends
+  ~66% of dispatch slots in backend-memory stalls and moves ~153GB/query.
+  Use the existing second-level partition implementation as the counterfactual;
+  compare its extra copying against fewer state misses, with a fixed-width
+  control and identical final output. Do not infer a cache-capacity bottleneck
+  merely from the estimated footprint.
+  The 2026-10-28 experiment rejects more aggressive subdivision: 500M-row
+  execution rises ~3.1 -> 3.56s, with traffic 153 -> 172GB/query. The missing
+  allocation bytes are real, but this counterfactual does not establish a
+  profitable cache-capacity policy. Keep the current policy. Borrowed winning
+  string representations were also tested and rejected; dependent payload reads
+  offset the allocation saving.
+- [x] Schedule independent VARCHAR MIN/MAX after exact partition ranking, replaying
+  existing records only into selected keys. Preserve ordinary state layouts and
+  use the existing sampled cardinality sketch to decline small partitions.
+- [ ] When profiling is resumed, complete final-build balanced measurements for
+  this schedule, including cross-cache placement, skew and other architectures.
+  Earlier accepted profiles and one/four-core checks are encouraging; subsequent
+  contaminated/interrupted desktop runs are excluded. No new coverage claim.

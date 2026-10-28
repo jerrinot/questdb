@@ -120,8 +120,8 @@ using Dense = std::unique_ptr<Agg, Free>;
 }
 
 extern "C" int64_t query(uint64_t input, int64_t frame_count, uint64_t state_address,
-                          uint64_t allocate_fn, uint64_t free_fn, uint64_t poll_fn) {
-    (void)allocate_fn; (void)free_fn; (void)poll_fn;
+                          uint64_t allocate_fn, uint64_t free_fn, uint64_t poll_fn, uint64_t realloc_fn) {
+    (void)allocate_fn; (void)free_fn; (void)poll_fn; (void)realloc_fn;
     auto *state = (uint64_t *)state_address;
     if ((int64_t)state[0] == -1) { std::free((void *)state[2]); state[2] = state[3] = 0; return 0; }
     try {

@@ -46,6 +46,84 @@ public class ScanStageTest {
     @Parameterized.Parameters(name="{0}") public static List<Object[]> parameters(){return List.of(
             new Object[]{"llvm",new LlvmBackend(2)},new Object[]{"c",new NativeBackend()},new Object[]{"asmjit",new AsmJitBackend()});}
 
+    @Test public void literalSearchNeverReadsOutsideTheSlice() throws Throwable {
+        var random = new java.util.Random(72571);
+        for (int size = 1; size <= 8; size++) for (boolean repeated : new boolean[]{false, true}) {
+            byte[] pattern = new byte[size];
+            for (int i = 0; i < size; i++) pattern[i] = (byte) (repeated ? 'a' : size % 2 == 0 ? 'a' + i % 2 : 0x80 + i % 3);
+            Builder b = new Builder();
+            Var found = ByteSequences.contains(b, COLUMNS, ROWS, pattern);
+            b.exit(new Select(found, i64(1), i64(0)));
+            try (var code = backend.compile(new Program(b.block()), temporary.getRoot().toPath())) {
+                for (int length = 0; length <= 140; length++) {
+                    for (boolean atEnd : new boolean[]{true, false}) try (var page = new GuardedPage(length, atEnd)) {
+                        for (int trial = 0; trial < 5; trial++) {
+                            byte[] bytes = new byte[length];
+                            for (int i = 0; i < length; i++) bytes[i] = trial == 0 ? pattern[i % size] : repeated && trial == 4 ? (byte) ('a' + i % 2) : (byte) random.nextInt(256);
+                            if (length >= size && trial > 0 && trial < 4) {
+                                int start = trial == 1 ? 0 : trial == 2 ? length - size : random.nextInt(length - size + 1);
+                                System.arraycopy(pattern, 0, bytes, start, size);
+                            }
+                            boolean expected = false;
+                            for (int i = 0; i + size <= length; i++) {
+                                boolean same = true;
+                                for (int j = 0; j < size; j++) same &= bytes[i + j] == pattern[j];
+                                expected |= same;
+                            }
+                            for (int i = 0; i < length; i++) Unsafe.getUnsafe().putByte(page.address + i, bytes[i]);
+                            assertEquals("size=" + size + " length=" + length + " trial=" + trial,
+                                    expected ? 1 : 0, code.run(page.address, length, 0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test public void byteMasksNeverReadOutsideTheSlice() throws Throwable {
+        for (int lanes : new int[]{8, 16, 32, 64}) {
+            Builder b = new Builder();
+            b.exit(new VectorMask(lanes, eq(new Load(MemoryType.I8, COLUMNS), i64(-1))));
+            try (var code = backend.compile(new Program(b.block()), temporary.getRoot().toPath())) {
+                for (boolean atEnd : new boolean[]{true, false}) try (var page = new GuardedPage(lanes, atEnd)) {
+                    for (int i = 0; i < lanes; i++) Unsafe.getUnsafe().putByte(page.address + i, (byte) -1);
+                    assertEquals(-1L >>> (64 - lanes), code.run(page.address, lanes, 0));
+                }
+            }
+        }
+    }
+
+    @Test public void byteOrderingPreservesUnsignedOrderAndSliceBounds() throws Throwable {
+        Builder b = new Builder();
+        Var leftSize = b.let(load(STATE)), rightSize = b.let(load(at(STATE, 8)));
+        Var right = b.let(new Load(MemoryType.ADDRESS, at(STATE, 16)));
+        b.exit(ByteSequences.compare(b, COLUMNS, leftSize, ByteSequences.sixPrefix(COLUMNS, leftSize),
+                right, rightSize, ByteSequences.sixPrefix(right, rightSize)));
+        try (var code = backend.compile(new Program(b.block()), temporary.getRoot().toPath()); Arena arena = Arena.ofConfined()) {
+            long state = arena.allocate(24, 8).address();
+            for (int length = 0; length <= 80; length++) for (int delta : new int[]{-1, 0, 1}) {
+                int rightLength = Math.max(0, length + delta);
+                for (boolean end : new boolean[]{true, false}) try (var left = new GuardedPage(length, end);
+                                                                  var other = new GuardedPage(rightLength, !end)) {
+                    byte[] a = new byte[length], c = new byte[rightLength];
+                    for (int i = 0; i < a.length; i++) a[i] = (byte) (i * 37);
+                    for (int i = 0; i < c.length; i++) c[i] = (byte) (i * 37);
+                    for (int i = 0; i < a.length; i++) Unsafe.getUnsafe().putByte(left.address + i, a[i]);
+                    for (int i = 0; i < c.length; i++) Unsafe.getUnsafe().putByte(other.address + i, c[i]);
+                    Unsafe.putLong(state, length); Unsafe.putLong(state + 8, rightLength); Unsafe.putLong(state + 16, other.address);
+                    assertEquals(Integer.signum(java.util.Arrays.compareUnsigned(a, c)), Long.signum(code.run(left.address, 0, state)));
+                    for (int i = 0; i < Math.min(length, rightLength); i++) {
+                        byte saved = c[i]; c[i] ^= (byte) 0x80;
+                        Unsafe.getUnsafe().putByte(other.address + i, c[i]);
+                        assertEquals("length=" + length + " delta=" + delta + " difference=" + i,
+                                Integer.signum(java.util.Arrays.compareUnsigned(a, c)), Long.signum(code.run(left.address, 0, state)));
+                        c[i] = saved; Unsafe.getUnsafe().putByte(other.address + i, saved);
+                    }
+                }
+            }
+        }
+    }
+
     @Test public void byteEqualityNeverReadsBeyondEitherSlice() throws Throwable {
         Builder b = new Builder();
         Var same = ByteSequences.equal(b, COLUMNS, STATE, ROWS);

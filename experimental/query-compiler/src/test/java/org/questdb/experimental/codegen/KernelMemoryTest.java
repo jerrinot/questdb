@@ -65,7 +65,9 @@ public class KernelMemoryTest {
                 for (int i = 0; i < 1_000; i++) assertEquals(0, KernelMemory.poll());
                 long address = KernelMemory.malloc(8);
                 assertNotEquals(0, address);
-                KernelMemory.free(address, 8);
+                address = KernelMemory.realloc(address, 8, 16);
+                assertNotEquals(0, address);
+                KernelMemory.free(address, 16);
                 assertEquals("Allocation and poll share the breaker's connection window", 1, breaker.probes);
                 breaker.cancel();
                 assertEquals(1, KernelMemory.poll());
@@ -78,9 +80,11 @@ public class KernelMemoryTest {
             scope.enter(breaker);
             try (scope) {
                 assertEquals(0, KernelMemory.poll());
+                long address = KernelMemory.malloc(8);
                 int probes = breaker.probes;
                 clock.addAndGet(1_001);
-                assertEquals("Allocation also checks timeout", 0, KernelMemory.malloc(8));
+                assertEquals("Reallocation also checks timeout", 0, KernelMemory.realloc(address, 8, 16));
+                assertEquals("A failed scope refuses later allocations", 0, KernelMemory.malloc(8));
                 assertThrows(CairoException.class, scope::throwIfFailed);
                 assertEquals("Timeout is checked before any socket syscall", probes, breaker.probes);
             }

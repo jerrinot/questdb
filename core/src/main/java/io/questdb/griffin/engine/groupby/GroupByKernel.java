@@ -106,6 +106,17 @@ public interface GroupByKernel extends QuietCloseable {
         /** Called exactly once for each final map, after every partial state has merged. */
         default void finalizeMap(Map map, Runnable checkpoint) { }
 
+        /** The prepared consumer needs only a fixed ordered prefix of complete groups. */
+        default boolean hasPartitionTopK() { return false; }
+
+        /** Merge complete disjoint groups, retaining the prepared ordered prefix in destination.
+         * Working is owned by this acquired slot and may be reused; no row address may escape it.
+         */
+        default void mergeTopKPartition(Map working, Map destination, ObjList<Updater> sources,
+                                       int partition, Runnable checkpoint) {
+            throw new UnsupportedOperationException();
+        }
+
         /** Nonzero opts into bounded local preaggregation and the existing partition merge. */
         default int localMapCapacity() { return 0; }
 
@@ -126,10 +137,12 @@ public interface GroupByKernel extends QuietCloseable {
         /** Whether a generated filter can feed aggregation without a frame selection vector. */
         default boolean hasFusedFilter() { return false; }
 
-        /** Return accepted rows, or -1 to decline before aggregate mutation. Input and acquired maps are borrowed. */
+        /** Return accepted rows, or -1 to decline before aggregate mutation.
+         * Input, selection scratch and acquired maps are borrowed for this frame.
+         */
         default long updateFiltered(PageFrameMemoryRecord record, long rowCount, @Nullable Map map,
-                                       @Nullable ObjList<Map> shards, int batchSize,
-                                       SqlExecutionCircuitBreaker circuitBreaker) { return -1; }
+                                    @Nullable ObjList<Map> shards, int batchSize, DirectLongList rows,
+                                    SqlExecutionCircuitBreaker circuitBreaker) { return -1; }
 
         /** Fill the existing selection vector; false is permitted only before changing it. */
         default boolean filter(PageFrameMemoryRecord record, long rowCount, DirectLongList rows, SqlExecutionCircuitBreaker breaker) {

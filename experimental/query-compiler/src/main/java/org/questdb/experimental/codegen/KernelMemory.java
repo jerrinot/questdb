@@ -134,6 +134,21 @@ public final class KernelMemory implements AutoCloseable {
         }
     }
 
+    public static long realloc(long address, long oldBytes, long newBytes) {
+        KernelMemory memory = CURRENT.get();
+        if (memory == null || memory.failure != null) { return 0; }
+        try {
+            memory.checkpoint();
+            if (address == 0 || oldBytes <= 0 || newBytes <= 0) {
+                throw new IllegalArgumentException("Invalid reallocation");
+            }
+            return memory.allocator.realloc(address, oldBytes, newBytes);
+        } catch (Throwable failure) {
+            memory.failure = failure;
+            return 0;
+        }
+    }
+
     public static void free(long address, long bytes) {
         KernelMemory memory = CURRENT.get();
         if (memory == null || memory.failure != null) { return; }

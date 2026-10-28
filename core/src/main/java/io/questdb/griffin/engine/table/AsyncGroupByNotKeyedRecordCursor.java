@@ -35,7 +35,6 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.SymbolFunction;
-import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.GroupByUtils;
 import io.questdb.griffin.engine.groupby.SimpleMapValue;
 import io.questdb.std.Misc;
@@ -142,7 +141,6 @@ class AsyncGroupByNotKeyedRecordCursor implements NoRandomAccessRecordCursor {
 
         // Merge the values.
         final AsyncGroupByNotKeyedAtom atom = frameSequence.getAtom();
-        final GroupByFunctionsUpdater functionUpdater = atom.getFunctionUpdater(-1);
         final SimpleMapValue destValue = atom.getOwnerMapValue();
         for (int i = 0, n = atom.getPerWorkerMapValues().size(); i < n; i++) {
             final SimpleMapValue srcValue = atom.getPerWorkerMapValues().getQuick(i);
@@ -150,11 +148,7 @@ class AsyncGroupByNotKeyedRecordCursor implements NoRandomAccessRecordCursor {
                 continue;
             }
 
-            if (destValue.isNew()) {
-                destValue.copy(srcValue);
-            } else {
-                functionUpdater.merge(destValue, srcValue);
-            }
+            atom.merge(srcValue, destValue);
             destValue.setNew(false);
         }
 

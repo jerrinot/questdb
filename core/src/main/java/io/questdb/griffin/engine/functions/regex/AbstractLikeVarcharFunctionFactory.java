@@ -152,7 +152,7 @@ public abstract class AbstractLikeVarcharFunctionFactory implements FunctionFact
      * Optimized variant of {@link ConstContainsVarcharFunction} with SWAR-based contains implementation.
      * Works only for patterns up to 8 bytes in size.
      */
-    private static class ConstContainsSwarVarcharFunction extends BooleanFunction implements UnaryFunction {
+    public static class ConstContainsSwarVarcharFunction extends BooleanFunction implements UnaryFunction {
         private static final int MAX_SIZE = Long.BYTES;
         private final Utf8Sequence pattern; // only used in toPlan
         private final long patternMask;
@@ -180,6 +180,10 @@ public abstract class AbstractLikeVarcharFunctionFactory implements FunctionFact
         @Override
         public Function getArg() {
             return value;
+        }
+
+        public Utf8Sequence getPattern() {
+            return pattern;
         }
 
         @Override

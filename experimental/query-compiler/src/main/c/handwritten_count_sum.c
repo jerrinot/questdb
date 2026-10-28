@@ -159,9 +159,10 @@ static inline uint64_t prepare(uint64_t state, int64_t key) {
 }
 
 int64_t query(uint64_t columns, int64_t rows, uint64_t state,
-              uint64_t allocate_fn, uint64_t free_fn, uint64_t poll_fn) {
+              uint64_t allocate_fn, uint64_t free_fn, uint64_t poll_fn, uint64_t realloc_fn) {
     (void)allocate_fn;
     (void)free_fn;
+    (void)realloc_fn;
     uint64_t longs = u64(columns + 8), ints = u64(columns + 16), shorts = u64(columns + 24);
 #if SHARDED
     uint64_t row_ids = u64(state + 8), keys = u64(state + 16);

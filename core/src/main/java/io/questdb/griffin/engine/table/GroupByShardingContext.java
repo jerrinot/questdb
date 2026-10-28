@@ -183,7 +183,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         } else if (mergePhase == 2) {
             compiledUpdater(slotId).finalizeMap(destShards.getQuick(shardIndex), checkpoint);
         } else {
-            mergeShard(shardIndex, getFunctionUpdater(slotId), compiledUpdater(slotId), checkpoint);
+            mergeShard(slotId, shardIndex, getFunctionUpdater(slotId), compiledUpdater(slotId), checkpoint);
         }
     }
 
@@ -257,7 +257,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         return destMap;
     }
 
-    private void mergeShard(int shardIndex, GroupByFunctionsUpdater functionUpdater, GroupByKernel.Updater compiled, Runnable checkpoint) {
+    private void mergeShard(int slotId, int shardIndex, GroupByFunctionsUpdater functionUpdater, GroupByKernel.Updater compiled, Runnable checkpoint) {
         assert sharded;
 
         final Map destMap = reopenDestShard(shardIndex);
@@ -280,8 +280,17 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
             return;
         }
         if (bounded) {
-            for (int i = 0; i < compiledUpdaters.size(); i++) {
-                compiled.mergePartition(destMap, compiledUpdaters.getQuick(i), shardIndex, checkpoint);
+            boolean select = compiled.hasPartitionTopK();
+            // shardAll() flushed and closed the fragment. This acquired slot can reuse
+            // it for complete groups; only retained destination rows survive the task.
+            Map working = select ? getFragment(slotId).reopenMap() : destMap;
+            if (select) {
+                compiled.mergeTopKPartition(working, destMap, compiledUpdaters, shardIndex, checkpoint);
+                working.clear();
+            } else {
+                for (int i = 0; i < compiledUpdaters.size(); i++) {
+                    compiled.mergePartition(working, compiledUpdaters.getQuick(i), shardIndex, checkpoint);
+                }
             }
             compiled.finalizeMap(destMap, checkpoint);
             if (configuration.isGroupByPresizeEnabled()) {

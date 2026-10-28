@@ -71,13 +71,14 @@ final class LlvmEmitter {
         out.append("define ").append(helper ? "internal " : "").append("i64 @").append(name).append("(");
         out.append(graph.parameters.stream().map(p -> type(p.type()) + " " + operand(p)).collect(Collectors.joining(", ")));
         if (!graph.parameters.isEmpty()) out.append(", ");
-        out.append("i64 %alloc_arg, i64 %free_arg, i64 %poll_arg)").append(helper ? " noinline" : "").append(" {\n");
+        out.append("i64 %alloc_arg, i64 %free_arg, i64 %poll_arg, i64 %realloc_arg)").append(helper ? " noinline" : "").append(" {\n");
         for (var b : graph.blocks) {
             out.append('b').append(b.id).append(":\n");
             if (b.id == 0) {
                 line("%alloc_fn = inttoptr i64 %alloc_arg to ptr");
                 line("%free_fn = inttoptr i64 %free_arg to ptr");
                 line("%poll_fn = inttoptr i64 %poll_arg to ptr");
+                line("%realloc_fn = inttoptr i64 %realloc_arg to ptr");
             }
             for (var p : b.phis) {
                 String incoming = p.inputs.entrySet().stream().map(e -> "[ " + operand(e.getValue()) + ", %" + exits.get(e.getKey()) + " ]")
@@ -96,7 +97,7 @@ final class LlvmEmitter {
                 case Call call -> {
                     String args = call.arguments().stream().map(a -> type(a.type()) + " " + operand(a)).collect(Collectors.joining(", "));
                     if (!args.isEmpty()) args += ", ";
-                    String status = temp("call i64 @" + call.helper().name() + "(" + args + "i64 %alloc_arg, i64 %free_arg, i64 %poll_arg)");
+                    String status = temp("call i64 @" + call.helper().name() + "(" + args + "i64 %alloc_arg, i64 %free_arg, i64 %poll_arg, i64 %realloc_arg)");
                     String failed = temp("icmp ne i64 " + status + ", 0");
                     String continuation = "b" + b.id + "p" + ++polls;
                     line("br i1 " + failed + ", label %" + continuation + "failed, label %" + continuation);
@@ -158,6 +159,7 @@ final class LlvmEmitter {
             case SelectRows s -> selectRows(result, s);
             case ToDouble c -> line(result + " = sitofp i64 " + operand(c.value()) + " to double");
             case Allocate a -> line(result + " = call i64 %alloc_fn(i64 " + operand(a.bytes()) + ")");
+            case Reallocate r -> line(result + " = call i64 %realloc_fn(i64 " + operand(r.address()) + ", i64 " + operand(r.oldBytes()) + ", i64 " + operand(r.newBytes()) + ")");
             default -> throw new IllegalArgumentException("Unexpected SSA expression: " + expression);
         }
     }
