@@ -18,7 +18,7 @@ sharding and aggregate-merge algorithms over the existing prototype table ABI.
 It reuses the core allocator factory and slot locks. Its executor/frame barrier,
 outer table and lack of map pre-sizing remain explicit integration differences;
 it is not yet the production asynchronous runtime. See the [parallel prototype
-contract](README.md#working-with-it) and the progress log. Future changes must
+implementation](src/main/java/org/questdb/experimental/codegen/ParallelGroupBy.java) and the progress log. Future changes must
 start from the Java algorithms and an executable Java oracle, not invent a second
 merge/allocation strategy.
 

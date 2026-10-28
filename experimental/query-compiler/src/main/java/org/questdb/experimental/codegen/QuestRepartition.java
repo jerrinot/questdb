@@ -24,18 +24,19 @@
 
 package org.questdb.experimental.codegen;
 
-import io.questdb.griffin.engine.table.GroupByMapFragment;
 import static org.questdb.experimental.codegen.Ir.*;
 
 /** Cache-sized subpartitions; storage belongs to the existing acquired slot allocator. */
 final class QuestRepartition {
     static final int PARTS = 64;
-    static final int STATE_BYTES = PARTS * 16 + 16;
+    static final int MASK_OFFSET = PARTS * QuestPartitions.BUCKET_BYTES;
+    static final int SHIFT_OFFSET = MASK_OFFSET + Long.BYTES;
+    static final int STATE_BYTES = SHIFT_OFFSET + Long.BYTES;
 
     private static QuestPartitions.Append append(Builder b, Expr hash, long rowBytes) {
         Var part = b.let(binary(Op.AND, binary(Op.USHR, hash,
-                load(at(STATE, PARTS * 16L + 8))), load(at(STATE, PARTS * 16L))));
-        Var bucket = b.let(new Offset(STATE, binary(Op.MUL, part, i64(16))));
+                load(at(STATE, SHIFT_OFFSET))), load(at(STATE, MASK_OFFSET))));
+        Var bucket = b.let(new Offset(STATE, binary(Op.MUL, part, i64(QuestPartitions.BUCKET_BYTES))));
         return QuestPartitions.reserve(b, bucket, rowBytes);
     }
 

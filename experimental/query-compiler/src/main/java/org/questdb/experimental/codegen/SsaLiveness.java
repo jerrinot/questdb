@@ -84,7 +84,9 @@ final class SsaLiveness {
         return aliases;
     }
     private static Set<Var> reads(Statement s) {
-        Set<Var> result = new HashSet<>(); map(s, e -> { result.add((Var)e); return e; }); return result;
+        Set<Var> result = new HashSet<>();
+        Ir.collectReads(s, result);
+        return result;
     }
     private static void interfere(Var definition, Set<Var> live, Map<Var, Set<Var>> graph) {
         for (Var v : live) if (!definition.equals(v)) {

@@ -34,7 +34,6 @@ final class QuestPartitionSketch {
     static final int PRECISION = 7;
     static final int REGISTERS = 1 << PRECISION;
     static final int SAMPLE_RATE = 16;
-    static final long OFFSET = GroupByMapFragment.NUM_SHARDS * 16L;
     static final long BYTES = GroupByMapFragment.NUM_SHARDS * REGISTERS;
 
     static void add(Builder b, Expr sketch, Expr hash) {

@@ -47,11 +47,11 @@ import static io.questdb.cairo.VarcharTypeDriver.VARCHAR_INLINED_PREFIX_MASK;
  * </pre>
  */
 public final class GroupByUtf8Sink implements Utf8Sink, Utf8Sequence {
-    private static final long HEADER_SIZE = 2 * Integer.BYTES + Byte.BYTES;
-    private static final long IS_ASCII_OFFSET = 2 * Integer.BYTES;
+    public static final long HEADER_SIZE = 2 * Integer.BYTES + Byte.BYTES;
+    public static final long IS_ASCII_OFFSET = 2 * Integer.BYTES;
     // Must be at least 8 bytes, so that zeroPaddedSixPrefix can safely read long.
-    private static final int MIN_CAPACITY = 8;
-    private static final long SIZE_OFFSET = Integer.BYTES;
+    public static final int MIN_CAPACITY = 8;
+    public static final long SIZE_OFFSET = Integer.BYTES;
     private GroupByAllocator allocator;
     private AsciiCharSequence asciiCharSequence;
     private long ptr;

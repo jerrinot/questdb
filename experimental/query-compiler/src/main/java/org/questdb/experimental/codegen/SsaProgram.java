@@ -116,7 +116,7 @@ final class SsaProgram {
     }
     static Set<Var> reads(Expr e) {
         Set<Var> result = new HashSet<>();
-        map(e, value -> { result.add((Var) value); return value; });
+        Ir.collectReads(e, result);
         return result;
     }
     String dump() {

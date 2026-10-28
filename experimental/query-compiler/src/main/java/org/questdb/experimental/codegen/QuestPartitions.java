@@ -30,9 +30,19 @@ import static org.questdb.experimental.codegen.Ir.*;
 
 /** Dense partial-state pages. Allocation and final maps retain their existing query owners. */
 final class QuestPartitions {
+    // Each bucket starts with its head pointer; a zero tail marks an empty live chain.
+    static final int BUCKET_TAIL_OFFSET = Long.BYTES;
+    static final int BUCKET_BYTES = 2 * Long.BYTES;
+    // Each page starts with its successor pointer, followed by the published row count.
+    static final int PAGE_COUNT_OFFSET = Long.BYTES;
+    static final int PAGE_HEADER_BYTES = 2 * Long.BYTES;
     static final int PAGE_BYTES = 64 * 1024;
-    static final int BLOB_OFFSET = GroupByMapFragment.NUM_SHARDS * 16 + 16;
-    static final int STATE_BYTES = BLOB_OFFSET + 16;
+    static final int SKETCH_OFFSET = GroupByMapFragment.NUM_SHARDS * BUCKET_BYTES;
+    // A reserved word follows the sketch pointer.
+    private static final int BLOB_OFFSET = SKETCH_OFFSET + 2 * Long.BYTES;
+    // The blob descriptor starts with the next writable byte pointer.
+    private static final int BLOB_AVAILABLE_OFFSET = Long.BYTES;
+    static final int STATE_BYTES = BLOB_OFFSET + 2 * Long.BYTES;
     static final int NEED_FLUSH = 10;
 
     private QuestPartitions() { }
@@ -40,16 +50,16 @@ final class QuestPartitions {
     /** Reserve one row without publishing its count until the payload is complete. */
     static Append append(Builder b, Expr partitions, Expr hash, long rowBytes) {
         Var bucket = b.let(new Offset(partitions, binary(Op.MUL,
-                binary(Op.USHR, hash, i64(GroupByMapFragment.NUM_SHARDS_SHR)), i64(16))));
+                binary(Op.USHR, hash, i64(GroupByMapFragment.NUM_SHARDS_SHR)), i64(BUCKET_BYTES))));
         return reserve(b, bucket, rowBytes);
     }
 
     /** A reset tail reuses the head chain; consumers stop at the current tail, not a stale successor. */
     static Append reserve(Builder b, Expr bucket, long rowBytes) {
-        Var tail = b.let(new Load(MemoryType.ADDRESS, at(bucket, 8)));
+        Var tail = b.let(new Load(MemoryType.ADDRESS, at(bucket, BUCKET_TAIL_OFFSET)));
         Var count = b.let(i64(0));
-        b.when(ne(tail, nil()), existing -> existing.assign(count, load(at(tail, 8))));
-        b.when(binary(Op.EITHER, eq(tail, nil()), binary(Op.GE, count, i64((PAGE_BYTES - 16) / rowBytes))), full -> {
+        b.when(ne(tail, nil()), existing -> existing.assign(count, load(at(tail, PAGE_COUNT_OFFSET))));
+        b.when(binary(Op.EITHER, eq(tail, nil()), binary(Op.GE, count, i64((PAGE_BYTES - PAGE_HEADER_BYTES) / rowBytes))), full -> {
             Var page = full.let(nil());
             full.when(eq(tail, nil()), first -> first.assign(page, new Load(MemoryType.ADDRESS, bucket)));
             full.when(ne(tail, nil()), following -> following.assign(page, new Load(MemoryType.ADDRESS, tail)));
@@ -60,17 +70,17 @@ final class QuestPartitions {
                 allocate.when(ne(tail, nil()), link -> link.store(MemoryType.ADDRESS, tail, page));
                 allocate.when(eq(tail, nil()), first -> first.store(MemoryType.ADDRESS, bucket, page));
             });
-            full.store(at(page, 8), i64(0));
-            full.store(MemoryType.ADDRESS, at(bucket, 8), page);
+            full.store(at(page, PAGE_COUNT_OFFSET), i64(0));
+            full.store(MemoryType.ADDRESS, at(bucket, BUCKET_TAIL_OFFSET), page);
             full.assign(tail, page);
             full.assign(count, i64(0));
         });
-        Var row = b.let(new Offset(at(tail, 16), binary(Op.MUL, count, i64(rowBytes))));
+        Var row = b.let(new Offset(at(tail, PAGE_HEADER_BYTES), binary(Op.MUL, count, i64(rowBytes))));
         return new Append(row, tail, count);
     }
 
     record Append(Var row, Var tail, Var count) {
-        void commit(Builder b) { b.store(at(tail, 8), add(count, i64(1))); }
+        void commit(Builder b) { b.store(at(tail, PAGE_COUNT_OFFSET), add(count, i64(1))); }
     }
 
     /** Retain only transient bytes; stable payloads already belong to the pinned query snapshot. */
@@ -79,7 +89,7 @@ final class QuestPartitions {
         b.when(binary(Op.BOTH, eq(value.stable(), bool(false)), ne(value.size(), i64(0))), unstable -> {
             Expr blob = at(partitions, BLOB_OFFSET);
             Var next = unstable.let(new Load(MemoryType.ADDRESS, blob));
-            Var available = unstable.let(load(at(blob, 8)));
+            Var available = unstable.let(load(at(blob, BLOB_AVAILABLE_OFFSET)));
             Var length = unstable.let(value.size());
             unstable.when(binary(Op.LT, available, length), full -> {
                 Var capacity = full.let(new Select(binary(Op.LT, length, i64(PAGE_BYTES)), i64(PAGE_BYTES), length));
@@ -90,7 +100,7 @@ final class QuestPartitions {
             QuestMapMutation.copy(unstable, pointer, next, length);
             unstable.assign(pointer, next);
             unstable.store(MemoryType.ADDRESS, blob, new Offset(next, length));
-            unstable.store(at(blob, 8), binary(Op.SUB, available, length));
+            unstable.store(at(blob, BLOB_AVAILABLE_OFFSET), binary(Op.SUB, available, length));
         });
         return pointer;
     }
@@ -99,7 +109,7 @@ final class QuestPartitions {
         Builder b = new Builder();
         int keyBytes = probe.varchar() ? 24 : probe.keyBytes();
         long rowBytes = keyBytes + valueBytes;
-        Var sketch = probe.varchar() ? null : b.let(new Load(MemoryType.ADDRESS, at(STATE, QuestPartitionSketch.OFFSET)));
+        Var sketch = probe.varchar() ? null : b.let(new Load(MemoryType.ADDRESS, at(STATE, SKETCH_OFFSET)));
         QuestMapScan.emit(b, probe, COLUMNS, (entry, source) -> {
                 Var hash = probe.varchar() ? QuestVarchar.hash(entry, QuestVarchar.pointer(source), QuestVarchar.size(source))
                         : probe.orderedNative() ? probe.hash(entry, source)

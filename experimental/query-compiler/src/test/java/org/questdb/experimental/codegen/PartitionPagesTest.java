@@ -122,9 +122,11 @@ public class PartitionPagesTest {
             for (int round = 0; round < fanouts.length; round++) {
                 int parts = fanouts[round], count = lengths[round];
                 int shift = 56 - Integer.numberOfTrailingZeros(parts);
-                Unsafe.putLong(state + QuestRepartition.PARTS * 16L, parts - 1);
-                Unsafe.putLong(state + QuestRepartition.PARTS * 16L + 8, shift);
-                for (int part = 0; part < parts; part++) Unsafe.putLong(state + part * 16L + 8, 0);
+                Unsafe.putLong(state + QuestRepartition.MASK_OFFSET, parts - 1);
+                Unsafe.putLong(state + QuestRepartition.SHIFT_OFFSET, shift);
+                for (int part = 0; part < parts; part++) {
+                    Unsafe.putLong(state + part * (long) QuestPartitions.BUCKET_BYTES + QuestPartitions.BUCKET_TAIL_OFFSET, 0);
+                }
                 for (int row = 0; row < count; row++) {
                     Unsafe.putLong(records + row * 16L, key(row, round));
                     Unsafe.putLong(records + row * 16L + 8, row);
@@ -139,14 +141,14 @@ public class PartitionPagesTest {
                 boolean[] seen = new boolean[count];
                 int actual = 0;
                 for (int part = 0; part < parts; part++) {
-                    long tail = Unsafe.getLong(state + part * 16L + 8);
+                    long tail = Unsafe.getLong(state + part * (long) QuestPartitions.BUCKET_BYTES + QuestPartitions.BUCKET_TAIL_OFFSET);
                     if (tail == 0) continue;
-                    long page = Unsafe.getLong(state + part * 16L);
+                    long page = Unsafe.getLong(state + part * (long) QuestPartitions.BUCKET_BYTES);
                     while (true) {
-                        long rows = Unsafe.getLong(page + 8);
-                        assertTrue(rows > 0 && rows <= (QuestPartitions.PAGE_BYTES - 16) / 16);
+                        long rows = Unsafe.getLong(page + QuestPartitions.PAGE_COUNT_OFFSET);
+                        assertTrue(rows > 0 && rows <= (QuestPartitions.PAGE_BYTES - QuestPartitions.PAGE_HEADER_BYTES) / 16);
                         for (int row = 0; row < rows; row++) {
-                            long record = page + 16 + row * 16L;
+                            long record = page + QuestPartitions.PAGE_HEADER_BYTES + row * 16L;
                             int input = Math.toIntExact(Unsafe.getLong(record + 8));
                             assertTrue(input >= 0 && input < count);
                             assertFalse("Stale or duplicate row", seen[input]);

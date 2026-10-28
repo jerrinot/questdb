@@ -50,7 +50,7 @@ final class QuestPartitionInputs {
     static Program rows(QuestMapProbe probe, AggregateUpdates updates) {
         Builder b = new Builder();
         Var partitions = b.let(new Load(MemoryType.ADDRESS, COLUMNS));
-        Var sketch = b.let(new Load(MemoryType.ADDRESS, at(partitions, QuestPartitionSketch.OFFSET)));
+        Var sketch = b.let(new Load(MemoryType.ADDRESS, at(partitions, QuestPartitions.SKETCH_OFFSET)));
         Var rowIds = b.let(new Load(MemoryType.ADDRESS, at(STATE, 8)));
         var addresses = new ArrayList<Var>();
         for (int i = 0; i < updates.columns().size(); i++) {

@@ -28,11 +28,22 @@ import static org.questdb.experimental.codegen.Ir.*;
 
 /** DirectLongLongAsc/DescList's bounded insertion algorithm over borrowed engine storage. */
 final class QuestLongTopK {
+    static final int SIZE_OFFSET = 8;
+    static final int CAPACITY_OFFSET = 16;
+    static final int SOURCE_KIND_OFFSET = 24;
+    static final int ORDER_OFFSET = 32;
+    static final int VALUE_OFFSET = 40;
+    static final int SCRATCH_OFFSET = 48;
+    static final int SCRATCH_CAPACITY_OFFSET = 56;
+    static final int SOURCE_MAP = 0;
+    static final int SOURCE_PAIRS = 1;
+    static final int SOURCE_MAPS = 2;
+
     private QuestLongTopK() {
     }
 
-    // STATE: destination address, size, capacity, source kind (map=0/list=1), order, value offset.
-    // COLUMNS: the existing 48-byte map probe view, or source pairs. ROWS: source list size.
+    // STATE starts with the destination address, followed by the fields above.
+    // COLUMNS is a map view, source pairs or an array of map views; ROWS counts pairs/views.
     static Program program(int keyType) { return program(QuestMapProbe.direct(-1, keyType, false)); }
 
     static Program program(QuestMapProbe probe) { return program(probe, -1); }
@@ -47,8 +58,8 @@ final class QuestLongTopK {
         if (sortOrder < -1 || sortOrder > 1) throw new IllegalArgumentException("Invalid Top-K order");
         Builder b = new Builder();
         Var destination = b.let(new Load(MemoryType.ADDRESS, STATE));
-        Var size = b.let(load(at(STATE, 8)));
-        Var capacity = b.let(load(at(STATE, 16)));
+        Var size = b.let(load(at(STATE, SIZE_OFFSET)));
+        Var capacity = b.let(load(at(STATE, CAPACITY_OFFSET)));
         if (capacityClass != -1) {
             // Retain the range information supplied by generic algorithm dispatch.
             b.when(eq(binary(Op.LT, i64(64), capacity), bool(capacityClass == 0)), invalid -> invalid.exit(1));
@@ -63,9 +74,9 @@ final class QuestLongTopK {
         for (int order = 0; order < 2; order++) {
             if (sortOrder != -1 && sortOrder != order) continue;
             boolean ascending = order == 0;
-            b.when(sortOrder == -1 ? eq(load(at(STATE, 32)), i64(order)) : bool(true), ordered -> {
-                ordered.when(eq(load(at(STATE, 24)), i64(0)), map -> {
-                    Var valueOffset = map.let(load(at(STATE, 40)));
+            b.when(sortOrder == -1 ? eq(load(at(STATE, ORDER_OFFSET)), i64(order)) : bool(true), ordered -> {
+                ordered.when(eq(load(at(STATE, SOURCE_KIND_OFFSET)), i64(SOURCE_MAP)), map -> {
+                    Var valueOffset = map.let(load(at(STATE, VALUE_OFFSET)));
                     QuestMapScan.emit(map, probe, COLUMNS, (entryBuilder, entry) -> {
                         Expr value = probe.variable() ? new Offset(QuestVariableKey.value(entry), valueOffset)
                                 : new Offset(entry, valueOffset);
@@ -142,7 +153,7 @@ final class QuestLongTopK {
                 insert.store(target, value);
                 insert.store(MemoryType.ADDRESS, at(target, 8), rowId);
                 insert.when(binary(Op.LT, size, capacity), grow -> grow.assign(size, Ir.add(size, i64(1))));
-                insert.store(at(STATE, 8), size);
+                insert.store(at(STATE, SIZE_OFFSET), size);
             });
         });
     }

@@ -1,9 +1,9 @@
 # Compiler experiment plan: own the parallel program
 
-Updated 2026-10-28 against `4cc95d1e96` plus the working changes. This is the active experiment plan,
-replacing the completed coverage slices and helper experiments previously listed
-here. E0 now has fresh 500M-row measurements, and E1's first adaptive partial-record
-representation and E3's first bounded filter stage are implemented; see [PROGRESS.md](PROGRESS.md).
+Updated 2026-10-28 against committed checkpoint `9df4de643d`. The immediate work
+is the maintainability sequence below, before further operator expansion. E0 has
+500M-row measurements, and E1's first adaptive partial-record representation and
+E3's first bounded filter stage are implemented; see [PROGRESS.md](PROGRESS.md).
 Older timings below still require a fresh matched control before another
 optimization claim. Research and its limitations are in
 [PIPELINE_DESIGN.md](PIPELINE_DESIGN.md#literature-reassessment-2026-10-27).
@@ -82,8 +82,114 @@ This checkpoint completes the current experiment for the requested commit.
 Wall-clock profiling is paused at the user's request while the desktop is in use. Later contaminated
 and interrupted timing runs are excluded. Before making a broader claim, resume
 controlled final-build measurements, including cross-cache placement, skew and
-other architectures. Do not start another experiment as part of this checkpoint.
+other architectures. The checkpoint is committed; the following maintainability
+work is planned and does not resume performance experiments or profiling.
 See [PROGRESS.md](PROGRESS.md).
+
+## Immediate sequence: maintainability
+
+### Success criteria
+
+A cleanup must remove a demonstrated maintenance burden while preserving execution.
+Passing tests is necessary, but does not establish that the design became simpler.
+For each patch, identify the concrete before/after benefit in at least one of:
+
+- **Fewer independently maintained facts:** a layout, capability decision or
+  lifecycle rule has one authoritative definition and its old copies disappear.
+- **Fewer states to reason about:** coupled fields or flags cannot disagree, and
+  the change removes corresponding checks or coordination from callers. Moving
+  the same nullable fields into a record is insufficient.
+- **A smaller change surface:** name a realistic follow-up edit and show that it
+  requires fewer independently coordinated edits or less unrelated code reading.
+- **A clearer execution/lifetime path:** a responsibility has an identifiable
+  owner, without adding forwarding layers or spreading its lifecycle across files.
+
+Check the benefit against any new types, mutable state, dispatch, dependencies and
+public API. Net line count and file size are supporting evidence, not targets.
+If the tradeoff cannot be explained concretely, keep the current implementation.
+
+### Guardrails
+
+1. **One concern per reversible patch.** Preserve the existing dirty work. Capture
+   the current implementation before editing; compare against that baseline.
+   Do not combine cleanup with algorithm changes, heuristics, eligibility changes,
+   new operators, bug fixes or unrelated formatting. Record discovered bugs separately.
+2. **Prefer deletion, direct code and existing infrastructure.** A new helper or
+   type must remove a real responsibility elsewhere or enforce a current invariant.
+   No new configuration switches, forwarding-only wrappers, single-implementation
+   strategy interfaces, registries, generic phase graphs, layout frameworks or speculative extension
+   points. A single cohesive owner can justify a helper; hypothetical reuse cannot.
+3. **Preserve contracts.** Keep SQL/null/overflow semantics, native layouts,
+   allocation ownership, reset/close order, publication, cancellation, lazy
+   compilation, fallback and worker scheduling. Trace producers and consumers
+   before changing their boundary. Remove defensive checks only after proving
+   that they are redundant under the actual callers.
+4. **Protect execution cost.** No new per-row/per-batch allocation, dispatch or
+   synchronization for abstraction convenience. Keep generated loops and data
+   movement unchanged in cleanup. Query/slot metadata additions need an explicit
+   benefit. Core changes must be narrow and retain no experimental dependency.
+5. **Keep verification proportional.** Use existing focused tests for affected
+   behavior and lifetimes; add a test only for an uncovered failure mode. When
+   generation changes, compare representative LLVM IR, AsmJit streams and C output.
+   Account for every difference. Matching generated code does not prove that Java
+   orchestration or compilation costs stayed constant. No permanent golden-output
+   archive or test suite that merely mirrors the refactored structure.
+6. **Respect the profiling pause.** Correctness work runs at reduced priority.
+   If accepting a patch depends on measuring a performance tradeoff, defer that
+   patch until controlled profiling resumes. Performance experiments remain
+   separate, with hardware evidence and the existing 500M-row workload requirement.
+7. **Keep the process light.** Before each patch, state the code evidence, the
+   smallest change and how it will be checked. Afterwards, report what became
+   simpler, what new machinery was introduced and the validation limit. If the
+   benefit fails to materialize, undo only that patch and choose another candidate.
+   Finish when no concrete improvement meets these rules; do not manufacture work.
+
+### Candidate work, subject to those criteria
+
+- Finish consolidating duplicated operator control words where readers and writers
+  can share the existing owner. Avoid inventing a descriptor system.
+- Inspect `ResolvedAggregateKernel.Prepared`'s partition/ranking/replay combinations.
+  Introduce a description only if it eliminates invalid combinations and caller
+  coordination. Preserve late `prepareLongTopK` binding and `CompiledKernel.defer`.
+- Consider extracting partition orchestration from `AggregateSlot` only if it
+  produces a cohesive owner with fewer cross-boundary dependencies. Keep
+  `runMutable`, allocation and scheduling in their existing owners. A smaller
+  `AggregateSlot` alone is not success.
+- Factor genuinely identical IR traversal using existing `SsaProgram.map` where
+  appropriate. Preserve explicit effects, scope, evaluation order and exhaustive
+  switches. Leave intentional backend-specific duplication alone.
+- Shorten architecture documentation and the progress log while preserving current
+  entrypoints, controls and evidence limits. Distinguish the standalone plan harness
+  from SQL integration; audit callers before removing either.
+
+The shared aggregate-definition/Java-emitter pilot in
+[AGGREGATE_DESIGN.md](AGGREGATE_DESIGN.md#shared-definition-experiment) is compiler
+research, outside this cleanup sequence. It requires its own experiment and
+acceptance criteria; refactoring does not authorize a generator framework.
+
+Layout cleanup completed so far (2026-10-28): partition fields belong to
+`QuestPartitions`/`QuestRepartition`; VARCHAR extrema use `GroupByUtf8Sink` constants;
+each slot calculates its state, scratch and key addresses once. Native layouts,
+allocation sizes and page reuse are unchanged. Thirteen representative kernels
+emitted identical LLVM IR, AsmJit streams and C bodies (39 comparisons). The latest
+slot/sink checks passed 48 SQL, 18 kernel and 3 fused-filter tests. The earlier
+partition slice passed page reuse checks. No performance claim follows from this.
+
+Sort/Top-K/LIMIT control fields now belong to their existing operator classes.
+Their Java writers and generated readers share those definitions: 51 generated
+outputs and normalized `AggregateSlot` bytecode are unchanged; 39 focused tests
+passed. README now separates current SQL integration from standalone controls in
+223 lines instead of 785. A record wrapping the nullable partition kernels was
+rejected: their construction already has one owner, and wrapping alone would not
+remove runtime choices or caller coordination. No new types or runtime branches
+were needed for this pass.
+
+Variable-use collection now lives beside the IR definitions. Structured dead-local
+analysis, SSA expression reads and liveness reads share it; the latter two no longer
+rebuild expression trees just to discard them. Rewriting, scope validation and
+effect classification remain separate. Thirty representative kernels match across
+all backends with default and SSA lowering; 99 focused checks pass in each mode.
+This removes unnecessary compiler allocations without a measured timing claim.
 
 ## What the evidence makes worth trying
 

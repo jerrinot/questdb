@@ -28,14 +28,19 @@ import static org.questdb.experimental.codegen.Ir.*;
 
 /** Positive LIMIT/OFFSET selection in actual map cursor order. No copied payloads. */
 final class QuestRowLimit {
+    static final int SELECTED_OFFSET = 8;
+    static final int SKIP_OFFSET = 16;
+    static final int TAKE_OFFSET = 24;
+    static final int SHARD_OFFSET = 32;
+
     private QuestRowLimit() { }
-    // STATE: output address, selected count, skip remaining, take count, shard row-ID bits.
+    // STATE starts with the output address, followed by the fields above.
     static Program program(QuestMapProbe probe) {
         Builder b = new Builder();
         Var output = b.let(new Load(MemoryType.ADDRESS, STATE));
-        Var selected = b.let(load(at(STATE, 8)));
-        Var skip = b.let(load(at(STATE, 16)));
-        Var take = b.let(load(at(STATE, 24)));
+        Var selected = b.let(load(at(STATE, SELECTED_OFFSET)));
+        Var skip = b.let(load(at(STATE, SKIP_OFFSET)));
+        Var take = b.let(load(at(STATE, TAKE_OFFSET)));
         // A nonempty sorted list supplies ROWS; ordinary map selection passes zero.
         b.when(ne(ROWS, i64(0)), sorted -> {
             sorted.poll();
@@ -45,10 +50,10 @@ final class QuestRowLimit {
                 copy.assign(selected, add(selected, i64(1)));
                 copy.when(eq(binary(Op.AND, selected, i64(1023)), i64(0)), Builder::poll);
             });
-            sorted.store(at(STATE, 8), selected);
+            sorted.store(at(STATE, SELECTED_OFFSET), selected);
             sorted.exit(0);
         });
-        Var shard = b.let(load(at(STATE, 32)));
+        Var shard = b.let(load(at(STATE, SHARD_OFFSET)));
         QuestMapScan.emit(b, probe, COLUMNS, true, (entryBuilder, entry) -> {
             Var skipped = entryBuilder.let(binary(Op.LT, i64(0), skip));
             entryBuilder.when(skipped, next -> next.assign(skip, binary(Op.SUB, skip, i64(1))));
@@ -58,14 +63,14 @@ final class QuestRowLimit {
                 keep.store(target, add(load(target), shard));
                 keep.assign(selected, add(selected, i64(1)));
                 keep.when(eq(selected, take), done -> {
-                    done.store(at(STATE, 8), selected);
-                    done.store(at(STATE, 16), skip);
+                    done.store(at(STATE, SELECTED_OFFSET), selected);
+                    done.store(at(STATE, SKIP_OFFSET), skip);
                     done.exit(0);
                 });
             });
         });
-        b.store(at(STATE, 8), selected);
-        b.store(at(STATE, 16), skip);
+        b.store(at(STATE, SELECTED_OFFSET), selected);
+        b.store(at(STATE, SKIP_OFFSET), skip);
         b.exit(0);
         return new Program(b.block());
     }
