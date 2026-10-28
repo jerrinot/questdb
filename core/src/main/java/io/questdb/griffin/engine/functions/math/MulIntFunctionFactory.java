@@ -68,7 +68,7 @@ public class MulIntFunctionFactory implements FunctionFactory {
         return new Func(left, right);
     }
 
-    private static final class Func extends IntFunction implements ArithmeticBinaryFunction {
+    public static final class Func extends IntFunction implements ArithmeticBinaryFunction {
         private final Function left;
         private final Function right;
 

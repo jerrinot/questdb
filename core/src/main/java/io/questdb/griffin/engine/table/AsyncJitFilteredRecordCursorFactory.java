@@ -259,6 +259,9 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
             order = baseOrder;
         }
 
+        boolean compiledLimit = compiledFilter.prepareLimit(
+                order == ORDER_ASC && base.getScanDirection() == SCAN_DIRECTION_FORWARD ? rowsRemaining : Long.MAX_VALUE
+        );
         if (order != baseOrder && rowsRemaining != Long.MAX_VALUE) {
             // A negative limit is negated above; -Long.MIN_VALUE overflows back to a negative value,
             // so reject rowsRemaining < 0 too instead of letting it slip past the maxNegativeLimit
@@ -273,7 +276,7 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
             return negativeLimitCursor;
         }
 
-        cursor.of(execute(executionContext, collectSubSeq, order), rowsRemaining);
+        cursor.of(execute(executionContext, collectSubSeq, order), rowsRemaining, compiledLimit ? compiledFilter : null);
         return cursor;
     }
 

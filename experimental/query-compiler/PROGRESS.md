@@ -3750,3 +3750,319 @@ inputs, column tops, lazy conversion, Parquet, cancellation, reopen and partial
 slot-construction cleanup. Main sources and changed tests compile. Evidence and
 LLVM dumps: `/tmp/query-scalar-aggregate-20261028`. Profiling remains paused;
 no new performance or ClickBench coverage claim.
+
+## 2026-10-28: shared integer multiplication
+
+INT/LONG multiplication now binds the exact QuestDB function implementations and
+uses the existing arithmetic emitter for wrapping, NULL propagation and INT-to-LONG
+widening. It composes in predicates, projections, grouping keys and aggregate
+arguments, including unkeyed reductions. Scan substitution, column tracking and
+expression limits understand the new node. No backend changes or toggles.
+
+The old compiler fails the six new SQL coverage cases. The implementation passes
+12 focused SQL checks across LLVM/AsmJit/C and both worker modes, plus three scan
+checks that each exercise all lowering modes. Cases include NULL operands, zero
+multipliers, overflow into the NULL sentinel, widening before/after multiplication,
+native row counts and repeated execution. Evidence: `/tmp/query-integer-multiply-20261028`.
+Profiling remains paused; this is a coverage gain, not a measured speedup.
+
+## 2026-10-28: string negation and ordered filter LIMIT
+
+Supported VARCHAR predicates now bind through NOT, preserving the resolved
+functions' NULL behavior. Forward finite filter LIMIT uses generated frame-prefix
+admission in the existing ordered collector. Native VARCHAR selection stops after
+K matches per frame; workers share an immutable cap, not a racing global quota.
+No copied row lists, scheduler changes or new switches. Numeric-only selection
+keeps its full-frame SIMD path; Parquet stays full-frame for selectivity statistics
+and retains its existing late-materialization/column-top fallback.
+
+Original Q22–Q24 SQL matches stock on a 4,096-row ClickBench-schema fixture,
+including all 105 Q23 output columns in order. Q22 filters 4,096 rows natively and
+updates 2,253. Q23/Q24 evaluate 24/10 rows across dispatched frames and each admit
+ten; the full-frame LLVM control evaluates 262 for each at identical settings.
+A separate dense fixture checks 10–20 evaluated rows at LIMIT 10 with two in-flight
+frames. Work includes scheduling slack; this does not establish lower elapsed time.
+
+42 focused SQL, nine scan and four existing core checks pass: LLVM/AsmJit/C, both
+worker modes, later-frame-first completion, cursor operations, runtime bound
+changes, zero dispatch, tails and preparation-failure recovery. Evidence:
+`/tmp/query-filter-limit-20261028`. Full-data coverage remains 30/43 pending the
+planned audit; controlled profiling remains paused. No speedup claim.
+
+## 2026-10-28: generated VARCHAR Top-K batch build
+
+Single-VARCHAR ordering now generates the existing encoded-buffer build: six-byte
+split-prefix rejection, normalized key encoding, full threshold comparison and
+admission, in either direction. It borrows actual worker buffers and returns only
+for growth/compaction, retaining existing budgets, threshold copies, scheduling
+and row IDs. LLVM recognizes the byte permutations as bswap intrinsics; its only
+external call site in this kernel is the throttled cancellation poll.
+
+The old build fails all six added SQL coverage cases. The implementation passes
+12 SQL checks across LLVM/AsmJit/C and both worker modes, three guard-page checks,
+and the existing Top-K partial-filter-compilation cleanup check. Cases include
+NULL/empty/long-prefix strings, encoding boundaries, Parquet, ordered ties,
+compaction, reopen, preparation/worker failure and memory-limit recovery. A losing
+split-prefix guard test proves no payload read. Original Q25 matches stock on the
+4,096-row ClickBench-schema fixture; native filter and build counters both cover
+4,096 rows. Evidence: `/tmp/query-varchar-topk-20261028`.
+
+Compaction, merge and final sorting remain ordinary, so Q25 is not yet a complete
+LLVM pipeline. Q26's partially ordered composite path remains untouched. Profiling
+is paused; no performance or full-data qualification claim. No new toggles.
+
+## 2026-10-28: generated encoded Top-K merge and heap packing
+
+Worker-result admission and compaction's survivor selection/heap packing now use
+shared typed IR over QuestDB's normalized variable-key entries. These stages are
+compiled lazily, retain the existing threshold and compaction algorithm, and
+resume after ordinary buffer growth. Scan and merge share one full-key comparison.
+FIRST N avoids copying entries already in place; LAST N safely moves overlapping
+ranges. Scratch packing remains necessary because survivors reference arbitrary
+positions in the old heap. Sorting and threshold publication still use stock code.
+
+21 focused checks pass across LLVM/AsmJit/C: 12 SQL checks, six buffer checks and
+three guard-page checks. Buffer contents and packed heaps match stock byte for
+byte, including a capped compaction trigger, repeated heap growth, FIRST/LAST N,
+both directions and recovery after failure midway through packing. Source buffers
+remain unchanged; compiled code and scratch allocations are released. Original
+Q25 matches stock on the 4,096-row fixture, with 4,096 generated build rows, 3,965
+merge input entries and one generated packing pass. Optimized LLVM merge/packing
+have only cancellation polls as runtime call sites. Evidence:
+`/tmp/query-encoded-topk-20261028`.
+
+Generated sorting (inside compaction and for final output) is still missing;
+Q25 remains partial and full-data verified coverage stays 30/43. No controlled
+performance runs or speedup claim; desktop profiling remains paused.
+
+## 2026-10-28: generated normalized variable-key sorting
+
+Compaction and final Top-K sorting now execute typed-IR ports of the existing
+natural-run detection, in-place MSD radix partitioning and non-branchless pdqsort.
+Insertion sort, pattern breaking, equal-key handling and worst-case heapsort remain.
+Bounded explicit stacks replace recursion; pdqsort processes the smaller partition
+first. Sorting uses normalized 40-byte entries, without SQL names, column types or
+hardware-specific tuning. The 16-byte prefix avoids heap reads when it decides the
+order; entries already in their radix bucket avoid copying. Workspace reuses the
+buffer's tracked DirectLongList and only grows. Small sorts need no radix workspace.
+
+The final cursor's Java LIMIT truncation was another uncovered boundary. It now
+consumes the prefix count from generated sorting, using the existing row-limit
+expression. The EXPLAIN marker is `compiledTopK`. Stock execution remains available
+through the ordinary factory; lazy-conversion fallback remains explicit.
+
+Validation: 12 existing SQL checks pass across all three backends and both worker
+modes. Six further SQL checks cover empty/singleton/short results, changing binds
+and cached-factory reopening. Six guarded-sort checks cover eight distributions,
+0/1/23/24/127/128 boundaries, long shared prefixes, arbitrary normalized bytes,
+unsigned row IDs, both guard edges and forced heapsort, plus query-budget failure
+and cancellation recovery. Six buffer checks and three encoding guard checks pass.
+The first edge-fixture attempt omitted its bind service; matching existing test
+setup fixed the fixture. No production workaround was added.
+
+Original Q25 matches stock on 4,096 fixture rows: filter/build process all rows,
+merge consumes 262 worker entries, and generated sorts process 4,096 entries at
+compaction plus ten for final output. The LLVM module defines its own sort helpers;
+external runtime calls are cancellation polls, with compiler intrinsics for primitive
+operations. Evidence: `/tmp/query-encoded-sort-20261028`.
+
+Q25 now has a complete generated path on the fixture, joining Q22–Q24 awaiting
+full-data qualification (34 provisional shapes, 30/43 full-data verified). This
+establishes correctness coverage. Profiling stays paused;
+compilation cost, long-tail comparison cost and end-to-end gains still need measured
+validation. Composite/partially ordered SQL binding remains the next separate gap.
+
+## 2026-10-28: packed variable-key aggregation partitions
+
+The Q32 locality result survives independent 500M-row controls. With the same LLVM
+backend, disabling only cache subdivision changes unique composite-key aggregation
+from 2.58 to 4.49 seconds and wide-state aggregation from 1.76 to 3.42 seconds.
+The unique-key benefit survives splitting eight physical cores across both L3s
+(2.45 versus 4.18 seconds). Repeated groups, 90% hot-key skew and the K=64/65
+boundary show no material hot-time regression in clean samples. Controller traffic
+for the unique case falls from 244 to 121 GB/query. These are physical-layout gains,
+not an isolated comparison of compiler instruction selection.
+
+Q16 then exposed a variable-key memory-latency problem: generated source-key and
+entry-header loads miss at roughly 170–330 sampled cycles, and removing existing
+lookahead slows the query. About 40 GB/s controller traffic remains below the
+same-affinity measured 64 GB/s mixed-streaming ceiling. Extra header staging made
+merge faster but scan slower; capturing copy length reduced instructions but raised
+cycles. A partition layout with separate key pointers increased traffic and lost.
+Those experiments were rejected.
+
+Eligible OrderedMap variable keys now use the existing bounded local aggregation
+and partition Top-K path by default. Each page packs cached hash, ordinary encoded
+key and raw aggregate state together. Merge stages cached hashes and contiguous
+source records before probing the existing maps. Selected keys are copied into
+owned output maps before workspace reuse. Pages, oversize allocations, workers,
+shards, query budgets and failure cleanup retain their existing owners. No new
+toggle or SQL recognition. Allocating variable-key aggregates retain their previous
+path; the separate direct-VARCHAR map is unchanged. Variable keys do not use the
+fixed-stride cache subdivision estimator.
+
+Balanced warm diagnostics on the actual 99,997,497 rows, eight physical cores:
+
+| Query (zero-based) | Stock | Previous LLVM | Packed LLVM | Time reduction vs previous LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| Q14 | 420–465 ms | 261 ms | 221 ms | 15% |
+| Q16 | 1,203–1,269 ms | 653 ms | 580 ms | 11% |
+| Q18 | 2,135–2,213 ms | 1,198 ms | 757 ms | 37% |
+
+LLVM cells average two process medians, each with three measured queries after
+three warmups. Stock ranges expose process variation; Q14's second stock process
+had more desktop activity. This is a focused diagnostic, not a replacement for
+the standard-protocol HTML. First requests include compilation and also improve.
+Exact ordered results match clean stock; unordered Q17 is neutral, and all returned
+groups were independently recomputed by stock. All Q16 groups are still examined.
+
+Integrated Q16 controller traffic falls 26.62 to 17.86 GB/query. Load-wait cycles
+fall 180.4 to 96.7 per input row; ordinary paired runs fall roughly 263 to 235 total
+cycles/row while instructions rise 337 to 431. Packing pays more execution work to
+avoid stalls, so the elapsed gain is smaller than the stall reduction. At the
+calibrated streaming ceiling, 17.86 GB alone would take about 0.28 seconds; this
+does not establish an optimal execution floor. The benefit survives split-L3
+placement (620 to 558 ms). No cross-architecture result is claimed.
+
+Independent 500M-row VARCHAR controls cover high cardinality, long shared prefixes,
+skew and small groups. The integrated high-cardinality case falls 3.63 to 2.71
+seconds; prototype skew and small-group controls improve about 20% and 7%.
+Important cost: the high-cardinality case's peak process RSS rises 20.4 to 34.9 GB
+because partial pages retain many weakly combined states. Small working maps do
+not bound total query memory. Q16/Q18 peak RSS instead falls (about 7.5 to 6.7 GB
+and 12.5 to 9.3 GB). Retained-partial memory needs a separate general solution.
+
+Validation: 36 focused checks passed across LLVM/AsmJit/C and both worker modes;
+24 relevant checks were rerun after binding the lazy merge window to its existing
+slot scratch size. Maven compile passes. Two new tests cover exact variable bytes,
+raw AVG state, complete results, Top-K fallback, failure/reopen, records larger than
+64 KiB and repeated keys larger than the local byte target. Existing tests cover
+memory-budget failure/recovery and fixed-width paths. The first run's wrong AsmJit
+library path and unsupported AVG(long) fixture were corrected without widening scope.
+Final 500M samples have zero measured reads, major faults and GC time. HTTP runs
+have zero major faults/GC and a small read burst on their second measured request;
+zero-read first/third samples retain the benefit. No memory pressure or throttling.
+Raw diagnostic evidence and the validated hardware study: `/tmp/query-generality-20261028`.
+
+## 2026-10-28: compact variable-key inputs reduce retained memory
+
+Variable keys now share the existing adaptive compact-input path. A full local
+window with zero combining, plus numeric inputs narrower than aggregate state,
+admits raw records for the rest of the frame; the next frame reassesses reuse.
+Pages retain the ordinary encoded key, cached hash and numeric inputs. Merge uses
+the existing staged probes and aggregate update emitters. Key staging can grow
+and resume at the first unconsumed row. No new toggle or query recognition.
+
+500M rows, 16.78M groups, SUM/COUNT, eight physical cores on one Ryzen 9950X L3:
+
+| Metric | Previous packed LLVM | Compact-input LLVM |
+| --- | ---: | ---: |
+| Complete hot query | 2.650 s | 2.376 s |
+| Retained page capacity | 24.09 GB | 16.65 GB |
+| Peak process RSS | 34.8 GB | 27.6–27.8 GB |
+| Instructions/input row | 512 | 294 |
+| Cycles/input row | 224 | 195 |
+| Controller traffic/query | 117.81 GB | 92.27 GB |
+
+Timing averages two process medians per arm in ABBA order, three measured queries
+after two warmups. Compilation is separate. Exact stock-oracle results and all
+500M generated rows match. About 497.95M records shrink from 48 to 33 bytes:
+eight-byte hash, 17-byte encoded key and eight-byte SUM input; COUNT is implicit.
+This saves 7.47 GB of payload, matching the page audit. Both goals pass: over 25%
+less retained-page memory and over 20% lower latency than the earlier 3.63 s
+unbounded LLVM result. This is a footprint improvement with a 10% incremental
+time reduction, not a workload-wide breakthrough.
+
+The first compact version reduced instructions 44% but time only 5%. IBS and
+disassembly found a dependency on reloading the just-copied key length. Capturing
+the source length once removes that read and copy-loop header reloads: a separate
+balanced comparison improves 2.465 to 2.370 s and load-wait cycles fall 152 to 144
+per row, with little instruction-count change. Overall load-wait cycles remain
+above the old path's 91 despite lower total cycles. Removing cache-hot work does
+not remove the remaining memory dependencies. Controller throughput is about
+39 GB/s versus the same-affinity 64 GB/s mixed-streaming ceiling; bandwidth
+saturation is not established. At that ceiling, 92 GB would still require 1.44 s.
+Phase diagnostics reduce scan from 1.766 to 1.497 s and merge from 0.887 to 0.735 s;
+full-query timing also includes output and cleanup.
+
+The gain survives split-L3 placement (final three-query medians 2.598 to 2.210 s;
+the earlier uncaptured version also passed balanced split-L3 controls). Independent
+500M-row small-group and long-prefix/90%-hot-key controls stay on local combining:
+0.523/0.521 s and 1.911/1.932 s, respectively. Actual Q14/Q16/Q17/Q18 likewise admit
+no compact inputs and show no material regression; ordered results match clean
+stock, and stock independently recomputes all 180 returned unordered Q17 rows.
+These are focused diagnostics; the standard ClickBench HTML is unchanged.
+
+Validation: Maven compile and 42 focused checks pass across LLVM/AsmJit/C and both
+worker modes, including oversized keys, staging retries, null/empty/Unicode bytes,
+raw AVG state, failure/reopen and fixed-key compact VARCHAR arguments. Hot synthetic
+runs have zero reads, major faults and GC time; HTTP runs retain their small second-
+request read burst. No memory pressure or throttling; desktop activity and testing
+on one CPU model remain limits. Retained pages still scale with input rows, so total-memory
+admission/draining and byte-aware variable-key cache subdivision remain open.
+Evidence and validated study: `/tmp/query-variable-inputs-20261028`; HTTP controls:
+`/tmp/query-generality-20261028/q16/compact-input-*`.
+
+## 2026-10-28: variable-key cache subdivision
+
+On 500M independent unique keys, the compact-input pipeline still built each
+outer partition into about 78 MB of entries plus 34 MB of offsets per worker,
+against a 4 MiB L3 share. Merge took 2.83 of 4.49 seconds. IBS located roughly
+540–630-cycle demand misses in generated merge key-header and offset-table loads;
+L3 misses increased from 1.97 to 4.54 per input row when the same 500M-row shape
+grew from 16.78M to 500M groups. The validated study supports a cache-capacity and
+latency problem, without claiming saturated memory bandwidth.
+
+Variable keys now reuse the existing cache subdivision. Each HLL register also
+retains one encoded-key width, selected by deterministic hash priority. Repeated
+rows cannot gain sample weight; worker merges select the same representative.
+Planning averages aligned entry sizes and accounts for the power-of-two offset
+table using the existing native map view's load factor. A previous large offset
+table is shrunk through OrderedMap's existing API when it would defeat the split.
+Generated repartitioning copies cached hashes with either raw states or compact
+inputs. Variable pages reuse their chains, including oversized allocations, and
+consumers stop at the current tail. No new toggle, SQL recognition or scheduler.
+
+Final balanced hot measurements, eight physical cores on one Ryzen 9950X L3:
+
+| 500M unique-key workload | Committed compact LLVM | With subdivision |
+| --- | ---: | ---: |
+| Complete query | 4.465 s | 3.296 s |
+| Cycles/input row | 381 | 279 |
+| Instructions/input row | 381 | 479 |
+| L3 misses/input row, including state-change requests | 4.54 | 3.13 |
+| Load-wait cycles/input row | 304 | 164 |
+| Controller traffic/query | 228.68 GB | 145.95 GB |
+
+Times average two process medians in ABBA order, three executions after two
+warmups; compilation is separate. All 500M generated rows and exact clean-stock
+results match. Typical completed subpartitions touch 2.44 MB of entries plus
+1.05 MB of offsets. Phase diagnostics move scan from 1.48 to 1.58 s and merge
+from 2.83 to 1.54 s, including redistribution. Extra instructions buy locality.
+At the calibrated 64 GB/s mixed-streaming ceiling, 146 GB alone requires 2.28 s;
+the measured rate is about 45 GB/s. This is not an optimal-execution claim.
+Split-L3 placement also improves, 4.185 to 3.390 s. Peak RSS remains around 29 GB;
+retained source pages still scale with input rows.
+
+The initial generic two-times-entry-width model made actual Q18 15% slower by
+subdividing marginal maps. Disabling just subdivision removed that regression;
+the footprint audit found about 14 MB of touched data, not its larger allocated
+heap capacity. Correcting the model leaves Q18 at 0.745 versus 0.762 s, a 2.2%
+estimation cost. Moving sampled bookkeeping after record emission did not help
+and was discarded. Other 500M controls expose the remaining cost: 16.78M groups
+2.380/2.460 s (+3.4%), long-prefix/90%-hot-key skew 1.907/1.934 s (+1.4%), and
+small groups 0.523/0.518 s. Actual Q14/Q16/Q17 are within roughly -1% to +2%.
+All ordered results match stock; stock independently recomputes the unordered
+Q17 output. The gain is strongest on large working maps, not workload-wide.
+
+Maven compile and 36 distinct focused checks pass across LLVM/AsmJit/C and both
+worker modes where applicable. Coverage includes sample order/frequency
+invariance, changing fan-out and shorter reused tails, oversized records, complete
+variable groups, raw AVG state, failure/reopen and fixed-key subdivision. Final
+hot synthetic runs have zero reads, major faults and GC time, with no throttling.
+Baseline PSI had a decaying historical average but only 210 microseconds of
+cumulative pressure over the whole 24-second process; final A/B PSI is zero.
+Desktop activity and testing on one CPU model limit precision and portability
+claims. Coverage and the standard ClickBench HTML are unchanged. Evidence:
+`/tmp/query-variable-cache-20261028`, plus `variable-cache-*`, `variable-nosplit-*`
+and `variable-final-*` under `/tmp/query-generality-20261028/q16`.

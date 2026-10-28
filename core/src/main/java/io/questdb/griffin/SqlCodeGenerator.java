@@ -2272,7 +2272,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                 baseOrderByFilter,
                 baseMetadata,
                 lo,
-                executionContext.getSharedQueryWorkerCount()
+                executionContext.getSharedQueryWorkerCount(),
+                executionContext.getQueryCodeGenerator()
         );
     }
 

@@ -96,7 +96,8 @@ public class AsyncTopKRecordCursorFactory extends AbstractRecordCursorFactory {
             @NotNull ListColumnFilter orderByFilter,
             @NotNull @Transient RecordMetadata orderByMetadata,
             long lo,
-            int workerCount
+            int workerCount,
+            @Nullable io.questdb.griffin.engine.QueryCodeGenerator codeGenerator
     ) throws SqlException {
         super(metadata);
         assert !(base instanceof AsyncTopKRecordCursorFactory);
@@ -114,7 +115,8 @@ public class AsyncTopKRecordCursorFactory extends AbstractRecordCursorFactory {
                     orderByFilter,
                     orderByMetadata,
                     lo,
-                    workerCount
+                    workerCount,
+                    codeGenerator
             );
             this.frameSequence = new UnorderedPageFrameSequence<>(
                     engine,
@@ -188,6 +190,9 @@ public class AsyncTopKRecordCursorFactory extends AbstractRecordCursorFactory {
             sink.type("Async JIT Top K");
         } else {
             sink.type("Async Top K");
+        }
+        if (frameSequence.getAtom().getCompiledTopK() != null) {
+            sink.meta("compiledTopK").val(frameSequence.getAtom().getCompiledTopK().getName());
         }
         sink.meta("lo").val(lo);
         sink.meta("workers").val(workerCount);
@@ -264,7 +269,9 @@ public class AsyncTopKRecordCursorFactory extends AbstractRecordCursorFactory {
                 }
                 final SortKeyEncoder encoder = atom.getEncoder(slotId);
                 final EncodedTopKBuffer topK = atom.getTopK(slotId);
-                encoder.encodeFrame(frameMemory, frameIndex, rows, frameRowCount, topK, record);
+                if (atom.getCompiledTopK() == null || !atom.getCompiledTopK().encodeFrame(record, frameIndex, rows, frameRowCount, topK, circuitBreaker)) {
+                    encoder.encodeFrame(frameMemory, frameIndex, rows, frameRowCount, topK, record);
+                }
             } else {
                 if (useLateMaterialization && frameMemory.populateRemainingColumns(filterCtx.getFilterUsedColumnIndexes(), rows, true)) {
                     record.init(frameMemory);
@@ -318,7 +325,9 @@ public class AsyncTopKRecordCursorFactory extends AbstractRecordCursorFactory {
                 record.init(frameMemory);
                 final SortKeyEncoder encoder = atom.getEncoder(slotId);
                 final EncodedTopKBuffer topK = atom.getTopK(slotId);
-                encoder.encodeFrame(frameMemory, frameIndex, null, frameRowCount, topK, record);
+                if (atom.getCompiledTopK() == null || !atom.getCompiledTopK().encodeFrame(record, frameIndex, null, frameRowCount, topK, circuitBreaker)) {
+                    encoder.encodeFrame(frameMemory, frameIndex, null, frameRowCount, topK, record);
+                }
             } else {
                 final PageFrameMemory frameMemory = frameMemoryPool.navigateTo(frameIndex);
                 record.init(frameMemory);

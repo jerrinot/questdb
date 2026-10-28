@@ -42,9 +42,16 @@ final class QuestPartitionInputs {
     }
 
     static long rowBytes(QuestMapProbe probe, AggregateUpdates updates) {
-        long bytes = probe.keyBytes();
-        for (var column : updates.columns()) bytes += column.width().bytes;
+        // Variable records return a lower bound; actual size includes each encoded key's payload.
+        if (probe.variable()) return 8L + probe.variableKey().minimumBytes() + numericBytes(updates);
+        long bytes = probe.keyBytes() + numericBytes(updates);
         return ((bytes + 7) & ~7L) + stringArguments(updates).size() * 16L;
+    }
+
+    static long numericBytes(AggregateUpdates updates) {
+        long bytes = 0;
+        for (var column : updates.columns()) bytes += column.width().bytes;
+        return bytes;
     }
 
     static Program rows(QuestMapProbe probe, AggregateUpdates updates) {
@@ -62,20 +69,30 @@ final class QuestPartitionInputs {
             Var inputRow = entry.let(index);
             entry.when(ne(rowIds, nil()), filtered -> filtered.assign(inputRow,
                     load(new Offset(rowIds, binary(Op.MUL, index, i64(8))))));
+            if (probe.variable()) { entry.store(at(STATE, 80), i64(0)); entry.store(at(STATE, 32), index); }
             Var key = probe.loadFrameKey(entry, inputRow, at(STATE, ResolvedAggregateKernel.prefetchScratch(probe) + 24));
+            Var keyBytes = probe.variable() ? entry.let(QuestVariableKey.bytes(key)) : null;
             Var hash = probe.hash(entry, key);
-            QuestPartitionSketch.add(entry, sketch, hash);
-            var append = QuestPartitions.append(entry, partitions, hash, rowBytes(probe, updates));
-            if (probe.orderedNative()) QuestMapMutation.copy(entry, key, append.row(), probe.keyBytes());
+            QuestPartitionSketch.add(entry, sketch, hash, keyBytes);
+            var append = probe.variable() ? QuestPartitions.appendVariable(entry, partitions, hash,
+                    entry.let(add(keyBytes, i64(8 + numericBytes(updates)))))
+                    : QuestPartitions.append(entry, partitions, hash, rowBytes(probe, updates));
+            Var row = append.row();
+            if (probe.variable()) {
+                entry.store(row, hash);
+                row = entry.let(at(row, 8));
+                QuestMapMutation.copy(entry, key, row, keyBytes);
+            } else if (probe.orderedNative()) QuestMapMutation.copy(entry, key, row, probe.keyBytes());
             else entry.store(probe.keyBytes() == 4 ? MemoryType.I32 : MemoryType.I64, append.row(), key);
             var values = updates.loadFrameRow(entry, inputRow, addresses);
-            long offset = probe.keyBytes();
+            Var valueAddress = entry.let(probe.variable() ? new Offset(row, keyBytes) : probe.valueAddress(row));
+            long offset = 0;
             for (int i = 0; i < updates.columns().size(); i++) {
                 var width = updates.columns().get(i).width();
-                entry.store(width, at(append.row(), offset), values.values().get(i).data());
+                entry.store(width, at(valueAddress, offset), values.values().get(i).data());
                 offset += width.bytes;
             }
-            offset = (offset + 7) & ~7L;
+            offset = (probe.keyBytes() + offset + 7) & ~7L;
             var frame = updates.inputs().frame(values, inputRow, at(COLUMNS, 8));
             for (var argument : stringArguments(updates)) {
                 var value = argument.emit(entry, frame);
@@ -114,6 +131,7 @@ final class QuestPartitionInputs {
     }
 
     static Program merge(QuestMapProbe probe, AggregateUpdates layout, AggregateUpdates updates, long valueBytes, int batchRows) {
+        if (probe.variable()) return QuestPartitions.mergeInputs(probe, updates, valueBytes, batchRows);
         if (batchRows == 0) return mergeScalar(probe, layout, updates);
         Builder b = new Builder();
         Var index = b.let(load(STATE));
@@ -176,15 +194,20 @@ final class QuestPartitionInputs {
         return new Program(b.block());
     }
 
-    private static void emitValues(Builder b, AggregateUpdates layout, AggregateUpdates updates, QuestMapProbe probe, Var row, Var destination) {
+    static Pipeline.Row loadValues(Builder b, AggregateUpdates layout, Expr address) {
         var values = new ArrayList<Pipeline.Value>();
-        long offset = probe.keyBytes();
+        long offset = 0;
         for (var column : layout.columns()) {
-            Var value = b.let(new Load(column.width(), at(row, offset)));
+            Var value = b.let(new Load(column.width(), at(address, offset)));
             values.add(new Pipeline.Value(value, column.nullable() ? eq(value, i64(column.nullValue())) : bool(false)));
             offset += column.width().bytes;
         }
-        offset = (offset + 7) & ~7L;
+        return new Pipeline.Row(layout.columns(), values);
+    }
+
+    private static void emitValues(Builder b, AggregateUpdates layout, AggregateUpdates updates, QuestMapProbe probe, Var row, Var destination) {
+        var values = loadValues(b, layout, at(row, probe.keyBytes()));
+        long offset = (probe.keyBytes() + numericBytes(layout) + 7) & ~7L;
         var strings = new LinkedHashMap<ResolvedVarchar.Expression, Pipeline.Utf8Value>();
         for (var argument : stringArguments(layout)) {
             Var header = b.let(load(at(row, offset)));
@@ -194,7 +217,7 @@ final class QuestPartitionInputs {
                     ne(binary(Op.AND, header, i64(1L << 33)), i64(0)), bool(true)));
             offset += 16;
         }
-        var frame = new ResolvedVarchar.Frame(new Pipeline.Row(layout.columns(), values), i64(0), nil(), nil(), strings);
+        var frame = new ResolvedVarchar.Frame(values, i64(0), nil(), nil(), strings);
         updates.emit(b, frame, destination, nil());
     }
 

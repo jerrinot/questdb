@@ -71,8 +71,10 @@ not promises that every aggregation uses the same strategy.
 
 The binders and focused tests are authoritative. Current families include:
 
-- Integer expressions, comparisons, boolean predicates and constant membership;
-  direct VARCHAR null and literal substring predicates; searched CASE string values.
+- INT/LONG addition, subtraction and multiplication, widening casts, comparisons,
+  boolean predicates and constant membership;
+  direct VARCHAR null and literal substring predicates, including their negation;
+  searched CASE string values.
 - Direct and computed fixed-width keys, SYMBOL IDs, VARCHAR keys and composite keys
   using existing map encodings. NULL and empty strings remain distinct.
 - Resolved COUNT, integer SUM/MIN/MAX, LONG DISTINCT, SHORT AVG and VARCHAR MIN/MAX
@@ -82,6 +84,13 @@ The binders and focused tests are authoritative. Current families include:
   metadata specializations retain priority. Worker-state copying/merging is generated.
 - Numeric projection, final COUNT reduction, LONG full sort and Top-K, and positive
   LIMIT/OFFSET selection over supported generated results.
+- Ordered frame-prefix admission for forward filtered scans with finite nonnegative
+  LIMIT advice. Native VARCHAR selection stops each frame after K matches; the
+  existing ordered collector applies the remaining global budget.
+- Single-column VARCHAR Top-K: generated prefix rejection, key encoding, threshold
+  admission, worker-result merge, survivor heap packing, compaction/final sorting
+  and final LIMIT prefix selection in the existing EncodedTopKBuffer. EXPLAIN uses
+  `compiledTopK`; execution counters and result checks establish actual coverage.
 - INT inner-join probe pipelines with supported COUNT/integer SUM/MIN/MAX, post-join
   predicates and direct INT/LONG grouping. They borrow the existing frozen join;
   Java retains build and runtime ownership. Outer joins and general join-to-DISTINCT
@@ -100,6 +109,32 @@ Generic string construction, general string ordering and unsupported function
 implementations retain ordinary execution. `compiledAggregateBatches` in EXPLAIN
 proves aggregate binding, not complete generated execution for the entire query.
 The ordinary `Async JIT` label refers to filter compilation.
+
+Filter LIMIT kernels are prepared on eligible cursor open and reused across bind
+changes and rewinds. They borrow existing task row IDs; no extra sort, result copy
+or worker quota is introduced. Numeric-only selection keeps its existing full-frame
+SIMD kernel. Parquet filtering remains full-frame to preserve selectivity statistics;
+its existing column-top/type-cast fallback still applies. Negative, reverse and
+unbounded scans retain ordinary LIMIT handling. Native admission/input counters
+establish execution; an EXPLAIN filter label alone does not.
+
+The VARCHAR Top-K build borrows a pinned frame and the acquired slot's buffer.
+Generated code returns at buffer growth/compaction boundaries and resumes with
+refreshed addresses. The existing owner keeps heap budgets, threshold copies and
+row-ID lifetime. Merge, packing and sorting operate on normalized entries independently
+of source types and compile lazily. The sort ports the existing natural-run detection,
+in-place MSD radix partitioning and non-branchless pdqsort, including its insertion
+and heapsort paths. A bounded explicit stack replaces recursion; pdqsort handles the
+smaller partition first to bound its stack. Comparisons retain the 16-byte inline
+prefix, bounded heap tails, length and unsigned row-ID ordering. Generated helpers
+contain the sort loops; the stock native sorter is not called on this path.
+
+Sorting workspace grows in a buffer-owned DirectLongList charged to the existing
+query tracker. Small sorts reserve only their comparison-sort stack. FIRST/LAST
+compaction, scratch-heap copying and heap-offset restoration keep the existing
+algorithm. Lazy type conversions decline before mutation and retain ordinary
+build/compaction. SQL binding remains one physical VARCHAR key; the generic sorter
+does not by itself qualify composite ordering or partially ordered plans.
 
 Filter/aggregate fusion is a separate harness experiment exposed by
 `ResolvedQueryCompiler.filterFusionExperiment`; ordinary construction does not

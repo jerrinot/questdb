@@ -78,7 +78,7 @@ public sealed interface PhysicalPlan permits PhysicalPlan.Scan, PhysicalPlan.Fil
             return List.copyOf(result);
         }
     }
-    private static int type(Scalar scalar){return scalar instanceof Column c?c.columnType():scalar instanceof IPv4Subtract?ColumnType.IPv4:scalar instanceof Add a?a.columnType():scalar instanceof Subtract s?s.columnType():ColumnType.LONG;}
+    private static int type(Scalar scalar){return scalar instanceof Column c?c.columnType():scalar instanceof IPv4Subtract?ColumnType.IPv4:scalar instanceof Add a?a.columnType():scalar instanceof Subtract s?s.columnType():scalar instanceof Multiply m?m.columnType():ColumnType.LONG;}
     private static void checkColumns(List<Column> columns) {
         if(columns.isEmpty())throw new IllegalArgumentException("Scan needs a row source");
         for(int i=0;i<columns.size();i++)if(columns.get(i).index()!=i)throw new IllegalArgumentException("Non-consecutive column index");

@@ -108,6 +108,103 @@ public class PartitionPagesTest {
     }
 
     @Test
+    public void keyWidthSamplesIgnoreFrequencyAndInputOrder() throws Exception {
+        Builder b = new Builder();
+        Var index = b.let(i64(0));
+        b.loop(binary(Op.LT, index, ROWS), loop -> {
+            Var row = loop.let(new Offset(COLUMNS, binary(Op.MUL, index, i64(16))));
+            QuestPartitionSketch.add(loop, STATE, load(row), load(at(row, 8)));
+            loop.assign(index, add(index, i64(1)));
+        });
+        b.exit(0);
+        try (var code = backend.compile(new Program(b.block()), temporary.getRoot().toPath());
+             Arena arena = Arena.ofConfined()) {
+            int count = 32_768;
+            long data = arena.allocate(count * 16L, 8).address();
+            long reversed = arena.allocate(count * 16L, 8).address();
+            long sketch = arena.allocate(QuestPartitionSketch.VARIABLE_BYTES, 8).address();
+            long reference = arena.allocate(QuestPartitionSketch.VARIABLE_BYTES, 8).address();
+            var random = new Random(1747);
+            for (int i = 0; i < count; i++) {
+                long hash = random.nextLong(), width = i % 31 == 0 ? 100_003 : 17 + i % 73;
+                Unsafe.putLong(data + i * 16L, hash);
+                Unsafe.putLong(data + i * 16L + 8, width);
+                Unsafe.putLong(reversed + (count - 1L - i) * 16, hash);
+                Unsafe.putLong(reversed + (count - 1L - i) * 16 + 8, width);
+            }
+            assertEquals(0, code.run(data, count, reference));
+            assertEquals(0, code.run(reversed, count, sketch));
+            for (int repeat = 0; repeat < 100; repeat++) assertEquals(0, code.run(data, 1024, sketch));
+            for (long i = 0; i < QuestPartitionSketch.VARIABLE_BYTES; i++) {
+                assertEquals("A repeated key must not gain sample weight", Unsafe.getByte(reference + i), Unsafe.getByte(sketch + i));
+            }
+        }
+    }
+
+    @Test
+    public void variableRepartitionReusesPagesAndPreservesOversizedRecords() throws Exception {
+        for (boolean inputs : new boolean[]{false, true}) {
+            try (var code = backend.compile(QuestRepartition.variableRows(8, inputs), temporary.newFolder().toPath());
+                 var allocator = new FastGroupByAllocator(64 * 1024, 1 << 20);
+                 Arena arena = Arena.ofConfined()) {
+                long records = arena.allocate(2_000_000, 8).address();
+                long state = arena.allocate(QuestRepartition.STATE_BYTES, 8).address();
+                var memory = KernelMemory.reusable(allocator);
+                int[] lengths = {10_000, 17, 6_000, 9_000, 9}, fanouts = {2, 16, 4, 64, 2};
+                for (int round = 0; round < lengths.length; round++) {
+                    int count = lengths[round], parts = fanouts[round], shift = 56 - Integer.numberOfTrailingZeros(parts);
+                    long row = records;
+                    for (int i = 0; i < count; i++) {
+                        long keyBytes = round == 1 && i == 0 ? 90_013 : 12 + i % 73;
+                        long bytes = inputs ? keyBytes + 8 : (keyBytes + 15) & ~7L;
+                        Unsafe.putLong(row, Hash.hashLong64(i));
+                        Unsafe.putInt(row + 8, (int) keyBytes - 4);
+                        Vect.memset(row + 12, keyBytes - 4, i & 255);
+                        Unsafe.putLong(row + 8 + keyBytes, i);
+                        row += 8 + bytes;
+                    }
+                    Unsafe.putLong(state + QuestRepartition.MASK_OFFSET, parts - 1);
+                    Unsafe.putLong(state + QuestRepartition.SHIFT_OFFSET, shift);
+                    long allocated = 0;
+                    for (int repeat = 0; repeat < 2; repeat++) {
+                        for (int part = 0; part < parts; part++) Unsafe.putLong(state + part * 16L + 8, 0);
+                        memory.enterCheckpoint(() -> { });
+                        try { assertEquals(0, code.run(records, count, state)); memory.throwIfFailed(); }
+                        finally { memory.close(); }
+                        if (repeat == 0) allocated = allocator.allocated();
+                        else assertEquals("Replaying an outer partition must reuse its pages", allocated, allocator.allocated());
+                    }
+                    boolean[] seen = new boolean[count];
+                    int actual = 0;
+                    for (int part = 0; part < parts; part++) {
+                        long tail = Unsafe.getLong(state + part * 16L + 8), page = Unsafe.getLong(state + part * 16L);
+                        if (tail == 0) continue;
+                        while (true) {
+                            row = page + QuestPartitions.VARIABLE_HEADER_BYTES;
+                            for (long n = 0; n < Unsafe.getLong(page + 8); n++) {
+                                long keyBytes = 4L + Unsafe.getInt(row + 8);
+                                int id = Math.toIntExact(Unsafe.getLong(row + 8 + keyBytes));
+                                assertTrue(id >= 0 && id < count);
+                                assertFalse("Stale or duplicate record", seen[id]); seen[id] = true;
+                                assertEquals(Hash.hashLong64(id), Unsafe.getLong(row));
+                                assertEquals(part, (Unsafe.getLong(row) >>> shift) & (parts - 1));
+                                for (long j = 4; j < keyBytes; j++) assertEquals((byte) id, Unsafe.getByte(row + 8 + j));
+                                row += 8 + (inputs ? keyBytes + 8 : (keyBytes + 15) & ~7L);
+                                actual++;
+                            }
+                            assertEquals(page + QuestPartitions.VARIABLE_HEADER_BYTES + Unsafe.getLong(page + 16), row);
+                            if (page == tail) break;
+                            page = Unsafe.getLong(page);
+                            assertNotEquals(0, page);
+                        }
+                    }
+                    assertEquals(count, actual);
+                }
+            }
+        }
+    }
+
+    @Test
     public void repartitionReusesChainsWithDifferentFanoutsAndShorterTails() throws Exception {
         var probe = QuestMapProbe.direct(0, ColumnType.LONG, false).mutating();
         try (var code = backend.compile(QuestRepartition.rows(probe, 16), temporary.getRoot().toPath());

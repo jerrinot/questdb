@@ -47,6 +47,10 @@ public interface QueryCodeGenerator {
     /** Only bind inputs whose calculateSize supplies bulk counts, without enumerating rows. */
     default @Nullable CompiledCounter compileCounter(@Transient RecordCursorFactory input) { return null; }
 
+    /** Optional encoded Top-K; ordinary cursors and buffers retain scheduling and memory ownership. */
+    default @Nullable io.questdb.griffin.engine.orderby.CompiledTopK compileTopK(
+            ColumnTypes inputs, io.questdb.cairo.ListColumnFilter order) { return null; }
+
     /** Resolved selection/count kernels using the existing filter ABI and cursor ownership. */
     default @Nullable CompiledFilters compileFilters(ColumnTypes inputs, Function predicate) { return null; }
 

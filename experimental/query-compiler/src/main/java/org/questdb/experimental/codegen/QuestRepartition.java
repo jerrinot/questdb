@@ -33,11 +33,10 @@ final class QuestRepartition {
     static final int SHIFT_OFFSET = MASK_OFFSET + Long.BYTES;
     static final int STATE_BYTES = SHIFT_OFFSET + Long.BYTES;
 
-    private static QuestPartitions.Append append(Builder b, Expr hash, long rowBytes) {
+    private static Var bucket(Builder b, Expr hash) {
         Var part = b.let(binary(Op.AND, binary(Op.USHR, hash,
                 load(at(STATE, SHIFT_OFFSET))), load(at(STATE, MASK_OFFSET))));
-        Var bucket = b.let(new Offset(STATE, binary(Op.MUL, part, i64(QuestPartitions.BUCKET_BYTES))));
-        return QuestPartitions.reserve(b, bucket, rowBytes);
+        return b.let(new Offset(STATE, binary(Op.MUL, part, i64(QuestPartitions.BUCKET_BYTES))));
     }
 
     static Program rows(QuestMapProbe probe, long rowBytes) {
@@ -47,9 +46,28 @@ final class QuestRepartition {
             loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
             Var row = loop.let(new Offset(COLUMNS, binary(Op.MUL, index, i64(rowBytes))));
             Var key = probe.orderedNative() ? row : loop.let(new Load(probe.keyBytes() == 4 ? MemoryType.I32 : MemoryType.I64, row));
-            var output = append(loop, probe.hash(loop, key), rowBytes);
+            var output = QuestPartitions.reserve(loop, bucket(loop, probe.hash(loop, key)), rowBytes);
             QuestMapMutation.copy(loop, row, output.row(), rowBytes);
             output.commit(loop);
+            loop.assign(index, add(index, i64(1)));
+        });
+        b.exit(0);
+        return new Program(b.block());
+    }
+
+    static Program variableRows(long payloadBytes, boolean inputs) {
+        Builder b = new Builder();
+        Var index = b.let(i64(0)), offset = b.let(i64(0));
+        b.loop(binary(Op.LT, index, ROWS), loop -> {
+            loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
+            Var row = loop.let(new Offset(COLUMNS, offset));
+            Var key = loop.let(at(row, 8));
+            Var bytes = loop.let(add(i64(8), inputs ? add(QuestVariableKey.bytes(key), i64(payloadBytes))
+                    : QuestVariableKey.stride(key, i64(payloadBytes))));
+            var output = QuestPartitions.reserveVariable(loop, bucket(loop, load(row)), bytes);
+            QuestMapMutation.copy(loop, row, output.row(), bytes);
+            output.commit(loop);
+            loop.assign(offset, add(offset, bytes));
             loop.assign(index, add(index, i64(1)));
         });
         b.exit(0);

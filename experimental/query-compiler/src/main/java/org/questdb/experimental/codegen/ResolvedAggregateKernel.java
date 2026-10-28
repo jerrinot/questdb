@@ -263,8 +263,16 @@ public final class ResolvedAggregateKernel {
 
     private static void checkLocalBound(Builder b, QuestMapProbe probe, Var index, int capacity) {
         if (capacity == 0) return;
-        b.when(binary(Op.BOTH, eq(load(at(STATE, 56)), i64(0)),
-                binary(Op.GE, load(at(STATE, probe.controlBytes() + 56)), i64(capacity))), full -> {
+        Expr size = load(at(STATE, probe.controlBytes() + NativeMapView.SIZE));
+        Expr fullMap = binary(Op.GE, size, i64(capacity));
+        if (probe.variable()) {
+            Expr used = binary(Op.SUB, load(at(STATE, probe.controlBytes() + NativeMapView.Ordered.APPEND)),
+                    load(at(STATE, probe.controlBytes())));
+            // A few oversized, repeated keys must keep combining instead of flushing every batch.
+            fullMap = binary(Op.EITHER, fullMap, binary(Op.BOTH, binary(Op.GE, size, i64(64)),
+                    binary(Op.GE, used, i64(256 * 1024))));
+        }
+        b.when(binary(Op.BOTH, eq(load(at(STATE, 56)), i64(0)), fullMap), full -> {
             full.store(at(STATE, 32), index);
             full.exit(QuestPartitions.NEED_FLUSH);
         });
@@ -313,7 +321,7 @@ public final class ResolvedAggregateKernel {
         final int prefetchRows;
         private final boolean countSumReference;
         private final AggregateUpdates updates;
-        private final long valueBytes;
+        final long valueBytes;
         private final List<ResultRead> readers;
 
         private Binding(Program program, boolean allocates, QuestMapProbe probe, int prefetchRows, boolean countSumReference, AggregateUpdates updates, long valueBytes, List<ResultRead> readers) {
@@ -384,8 +392,10 @@ public final class ResolvedAggregateKernel {
                 }
                 if (prepared.localCapacity > 0) {
                     prepared.flushCode = prepared.defer(() -> QuestPartitions.flush(activeProbe, valueBytes));
-                    prepared.partitionMergeCode = prepared.defer(() -> QuestPartitions.merge(activeProbe, updates, valueBytes));
-                    if (prepared.inputPartitionRowBytes > 0 && prepared.inputPartitionRowBytes < prepared.partitionRowBytes) {
+                    prepared.partitionMergeCode = prepared.defer(() -> QuestPartitions.merge(activeProbe, updates, valueBytes, prefetchRows));
+                    if (prepared.inputPartitionRowBytes > 0 && (activeProbe.variable()
+                            ? QuestPartitionInputs.numericBytes(updates) < valueBytes
+                            : prepared.inputPartitionRowBytes < prepared.partitionRowBytes)) {
                         prepared.inputPartitionCode = prepared.defer(() -> QuestPartitionInputs.rows(activeProbe, updates));
                         prepared.inputPartitionMergeCode = prepared.defer(() -> QuestPartitionInputs.merge(activeProbe, updates, valueBytes, prefetchRows));
                     }
@@ -398,16 +408,17 @@ public final class ResolvedAggregateKernel {
         }
 
         private int localCapacity(QuestMapProbe activeProbe) {
-            if (activeProbe == null || !activeProbe.mutable() || activeProbe.variable()) return 0;
+            if (activeProbe == null || !activeProbe.mutable() || (activeProbe.variable() && allocates)) return 0;
             if (allocates && (activeProbe.varchar()
                     || updates.updates().stream().anyMatch(update -> update.allocates() && !(update instanceof VarcharExtremum))
                     || QuestPartitionInputs.rowBytes(activeProbe, updates) >= activeProbe.keyBytes() + valueBytes)) return 0;
             String enabled = System.getProperty("query.codegen.bounded");
-            // Fixed-width states benefit from bounded working sets. VARCHAR's extra partial
-            // groups can cost more than they save; keep it an explicit experiment for now.
+            // The direct VARCHAR map still uses its separate pointer-based partition layout.
+            // OrderedMap variable keys use packed records and share the default bounded path.
             if (enabled == null ? activeProbe.varchar() : !Boolean.parseBoolean(enabled)) return 0;
+            int keyBytes = activeProbe.variable() ? activeProbe.variableKey().minimumBytes() : activeProbe.keyBytes();
             int capacity = Integer.getInteger("query.codegen.localCapacity",
-                    Integer.highestOneBit((int) (256 * 1024 / (2 * (activeProbe.keyBytes() + valueBytes)))));
+                    Math.max(64, Integer.highestOneBit((int) (256 * 1024 / (2 * (keyBytes + valueBytes))))));
             if (capacity < 64 || capacity > 65536 || (capacity & (capacity - 1)) != 0)
                 throw new IllegalArgumentException("Local aggregation capacity must be a power of two in [64,65536]");
             return capacity;
@@ -461,7 +472,7 @@ public final class ResolvedAggregateKernel {
 
         private Prepared(Binding binding, QuestMapProbe probe, Backend backend, Path artifacts, int localCapacity) {
             this.localCapacity = localCapacity;
-            this.partitionRowBytes = probe != null ? probe.keyBytes() + binding.valueBytes : 0;
+            this.partitionRowBytes = probe != null && !probe.variable() ? probe.keyBytes() + binding.valueBytes : 0;
             this.inputPartitionRowBytes = localCapacity > 0 && !probe.varchar()
                     ? QuestPartitionInputs.rowBytes(probe, binding.updates) : 0;
             this.backend = backend;
@@ -580,7 +591,7 @@ public final class ResolvedAggregateKernel {
                 topKCode = compile(QuestLongTopK.program(probe, order, capacityClass));
                 topKOrder = order;
                 topKCapacityClass = capacityClass;
-                if (localCapacity > 0 && !probe.varchar() && !probe.variable()
+                if (localCapacity > 0 && !probe.varchar()
                         && limit > 0 && capacityClass == 0 && order >= 0
                         && binding.updates.updates().stream().noneMatch(update -> update.offset() == offset
                         && (update.finalizesResult() || update.deferredMerge()))) {
@@ -591,7 +602,7 @@ public final class ResolvedAggregateKernel {
                         var early = new AggregateUpdates(binding.updates.inputs(), binding.updates.updates().stream()
                                 .filter(update -> !(update instanceof VarcharExtremum)).toList());
                         var late = new AggregateUpdates(binding.updates.inputs(), delayed);
-                        rankStateCode = defer(() -> QuestPartitions.merge(probe, early, binding.valueBytes, binding.updates));
+                        rankStateCode = defer(() -> QuestPartitions.merge(probe, early, binding.valueBytes, binding.prefetchRows, binding.updates));
                         lateStateCode = defer(() -> QuestPartitions.replay(probe, late, binding.valueBytes));
                         if (inputPartitionCode != null) {
                             rankInputCode = defer(() -> QuestPartitionInputs.merge(probe, binding.updates, early, binding.valueBytes, binding.prefetchRows));
@@ -599,8 +610,14 @@ public final class ResolvedAggregateKernel {
                         }
                     }
                     partitionSelectCode = defer(() -> QuestPartitions.selected(probe, binding.valueBytes));
-                    splitStateCode = defer(() -> QuestRepartition.rows(probe, partitionRowBytes));
-                    if (inputPartitionCode != null) splitInputCode = defer(() -> QuestRepartition.rows(probe, inputPartitionRowBytes));
+                    if (probe.variable()) {
+                        splitStateCode = defer(() -> QuestRepartition.variableRows(binding.valueBytes, false));
+                        if (inputPartitionCode != null) splitInputCode = defer(() -> QuestRepartition.variableRows(
+                                QuestPartitionInputs.numericBytes(binding.updates), true));
+                    } else {
+                        splitStateCode = defer(() -> QuestRepartition.rows(probe, partitionRowBytes));
+                        if (inputPartitionCode != null) splitInputCode = defer(() -> QuestRepartition.rows(probe, inputPartitionRowBytes));
+                    }
                     partitionTopKLimit = limit;
                     partitionTopKOffset = offset;
                 }

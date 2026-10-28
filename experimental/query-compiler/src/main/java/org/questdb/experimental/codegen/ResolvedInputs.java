@@ -48,6 +48,8 @@ import io.questdb.griffin.engine.functions.lt.LtIntFunctionFactory;
 import io.questdb.griffin.engine.functions.lt.LtLongFunctionFactory;
 import io.questdb.griffin.engine.functions.math.AddIntFunctionFactory;
 import io.questdb.griffin.engine.functions.math.AddLongFunctionFactory;
+import io.questdb.griffin.engine.functions.math.MulIntFunctionFactory;
+import io.questdb.griffin.engine.functions.math.MulLongFunctionFactory;
 import io.questdb.griffin.engine.functions.math.SubIntFunctionFactory;
 import io.questdb.griffin.engine.functions.math.SubLongFunctionFactory;
 import io.questdb.griffin.engine.functions.cast.*;
@@ -299,11 +301,15 @@ final class ResolvedInputs {
                 return input == null ? null : new Pipeline.TimestampPart(input, unit, period);
             }
             if (implementation == AddIntFunctionFactory.AddIntFunc.class || implementation == AddLongFunctionFactory.AddLongFunc.class
-                    || implementation == SubIntFunctionFactory.SubIntFunc.class || implementation == SubLongFunctionFactory.SubLongFunc.class) {
+                    || implementation == SubIntFunctionFactory.SubIntFunc.class || implementation == SubLongFunctionFactory.SubLongFunc.class
+                    || implementation == MulIntFunctionFactory.Func.class || implementation == MulLongFunctionFactory.Func.class) {
                 var binary = (BinaryFunction) function;
                 var left = scalar(binary.getLeft(), type, depth + 1);
                 var right = scalar(binary.getRight(), type, depth + 1);
                 if (left == null || right == null) return null;
+                if (implementation == MulIntFunctionFactory.Func.class || implementation == MulLongFunctionFactory.Func.class) {
+                    return new Pipeline.Multiply(left, right, type);
+                }
                 return implementation == AddIntFunctionFactory.AddIntFunc.class || implementation == AddLongFunctionFactory.AddLongFunc.class
                         ? new Pipeline.Add(left, right, type) : new Pipeline.Subtract(left, right, type);
             }

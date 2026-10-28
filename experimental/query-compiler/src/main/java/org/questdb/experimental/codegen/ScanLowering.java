@@ -78,6 +78,11 @@ final class ScanLowering {
         return selection(plan, residual, true, false, null, new Load(MemoryType.I64, at(COLUMNS, beginOffset)));
     }
 
+    /** Descriptor tail holds an immutable per-frame cap and receives the evaluated row count. */
+    static Program boundedSelection(ScanPlan plan, RowPredicate residual, long limitOffset) {
+        return selection(plan, residual, false, false, null, i64(0), limitOffset);
+    }
+
     private static Program selection(ScanPlan plan, RowPredicate residual, boolean cancellable,
                                      boolean countOnly, int[] sourceIndexes) {
         return selection(plan, residual, cancellable, countOnly, sourceIndexes, i64(0));
@@ -85,21 +90,51 @@ final class ScanLowering {
 
     private static Program selection(ScanPlan plan, RowPredicate residual, boolean cancellable,
                                      boolean countOnly, int[] sourceIndexes, Expr begin) {
+        return selection(plan, residual, cancellable, countOnly, sourceIndexes, begin, -1);
+    }
+
+    private static Program selection(ScanPlan plan, RowPredicate residual, boolean cancellable,
+                                     boolean countOnly, int[] sourceIndexes, Expr begin, long limitOffset) {
         // Row IDs are 64-bit: keep each predicate mask at the output-vector width.
         final int selectionLanes = countOnly ? 64 : 8;
         Builder b = new Builder();
         Var count = b.let(i64(0));
+        Var limit = limitOffset < 0 ? null : b.let(load(at(COLUMNS, limitOffset)));
+        Var visited = limit == null ? null : b.let(i64(0));
+        if (limit != null) b.when(eq(limit, i64(0)), empty -> {
+            empty.store(at(COLUMNS, limitOffset + 8), visited);
+            empty.exit(count);
+        });
         if (cancellable) b.poll();
         emit(plan, b, (selected, row, index) -> {
             java.util.function.Consumer<Builder> accept = accepted -> {
                 if (countOnly) accepted.assign(count, add(count, i64(1)));
                 else selectRow(accepted, count, index);
+                if (limit != null) accepted.when(eq(count, limit), done -> {
+                    done.store(at(COLUMNS, limitOffset + 8), visited);
+                    done.exit(count);
+                });
             };
             if (residual == null) accept.accept(selected);
             else selected.when(residual.emit(selected, index), accept);
-        }, Mode.MASKED, cancellable, selectionLanes, residual != null ? null : (selected, index, mask) -> selected.assign(count, add(count,
-                countOnly ? new PopulationCount(mask)
-                        : new SelectRows(selectionLanes, mask, index, new Offset(STATE, binary(Op.MUL, count, i64(8)))))), sourceIndexes, begin);
+        }, Mode.MASKED, cancellable, selectionLanes, residual != null ? null : (selected, index, mask) -> {
+            if (limit != null) selected.when(binary(Op.LT, binary(Op.SUB, limit, count), new PopulationCount(mask)), tail -> {
+                Var remaining = tail.let(mask);
+                tail.loop(binary(Op.LT, count, limit), row -> {
+                    selectRow(row, count, add(index, new TrailingZeros(remaining)));
+                    row.assign(remaining, binary(Op.AND, remaining, binary(Op.SUB, remaining, i64(1))));
+                });
+                tail.store(at(COLUMNS, limitOffset + 8), visited);
+                tail.exit(count);
+            });
+            selected.assign(count, add(count, countOnly ? new PopulationCount(mask)
+                    : new SelectRows(selectionLanes, mask, index, new Offset(STATE, binary(Op.MUL, count, i64(8))))));
+            if (limit != null) selected.when(eq(count, limit), done -> {
+                done.store(at(COLUMNS, limitOffset + 8), visited);
+                done.exit(count);
+            });
+        }, sourceIndexes, begin, visited);
+        if (visited != null) b.store(at(COLUMNS, limitOffset + 8), visited);
         b.exit(count);
         return new Program(b.block());
     }
@@ -126,6 +161,11 @@ final class ScanLowering {
 
     private static void emit(ScanPlan plan, Builder b, RowConsumer consume, Mode mode, boolean cancellable,
                              int lanes, MaskConsumer consumeMask, int[] sourceIndexes, Expr begin) {
+        emit(plan, b, consume, mode, cancellable, lanes, consumeMask, sourceIndexes, begin, null);
+    }
+
+    private static void emit(ScanPlan plan, Builder b, RowConsumer consume, Mode mode, boolean cancellable,
+                             int lanes, MaskConsumer consumeMask, int[] sourceIndexes, Expr begin, Var visited) {
         List<Var> addresses = new ArrayList<>();
         for (Column column : plan.input()) {
             int source = sourceIndexes == null ? column.index() : sourceIndexes[column.index()];
@@ -138,6 +178,7 @@ final class ScanLowering {
             for (int i = columns.nextSetBit(0); i >= 0; i = columns.nextSetBit(i + 1))
                 present = binary(Op.BOTH, present, ne(addresses.get(i), nil()));
             b.when(present, fast -> fast.loop(binary(Op.GE, binary(Op.SUB, ROWS, index), i64(lanes)), batch -> {
+                if (visited != null) batch.assign(visited, add(index, i64(lanes)));
                 if (cancellable) batch.when(eq(binary(Op.AND, index, i64(4095)), i64(0)), Builder::poll);
                 Var mask = batch.let(i64(lanes == 64 ? -1L : (1L << lanes) - 1));
                 predicateMask(batch, mask, plan.predicate(), row(plan.input(), addresses, index, false), lanes);
@@ -155,6 +196,7 @@ final class ScanLowering {
         }
         // Also handles column tops and zero rows. Never speculatively read a tail.
         b.loop(binary(Op.LT, index, ROWS), loop -> {
+            if (visited != null) loop.assign(visited, add(index, i64(1)));
             if (cancellable) loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
             Row raw = row(plan.input(), addresses, index, true);
             if (mode == Mode.EAGER && !(plan.predicate() instanceof All)) {

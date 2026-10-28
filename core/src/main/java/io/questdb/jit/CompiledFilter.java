@@ -58,6 +58,18 @@ public class CompiledFilter implements Closeable {
 
     public long getNativeInputRows() { return 0; }
 
+    /** Owner-only frame admission. Called before dispatch, or after draining on rewind. */
+    public boolean prepareLimit(long limit) { return false; }
+
+    /** Admits a prefix and debits the prepared budget once, in frame collection order. */
+    public long admitRows(long available) { throw new UnsupportedOperationException(); }
+
+    public long getLimitRemaining() { throw new UnsupportedOperationException(); }
+
+    public long getNativeLimitFrames() { return 0; }
+
+    public long getNativeLimitRows() { return 0; }
+
     /** Borrowed frame metadata for backends that decode variable-length values. */
     public long call(
             long dataAddress,

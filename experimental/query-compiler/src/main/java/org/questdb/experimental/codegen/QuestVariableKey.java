@@ -88,6 +88,12 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
 
     long descriptorBytes() { return inputs.bytes(); }
 
+    int minimumBytes() {
+        int bytes = Integer.BYTES;
+        for (Part part : parts) bytes += part.width != null ? part.width.bytes : Integer.BYTES;
+        return bytes;
+    }
+
     boolean prepare(PageFrameMemoryRecord record, long descriptor) {
         return inputs.prepare(record, descriptor);
     }

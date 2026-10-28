@@ -66,6 +66,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private long sharedRows;
     private long finalizedRows;
     private int sampledGroupLowerBound;
+    private long sampledGroupBytes;
     private long sortedRows;
     private long limitedRows;
     private long unionTasks;
@@ -203,8 +204,9 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private void flush(Map source) {
         if (source.size() == 0) return;
         if (prepared.partitionSelectCode != null && partitionSketch == 0) {
-            partitionSketch = KernelMemory.allocator().malloc(QuestPartitionSketch.BYTES);
-            io.questdb.std.Vect.memset(partitionSketch, QuestPartitionSketch.BYTES, 0);
+            long bytes = prepared.probe.variable() ? QuestPartitionSketch.VARIABLE_BYTES : QuestPartitionSketch.BYTES;
+            partitionSketch = KernelMemory.allocator().malloc(bytes);
+            io.questdb.std.Vect.memset(partitionSketch, bytes, 0);
             Unsafe.putLong(partitions + QuestPartitions.SKETCH_OFFSET, partitionSketch);
             if (inputPartitions != 0) Unsafe.putLong(inputPartitions + QuestPartitions.SKETCH_OFFSET, partitionSketch);
         }
@@ -236,12 +238,14 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         memory.enterCheckpoint(checkpoint);
         try {
             while (page != 0) {
-                runMutable(stateCode, page + QuestPartitions.PAGE_HEADER_BYTES,
+                runMutable(stateCode, page + (prepared.probe.variable()
+                        ? QuestPartitions.VARIABLE_HEADER_BYTES : QuestPartitions.PAGE_HEADER_BYTES),
                         Unsafe.getLong(page + QuestPartitions.PAGE_COUNT_OFFSET), destination, null, false);
                 page = Unsafe.getLong(page);
             }
             while (inputPage != 0) {
-                runMutable(inputCode, inputPage + QuestPartitions.PAGE_HEADER_BYTES,
+                runMutable(inputCode, inputPage + (prepared.probe.variable()
+                        ? QuestPartitions.VARIABLE_HEADER_BYTES : QuestPartitions.PAGE_HEADER_BYTES),
                         Unsafe.getLong(inputPage + QuestPartitions.PAGE_COUNT_OFFSET), destination, null, false);
                 inputPage = Unsafe.getLong(inputPage);
             }
@@ -284,16 +288,33 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         try {
             if (mergedSketch == 0) mergedSketch = KernelMemory.allocator().malloc(QuestPartitionSketch.HEADER_BYTES + QuestPartitionSketch.REGISTERS);
             sampledGroupLowerBound = 0;
+            long entryBytes = 0;
+            int keySamples = 0;
             for (int r = 0; r < QuestPartitionSketch.REGISTERS; r++) {
                 byte maximum = 0;
+                long priority = -1, width = 0;
                 for (int i = 0; i < sources.size(); i++) {
                     long sketch = ((AggregateSlot) sources.getQuick(i)).partitionSketch;
                     if (sketch != 0) maximum = (byte) Math.max(maximum,
                             Unsafe.getByte(sketch + (long) partition * QuestPartitionSketch.REGISTERS + r));
+                    if (sketch != 0 && prepared.probe.variable()) {
+                        long sample = sketch + QuestPartitionSketch.BYTES
+                                + ((long) partition * QuestPartitionSketch.REGISTERS + r) * QuestPartitionSketch.KEY_SAMPLE_BYTES;
+                        long candidate = Unsafe.getLong(sample), candidateWidth = Unsafe.getLong(sample + 8);
+                        if (candidate > priority || (candidate == priority && candidateWidth > width)) {
+                            priority = candidate;
+                            width = candidateWidth;
+                        }
+                    }
                 }
                 Unsafe.putByte(mergedSketch + QuestPartitionSketch.HEADER_BYTES + r, maximum);
                 if (maximum != 0) sampledGroupLowerBound++;
+                if (width > 0) {
+                    entryBytes += (width + prepared.binding.valueBytes + 7) & ~7L;
+                    keySamples++;
+                }
             }
+            sampledGroupBytes = keySamples == 0 ? 0 : (entryBytes + keySamples - 1) / keySamples;
             return estimator.of(mergedSketch).computeCardinality() * QuestPartitionSketch.SAMPLE_RATE;
         } finally { memory.close(); }
     }
@@ -314,8 +335,18 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         CompiledKernel stateCode = late ? prepared.rankStateCode : prepared.partitionMergeCode;
         CompiledKernel inputCode = late ? prepared.rankInputCode : prepared.inputPartitionMergeCode;
         estimatedGroups += groups;
-        long groupBytes = (prepared.partitionRowBytes + 7) & ~7L;
+        long groupBytes = prepared.probe.variable() ? sampledGroupBytes : (prepared.partitionRowBytes + 7) & ~7L;
+        // An empty hash sample needs no subdivision, and supplies no width estimate.
+        if (groupBytes == 0) groupBytes = 8;
         long groupLimit = cacheBytes / (2 * groupBytes);
+        double loadFactor = 0;
+        if (prepared.probe.variable()) {
+            working.writeNativeMutationView(scratchAddress);
+            loadFactor = (Unsafe.getLong(scratchAddress + NativeMapView.FREE)
+                    + Unsafe.getLong(scratchAddress + NativeMapView.SIZE))
+                    / (double) (Unsafe.getLong(scratchAddress + NativeMapView.MASK) + 1);
+            groupLimit = variableGroupLimit(cacheBytes, groupBytes, loadFactor);
+        }
         // Leave a margin for estimation error and the extra partition pass. A mildly
         // oversized map can be cheaper than copying every record again.
         if (groupLimit == 0 || groups <= 4 * groupLimit) {
@@ -330,6 +361,11 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         }
         int parts = 2;
         while (parts < QuestRepartition.PARTS && groupLimit * parts < groups) parts *= 2;
+        if (prepared.probe.variable() && working.getKeyCapacity()
+                > io.questdb.std.Numbers.ceilPow2((long) Math.ceil((groupLimit + 1) / loadFactor))) {
+            // clear() keeps a previous large offset table, which would defeat subdivision.
+            working.restoreInitialCapacity();
+        }
         long shift = io.questdb.griffin.engine.table.GroupByMapFragment.NUM_SHARDS_SHR - Integer.numberOfTrailingZeros(parts);
         memory.enterCheckpoint(checkpoint);
         try {
@@ -367,9 +403,21 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         }
     }
 
+    private static long variableGroupLimit(long cacheBytes, long groupBytes, double loadFactor) {
+        long groups = 0;
+        // OrderedMap touches its used entry heap and the entire power-of-two offset table.
+        // Unused heap capacity contributes allocation, but not cache working data.
+        for (long slots = 1; slots <= cacheBytes / Long.BYTES; slots *= 2) {
+            groups = Math.max(groups, Math.min((long) (slots * loadFactor) - 1,
+                    (cacheBytes - slots * Long.BYTES) / groupBytes));
+        }
+        return groups;
+    }
+
     private void splitPages(CompiledKernel code, long page, long state) {
         while (page != 0) {
-            long status = code.run(page + QuestPartitions.PAGE_HEADER_BYTES, Unsafe.getLong(page + QuestPartitions.PAGE_COUNT_OFFSET), state);
+            long status = code.run(page + (prepared.probe.variable() ? QuestPartitions.VARIABLE_HEADER_BYTES
+                    : QuestPartitions.PAGE_HEADER_BYTES), Unsafe.getLong(page + QuestPartitions.PAGE_COUNT_OFFSET), state);
             memory.throwIfFailed();
             if (status != 0) throw new IllegalStateException("Split records failed: " + status);
             page = Unsafe.getLong(page);
@@ -384,7 +432,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         memory.enterCheckpoint(checkpoint);
         try {
             while (true) {
-                runMutable(code, page + QuestPartitions.PAGE_HEADER_BYTES,
+                runMutable(code, page + (prepared.probe.variable() ? QuestPartitions.VARIABLE_HEADER_BYTES : QuestPartitions.PAGE_HEADER_BYTES),
                         Unsafe.getLong(page + QuestPartitions.PAGE_COUNT_OFFSET), destination, null, false);
                 if (page == tail) break;
                 page = Unsafe.getLong(page);
@@ -789,7 +837,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 long selected = filter.filterRange(begin, end, rows, circuitBreaker);
                 if (selected > 0) {
                     Unsafe.putLong(state + 8, rows.getAddress());
-                    if (compact) partitionInputs(0, selected);
+                    if (compact) partitionInputs(0, selected, map);
                     else compact = runMutable(prepared.mapCode, addresses, selected, map, shards, true, 0, accepted > 0);
                     accepted += selected;
                 }
@@ -868,14 +916,20 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         }
     }
 
-    private void partitionInputs(long begin, long rows) {
+    private void partitionInputs(long begin, long rows, Map map) {
         long batchSize = Unsafe.getLong(addresses);
         Unsafe.putLong(addresses, inputPartitions);
-        Unsafe.putLong(stateAddress, begin);
         try {
-            long status = prepared.inputPartitionCode.run(addresses, rows, stateAddress);
-            memory.throwIfFailed();
-            if (status != 0) throw new IllegalStateException("Input partition failed: " + status);
+            long position = begin;
+            while (position < rows) {
+                Unsafe.putLong(stateAddress, position);
+                long status = prepared.inputPartitionCode.run(addresses, rows, stateAddress);
+                memory.throwIfFailed();
+                if (status == 0) break;
+                if (status != QuestVariableKey.NEED_STAGING) throw new IllegalStateException("Input partition failed: " + status);
+                position = Unsafe.getLong(stateAddress + 32);
+                ((io.questdb.cairo.map.OrderedMap) map).writeNativeKeyStagingView(stateAddress + 64, Unsafe.getLong(stateAddress + 88));
+            }
             long accepted = rows - begin;
             updatedRows += accepted;
             mapRows += accepted;
@@ -1030,11 +1084,14 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 // Return to local aggregation on the next frame to detect reuse.
                 boolean compact = inputPartitions != 0 && kernel == prepared.mapCode && update
                         && (position > begin || frameHasRows) && localRows >= map.size()
-                        && map.size() * prepared.partitionRowBytes > localRows * prepared.inputPartitionRowBytes;
+                        // With variable keys, zero combining proves that smaller input payloads
+                        // save bytes without estimating a skewed distribution of key lengths.
+                        && (prepared.probe.variable() ? localRows == map.size()
+                        : map.size() * prepared.partitionRowBytes > localRows * prepared.inputPartitionRowBytes);
                 flush(map);
                 writeViews(map, null);
                 if (compact) {
-                    partitionInputs(position, rows);
+                    partitionInputs(position, rows, map);
                     return true;
                 }
                 continue;

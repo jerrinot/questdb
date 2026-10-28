@@ -32,6 +32,25 @@ not a change to execution defaults.
 - [ ] Vary cardinality, range density, key order, skew, aggregate width and worker
   count independently; use at least 500M rows and unchanged stock defaults.
   Require exact results and a repeatable full-query improvement.
+  The 2026-10-28 controls now cover unique/repeated keys, skew, wider state, K=64/65
+  and same/split L3 placement; see PROGRESS.md. Other machines remain unmeasured.
+- [x] Reduce retained variable-key state when local combining is ineffective.
+  Existing compact-input partitions now accept variable keys after a full window
+  with zero combining, when numeric inputs are narrower than aggregate state.
+  The 500M-row / 16.78M-group case retains 16.65 rather than 24.09 GB of pages;
+  complete hot execution falls 2.65 to 2.38 s. Reassess each frame and retain the
+  existing maps, allocators, budgets and retry paths. See PROGRESS.md.
+- [ ] Bound total retained variable-key memory. Compact records still grow with
+  input rows; peak RSS is now about 27.7 GB, above the older unbounded-map path's
+  20.4 GB. Evaluate admission or draining through existing owners and query
+  budgets. A small local map alone does not bound query memory.
+- [x] Measure variable-key bytes before extending cache subdivision to that path.
+  The existing HLL now carries deterministic distinct-key width samples. Planning
+  counts aligned used entries and the actual power-of-two offset table at the
+  map's load factor; unused OrderedMap heap capacity is not cache working data.
+  Variable state/input records share existing subdivision, page reuse and owners.
+  The 500M-unique-key control improves 4.47 to 3.30 s. Small-map cases can pay
+  roughly 1–3% for estimation; this is advisory sizing, not a total-memory bound.
 
 Evidence and limits:
 
@@ -107,6 +126,24 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
   temporary controls under `/tmp/query-current-clickbench/q13-*`.
 
 ## Remaining VARCHAR boundaries
+
+- [x] Generate single-VARCHAR encoded Top-K build: prefix rejection, normalization,
+  key-heap writes and threshold admission use typed IR against existing buffers.
+  Compaction/growth refreshes the borrowed view before resumption.
+- [x] Generate worker-result merge and compaction's survivor selection/heap packing
+  against the existing normalized entries. Preserve thresholds, scratch memory and
+  heap offsets; source buffers remain unchanged. Threshold publication remains
+  with the buffer owner.
+- [x] Generate encoded Top-K sorting, including the sorts inside compaction and
+  final LIMIT selection. Port `vergesort_entries<encoded_var>`, MSD radix and pdqsort
+  from existing sources. Preserve prefix/tail ordering, heap rebasing and small/large
+  partition behavior; use bounded stacks and tracked, reusable workspace.
+- [ ] Qualify Q22–Q25 on actual data when desktop profiling resumes. Q25's complete
+  generated path matches stock on the small schema fixture; the confirmed full-data
+  count remains 30/43. Measure compilation and complete latency, including long-tail
+  comparison sensitivity, before claiming a performance benefit.
+- [ ] Extend to composite ordering for Q26 without losing its existing partially
+  timestamp-sorted execution. Do not replace that plan with a full-table Top-K scan.
 
 - [x] Mixed/composite VARCHAR and wider-state keys now use the existing OrderedMap
   encoding, tracked staging buffer and heap ownership (2026-10-27). Direct SYMBOL

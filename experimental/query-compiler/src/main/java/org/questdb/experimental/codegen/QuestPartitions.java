@@ -37,6 +37,10 @@ final class QuestPartitions {
     static final int PAGE_COUNT_OFFSET = Long.BYTES;
     static final int PAGE_HEADER_BYTES = 2 * Long.BYTES;
     static final int PAGE_BYTES = 64 * 1024;
+    // Variable pages add used/capacity bytes; each record is hash + aligned OrderedMap key/state.
+    static final int VARIABLE_HEADER_BYTES = 4 * Long.BYTES;
+    private static final int PAGE_USED_OFFSET = 2 * Long.BYTES;
+    private static final int PAGE_CAPACITY_OFFSET = 3 * Long.BYTES;
     static final int SKETCH_OFFSET = GroupByMapFragment.NUM_SHARDS * BUCKET_BYTES;
     // A reserved word follows the sketch pointer.
     private static final int BLOB_OFFSET = SKETCH_OFFSET + 2 * Long.BYTES;
@@ -52,6 +56,12 @@ final class QuestPartitions {
         Var bucket = b.let(new Offset(partitions, binary(Op.MUL,
                 binary(Op.USHR, hash, i64(GroupByMapFragment.NUM_SHARDS_SHR)), i64(BUCKET_BYTES))));
         return reserve(b, bucket, rowBytes);
+    }
+
+    static Append appendVariable(Builder b, Expr partitions, Expr hash, Var rowBytes) {
+        Var bucket = b.let(new Offset(partitions, binary(Op.MUL,
+                binary(Op.USHR, hash, i64(GroupByMapFragment.NUM_SHARDS_SHR)), i64(BUCKET_BYTES))));
+        return reserveVariable(b, bucket, rowBytes);
     }
 
     /** A reset tail reuses the head chain; consumers stop at the current tail, not a stale successor. */
@@ -106,6 +116,7 @@ final class QuestPartitions {
     }
 
     static Program flush(QuestMapProbe probe, long valueBytes) {
+        if (probe.variable()) return flushVariable(probe, valueBytes);
         Builder b = new Builder();
         int keyBytes = probe.varchar() ? 24 : probe.keyBytes();
         long rowBytes = keyBytes + valueBytes;
@@ -141,7 +152,7 @@ final class QuestPartitions {
             Var row = loop.let(new Load(MemoryType.ADDRESS, new Offset(COLUMNS, add(binary(Op.MUL, index, i64(16)), i64(8)))));
             Var key = probe.orderedNative() ? row : loop.let(new Load(probe.keyBytes() == 4 ? MemoryType.I32 : MemoryType.I64, row));
             probe.find(loop, key, index, i64(0), null, (init, value) ->
-                    QuestMapMutation.copy(init, at(row, probe.keyBytes()), value, valueBytes));
+                    QuestMapMutation.copy(init, probe.valueAddress(row), value, valueBytes));
             loop.assign(index, add(index, i64(1)));
         });
         b.exit(0);
@@ -163,11 +174,12 @@ final class QuestPartitions {
         return new Program(b.block());
     }
 
-    static Program merge(QuestMapProbe probe, AggregateUpdates updates, long valueBytes) {
-        return merge(probe, updates, valueBytes, null);
+    static Program merge(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, int batchRows) {
+        return merge(probe, updates, valueBytes, batchRows, null);
     }
 
-    static Program merge(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, AggregateUpdates initialization) {
+    static Program merge(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, int batchRows, AggregateUpdates initialization) {
+        if (probe.variable()) return mergeVariable(probe, updates, valueBytes, batchRows, initialization, false);
         Builder b = new Builder();
         int keyBytes = probe.varchar() ? 24 : probe.keyBytes();
         Var index = b.let(load(STATE));
@@ -184,6 +196,130 @@ final class QuestPartitions {
             if (initialization != null) updates.merge(loop, at(row, keyBytes), destination);
             else loop.when(eq(inserted, bool(false)), existing -> updates.merge(existing, at(row, keyBytes), destination));
             loop.assign(index, add(index, i64(1)));
+        });
+        b.exit(0);
+        return new Program(b.block());
+    }
+
+    static Program mergeInputs(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, int batchRows) {
+        return mergeVariable(probe, updates, valueBytes, batchRows, null, true);
+    }
+
+    static Append reserveVariable(Builder b, Expr bucket, Var rowBytes) {
+        Var tail = b.let(new Load(MemoryType.ADDRESS, at(bucket, BUCKET_TAIL_OFFSET)));
+        Var used = b.let(i64(0)), count = b.let(i64(0)), available = b.let(i64(0));
+        b.when(ne(tail, nil()), existing -> {
+            existing.assign(count, load(at(tail, PAGE_COUNT_OFFSET)));
+            existing.assign(used, load(at(tail, PAGE_USED_OFFSET)));
+            existing.assign(available, load(at(tail, PAGE_CAPACITY_OFFSET)));
+        });
+        b.when(binary(Op.EITHER, eq(tail, nil()), binary(Op.LT, available, add(used, rowBytes))), full -> {
+            Var page = full.let(nil());
+            Var fits = full.let(bool(false));
+            full.when(eq(tail, nil()), first -> first.assign(page, new Load(MemoryType.ADDRESS, bucket)));
+            full.when(ne(tail, nil()), following -> following.assign(page, new Load(MemoryType.ADDRESS, tail)));
+            full.when(ne(page, nil()), existing -> existing.assign(fits,
+                    binary(Op.GE, load(at(page, PAGE_CAPACITY_OFFSET)), rowBytes)));
+            full.when(eq(fits, bool(false)), allocate -> {
+                Var required = allocate.let(add(rowBytes, i64(VARIABLE_HEADER_BYTES)));
+                Var capacity = allocate.let(new Select(binary(Op.LT, required, i64(PAGE_BYTES)), i64(PAGE_BYTES), required));
+                Var next = allocate.let(new Allocate(capacity));
+                allocate.when(eq(next, nil()), failed -> failed.exit(2));
+                // Keep the unused suffix reachable when an oversized record needs a larger page.
+                allocate.store(MemoryType.ADDRESS, next, page);
+                allocate.store(at(next, PAGE_CAPACITY_OFFSET), binary(Op.SUB, capacity, i64(VARIABLE_HEADER_BYTES)));
+                allocate.when(eq(tail, nil()), first -> first.store(MemoryType.ADDRESS, bucket, next));
+                allocate.when(ne(tail, nil()), following -> following.store(MemoryType.ADDRESS, tail, next));
+                allocate.assign(page, next);
+            });
+            full.store(at(page, PAGE_COUNT_OFFSET), i64(0));
+            full.store(at(page, PAGE_USED_OFFSET), i64(0));
+            full.store(MemoryType.ADDRESS, at(bucket, BUCKET_TAIL_OFFSET), page);
+            full.assign(tail, page);
+            full.assign(used, i64(0));
+            full.assign(count, i64(0));
+        });
+        Var row = b.let(new Offset(at(tail, VARIABLE_HEADER_BYTES), used));
+        b.store(at(tail, PAGE_USED_OFFSET), add(used, rowBytes));
+        return new Append(row, tail, count);
+    }
+
+    private static Program flushVariable(QuestMapProbe probe, long valueBytes) {
+        Builder b = new Builder();
+        Var sketch = b.let(new Load(MemoryType.ADDRESS, at(STATE, SKETCH_OFFSET)));
+        QuestMapScan.emit(b, probe, COLUMNS, (entry, source) -> {
+            Var hash = probe.hash(entry, source);
+            QuestPartitionSketch.add(entry, sketch, hash, QuestVariableKey.bytes(source));
+            Var bytes = entry.let(QuestVariableKey.stride(source, i64(valueBytes)));
+            Var rowBytes = entry.let(add(bytes, i64(8)));
+            Append append = appendVariable(entry, STATE, hash, rowBytes);
+            entry.store(append.row(), hash);
+            QuestMapMutation.copy(entry, source, at(append.row(), 8), bytes);
+            append.commit(entry);
+        });
+        b.exit(0);
+        return new Program(b.block());
+    }
+
+    /** Stage cached hashes and contiguous source records before dependent destination probes. */
+    private static Program mergeVariable(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, int batchRows,
+                                         AggregateUpdates initialization, boolean inputs) {
+        Builder b = new Builder();
+        int window = Math.max(1, batchRows);
+        Var index = b.let(load(STATE));
+        Var batches = b.let(i64(0));
+        Var sourceOffset = b.let(load(at(STATE, 96)));
+        b.loop(binary(Op.LT, index, ROWS), batch -> {
+            batch.when(eq(binary(Op.AND, batches, i64(Math.max(1, 1024 / window) - 1)), i64(0)), Builder::poll);
+            batch.assign(batches, add(batches, i64(1)));
+            Var end = batch.let(new Select(binary(Op.LT, add(index, i64(window)), ROWS), add(index, i64(window)), ROWS));
+            Var position = batch.let(index);
+            Var scratch = batch.let(at(STATE, ResolvedAggregateKernel.prefetchScratch(probe)));
+            batch.loop(binary(Op.LT, position, end), stage -> {
+                Var row = stage.let(new Offset(COLUMNS, sourceOffset));
+                Var key = stage.let(at(row, 8));
+                Var hash = stage.let(load(row));
+                stage.prefetch(key, false);
+                probe.prefetchOffset(stage, key, hash);
+                stage.store(scratch, sourceOffset);
+                stage.store(MemoryType.ADDRESS, at(scratch, 8), key);
+                stage.store(at(scratch, 24), hash);
+                stage.assign(scratch, at(scratch, probe.prefetchRowBytes()));
+                Expr payloadBytes = inputs ? add(QuestVariableKey.bytes(key), i64(QuestPartitionInputs.numericBytes(updates)))
+                        : QuestVariableKey.stride(key, i64(valueBytes));
+                stage.assign(sourceOffset, add(sourceOffset, add(i64(8), payloadBytes)));
+                stage.assign(position, add(position, i64(1)));
+            });
+            batch.assign(position, index);
+            batch.assign(scratch, at(STATE, ResolvedAggregateKernel.prefetchScratch(probe)));
+            batch.loop(binary(Op.LT, position, end), prepare -> {
+                Var key = prepare.let(new Load(MemoryType.ADDRESS, at(scratch, 8)));
+                var candidate = probe.prepare(prepare, key, valueBytes, (hint, destination) -> {}, prepare.let(load(at(scratch, 24))));
+                prepare.store(MemoryType.ADDRESS, at(scratch, 16), candidate.entry());
+                prepare.store(at(scratch, 32), candidate.slot());
+                prepare.assign(scratch, at(scratch, probe.prefetchRowBytes()));
+                prepare.assign(position, add(position, i64(1)));
+            });
+            batch.assign(scratch, at(STATE, ResolvedAggregateKernel.prefetchScratch(probe)));
+            batch.loop(binary(Op.LT, index, end), consume -> {
+                Var key = consume.let(new Load(MemoryType.ADDRESS, at(scratch, 8)));
+                Var source = consume.let(probe.valueAddress(key));
+                // Heap growth rebuilds staging from this unconsumed record's byte offset.
+                consume.store(at(STATE, 96), load(scratch));
+                Var inserted = consume.let(bool(false));
+                Var destination = probe.finishOrdered(consume, key, consume.let(new Load(MemoryType.ADDRESS, at(scratch, 16))),
+                        consume.let(load(at(scratch, 24))), consume.let(load(at(scratch, 32))), index, (init, value) -> {
+                            if (inputs) updates.initialize(init, value);
+                            else if (initialization == null) QuestMapMutation.copy(init, source, value, valueBytes);
+                            else initialization.initialize(init, value);
+                            init.assign(inserted, bool(true));
+                        });
+                if (inputs) updates.emit(consume, QuestPartitionInputs.loadValues(consume, updates, source), destination, nil());
+                else if (initialization != null) updates.merge(consume, source, destination);
+                else consume.when(eq(inserted, bool(false)), existing -> updates.merge(existing, source, destination));
+                consume.assign(scratch, at(scratch, probe.prefetchRowBytes()));
+                consume.assign(index, add(index, i64(1)));
+            });
         });
         b.exit(0);
         return new Program(b.block());

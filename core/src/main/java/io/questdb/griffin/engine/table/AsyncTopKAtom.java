@@ -41,7 +41,9 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.PerWorkerLockOwner;
 import io.questdb.griffin.engine.PerWorkerLocks;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.RecordComparator;
+import io.questdb.griffin.engine.orderby.CompiledTopK;
 import io.questdb.griffin.engine.orderby.EncodedTopKBuffer;
 import io.questdb.griffin.engine.orderby.LimitedSizeLongTreeChain;
 import io.questdb.griffin.engine.orderby.RecordComparatorCompiler;
@@ -79,6 +81,7 @@ public class AsyncTopKAtom implements StatefulAtom, PerWorkerLockOwner, Reopenab
     private final ObjList<DirectIntList> rankMaps;
     private final IntHashSet sortKeyColumnIndexes;
     private final int workerCount;
+    private CompiledTopK compiledTopK;
     // Per-query native memory tracker captured from SqlExecutionContext on init.
     // Null when no per-query limit applies. Workers and operator code feed it to
     // tracker-aware Unsafe overloads to charge allocations to the active workload.
@@ -97,7 +100,8 @@ public class AsyncTopKAtom implements StatefulAtom, PerWorkerLockOwner, Reopenab
             @NotNull @Transient ListColumnFilter orderByFilter,
             @NotNull @Transient RecordMetadata orderByMetadata,
             long lo,
-            int workerCount
+            int workerCount,
+            @Nullable QueryCodeGenerator codeGenerator
     ) throws SqlException {
         assert perWorkerFilters == null || perWorkerFilters.size() == workerCount;
 
@@ -145,6 +149,9 @@ public class AsyncTopKAtom implements StatefulAtom, PerWorkerLockOwner, Reopenab
                     perWorkerTopK.extendAndSet(i, new EncodedTopKBuffer(configuration, false));
                 }
                 this.sortKeyColumnIndexes = SortKeyEncoder.extractSortKeyColumnIndexes(orderByFilter);
+                if (codeGenerator != null) {
+                    this.compiledTopK = codeGenerator.compileTopK(orderByMetadata, orderByFilter);
+                }
                 if (filterUsedColumnIndexes != null) {
                     // Late materialization needs only the sort-key columns the filter
                     // pass did not decode; everything else is skipped.
@@ -220,8 +227,15 @@ public class AsyncTopKAtom implements StatefulAtom, PerWorkerLockOwner, Reopenab
 
     @Override
     public void close() {
-        clear();
-        Misc.free(filterCtx);
+        try {
+            clear();
+        } finally {
+            try {
+                Misc.free(filterCtx);
+            } finally {
+                compiledTopK = Misc.free(compiledTopK);
+            }
+        }
     }
 
     public void freePerWorkerChainsAndPools() {
@@ -230,6 +244,10 @@ public class AsyncTopKAtom implements StatefulAtom, PerWorkerLockOwner, Reopenab
         Misc.freeObjListAndKeepObjects(perWorkerEncoders);
         Misc.freeObjListAndKeepObjects(filterCtx.getPerWorkerMemoryPools());
         Misc.freeObjListAndKeepObjects(perWorkerRecordsB);
+    }
+
+    public CompiledTopK getCompiledTopK() {
+        return compiledTopK;
     }
 
     public RecordComparator getComparator(int slotId) {
