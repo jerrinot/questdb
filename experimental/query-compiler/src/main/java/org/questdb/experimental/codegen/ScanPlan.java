@@ -82,6 +82,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
     private static int cost(Scalar s, Map<Scalar, Integer> memo) {
         Integer previous = memo.get(s); if (previous != null) return previous;
         int value = s instanceof Add a ? 1 + cost(a.left(), memo) + cost(a.right(), memo)
+                : s instanceof Multiply a ? 1 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof IPv4Subtract a ? 4 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof TimestampPart a ? 12 + cost(a.argument(), memo)
                 : s instanceof Subtract a ? 1 + cost(a.left(), memo) + cost(a.right(), memo) : 1;
@@ -103,6 +104,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
         switch (s) {
             case Column c -> { if (c.index() >= schema.size() || !c.equals(schema.get(c.index()))) throw new IllegalArgumentException("Foreign column: " + c); }
             case Add a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
+            case Multiply a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
             case IPv4Subtract a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
             case Subtract a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
             case TimestampPart a -> validate(a.argument(), schema, checked);
@@ -130,6 +132,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case Constant c -> c;
             case TimestampPart a -> new TimestampPart(rewrite(a.argument(), schema, bindings), a.unitTicks(), a.period());
             case Add a -> new Add(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
+            case Multiply a -> new Multiply(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
             case IPv4Subtract a -> new IPv4Subtract(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings));
             case Subtract a -> new Subtract(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
         };
@@ -150,6 +153,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case Column c -> used.set(c.index());
             case TimestampPart a -> collect(a.argument(), used);
             case Add a -> { collect(a.left(), used); collect(a.right(), used); }
+            case Multiply a -> { collect(a.left(), used); collect(a.right(), used); }
             case IPv4Subtract a -> { collect(a.left(), used); collect(a.right(), used); }
             case Subtract a -> { collect(a.left(), used); collect(a.right(), used); }
             case Constant ignored -> { }

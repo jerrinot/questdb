@@ -27,6 +27,7 @@ package org.questdb.experimental.codegen;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameMemory;
+import io.questdb.cairo.sql.PartitionFormat;
 import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.jit.CompiledCountOnlyFilter;
 import io.questdb.jit.CompiledFilter;
@@ -55,7 +56,7 @@ final class ResolvedStandaloneFilter {
                     ? ScanLowering.selection(binding.plan(), binding.residual(), true)
                     : ScanLowering.selection(binding.plan(), binding.sourceIndexes(), true), artifacts);
             var frameBinding = descriptors ? binding : null;
-            return new QueryCodeGenerator.CompiledFilters(new Rows(rows, backend.name(), frameBinding), new Count(count, frameBinding));
+            return new QueryCodeGenerator.CompiledFilters(new Rows(rows, backend, artifacts, frameBinding), new Count(count, frameBinding));
         } catch (Throwable failure) {
             try { rows.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             if (count != null) try { count.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
@@ -80,15 +81,77 @@ final class ResolvedStandaloneFilter {
     private static final class Rows extends CompiledFilter {
         private final CompiledKernel code;
         private final ResolvedFilter.Binding binding;
-        private final String backend;
+        private final Backend backend;
+        private final Path artifacts;
         private final LongAdder inputRows = new LongAdder();
+        private CompiledKernel limitCode;
+        private CompiledKernel boundedCode;
+        // Published before task dispatch; never changed while workers from that execution can run.
+        private long frameLimit = Long.MAX_VALUE;
+        private long limitState;
+        private long limitFrames;
+        private long limitRows;
 
-        private Rows(CompiledKernel code, String backend, ResolvedFilter.Binding binding) {
-            this.code = code; this.backend = backend; this.binding = binding;
+        private Rows(CompiledKernel code, Backend backend, Path artifacts, ResolvedFilter.Binding binding) {
+            this.code = code; this.backend = backend; this.artifacts = artifacts; this.binding = binding;
         }
+
+        @Override public boolean prepareLimit(long limit) {
+            frameLimit = Long.MAX_VALUE;
+            if (limit < 0 || limit == Long.MAX_VALUE) return false;
+            if (limitCode == null) {
+                CompiledKernel prepared;
+                try { prepared = backend.compile(QuestRowLimit.frame(), artifacts); }
+                catch (IOException failure) { throw io.questdb.cairo.CairoException.nonCritical().put("LIMIT compilation failed: ").put(failure.getMessage()); }
+                CompiledKernel bounded = null;
+                try {
+                    if (binding != null) {
+                        try { bounded = backend.compile(ScanLowering.boundedSelection(binding.plan(), binding.residual(), binding.bytes()), artifacts); }
+                        catch (IOException failure) { throw io.questdb.cairo.CairoException.nonCritical().put("Bounded filter compilation failed: ").put(failure.getMessage()); }
+                    }
+                    limitState = Unsafe.malloc(Long.BYTES, MemoryTag.NATIVE_JIT);
+                } catch (Throwable failure) {
+                    try { prepared.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+                    if (bounded != null) try { bounded.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+                    throw failure;
+                }
+                limitCode = prepared;
+                boundedCode = bounded;
+            }
+            Unsafe.putLong(limitState, limit);
+            frameLimit = limit;
+            return true;
+        }
+        @Override public long admitRows(long available) {
+            long take = limitCode.run(0, available, limitState);
+            if (take < 0 || take > available) throw new IllegalStateException("Invalid LIMIT admission");
+            limitFrames++;
+            limitRows += take;
+            return take;
+        }
+        @Override public long getLimitRemaining() { return Unsafe.getLong(limitState); }
+        @Override public long getNativeLimitFrames() { return limitFrames; }
+        @Override public long getNativeLimitRows() { return limitRows; }
 
         @Override public long call(long data, long columnCount, long aux, long vars, long variableCount, long output, long rows,
                                    PageFrameMemory frame) {
+            // Parquet selectivity statistics require the complete frame result. Keep that path intact.
+            if (boundedCode != null && frameLimit != Long.MAX_VALUE && frame.getFrameFormat() == PartitionFormat.NATIVE) {
+                long bytes = binding.bytes() + 16;
+                long addresses = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
+                try {
+                    binding.prepare(frame, data, aux, rows, addresses);
+                    Unsafe.putLong(addresses + binding.bytes(), frameLimit);
+                    long count = boundedCode.run(addresses, rows, output);
+                    long visited = Unsafe.getLong(addresses + binding.bytes() + 8);
+                    if (count < 0 || count > Math.min(rows, frameLimit) || visited < count || visited > rows)
+                        throw new IllegalStateException("Invalid bounded filter result");
+                    inputRows.add(visited);
+                    return count;
+                } finally {
+                    Unsafe.free(addresses, bytes, MemoryTag.NATIVE_JIT);
+                }
+            }
             if (binding == null) return call(data, columnCount, aux, vars, variableCount, output, rows);
             long count = run(code, binding, data, aux, output, rows, frame);
             inputRows.add(rows);
@@ -100,9 +163,13 @@ final class ResolvedStandaloneFilter {
             inputRows.add(rows);
             return count;
         }
-        @Override public CharSequence getBackendName() { return backend; }
+        @Override public CharSequence getBackendName() { return backend.name(); }
         @Override public long getNativeInputRows() { return inputRows.sum(); }
-        @Override public void close() { code.close(); }
+        @Override public void close() {
+            try (code; var limit = limitCode; var bounded = boundedCode) {
+                if (limitState != 0) limitState = Unsafe.free(limitState, Long.BYTES, MemoryTag.NATIVE_JIT);
+            }
+        }
     }
 
     private static final class Count extends CompiledCountOnlyFilter {

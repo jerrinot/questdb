@@ -128,6 +128,13 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     }
 
     @Override
+    public io.questdb.griffin.engine.orderby.CompiledTopK compileTopK(ColumnTypes inputs, io.questdb.cairo.ListColumnFilter order) {
+        if (handwritten) return null;
+        try { return ResolvedTopK.compile(inputs, order, backend, artifacts); }
+        catch (IOException failure) { throw CairoException.nonCritical().put("Top-K build compilation failed: ").put(failure.getMessage()); }
+    }
+
+    @Override
     public CompiledFilters compileFilters(ColumnTypes inputs, Function predicate) {
         if (handwritten) return null;
         try { return ResolvedStandaloneFilter.compile(inputs, predicate, backend, artifacts); }

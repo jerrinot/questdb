@@ -33,6 +33,7 @@ import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.PartitionFormat;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.engine.functions.columns.VarcharColumn;
+import io.questdb.griffin.engine.functions.bool.NotFunctionFactory;
 import io.questdb.griffin.engine.functions.eq.EqVarcharFunctionFactory;
 import io.questdb.griffin.engine.functions.regex.AbstractLikeVarcharFunctionFactory;
 import io.questdb.std.DirectLongList;
@@ -76,12 +77,19 @@ final class ResolvedFilter implements AutoCloseable {
         var tests = new java.util.ArrayList<StringPredicate>();
         Pipeline.Predicate numeric = new Pipeline.All();
         for (Function leaf : leaves) {
+            Function original = leaf;
+            int negations = 0;
+            while (leaf != null && leaf.getClass() == NotFunctionFactory.Func.class) {
+                if (++negations > 64) return null;
+                leaf = ((NotFunctionFactory.Func) leaf).getArg();
+            }
+            final boolean negate = (negations & 1) != 0;
             if (leaf != null && leaf.getClass() == EqVarcharFunctionFactory.NullCheckFunc.class) {
                 var check = (EqVarcharFunctionFactory.NullCheckFunc) leaf;
                 int column = varcharColumn(types, check.getArg());
                 if (column < 0) return null;
                 strings.add(column);
-                boolean wantNull = !check.isNegated();
+                boolean wantNull = !check.isNegated() ^ negate;
                 tests.add((builder, descriptor, row) -> eq(ne(binary(Op.AND,
                         QuestVarchar.header(builder, descriptor, row), i64(4)), i64(0)), bool(wantNull)));
             } else if (leaf != null && leaf.getClass() == AbstractLikeVarcharFunctionFactory.ConstContainsSwarVarcharFunction.class) {
@@ -97,10 +105,11 @@ final class ResolvedFilter implements AutoCloseable {
                     Var found = builder.let(bool(false));
                     builder.when(eq(value.isNull(), bool(false)), present ->
                             present.assign(found, ByteSequences.contains(present, value.address(), value.size(), pattern)));
-                    return found;
+                    // NOT negates the resolved Boolean, including false for a NULL input.
+                    return negate ? eq(found, bool(false)) : found;
                 });
             } else {
-                var predicate = inputs.predicate(leaf);
+                var predicate = inputs.predicate(original);
                 if (predicate == null) return null;
                 numeric = numeric instanceof Pipeline.All ? predicate : new Pipeline.And(numeric, predicate);
             }

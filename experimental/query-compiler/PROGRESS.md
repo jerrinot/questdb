@@ -3750,3 +3750,124 @@ inputs, column tops, lazy conversion, Parquet, cancellation, reopen and partial
 slot-construction cleanup. Main sources and changed tests compile. Evidence and
 LLVM dumps: `/tmp/query-scalar-aggregate-20261028`. Profiling remains paused;
 no new performance or ClickBench coverage claim.
+
+## 2026-10-28: shared integer multiplication
+
+INT/LONG multiplication now binds the exact QuestDB function implementations and
+uses the existing arithmetic emitter for wrapping, NULL propagation and INT-to-LONG
+widening. It composes in predicates, projections, grouping keys and aggregate
+arguments, including unkeyed reductions. Scan substitution, column tracking and
+expression limits understand the new node. No backend changes or toggles.
+
+The old compiler fails the six new SQL coverage cases. The implementation passes
+12 focused SQL checks across LLVM/AsmJit/C and both worker modes, plus three scan
+checks that each exercise all lowering modes. Cases include NULL operands, zero
+multipliers, overflow into the NULL sentinel, widening before/after multiplication,
+native row counts and repeated execution. Evidence: `/tmp/query-integer-multiply-20261028`.
+Profiling remains paused; this is a coverage gain, not a measured speedup.
+
+## 2026-10-28: string negation and ordered filter LIMIT
+
+Supported VARCHAR predicates now bind through NOT, preserving the resolved
+functions' NULL behavior. Forward finite filter LIMIT uses generated frame-prefix
+admission in the existing ordered collector. Native VARCHAR selection stops after
+K matches per frame; workers share an immutable cap, not a racing global quota.
+No copied row lists, scheduler changes or new switches. Numeric-only selection
+keeps its full-frame SIMD path; Parquet stays full-frame for selectivity statistics
+and retains its existing late-materialization/column-top fallback.
+
+Original Q22–Q24 SQL matches stock on a 4,096-row ClickBench-schema fixture,
+including all 105 Q23 output columns in order. Q22 filters 4,096 rows natively and
+updates 2,253. Q23/Q24 evaluate 24/10 rows across dispatched frames and each admit
+ten; the full-frame LLVM control evaluates 262 for each at identical settings.
+A separate dense fixture checks 10–20 evaluated rows at LIMIT 10 with two in-flight
+frames. Work includes scheduling slack; this does not establish lower elapsed time.
+
+42 focused SQL, nine scan and four existing core checks pass: LLVM/AsmJit/C, both
+worker modes, later-frame-first completion, cursor operations, runtime bound
+changes, zero dispatch, tails and preparation-failure recovery. Evidence:
+`/tmp/query-filter-limit-20261028`. Full-data coverage remains 30/43 pending the
+planned audit; controlled profiling remains paused. No speedup claim.
+
+## 2026-10-28: generated VARCHAR Top-K batch build
+
+Single-VARCHAR ordering now generates the existing encoded-buffer build: six-byte
+split-prefix rejection, normalized key encoding, full threshold comparison and
+admission, in either direction. It borrows actual worker buffers and returns only
+for growth/compaction, retaining existing budgets, threshold copies, scheduling
+and row IDs. LLVM recognizes the byte permutations as bswap intrinsics; its only
+external call site in this kernel is the throttled cancellation poll.
+
+The old build fails all six added SQL coverage cases. The implementation passes
+12 SQL checks across LLVM/AsmJit/C and both worker modes, three guard-page checks,
+and the existing Top-K partial-filter-compilation cleanup check. Cases include
+NULL/empty/long-prefix strings, encoding boundaries, Parquet, ordered ties,
+compaction, reopen, preparation/worker failure and memory-limit recovery. A losing
+split-prefix guard test proves no payload read. Original Q25 matches stock on the
+4,096-row ClickBench-schema fixture; native filter and build counters both cover
+4,096 rows. Evidence: `/tmp/query-varchar-topk-20261028`.
+
+Compaction, merge and final sorting remain ordinary, so Q25 is not yet a complete
+LLVM pipeline. Q26's partially ordered composite path remains untouched. Profiling
+is paused; no performance or full-data qualification claim. No new toggles.
+
+## 2026-10-28: generated encoded Top-K merge and heap packing
+
+Worker-result admission and compaction's survivor selection/heap packing now use
+shared typed IR over QuestDB's normalized variable-key entries. These stages are
+compiled lazily, retain the existing threshold and compaction algorithm, and
+resume after ordinary buffer growth. Scan and merge share one full-key comparison.
+FIRST N avoids copying entries already in place; LAST N safely moves overlapping
+ranges. Scratch packing remains necessary because survivors reference arbitrary
+positions in the old heap. Sorting and threshold publication still use stock code.
+
+21 focused checks pass across LLVM/AsmJit/C: 12 SQL checks, six buffer checks and
+three guard-page checks. Buffer contents and packed heaps match stock byte for
+byte, including a capped compaction trigger, repeated heap growth, FIRST/LAST N,
+both directions and recovery after failure midway through packing. Source buffers
+remain unchanged; compiled code and scratch allocations are released. Original
+Q25 matches stock on the 4,096-row fixture, with 4,096 generated build rows, 3,965
+merge input entries and one generated packing pass. Optimized LLVM merge/packing
+have only cancellation polls as runtime call sites. Evidence:
+`/tmp/query-encoded-topk-20261028`.
+
+Generated sorting (inside compaction and for final output) is still missing;
+Q25 remains partial and full-data verified coverage stays 30/43. No controlled
+performance runs or speedup claim; desktop profiling remains paused.
+
+## 2026-10-28: generated normalized variable-key sorting
+
+Compaction and final Top-K sorting now execute typed-IR ports of the existing
+natural-run detection, in-place MSD radix partitioning and non-branchless pdqsort.
+Insertion sort, pattern breaking, equal-key handling and worst-case heapsort remain.
+Bounded explicit stacks replace recursion; pdqsort processes the smaller partition
+first. Sorting uses normalized 40-byte entries, without SQL names, column types or
+hardware-specific tuning. The 16-byte prefix avoids heap reads when it decides the
+order; entries already in their radix bucket avoid copying. Workspace reuses the
+buffer's tracked DirectLongList and only grows. Small sorts need no radix workspace.
+
+The final cursor's Java LIMIT truncation was another uncovered boundary. It now
+consumes the prefix count from generated sorting, using the existing row-limit
+expression. The EXPLAIN marker is `compiledTopK`. Stock execution remains available
+through the ordinary factory; lazy-conversion fallback remains explicit.
+
+Validation: 12 existing SQL checks pass across all three backends and both worker
+modes. Six further SQL checks cover empty/singleton/short results, changing binds
+and cached-factory reopening. Six guarded-sort checks cover eight distributions,
+0/1/23/24/127/128 boundaries, long shared prefixes, arbitrary normalized bytes,
+unsigned row IDs, both guard edges and forced heapsort, plus query-budget failure
+and cancellation recovery. Six buffer checks and three encoding guard checks pass.
+The first edge-fixture attempt omitted its bind service; matching existing test
+setup fixed the fixture. No production workaround was added.
+
+Original Q25 matches stock on 4,096 fixture rows: filter/build process all rows,
+merge consumes 262 worker entries, and generated sorts process 4,096 entries at
+compaction plus ten for final output. The LLVM module defines its own sort helpers;
+external runtime calls are cancellation polls, with compiler intrinsics for primitive
+operations. Evidence: `/tmp/query-encoded-sort-20261028`.
+
+Q25 now has a complete generated path on the fixture, joining Q22–Q24 awaiting
+full-data qualification (34 provisional shapes, 30/43 full-data verified). This
+establishes correctness coverage. Profiling stays paused;
+compilation cost, long-tail comparison cost and end-to-end gains still need measured
+validation. Composite/partially ordered SQL binding remains the next separate gap.

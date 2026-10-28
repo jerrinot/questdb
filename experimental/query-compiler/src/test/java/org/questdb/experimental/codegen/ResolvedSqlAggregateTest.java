@@ -68,6 +68,7 @@ public class ResolvedSqlAggregateTest {
     private long queryMemoryLimit;
     private int mapEntrySize = 16;
     private int topKThreshold = Integer.MAX_VALUE;
+    private int filterDispatchLimit = Integer.MAX_VALUE;
     private String lastPlan;
 
     public ResolvedSqlAggregateTest(String name, Backend backend, WorkerPoolMode workerPoolMode) {
@@ -97,6 +98,7 @@ public class ResolvedSqlAggregateTest {
             @Override public int getSqlUnorderedMapMaxEntrySize() { return mapEntrySize; }
             @Override public long getGroupByParallelTopKThreshold() { return topKThreshold; }
             @Override public int getGroupByBatchSize() { return 32; }
+            @Override public int getSqlParallelFilterDispatchLimit() { return filterDispatchLimit; }
         };
         engine = new CairoEngine(config);
         pool = new WorkerPool(new WorkerPoolConfiguration() {
@@ -1211,7 +1213,8 @@ public class ResolvedSqlAggregateTest {
         for (boolean parquet : new boolean[]{false, true}) {
             context.setQueryCodeGenerator(null);
             if (parquet) engine.execute("alter table literals convert partition to parquet list '2024-01-01'", context);
-            for (String predicate : List.of("s like '%needle%'", "k<5 and s like '%ž%' and s is not null", "s like '%abcdefgh%'")) {
+            for (String predicate : List.of("s like '%needle%'", "k<5 and s like '%ž%' and s is not null", "s like '%abcdefgh%'",
+                    "s not like '%needle%'", "not (not (s like '%ž%'))", "not (s is not null)")) {
                 for (String output : List.of("count()", "v,k")) {
                     String sql = "select " + output + " from literals where " + predicate;
                     context.setQueryCodeGenerator(null);
@@ -1233,7 +1236,7 @@ public class ResolvedSqlAggregateTest {
                     }
                 }
             }
-            for (String predicate : List.of("s ilike '%NEEDLE%'", "s like '%n_edle%'", "s like '%abcdefghijkl%'")) {
+            for (String predicate : List.of("s ilike '%NEEDLE%'", "s like '%n_edle%'", "s like '%abcdefghijkl%'", "s not like '%abcdefghijkl%'")) {
                 String sql = "select count() from literals where " + predicate;
                 context.setQueryCodeGenerator(null);
                 try (var baseline = Demo.compileSql(engine, context, sql, true)) {
@@ -1264,11 +1267,18 @@ public class ResolvedSqlAggregateTest {
         engine.execute("create table literals as (select x v,cast(x%7 as int) k,"
                 + "cast(case when x%11=0 then null when x%5=0 then '' when x%3=0 then 'needle' "
                 + "else 'prefix-ž-needle-abcdefghijklmnopqrstuvw' end as varchar) s from long_sequence(10003))", context);
-        for (String predicate : List.of("s like '%needle%'", "k<5 and s like '%ž%' and s is not null", "s like '%abcdefgh%'")) {
+        for (String predicate : List.of("s like '%needle%'", "k<5 and s like '%ž%' and s is not null", "s like '%abcdefgh%'",
+                "s not like '%needle%'", "k<5 and s not like '%ž%' and s is not null")) {
             long before = compiler.filterRows.get();
             assertMatches("select k,count(),sum(v) from literals where " + predicate + " group by k", true);
             assertEquals(20006, compiler.filterRows.get() - before);
         }
+        long filtered = compiler.filterRows.get(), topK = compiler.topKRows.get();
+        assertMatches("select k,min(s),max(s),count_distinct(v),count() c from literals "
+                + "where s not like '%abcdefgh%' group by k order by c desc limit 7", true);
+        assertEquals(20006, compiler.filterRows.get() - filtered);
+        assertTrue(compiler.topKRows.get() > topK);
+        assertTrue(compiler.merges.get() > 0);
     }
 
     @Test
@@ -1300,6 +1310,334 @@ public class ResolvedSqlAggregateTest {
             }
         }
         assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
+    public void generatedVarcharTopKBuildKeepsEncodedOrderingAndReopens() throws Exception {
+        engine.execute("create table ranked as (select x id,cast(case when x%13=0 then null when x%17=0 then '' "
+                + "when x%19=0 then substring('abcdefghijklmnopqrs',1,cast(x%20 as int)) "
+                + "when x%11=0 then 'same-long-prefix-abcdefghijk-'||cast(x%97 as string) "
+                + "else 'ž-'||cast(x%211 as string) end as varchar) s,"
+                + "timestamp_sequence('2024-01-01',1000000) ts from long_sequence(20003)) timestamp(ts) partition by day", context);
+        long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        for (boolean parquet : new boolean[]{false, true}) {
+            context.setQueryCodeGenerator(null);
+            if (parquet) engine.execute("alter table ranked convert partition to parquet list '2024-01-01'", context);
+            for (String predicate : List.of("", " where s is not null")) for (String order : List.of("asc", "desc")) {
+                for (int limit : new int[]{10, 5000}) {
+                    String sql = "select id,s from ranked" + predicate + " order by s " + order + " limit " + limit;
+                    context.setQueryCodeGenerator(null);
+                    List<String> expected;
+                    try (var stock = Demo.compileSql(engine, context, sql, true); var cursor = stock.getCursor(context)) {
+                        expected = readOrderedStringTopK(cursor);
+                    }
+                    context.setQueryCodeGenerator(compiler.delegate);
+                    try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                        assertTrue(plan(factory), plan(factory).contains("compiledTopK: " + backend.name()));
+                        RecordCursorFactory base = factory;
+                        while (base != null && !(base instanceof io.questdb.griffin.engine.table.AsyncTopKRecordCursorFactory)) base = base.getBaseFactory();
+                        assertNotNull(base);
+                        var build = (ResolvedTopK) ((io.questdb.griffin.engine.table.AsyncTopKRecordCursorFactory) base).getAtom().getCompiledTopK();
+                        long inputRows = predicate.isEmpty() ? 20003 : 20003 - 20003 / 13;
+                        for (int execution = 0; execution < 2; execution++) try (var cursor = factory.getCursor(context)) {
+                            assertEquals(sql, expected, readOrderedStringTopK(cursor));
+                            assertEquals(inputRows * (execution + 1), build.getNativeRows());
+                            assertTrue("Generated compaction/final sort ran", build.sortedRows() > 0);
+                            cursor.toTop();
+                            assertEquals(expected, readOrderedStringTopK(cursor));
+                            assertEquals("Rewind must not rebuild", inputRows * (execution + 1), build.getNativeRows());
+                        }
+                    }
+                }
+            }
+        }
+        assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
+    public void generatedVarcharTopKBuildDrainsFailureAndDeclinesUnsupportedOrdering() throws Exception {
+        engine.execute("create table ranked as (select x id,cast('long-common-prefix-'||cast(x%37 as string) as varchar) s,"
+                + "timestamp_sequence('2024-01-01',1000000) ts from long_sequence(12007)) timestamp(ts) partition by day", context);
+        long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        for (boolean compileFailure : new boolean[]{true, false}) {
+            var fail = new java.util.concurrent.atomic.AtomicBoolean(true);
+            var closed = new java.util.concurrent.atomic.AtomicInteger();
+            var created = new java.util.concurrent.atomic.AtomicInteger();
+            Backend failing = new Backend() {
+                @Override public String name() { return backend.name(); }
+                @Override public CompiledKernel compile(Ir.Program program, java.nio.file.Path path) throws java.io.IOException {
+                    if (compileFailure && fail.getAndSet(false)) throw new java.io.IOException("Top-K preparation failure");
+                    var code = backend.compile(program, path);
+                    created.incrementAndGet();
+                    return new CompiledKernel((columns, count, state) -> {
+                        if (!compileFailure && fail.getAndSet(false)) throw CairoException.nonCritical().put("Top-K execution failure");
+                        return code.run(columns, count, state);
+                    }, () -> { code.close(); closed.incrementAndGet(); }, code.artifacts(), code.compilationNanos());
+                }
+            };
+            context.setQueryCodeGenerator(new ResolvedQueryCompiler(failing, temporary.newFolder().toPath()));
+            String sql = "select id,s from ranked order by s limit 10";
+            if (compileFailure) assertThrows(CairoException.class, () -> Demo.compileSql(engine, context, sql, true));
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                if (!compileFailure) assertThrows(CairoException.class, () -> {
+                    try (var cursor = factory.getCursor(context)) { readOrderedStringTopK(cursor); }
+                });
+                List<String> actual;
+                try (var cursor = factory.getCursor(context)) { actual = readOrderedStringTopK(cursor); }
+                context.setQueryCodeGenerator(null);
+                try (var stock = Demo.compileSql(engine, context, sql, true); var cursor = stock.getCursor(context)) {
+                    assertEquals(readOrderedStringTopK(cursor), actual);
+                }
+            }
+            assertEquals(created.get(), closed.get());
+            assertEquals(0, engine.getBusyReaderCount());
+            assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        }
+        context.setQueryCodeGenerator(compiler.delegate);
+        for (String order : List.of("s,id", "id")) try (var factory = Demo.compileSql(engine, context,
+                "select id,s from ranked order by " + order + " limit 10", true)) {
+            assertFalse(plan(factory), plan(factory).contains("compiledTopK:"));
+            try (var cursor = factory.getCursor(context)) { assertEquals(10, readOrderedStringTopK(cursor).size()); }
+        }
+        try (var factory = Demo.compileSql(engine, context, "select id,s from ranked order by s limit 10", true)) {
+            queryMemoryLimit = 16384;
+            CairoException failure = assertThrows(CairoException.class, () -> {
+                try (var cursor = factory.getCursor(context)) { readOrderedStringTopK(cursor); }
+            });
+            assertTrue(failure.isOutOfMemory());
+            queryMemoryLimit = 0;
+            try (var cursor = factory.getCursor(context)) { assertEquals(10, readOrderedStringTopK(cursor).size()); }
+        } finally { queryMemoryLimit = 0; }
+        assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+    }
+
+    @Test
+    public void generatedVarcharTopKSelectsEmptySingletonAndShortResults() throws Exception {
+        engine.execute("create table ranked_edges as (select x id,cast('v-'||x as varchar) s from long_sequence(17))", context);
+        context.with(new io.questdb.griffin.engine.functions.bind.BindVariableServiceImpl(engine.getConfiguration()));
+        context.getBindVariableService().setLong(0, 0);
+        context.setQueryCodeGenerator(compiler.delegate);
+        String sql = "select id,s from ranked_edges where id<$1 order by s limit 10";
+        long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            assertTrue(plan(factory), plan(factory).contains("compiledTopK: " + backend.name()));
+            RecordCursorFactory base = factory;
+            while (!(base instanceof io.questdb.griffin.engine.table.AsyncTopKRecordCursorFactory)) base = base.getBaseFactory();
+            var code = (ResolvedTopK) ((io.questdb.griffin.engine.table.AsyncTopKRecordCursorFactory) base).getAtom().getCompiledTopK();
+            long processed = 0;
+            for (int cutoff : new int[]{0, 2, 5, 100}) {
+                context.getBindVariableService().setLong(0, cutoff);
+                List<String> actual;
+                try (var cursor = factory.getCursor(context)) { actual = readOrderedStringTopK(cursor); }
+                context.setQueryCodeGenerator(null);
+                try (var stock = Demo.compileSql(engine, context, sql, true); var cursor = stock.getCursor(context)) {
+                    assertEquals(readOrderedStringTopK(cursor), actual);
+                }
+                processed += Math.min(17, Math.max(0, cutoff - 1));
+                assertEquals(processed, code.sortedRows());
+                assertEquals(processed, code.getNativeRows());
+            }
+        }
+        assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    private static List<String> readOrderedStringTopK(RecordCursor cursor) {
+        var rows = new java.util.ArrayList<String>();
+        while (cursor.hasNext()) {
+            var record = cursor.getRecord();
+            var value = record.getVarcharA(1);
+            rows.add(record.getLong(0) + ":" + (value == null ? null : io.questdb.std.str.Utf8String.newInstance(value)));
+        }
+        return rows;
+    }
+
+    @Test
+    public void generatedFilterLimitPreservesOrderAndCursorOperations() throws Exception {
+        filterDispatchLimit = 2;
+        engine.execute("create table limited as (select x id,cast(case when x%5=0 then null else 'row-'||x end as varchar) payload,"
+                + "timestamp_sequence('2024-01-01',60000000) ts from long_sequence(513)) timestamp(ts) partition by hour", context);
+        long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        for (String predicate : List.of("payload is not null", "id>300 and payload is not null", "id<0")) {
+            for (int limit : new int[]{10, 129, 1000}) {
+                String sql = "select * from limited where " + predicate + " order by ts limit " + limit;
+                context.setQueryCodeGenerator(null);
+                List<String> expected;
+                try (var stock = Demo.compileSql(engine, context, sql, true); var cursor = stock.getCursor(context)) {
+                    expected = readOrderedLimited(cursor);
+                }
+                context.setQueryCodeGenerator(compiler.delegate);
+                try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                    RecordCursorFactory base = factory;
+                    while (base != null && !(base instanceof io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory)) base = base.getBaseFactory();
+                    assertNotNull(plan(factory), base);
+                    var filter = ((io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory) base).getCompiledFilter();
+                    try (var cursor = factory.getCursor(context)) {
+                        assertEquals(sql, expected, readOrderedLimited(cursor));
+                        assertEquals(expected.size(), filter.getNativeLimitRows());
+                        cursor.toTop();
+                        var count = new RecordCursor.Counter();
+                        cursor.calculateSize(context.getCircuitBreaker(), count);
+                        assertEquals(expected.size(), count.get());
+                        assertFalse(cursor.hasNext());
+                        cursor.toTop();
+                        if (!expected.isEmpty()) {
+                            assertTrue(cursor.hasNext());
+                            long firstId = cursor.getRecord().getLong(0), rowId = cursor.getRecord().getRowId();
+                            var other = cursor.getRecordB();
+                            cursor.recordAt(other, rowId);
+                            assertEquals(firstId, other.getLong(0));
+                            var skip = new RecordCursor.Counter(); skip.set(3);
+                            cursor.skipRows(skip, Long.MAX_VALUE);
+                            assertEquals(0, skip.get());
+                            assertEquals(expected.subList(4, expected.size()), readOrderedLimited(cursor));
+                            cursor.toTop();
+                            assertTrue(cursor.hasNext());
+                            skip.set(3);
+                            cursor.skipRows(skip, Long.MAX_VALUE);
+                            count.clear();
+                            cursor.calculateSize(context.getCircuitBreaker(), count);
+                            assertEquals(expected.size() - 4, count.get());
+                            assertFalse(cursor.hasNext());
+                        }
+                        cursor.toTop();
+                        var skip = new RecordCursor.Counter(); skip.set(2000);
+                        cursor.skipRows(skip, Long.MAX_VALUE);
+                        assertEquals(2000 - expected.size(), skip.get());
+                        assertFalse(cursor.hasNext());
+                    }
+                    try (var cursor = factory.getCursor(context)) {
+                        assertEquals(expected, readOrderedLimited(cursor));
+                    }
+                    assertTrue(filter.getNativeLimitFrames() > 0);
+                }
+            }
+        }
+        assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+    }
+
+    private static List<String> readOrderedLimited(RecordCursor cursor) {
+        var rows = new java.util.ArrayList<String>();
+        while (cursor.hasNext()) {
+            var record = cursor.getRecord();
+            rows.add(record.getLong(0) + ":" + record.getVarcharA(1) + ":" + record.getTimestamp(2));
+        }
+        return rows;
+    }
+
+    @Test
+    public void generatedStringFilterLimitBoundsWorkAndKeepsParquetFallback() throws Exception {
+        filterDispatchLimit = 2;
+        engine.execute("create table bounded as (select x id,cast('needle' as varchar) payload,"
+                + "timestamp_sequence('2024-01-01',60000000) ts from long_sequence(4096)) timestamp(ts) partition by day", context);
+        for (boolean parquet : new boolean[]{false, true}) {
+            context.setQueryCodeGenerator(null);
+            if (parquet) engine.execute("alter table bounded convert partition to parquet list '2024-01-01'", context);
+            context.setQueryCodeGenerator(compiler.delegate);
+            // Mention all output columns in the Parquet predicate so its initial late-materialization
+            // projection does not appear as column tops and select the ordinary Java fallback.
+            String sql = parquet ? "select id,payload from bounded where id>0 and payload like '%needle%' limit 10"
+                    : "select * from bounded where payload like '%needle%' order by ts limit 10";
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                RecordCursorFactory base = factory;
+                while (base != null && !(base instanceof io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory)) base = base.getBaseFactory();
+                assertNotNull(plan(factory), base);
+                var filter = ((io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory) base).getCompiledFilter();
+                try (var cursor = factory.getCursor(context)) {
+                    for (int i = 1; i <= 10; i++) { assertTrue(cursor.hasNext()); assertEquals(i, cursor.getRecord().getLong(0)); }
+                    assertFalse(cursor.hasNext());
+                }
+                assertEquals(10, filter.getNativeLimitRows());
+                if (!parquet) {
+                    assertTrue(filter.getNativeInputRows() >= 10);
+                    assertTrue("Two in-flight frames each need only ten matches", filter.getNativeInputRows() <= 20);
+                } else {
+                    assertTrue("Parquet keeps full-frame selectivity statistics, evaluated=" + filter.getNativeInputRows(), filter.getNativeInputRows() >= 64);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void generatedFilterLimitReevaluatesBindsAndRecoversAfterPreparationFailure() throws Exception {
+        engine.execute("create table limits as (select v,cast('needle' as varchar) s from t)", context);
+        context.with(new io.questdb.griffin.engine.functions.bind.BindVariableServiceImpl(engine.getConfiguration()));
+        context.getBindVariableService().setLong(0, 10);
+        context.setQueryCodeGenerator(compiler.delegate);
+        String sql = "select v from limits where s like '%needle%' limit $1";
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            RecordCursorFactory base = factory;
+            while (base != null && !(base instanceof io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory)) base = base.getBaseFactory();
+            assertNotNull(plan(factory), base);
+            var filter = ((io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory) base).getCompiledFilter();
+            for (long limit : new long[]{10, -5, Long.MIN_VALUE, 0, 129}) {
+                context.getBindVariableService().setLong(0, limit);
+                context.setQueryCodeGenerator(null);
+                long inputs = filter.getNativeInputRows(), admissions = filter.getNativeLimitFrames();
+                try (var stock = Demo.compileSql(engine, context, sql, true)) {
+                    assertEquals(Demo.readSql(stock, context, 1), Demo.readSql(factory, context, 1));
+                }
+                if (limit == 0) {
+                    assertEquals(inputs, filter.getNativeInputRows());
+                    assertEquals(admissions, filter.getNativeLimitFrames());
+                }
+            }
+        }
+        for (int failAt : new int[]{3, 4}) {
+            Backend failing = new Backend() {
+                int calls;
+                @Override public String name() { return backend.name(); }
+                @Override public CompiledKernel compile(Ir.Program program, java.nio.file.Path path) throws java.io.IOException {
+                    if (++calls == failAt) throw new java.io.IOException("limit preparation");
+                    return backend.compile(program, path);
+                }
+            };
+            long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+            context.setQueryCodeGenerator(new ResolvedQueryCompiler(failing, temporary.newFolder().toPath()));
+            try (var factory = Demo.compileSql(engine, context, "select v from limits where s like '%needle%' limit 10", true)) {
+                assertThrows(CairoException.class, () -> factory.getCursor(context));
+                assertEquals(10, Demo.readSql(factory, context, 1).size());
+            }
+            assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        }
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
+    public void generatedFilterLimitCollectsInOrderWhenLaterFrameFinishesFirst() throws Exception {
+        filterDispatchLimit = 2;
+        engine.execute("create table reordered as (select x id,timestamp_sequence('2024-01-01',1000000) ts "
+                + "from long_sequence(513)) timestamp(ts) partition by day", context);
+        var laterFinished = new java.util.concurrent.CountDownLatch(1);
+        var firstWaited = new java.util.concurrent.atomic.AtomicBoolean();
+        Backend reordered = new Backend() {
+            int calls;
+            @Override public String name() { return backend.name(); }
+            @Override public CompiledKernel compile(Ir.Program program, java.nio.file.Path path) throws java.io.IOException {
+                var code = backend.compile(program, path);
+                if (++calls != 1) return code;
+                return new CompiledKernel((columns, rows, output) -> {
+                    if (Unsafe.getLong(Unsafe.getLong(columns)) == 1) {
+                        firstWaited.set(true);
+                        try { assertTrue("Later frame did not finish", laterFinished.await(10, java.util.concurrent.TimeUnit.SECONDS)); }
+                        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+                        return code.run(columns, rows, output);
+                    }
+                    long count = code.run(columns, rows, output);
+                    laterFinished.countDown();
+                    return count;
+                }, code, code.artifacts(), code.compilationNanos());
+            }
+        };
+        context.setQueryCodeGenerator(new ResolvedQueryCompiler(reordered, temporary.newFolder().toPath()));
+        try (var factory = Demo.compileSql(engine, context, "select id from reordered where id>0 order by ts limit 10", true);
+             var cursor = factory.getCursor(context)) {
+            for (int i = 1; i <= 10; i++) { assertTrue(cursor.hasNext()); assertEquals(i, cursor.getRecord().getLong(0)); }
+            assertFalse(cursor.hasNext());
+            assertTrue(firstWaited.get());
+            assertEquals(0, laterFinished.getCount());
+        }
     }
 
     @Test
@@ -1424,7 +1762,36 @@ public class ResolvedSqlAggregateTest {
         assertEquals(514, compiler.mapRows.get() - before);
         assertTrue(compiler.filterRows.get() > 0);
         // Unsupported children decline the complete binding, before any state mutation.
-        assertMatches("select k,sum(i*2+1) from arithmetic where k>=0 group by k", false);
+        assertMatches("select k,sum(i%2+1) from arithmetic where k>=0 group by k", false);
+    }
+
+    @Test
+    public void multiplicationSharesNullOverflowAndWideningSemanticsAcrossOperators() throws Exception {
+        engine.execute("create table products as (select cast(x as int) k,"
+                + "cast(case x%7 when 0 then null when 1 then 2147483647 when 2 then -2147483647 "
+                + "when 3 then 1073741824 when 4 then -1 when 5 then 0 else 3 end as int) i,"
+                + "case x%7 when 0 then null when 1 then 9223372036854775807L when 2 then -9223372036854775807L "
+                + "when 3 then 4611686018427387904L when 4 then -1L when 5 then 0L else 3L end l,"
+                + "cast(case when x%3=0 then null else x%5-2 end as int) j "
+                + "from long_sequence(257))", context);
+        // Unique keys isolate expression overflow from SUM's separate merge-order issue.
+        assertMatches("select k,sum(i*j),sum(l*j),sum(i*2+1),sum(l*2+1),"
+                + "sum(cast(i*2 as long)*j),sum(cast(i as long)*2*j),count(i*0),count(l*0) "
+                + "from products where k>=0 group by k", true);
+        long filters = compiler.filterRows.get();
+        assertMatches("select k,count() from products where i*j=null or l*j>=0 group by k", true);
+        assertEquals(514, compiler.filterRows.get() - filters);
+        long mapped = compiler.mapRows.get();
+        assertMatches("select i*j,l*2,count() from products where k>=0 group by i*j,l*2", true);
+        assertEquals(514, compiler.mapRows.get() - mapped);
+        assertMatches("select i*j,l*j,i*2+1,l*2+1,cast(i*2 as long)*j,cast(i as long)*2*j,i*0,l*0 from products", false);
+        assertTrue(lastPlan, lastPlan.contains("compiledProjection"));
+
+        long reduced = compiler.scalarRows.get();
+        assertScalarMatches("select sum(w*k),min(w*k),max(v*k),count(w*k) from t where k>=0", true);
+        assertEquals(20000, compiler.scalarRows.get() - reduced);
+        assertEquals(compiler.created.get(), compiler.closed.get());
+        assertEquals(compiler.slots.get(), compiler.closedSlots.get());
     }
 
     @Test

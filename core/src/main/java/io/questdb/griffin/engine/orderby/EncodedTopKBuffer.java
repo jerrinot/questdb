@@ -78,6 +78,7 @@ public class EncodedTopKBuffer implements QuietCloseable, Reopenable {
     private final long[] thresholdEntry = new long[SortKeyType.MAX_ENTRY_LONGS];
     private final long valueCapBytes;
     private long compactionTrigger;
+    private DirectLongList compiledSortScratch;
     private long count;
     private int entrySize;
     // Unsigned-max sentinel rejects nothing; compact() publishes the leading
@@ -92,6 +93,7 @@ public class EncodedTopKBuffer implements QuietCloseable, Reopenable {
     private int longsPerEntry;
     private long maxEntries;
     private long maxEntryMemBytes;
+    private MemoryTracker memoryTracker;
     // Compaction double-buffer: survivors' key bytes pack here, then copy back
     // so the encoder's keyHeap reference stays valid.
     private MemoryCARW scratchHeap;
@@ -117,6 +119,43 @@ public class EncodedTopKBuffer implements QuietCloseable, Reopenable {
         return entryMem.getAppendAddress();
     }
 
+    /** Borrowed by a compiled batch while its worker slot is held. No pointers may survive commit. */
+    public boolean writeCompiledView(long view) {
+        if (!isVariable) {
+            return false;
+        }
+        Unsafe.putLong(view + CompiledTopK.ENTRIES, entryMem.getAddress());
+        Unsafe.putLong(view + CompiledTopK.COUNT, count);
+        Unsafe.putLong(view + CompiledTopK.STOP, Math.min(Math.min(entryMem.getCapacity() / longsPerEntry, maxEntries), compactionTrigger));
+        Unsafe.putLong(view + CompiledTopK.HEAP, keyHeap.size() == 0 ? 0 : keyHeap.addressOf(0));
+        Unsafe.putLong(view + CompiledTopK.HEAP_POS, keyHeap.getAppendOffset());
+        Unsafe.putLong(view + CompiledTopK.HEAP_SIZE, keyHeap.size());
+        Unsafe.putLong(view + CompiledTopK.HAS_THRESHOLD, hasThreshold ? 1 : 0);
+        Unsafe.putLong(view + CompiledTopK.FIRST, isFirstN ? 1 : 0);
+        Unsafe.putLong(view + CompiledTopK.K1, thresholdEntry[0]);
+        Unsafe.putLong(view + CompiledTopK.K2, thresholdEntry[1]);
+        Unsafe.putLong(view + CompiledTopK.LENGTH, thresholdEntry[2]);
+        Unsafe.putLong(view + CompiledTopK.ROW_ID, thresholdEntry[4]);
+        Unsafe.putLong(view + CompiledTopK.TAIL, thresholdTailMem == null ? 0 : thresholdTailMem.getAddress());
+        return true;
+    }
+
+    /** Publishes a completed prefix, compacting at the existing boundary with the query's generated packing. */
+    public void commitCompiledView(long view, CompiledTopK compiled) {
+        final long appended = Unsafe.getLong(view + CompiledTopK.COUNT);
+        final long heapPosition = Unsafe.getLong(view + CompiledTopK.HEAP_POS);
+        if (appended < count || appended > Unsafe.getLong(view + CompiledTopK.STOP)
+                || heapPosition < keyHeap.getAppendOffset() || heapPosition > keyHeap.size()) {
+            throw new IllegalStateException("Invalid compiled Top-K buffer position");
+        }
+        count = appended;
+        entryMem.setPos(count * longsPerEntry);
+        keyHeap.jumpTo(heapPosition);
+        if (count == compactionTrigger) {
+            compact(compiled);
+        }
+    }
+
     public void clear() {
         count = 0;
         hasThreshold = false;
@@ -130,6 +169,7 @@ public class EncodedTopKBuffer implements QuietCloseable, Reopenable {
     @Override
     public void close() {
         Misc.free(entryMem);
+        compiledSortScratch = Misc.free(compiledSortScratch);
         keyHeap = Misc.free(keyHeap);
         scratchHeap = Misc.free(scratchHeap);
         thresholdTailMem = Misc.free(thresholdTailMem);
@@ -319,7 +359,11 @@ public class EncodedTopKBuffer implements QuietCloseable, Reopenable {
     // Bind before reopen() so the entry buffer's alloc/free is charged to the
     // active workload's per-query counter. Null when no per-query limit applies.
     public void setMemoryTracker(@Nullable MemoryTracker tracker) {
+        memoryTracker = tracker;
         entryMem.setMemoryTracker(tracker);
+        if (compiledSortScratch != null) {
+            compiledSortScratch.setMemoryTracker(tracker);
+        }
     }
 
     /**
@@ -329,6 +373,19 @@ public class EncodedTopKBuffer implements QuietCloseable, Reopenable {
      * as its heap rewrite restores the offsets.
      */
     public void sort() {
+        sort(null);
+    }
+
+    /** Sorts once and returns the selected prefix length; the stored entry count is unchanged. */
+    public long sort(@Nullable CompiledTopK compiled) {
+        if (isVariable && compiled != null) {
+            final long heapAddr = keyHeap.getAppendOffset() == 0 ? 0 : keyHeap.addressOf(0);
+            if (compiledSortScratch == null) {
+                compiledSortScratch = new DirectLongList(0, MemoryTag.NATIVE_JIT, true);
+                compiledSortScratch.setMemoryTracker(memoryTracker);
+            }
+            return compiled.sortEntries(entryMem.getAddress(), count, heapAddr, limit, compiledSortScratch);
+        }
         if (count > 1) {
             if (isVariable) {
                 final long heapAddr = keyHeap.getAppendOffset() == 0 ? 0 : keyHeap.addressOf(0);
@@ -337,6 +394,7 @@ public class EncodedTopKBuffer implements QuietCloseable, Reopenable {
                 Vect.sortEncodedEntries(entryMem.getAddress(), count, keyLongs, parallelThreshold);
             }
         }
+        return Math.min(count, limit);
     }
 
     // memcmp over [aAddr, aAddr+len) vs [bAddr, bAddr+len).
@@ -389,16 +447,28 @@ public class EncodedTopKBuffer implements QuietCloseable, Reopenable {
      * at O(limit) instead of O(scanned rows).
      */
     private void compact() {
-        sort();
-        if (!isFirstN) {
-            // LAST N keeps the tail of the sorted buffer.
-            Vect.memmove(entryMem.getAddress(), entryMem.getAddress() + (count - limit) * entrySize, limit * entrySize);
+        compact(null);
+    }
+
+    private void compact(@Nullable CompiledTopK compiled) {
+        sort(compiled);
+        if (isVariable && compiled != null) {
+            if (scratchHeap == null) {
+                scratchHeap = newKeyHeap();
+            }
+            compiled.compact(entryMem.getAddress(), count, limit, isFirstN, keyHeap, scratchHeap);
+        } else {
+            if (!isFirstN) {
+                // LAST N keeps the tail of the sorted buffer.
+                Vect.memmove(entryMem.getAddress(), entryMem.getAddress() + (count - limit) * entrySize, limit * entrySize);
+            }
+            count = limit;
+            if (isVariable) {
+                compactVarHeap();
+            }
         }
         count = limit;
         entryMem.setPos(limit * longsPerEntry);
-        if (isVariable) {
-            compactVarHeap();
-        }
         final long boundaryAddr = entryMem.getAddress() + (isFirstN ? limit - 1 : 0) * entrySize;
         for (int i = 0; i < longsPerEntry; i++) {
             thresholdEntry[i] = Unsafe.getLong(boundaryAddr + 8L * i);

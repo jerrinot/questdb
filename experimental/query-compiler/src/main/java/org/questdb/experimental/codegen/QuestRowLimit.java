@@ -34,6 +34,19 @@ final class QuestRowLimit {
     static final int SHARD_OFFSET = 32;
 
     private QuestRowLimit() { }
+
+    /** Owner-only admission of a borrowed frame prefix. STATE holds the remaining budget. */
+    static Program frame() {
+        Builder b = new Builder();
+        Var remaining = b.let(load(STATE));
+        Var take = b.let(prefix(ROWS, remaining));
+        b.store(STATE, binary(Op.SUB, remaining, take));
+        b.exit(take);
+        return new Program(b.block());
+    }
+    /** Both the available count and the limit are nonnegative. */
+    static Expr prefix(Expr count, Expr limit) { return new Select(binary(Op.LT, count, limit), count, limit); }
+
     // STATE starts with the output address, followed by the fields above.
     static Program program(QuestMapProbe probe) {
         Builder b = new Builder();

@@ -84,7 +84,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    public sealed interface Scalar permits Column, Constant, Add, Subtract, TimestampPart, IPv4Subtract {
+    public sealed interface Scalar permits Column, Constant, Add, Subtract, Multiply, TimestampPart, IPv4Subtract {
         Value emit(Row row);
     }
 
@@ -156,6 +156,14 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         @Override
         public Value emit(Row row) {
             return integerArithmetic(Op.SUB, left.emit(row), right.emit(row), columnType);
+        }
+    }
+
+    public record Multiply(Scalar left, Scalar right, int columnType) implements Scalar {
+        public Multiply { checkArithmeticType(columnType); }
+        @Override
+        public Value emit(Row row) {
+            return integerArithmetic(Op.MUL, left.emit(row), right.emit(row), columnType);
         }
     }
 

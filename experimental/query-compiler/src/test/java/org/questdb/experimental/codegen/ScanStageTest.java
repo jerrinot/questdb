@@ -80,6 +80,98 @@ public class ScanStageTest {
         }
     }
 
+    @Test public void varcharTopKEncodingKeepsSliceBoundsAndRejectsBeforePayloadLoads() throws Throwable {
+        for (boolean desc : new boolean[]{false, true}) {
+            try (var code = backend.compile(QuestVarcharTopK.program(desc), temporary.getRoot().toPath());
+                 var arena = Arena.ofConfined(); var memory = KernelMemory.bind(null, () -> { })) {
+                long input = arena.allocate(QuestEncodedTopK.INPUT_BYTES, 8).address();
+                long view = arena.allocate(io.questdb.griffin.engine.orderby.CompiledTopK.VIEW_BYTES, 8).address();
+                long aux = arena.allocate(16, 8).address();
+                for (int size = -1; size <= 33; size++) {
+                    int length = size < 0 ? 1 : size + 2;
+                    int capacity = length + (length < 16 ? 16 : 0);
+                    try (var source = new GuardedPage(Math.max(size, 0)); var heap = new GuardedPage(capacity);
+                         var entry = new GuardedPage(40)) {
+                        byte[] expected = new byte[Math.max(length, 16)];
+                        expected[0] = (byte) ((size < 0 ? 0 : 1) ^ (desc ? 255 : 0));
+                        for (int j = 0; j < size; j++) {
+                            int value = j * 37 % 255;
+                            Unsafe.putByte(source.address + j, (byte) value);
+                            expected[j + 1] = (byte) ((value + 1) ^ (desc ? 255 : 0));
+                        }
+                        if (size >= 0) expected[length - 1] = (byte) (desc ? 255 : 0);
+                        Unsafe.putInt(aux, size < 0 ? 4 : size << 4); Unsafe.putLong(aux + 8, source.address);
+                        Unsafe.putLong(input, aux); Unsafe.putLong(input + 16, 16); Unsafe.putLong(input + 32, 1);
+                        Unsafe.putLong(input + QuestVarcharTopK.ROW_BASE, 17); Unsafe.putLong(input + QuestEncodedTopK.NEXT, 0);
+                        Unsafe.putLong(view, entry.address); Unsafe.putLong(view + 8, 0); Unsafe.putLong(view + 16, 2);
+                        Unsafe.putLong(view + 24, heap.address); Unsafe.putLong(view + 32, 0); Unsafe.putLong(view + 40, capacity);
+                        Unsafe.putLong(view + 48, 0); Unsafe.putLong(view + 56, 1);
+                        assertEquals(0, code.run(input, 1, view));
+                        assertEquals(1, Unsafe.getLong(view + 8));
+                        assertEquals(length > 16 ? length : 0, Unsafe.getLong(view + 32));
+                        for (int word = 0; word < 2; word++) {
+                            long value = 0;
+                            for (int j = 0; j < 8; j++) value = (value << 8) | (expected[word * 8 + j] & 255L);
+                            assertEquals(value, Unsafe.getLong(entry.address + word * 8));
+                        }
+                        assertEquals(length, Unsafe.getLong(entry.address + 16));
+                        assertEquals(17, Unsafe.getLong(entry.address + 32));
+                        for (int j = 0; j < length; j++) assertEquals(expected[j], Unsafe.getByte(heap.address + j));
+                        if (size > 0) {
+                            Unsafe.putByte(source.address, (byte) 255);
+                            Unsafe.putLong(input + QuestEncodedTopK.NEXT, 0); Unsafe.putLong(view + 8, 0); Unsafe.putLong(view + 32, 0);
+                            assertEquals(QuestVarcharTopK.INVALID_UTF8, code.run(input, 1, view));
+                        }
+                    }
+                }
+                if (!desc) try (var inaccessible = new GuardedPage(0)) {
+                    Unsafe.putInt(aux, 10 << 4);
+                    Unsafe.putLong(aux + 4, 0x00007a7a7a7a7a7aL); Unsafe.putShort(aux + 10, (short) 0); Unsafe.putInt(aux + 12, 0);
+                    Unsafe.putLong(input + 8, inaccessible.address); Unsafe.putLong(input + 24, 10); Unsafe.putLong(input + 32, 0);
+                    Unsafe.putLong(input + QuestEncodedTopK.NEXT, 0);
+                    Unsafe.putLong(view + 8, 0); Unsafe.putLong(view + 32, 0); Unsafe.putLong(view + 48, 1);
+                    Unsafe.putLong(view + 64, 0x0162000000000000L);
+                    assertEquals(0, code.run(input, 1, view));
+                    assertEquals("Rejected split value must not read its data vector", 0, Unsafe.getLong(view + 8));
+                }
+            }
+        }
+    }
+
+    @Test public void boundedSelectionTrimsMasksAndReportsEvaluatedRows() throws Exception {
+        var column = new Column(0,"value",ColumnType.LONG);
+        var plan = ScanPlan.of(List.of(column),new Compare(Op.GE,column,new Constant(0)));
+        try (var code = backend.compile(ScanLowering.boundedSelection(plan,null,8),temporary.getRoot().toPath());
+             var arena = Arena.ofConfined()) {
+            long input = arena.allocate(257*8,8).address(), descriptor = arena.allocate(24,8).address();
+            long output = arena.allocate(258*8,8).address();
+            Unsafe.putLong(descriptor,input);
+            for (int pattern=0;pattern<3;pattern++) for (int rows:new int[]{0,1,7,8,9,64,65,257}) {
+                var expected = new java.util.ArrayList<Long>();
+                for (int i=0;i<rows;i++) {
+                    long value = pattern==0?1:pattern==1?-1:i%3==0?1:-1;
+                    Unsafe.putLong(input+i*8L,value);
+                    if (value>=0) expected.add((long)i);
+                }
+                for (long limit:new long[]{0,1,7,8,9,129,513}) {
+                    Unsafe.putLong(descriptor+8,limit); Unsafe.putLong(descriptor+16,-1);
+                    for(int i=0;i<=rows;i++) Unsafe.putLong(output+i*8L,-7);
+                    int take=(int)Math.min(limit,expected.size());
+                    assertEquals(take,code.run(descriptor,rows,output));
+                    for(int i=0;i<take;i++) assertEquals(expected.get(i).longValue(),Unsafe.getLong(output+i*8L));
+                    assertEquals("No writes beyond the admitted prefix",-7,Unsafe.getLong(output+take*8L));
+                    long visited=Unsafe.getLong(descriptor+16);
+                    if(limit==0) assertEquals(0,visited);
+                    else if(take<limit) assertEquals(rows,visited);
+                    else {
+                        long last=expected.get(take-1)+1;
+                        assertTrue(visited>=last && visited<=Math.min(rows,((last+7)/8)*8));
+                    }
+                }
+            }
+        }
+    }
+
     @Test public void byteMasksNeverReadOutsideTheSlice() throws Throwable {
         for (int lanes : new int[]{8, 16, 32, 64}) {
             Builder b = new Builder();
@@ -216,12 +308,15 @@ public class ScanStageTest {
                 }
             }
             var scan=new PhysicalPlan.Scan("t",List.of(k,v));
-            var project=new PhysicalPlan.Project(scan,List.of(new Add(v,new Constant(7)),k,v),List.of("derived","key","unused"));
+            var project=new PhysicalPlan.Project(scan,List.of(
+                    new Multiply(new Add(v,new Constant(7)),k,ColumnType.LONG),
+                    new Multiply(k,new Constant(1073741824),ColumnType.INT),v),List.of("derived","key","unused"));
             var filter=new PhysicalPlan.Filter(project,new SqlCompare(Op.GE,project.columns().get(0),new Constant(80)));
             var group=new PhysicalPlan.Aggregate(filter,List.of(project.columns().get(1)),List.of(new Count(),new Sum(project.columns().get(0))));
-            var planned=ScanPlan.from(filter);assertEquals(1,planned.predicateColumns().cardinality());assertTrue(planned.predicateColumns().get(1));
+            var planned=ScanPlan.from(filter);assertEquals(2,planned.predicateColumns().cardinality());
+            assertEquals(ColumnType.INT,project.columns().get(1).columnType());
             for(var mode:ScanLowering.Mode.values())try(var query=CompiledPlan.compile(engine,context,group,force(mode),temporary.getRoot().toPath());
-                var sql=Demo.compileSql(engine,context,"select k,count(*),sum(v+7) from t where v+7>=80 group by k",false)){
+                var sql=Demo.compileSql(engine,context,"select k*1073741824,count(*),sum((v+7)*k) from t where (v+7)*k>=80 group by k*1073741824",false)){
                 var actual=query.execute(context).stream().map(row -> new CompiledGroupBy.ResultRow(row.subList(0,1),row.subList(1,row.size()))).sorted().toList();
                 assertEquals(Demo.readSql(sql,context,1),actual);
             }
@@ -261,23 +356,25 @@ public class ScanStageTest {
     private static void write(MemoryType type,long p,long v){var u=Unsafe.getUnsafe();switch(type){case I8->u.putByte(p,(byte)v);case I16->u.putShort(p,(short)v);case I32->u.putInt(p,(int)v);case I64->u.putLong(p,v);default->throw new AssertionError();}}
 
     /** Linux guard page detects an actual over-read, including SIMD tails. */
-    private static final class GuardedPage implements AutoCloseable {
+    static final class GuardedPage implements AutoCloseable {
         static final Linker LINKER=Linker.nativeLinker();
         static MethodHandle function(String name,FunctionDescriptor fd){return LINKER.downcallHandle(LINKER.defaultLookup().find(name).orElseThrow(),fd);}
         static final MethodHandle MMAP=function("mmap",FunctionDescriptor.of(ValueLayout.ADDRESS,ValueLayout.ADDRESS,ValueLayout.JAVA_LONG,ValueLayout.JAVA_INT,ValueLayout.JAVA_INT,ValueLayout.JAVA_INT,ValueLayout.JAVA_LONG));
         static final MethodHandle PROTECT=function("mprotect",FunctionDescriptor.of(ValueLayout.JAVA_INT,ValueLayout.ADDRESS,ValueLayout.JAVA_LONG,ValueLayout.JAVA_INT));
         static final MethodHandle UNMAP=function("munmap",FunctionDescriptor.of(ValueLayout.JAVA_INT,ValueLayout.ADDRESS,ValueLayout.JAVA_LONG));
-        final long page=Unsafe.getUnsafe().pageSize(),address;final MemorySegment mapping;
+        final long page=Unsafe.getUnsafe().pageSize(),address,mappingBytes;final MemorySegment mapping;
         GuardedPage(int bytes)throws Throwable{
             this(bytes, true);
         }
         GuardedPage(int bytes, boolean atEnd)throws Throwable{
-            if(bytes>page)throw new IllegalArgumentException();
-            mapping=(MemorySegment)MMAP.invokeExact(MemorySegment.NULL,page*3,3,0x22,-1,0L);
+            if(bytes<0)throw new IllegalArgumentException();
+            long readable=Math.max(page,(bytes+page-1)/page*page);
+            mappingBytes=readable+page*2;
+            mapping=(MemorySegment)MMAP.invokeExact(MemorySegment.NULL,mappingBytes,3,0x22,-1,0L);
             if(mapping.address()==-1)throw new IllegalStateException("mmap failed");
-            address=mapping.address()+page+(atEnd?page-bytes:0);
-            if((int)PROTECT.invokeExact(mapping,page,0)!=0 || (int)PROTECT.invokeExact(MemorySegment.ofAddress(mapping.address()+page*2),page,0)!=0){close();throw new IllegalStateException("mprotect failed");}
+            address=mapping.address()+page+(atEnd?readable-bytes:0);
+            if((int)PROTECT.invokeExact(mapping,page,0)!=0 || (int)PROTECT.invokeExact(MemorySegment.ofAddress(mapping.address()+page+readable),page,0)!=0){close();throw new IllegalStateException("mprotect failed");}
         }
-        @Override public void close(){try{if((int)UNMAP.invokeExact(mapping,page*3)!=0)throw new IllegalStateException("munmap failed");}catch(Throwable e){throw new RuntimeException(e);}}
+        @Override public void close(){try{if((int)UNMAP.invokeExact(mapping,mappingBytes)!=0)throw new IllegalStateException("munmap failed");}catch(Throwable e){throw new RuntimeException(e);}}
     }
 }

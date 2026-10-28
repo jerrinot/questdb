@@ -38,6 +38,7 @@ import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.async.PageFrameReduceTask;
 import io.questdb.cairo.sql.async.PageFrameSequence;
+import io.questdb.jit.CompiledFilter;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.std.DirectLongList;
@@ -57,6 +58,7 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
     private final boolean hasDescendingOrder;
     private final PageFrameMemoryRecord record;
     private boolean allFramesActive;
+    private CompiledFilter compiledLimit;
     private long cursor = -1;
     private int dispatchLimit;
     private int frameIndex;
@@ -71,6 +73,7 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
     private DirectLongList rows;
     // Artificial limit on remaining rows to be returned from this cursor.
     // It is typically copied from LIMIT clause on SQL statement.
+    // With compiledLimit, this excludes the already-admitted prefix buffered in the current frame.
     private long rowsRemaining;
 
     public AsyncFilteredRecordCursor(@NotNull CairoConfiguration configuration, Function filter, int scanDirection) {
@@ -95,22 +98,27 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
 
     @Override
     public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, RecordCursor.Counter counter) {
+        if (compiledLimit != null && limitReached()) {
+            return;
+        }
         if (frameIndex == -1) {
             fetchNextFrame(dispatchLimit, true);
             circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottledOrYield();
         }
 
-        if (rowsRemaining < 1) {
+        if (limitReached()) {
             return;
         }
 
         // We have rows in the current frame we still need to dispatch
         if (frameRowIndex < frameRowCount) {
-            long frameRowsLeft = Math.min(frameRowCount - frameRowIndex, rowsRemaining);
-            rowsRemaining -= frameRowsLeft;
+            long frameRowsLeft = availableRows();
+            if (compiledLimit == null) {
+                rowsRemaining -= frameRowsLeft;
+            }
             frameRowIndex += frameRowsLeft;
             counter.add(frameRowsLeft);
-            if (rowsRemaining < 1) {
+            if (limitReached()) {
                 frameSequence.cancel(SqlExecutionCircuitBreaker.STATE_OK);
                 return;
             }
@@ -124,11 +132,13 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
         while (frameIndex < frameLimit) {
             fetchNextFrame(dispatchLimit, true);
             if (frameRowCount > 0 && frameRowIndex < frameRowCount) {
-                long frameRowsLeft = Math.min(frameRowCount - frameRowIndex, rowsRemaining);
-                rowsRemaining -= frameRowsLeft;
+                long frameRowsLeft = availableRows();
+                if (compiledLimit == null) {
+                    rowsRemaining -= frameRowsLeft;
+                }
                 frameRowIndex += frameRowsLeft;
                 counter.add(frameRowsLeft);
-                if (rowsRemaining < 1) {
+                if (limitReached()) {
                     frameSequence.cancel(SqlExecutionCircuitBreaker.STATE_OK);
                     return;
                 } else {
@@ -208,13 +218,16 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
 
     @Override
     public boolean hasNext() {
+        if (compiledLimit != null && limitReached()) {
+            return false;
+        }
         // Check for the first hasNext call.
         if (frameIndex == -1) {
             fetchNextFrame(dispatchLimit, false);
         }
 
         // Check for already reached row limit.
-        if (rowsRemaining <= 0) {
+        if (limitReached()) {
             return false;
         }
 
@@ -286,19 +299,28 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
         // hint is dropped here: filter discards rows, so the consumer's "max
         // output rows" cannot translate to a per-frame decode clamp without
         // knowing the filter selectivity.
+        if (compiledLimit != null && (limitReached() || rowCount.get() == 0)) {
+            return;
+        }
         if (frameIndex == -1) {
             fetchNextFrame(dispatchLimit, false);
         }
 
-        long rowCountLeft = Math.min(rowsRemaining, rowCount.get());
+        long rowCountLeft = compiledLimit == null ? Math.min(rowsRemaining, rowCount.get()) : rowCount.get();
 
         // We have rows in the current frame we still need to dispatch
         if (frameRowIndex < frameRowCount) {
             long frameRowsLeft = Math.min(frameRowCount - frameRowIndex, rowCountLeft);
-            rowsRemaining -= frameRowsLeft;
+            if (compiledLimit == null) {
+                rowsRemaining -= frameRowsLeft;
+            }
             frameRowIndex += frameRowsLeft;
             rowCountLeft -= frameRowsLeft;
             rowCount.dec(frameRowsLeft);
+            if (compiledLimit != null && limitReached()) {
+                frameSequence.cancel(SqlExecutionCircuitBreaker.STATE_OK);
+                return;
+            }
             if (rowCountLeft == 0) {
                 return;
             }
@@ -313,10 +335,16 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
             fetchNextFrame(dispatchLimit, false);
             if (frameRowCount > 0 && frameRowIndex < frameRowCount) {
                 long frameRowsLeft = Math.min(frameRowCount - frameRowIndex, rowCountLeft);
-                rowsRemaining -= frameRowsLeft;
+                if (compiledLimit == null) {
+                    rowsRemaining -= frameRowsLeft;
+                }
                 frameRowIndex += frameRowsLeft;
                 rowCountLeft -= frameRowsLeft;
                 rowCount.dec(frameRowsLeft);
+                if (compiledLimit != null && limitReached()) {
+                    frameSequence.cancel(SqlExecutionCircuitBreaker.STATE_OK);
+                    return;
+                }
                 if (rowCountLeft == 0) {
                     return;
                 }
@@ -336,6 +364,9 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
         filter.toTop();
         frameSequence.toTop();
         rowsRemaining = ogRowsRemaining;
+        if (compiledLimit != null) {
+            compiledLimit.prepareLimit(ogRowsRemaining);
+        }
         // Don't reset frameLimit here since its value is used to prepare frame sequence for dispatch only once.
         frameIndex = -1;
         frameRowIndex = -1;
@@ -348,11 +379,27 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
     }
 
     private boolean checkLimit() {
+        if (compiledLimit != null) {
+            if (limitReached()) {
+                frameSequence.cancel(SqlExecutionCircuitBreaker.STATE_OK);
+            }
+            return true;
+        }
         if (--rowsRemaining < 0) {
             frameSequence.cancel(SqlExecutionCircuitBreaker.STATE_OK);
             return false;
         }
         return true;
+    }
+
+    private long availableRows() {
+        long available = frameRowCount - frameRowIndex;
+        return compiledLimit == null ? Math.min(available, rowsRemaining) : available;
+    }
+
+    private boolean limitReached() {
+        // Generated admission has already charged the buffered prefix to the budget.
+        return rowsRemaining <= 0 && (compiledLimit == null || frameRowIndex >= frameRowCount);
     }
 
     private void collectCursor(boolean forceCollect) {
@@ -402,6 +449,10 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
                     }
                     frameIndex = task.getFrameIndex();
                     frameRowIndex = 0;
+                    if (compiledLimit != null && frameSequence.isActive()) {
+                        frameRowCount = compiledLimit.admitRows(frameRowCount);
+                        rowsRemaining = compiledLimit.getLimitRemaining();
+                    }
                     if (frameRowCount > 0 && frameSequence.isActive()) {
                         record.init(task.getFrameMemory());
                         break;
@@ -441,7 +492,12 @@ class AsyncFilteredRecordCursor implements AsyncFilteredRecordCursorFactory.Reco
     }
 
     void of(PageFrameSequence<?> frameSequence, long rowsRemaining) {
+        of(frameSequence, rowsRemaining, null);
+    }
+
+    void of(PageFrameSequence<?> frameSequence, long rowsRemaining, CompiledFilter compiledLimit) {
         this.isOpen = true;
+        this.compiledLimit = compiledLimit;
         this.frameSequence = frameSequence;
         this.rowsRemaining = rowsRemaining;
         this.ogRowsRemaining = rowsRemaining;

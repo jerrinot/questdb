@@ -108,6 +108,24 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
 
 ## Remaining VARCHAR boundaries
 
+- [x] Generate single-VARCHAR encoded Top-K build: prefix rejection, normalization,
+  key-heap writes and threshold admission use typed IR against existing buffers.
+  Compaction/growth refreshes the borrowed view before resumption.
+- [x] Generate worker-result merge and compaction's survivor selection/heap packing
+  against the existing normalized entries. Preserve thresholds, scratch memory and
+  heap offsets; source buffers remain unchanged. Threshold publication remains
+  with the buffer owner.
+- [x] Generate encoded Top-K sorting, including the sorts inside compaction and
+  final LIMIT selection. Port `vergesort_entries<encoded_var>`, MSD radix and pdqsort
+  from existing sources. Preserve prefix/tail ordering, heap rebasing and small/large
+  partition behavior; use bounded stacks and tracked, reusable workspace.
+- [ ] Qualify Q22–Q25 on actual data when desktop profiling resumes. Q25's complete
+  generated path matches stock on the small schema fixture; the confirmed full-data
+  count remains 30/43. Measure compilation and complete latency, including long-tail
+  comparison sensitivity, before claiming a performance benefit.
+- [ ] Extend to composite ordering for Q26 without losing its existing partially
+  timestamp-sorted execution. Do not replace that plan with a full-table Top-K scan.
+
 - [x] Mixed/composite VARCHAR and wider-state keys now use the existing OrderedMap
   encoding, tracked staging buffer and heap ownership (2026-10-27). Direct SYMBOL
   fields and searched-CASE VARCHAR keys are now bound too. General string
