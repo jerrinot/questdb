@@ -508,6 +508,7 @@ public final class ResolvedAggregateKernel {
         final long partitionRowBytes;
         final long inputPartitionRowBytes;
         ResolvedFilter filter;
+        GroupAdmission groupAdmission;
         boolean closed;
 
         private final ArrayList<AutoCloseable> resources = new ArrayList<>();
@@ -605,6 +606,16 @@ public final class ResolvedAggregateKernel {
 
         boolean hasCompiledFilter() { return filter != null; }
         boolean needsWorkerAllocators() { return probe != null || localCapacity > 0; }
+
+        boolean prepareGroupLimit(long requiredGroups) throws IOException {
+            if (closed) throw new IllegalStateException("Aggregate code is closed");
+            if (backend == null) return false;
+            if (groupAdmission == null) {
+                var admission = GroupAdmission.compile(probe, requiredGroups, backend, artifacts);
+                if (admission != null) groupAdmission = own(admission, admission.compilationNanos());
+            }
+            return groupAdmission != null && groupAdmission.supports(requiredGroups);
+        }
 
         boolean prepareRowLimit() throws IOException {
             if (closed) throw new IllegalStateException("Aggregate code is closed");

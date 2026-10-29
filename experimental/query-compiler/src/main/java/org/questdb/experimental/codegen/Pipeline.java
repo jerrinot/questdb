@@ -84,7 +84,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    public sealed interface Scalar permits Column, Constant, Add, Subtract, Multiply, TimestampPart, IPv4Subtract {
+    public sealed interface Scalar permits Column, Constant, Parameter, Add, Subtract, Multiply, TimestampPart, IPv4Subtract {
         Value emit(Row row);
     }
 
@@ -105,24 +105,47 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
             return row.values().get(index);
         }
 
-        public long nullValue() {
-            return switch (columnType) {
-                case ColumnType.INT -> Integer.MIN_VALUE;
-                case ColumnType.SYMBOL -> io.questdb.cairo.sql.SymbolTable.VALUE_IS_NULL;
-                case ColumnType.IPv4 -> io.questdb.std.Numbers.IPv4_NULL;
-                case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> Long.MIN_VALUE;
-                default -> 0; // BYTE and SHORT have no null sentinel in QuestDB.
-            };
-        }
-
-        public boolean nullable() { return columnType == ColumnType.INT || columnType == ColumnType.LONG || columnType == ColumnType.SYMBOL || columnType == ColumnType.IPv4
-                || columnType == ColumnType.DATE || ColumnType.isTimestamp(columnType); }
+        public long nullValue() { return nullValueOf(columnType); }
+        public boolean nullable() { return isNullable(columnType); }
         public MemoryType width() { return widthOf(columnType); }
     }
 
     public record Constant(long value) implements Scalar {
         @Override
         public Value emit(Row row) { return new Value(i64(value), bool(value == Long.MIN_VALUE)); }
+    }
+
+    /** A cursor-time value, loaded once before the row loop. */
+    public record Parameter(int index, int columnType) implements Scalar {
+        public Parameter {
+            if (index < 0) throw new IllegalArgumentException("Invalid parameter index");
+            widthOf(columnType);
+        }
+        @Override
+        public Value emit(Row row) {
+            Expr data = row.parameters().get(index);
+            return new Value(data, isNullable(columnType) ? eq(data, i64(nullValueOf(columnType))) : bool(false));
+        }
+        public MemoryType width() { return widthOf(columnType); }
+    }
+
+    private static long nullValueOf(int type) {
+        return switch (type) {
+            case ColumnType.INT -> Integer.MIN_VALUE;
+            case ColumnType.SYMBOL -> io.questdb.cairo.sql.SymbolTable.VALUE_IS_NULL;
+            case ColumnType.IPv4 -> io.questdb.std.Numbers.IPv4_NULL;
+            case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> Long.MIN_VALUE;
+            default -> 0;
+        };
+    }
+
+    private static boolean isNullable(int type) {
+        return type == ColumnType.INT || type == ColumnType.LONG || type == ColumnType.SYMBOL
+                || type == ColumnType.IPv4 || type == ColumnType.DATE || ColumnType.isTimestamp(type);
+    }
+
+    private static int storageType(Scalar value) {
+        return value instanceof Column c ? c.columnType() : value instanceof Parameter p ? p.columnType() : -1;
     }
 
     /** Example of adding a SQL operation once, without modifying either backend. */
@@ -234,6 +257,10 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         public Expr emit(Row row) {
             Value a = left.emit(row);
             Value b = right.emit(row);
+            // Equal storage types have the same NULL sentinel. Comparing raw values
+            // preserves equality without per-lane NULL normalization.
+            if ((op == Op.EQ || op == Op.NE) && storageType(left) != -1 && storageType(left) == storageType(right))
+                return binary(op, a.data(), b.data());
             Expr x = new Select(a.isNull(), i64(Long.MIN_VALUE), a.data());
             Expr y = new Select(b.isNull(), i64(Long.MIN_VALUE), b.data());
             if (op == Op.EQ || op == Op.NE) { return binary(op, x, y); }
@@ -284,11 +311,11 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         public long initialValue() { return 0; }
         @Override
         public void emit(Builder builder, Row row, Expr address) {
-            NestedDistinct.emit(builder, argument.emit(row), address, initialCapacity, loadFactor);
+            NestedDistinct.LONG.emit(builder, argument.emit(row), address, initialCapacity, loadFactor);
         }
         @Override
         public void merge(Builder builder, Expr source, Expr destination) {
-            NestedDistinct.merge(builder, source, destination, initialCapacity, loadFactor);
+            NestedDistinct.LONG.merge(builder, source, destination, initialCapacity, loadFactor);
         }
     }
 
@@ -349,7 +376,9 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         });
     }
 
-    public record Row(List<Column> columns, List<Value> values) { }
+    public record Row(List<Column> columns, List<Value> values, List<Expr> parameters) {
+        public Row(List<Column> columns, List<Value> values) { this(columns, values, List.of()); }
+    }
 
     public long entryBytes() { return aggregateOffset(aggregates.size()); }
     public long aggregateOffset(int index) {

@@ -207,6 +207,16 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
     public boolean prepareRowLimit() { return base.prepareRowLimit(); }
 
     @Override
+    public boolean prepareGroupLimit(long requiredGroups) {
+        for (int i = 0, n = functions.size(); i < n; i++) {
+            if (!functions.getQuick(i).isStableWithinExecution()) return false;
+        }
+        // The base establishes whether its groups may be narrowed. Its repeat-open stability
+        // is unrelated: admission and aggregation borrow one cursor and one snapshot.
+        return base.prepareGroupLimit(requiredGroups);
+    }
+
+    @Override
     public boolean prepareSortedRowLimit() { return base.prepareSortedRowLimit(); }
 
     @Override

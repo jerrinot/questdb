@@ -53,6 +53,7 @@ public class VectorAggregateEntry implements Mutable {
     private ObjList<PageFrameMemoryPool> frameMemoryPools;
     private long frameRowCount;
     private VectorAggregateFunction func;
+    private CompiledVectorAggregate compiled;
     private int keyColIndex;
     private AtomicInteger oomCounter;
     private long[] pRosti;
@@ -74,12 +75,17 @@ public class VectorAggregateEntry implements Mutable {
             @Nullable RostiAllocFacade raf,
             @NotNull VectorAggregateFunction func,
             @NotNull PerWorkerLocks perWorkerLocks,
-            @NotNull ExecutionCircuitBreaker circuitBreaker
+            @NotNull ExecutionCircuitBreaker circuitBreaker,
+            @Nullable CompiledVectorAggregate compiled
     ) {
         final int slot = perWorkerLocks.acquireSlot(workerId, circuitBreaker);
         try {
             final PageFrameMemoryPool frameMemoryPool = frameMemoryPools.getQuick(slot);
             final PageFrameMemory frameMemory = frameMemoryPool.navigateTo(frameIndex);
+            if (compiled != null) {
+                compiled.aggregate(frameMemory, frameRowCount, slot, circuitBreaker);
+                return;
+            }
             // for functions like `count()`, that do not have arguments we are required to provide
             // count of rows in table in a form of "pageSize >> shr". Since `vaf` doesn't provide column
             // this code used column 0. Assumption here that column 0 is fixed size.
@@ -116,6 +122,7 @@ public class VectorAggregateEntry implements Mutable {
         this.aggregateError = null;
         this.frameMemoryPools = null;
         this.func = null;
+        this.compiled = null;
         this.pRosti = null;
         this.startedCounter = null;
         this.doneLatch = null;
@@ -211,6 +218,7 @@ public class VectorAggregateEntry implements Mutable {
                 frameMemoryPools,
                 raf,
                 func,
+                compiled,
                 perWorkerLocks,
                 circuitBreaker,
                 startedCounter,
@@ -230,6 +238,7 @@ public class VectorAggregateEntry implements Mutable {
             ObjList<PageFrameMemoryPool> frameMemoryPools,
             RostiAllocFacade raf,
             VectorAggregateFunction func,
+            CompiledVectorAggregate compiled,
             PerWorkerLocks perWorkerLocks,
             SqlExecutionCircuitBreaker circuitBreaker,
             AtomicInteger startedCounter,
@@ -253,7 +262,8 @@ public class VectorAggregateEntry implements Mutable {
                         raf,
                         func,
                         perWorkerLocks,
-                        circuitBreaker
+                        circuitBreaker,
+                        compiled
                 );
             }
         } catch (Throwable th) {
@@ -295,7 +305,8 @@ public class VectorAggregateEntry implements Mutable {
             @Nullable RostiAllocFacade raf,
             @NotNull PerWorkerLocks perWorkerLocks,
             @NotNull SqlExecutionCircuitBreaker circuitBreaker,
-            @NotNull AsyncQueryProgressState progressState
+            @NotNull AsyncQueryProgressState progressState,
+            @Nullable CompiledVectorAggregate compiled
     ) {
         this.frameIndex = frameIndex;
         this.frameRowCount = frameRowCount;
@@ -304,6 +315,7 @@ public class VectorAggregateEntry implements Mutable {
         this.pRosti = pRosti;
         this.frameMemoryPools = frameMemoryPools;
         this.func = vaf;
+        this.compiled = compiled;
         this.startedCounter = startedCounter;
         this.doneLatch = doneLatch;
         this.oomCounter = oomCounter;

@@ -79,6 +79,11 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
     private final ColumnTypes keyTypes;
     private final GroupByMapStats lastOwnerStats;
     private final ObjList<GroupByMapStats> lastShardStats;
+    // Borrowed prefix of destShards. Completed maps never move or merge twice,
+    // so row IDs remain valid when a consumer asks for more groups.
+    private final ObjList<Map> mergedShards = new ObjList<>(NUM_SHARDS);
+    private long mergedGroupCount;
+    private boolean shardsPrepared;
     // Per-query native memory tracker propagated to every fragment and destination
     // shard. Null when no per-query limit applies (the shared horizon-join path never
     // binds one), leaving allocations on the global counter only.
@@ -144,6 +149,9 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
     @Override
     public void clear() {
         sharded = false;
+        shardsPrepared = false;
+        mergedGroupCount = 0;
+        mergedShards.clear();
         mergePhase = 0;
         postMergeTasks.clear();
         if (compiledUpdaters != null) {
@@ -431,6 +439,10 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         return sharded;
     }
 
+    boolean isMergeComplete() {
+        return mergedShards.size() == NUM_SHARDS;
+    }
+
     void maybeEnableSharding(GroupByMapFragment fragment, long functionCardinalityIncrement) {
         if (bounded || shared) return;
         fragment.totalFunctionCardinality += functionCardinalityIncrement;
@@ -463,16 +475,55 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
             SOUnboundedCountDownLatch postAggregationDoneLatch,
             AtomicInteger postAggregationStartedCounter
     ) {
+        return mergeShards(messageBus, workStealingStrategy, circuitBreaker, postAggregationCircuitBreaker,
+                postAggregationDoneLatch, postAggregationStartedCounter, Long.MAX_VALUE);
+    }
+
+    ObjList<Map> mergeShards(
+            MessageBus messageBus,
+            WorkStealingStrategy workStealingStrategy,
+            SqlExecutionCircuitBreaker circuitBreaker,
+            PostAggregationCircuitBreaker postAggregationCircuitBreaker,
+            SOUnboundedCountDownLatch postAggregationDoneLatch,
+            AtomicInteger postAggregationStartedCounter,
+            long requiredGroups
+    ) {
+        if (isMergeComplete() || mergedGroupCount >= requiredGroups) {
+            return mergedShards;
+        }
         postAggregationCircuitBreaker.reset();
-        shardAll(circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
+        if (!shardsPrepared) {
+            shardAll(circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
+            shardsPrepared = true;
+        }
         boolean deferred = false;
         if (compiledUpdaters != null) {
             for (int i = 0; i < compiledUpdaters.size(); i++) deferred |= compiledUpdaters.getQuick(i).beginParallelMerge();
         }
         try {
-            executeMergeTasks(NUM_SHARDS, messageBus, workStealingStrategy, circuitBreaker,
-                    postAggregationCircuitBreaker, postAggregationDoneLatch, postAggregationStartedCounter);
-            if (postAggregationCircuitBreaker.checkIfTrippedOrYield()) return destShards;
+            boolean limited = requiredGroups != Long.MAX_VALUE && bounded && !shared && !deferred
+                    && !compiledUpdaters.getQuick(0).hasPartitionTopK();
+            do {
+                int first = mergedShards.size();
+                int count = NUM_SHARDS - first;
+                if (limited) {
+                    long groupsPerShard = first == 0 ? 1 : Math.max(1, mergedGroupCount / first);
+                    count = first == 0 ? 1 : (int) Math.min(count,
+                            1 + (requiredGroups - mergedGroupCount - 1) / groupsPerShard);
+                }
+                if (limited && count == 1) {
+                    mergeShard(-1, first, circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled);
+                } else {
+                    executeMergeTasks(first, count, messageBus, workStealingStrategy, circuitBreaker,
+                            postAggregationCircuitBreaker, postAggregationDoneLatch, postAggregationStartedCounter);
+                }
+                if (postAggregationCircuitBreaker.checkIfTrippedOrYield()) return destShards;
+                for (int i = first; i < first + count; i++) {
+                    Map map = destShards.getQuick(i);
+                    mergedShards.add(map);
+                    mergedGroupCount += map.size();
+                }
+            } while (limited && !isMergeComplete() && mergedGroupCount < requiredGroups);
             if (deferred) {
                 Runnable checkpoint = circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled;
                 long work = 0;
@@ -487,18 +538,18 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
                         more |= compiledUpdaters.getQuick(i).prepareMergeTasks(postMergeTasks, targetTaskWork, checkpoint);
                     }
                     if (postMergeTasks.size() > 0) {
-                        executeMergeTasks(postMergeTasks.size(), messageBus, workStealingStrategy, circuitBreaker,
+                        executeMergeTasks(0, postMergeTasks.size(), messageBus, workStealingStrategy, circuitBreaker,
                                 postAggregationCircuitBreaker, postAggregationDoneLatch, postAggregationStartedCounter);
                         if (postAggregationCircuitBreaker.checkIfTrippedOrYield()) return destShards;
                     }
                 } while (more);
                 for (int i = 0; i < compiledUpdaters.size(); i++) compiledUpdaters.getQuick(i).endParallelMerge(work > 0);
                 mergePhase = 2;
-                executeMergeTasks(NUM_SHARDS, messageBus, workStealingStrategy, circuitBreaker,
+                executeMergeTasks(0, NUM_SHARDS, messageBus, workStealingStrategy, circuitBreaker,
                         postAggregationCircuitBreaker, postAggregationDoneLatch, postAggregationStartedCounter);
             }
-            if (!postAggregationCircuitBreaker.checkIfTrippedOrYield()) finalizeShardStats();
-            return destShards;
+            if (isMergeComplete() && !postAggregationCircuitBreaker.checkIfTrippedOrYield()) finalizeShardStats();
+            return mergedShards;
         } finally {
             // executeMergeTasks drains every published task, including on cancellation.
             mergePhase = 0;
@@ -510,6 +561,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
     }
 
     private void executeMergeTasks(
+            int firstTask,
             int taskCount,
             MessageBus messageBus,
             WorkStealingStrategy workStealingStrategy,
@@ -530,7 +582,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         ownerLoop.tryAcquirePublication();
 
         if (!ownerLoop.hasPublication()) {
-            for (int shardIndex = 0; shardIndex < taskCount; shardIndex++) {
+            for (int shardIndex = firstTask; shardIndex < firstTask + taskCount; shardIndex++) {
                 ownerLoop.checkBeforeHelping();
                 mergeShard(-1, shardIndex, circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
             }
@@ -544,7 +596,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         int mergedCount = 0; // positive completed-task count; the latch counts down from zero
 
         try {
-            for (int shardIndex = 0; shardIndex < taskCount; shardIndex++) {
+            for (int shardIndex = firstTask; shardIndex < firstTask + taskCount; shardIndex++) {
                 while (true) {
                     ownerLoop.observeProgress();
                     long cursor = pubSeq.next();

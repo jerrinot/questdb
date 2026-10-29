@@ -92,7 +92,7 @@ public class EqSymStrFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class ConstCheckColumnFunc extends ConstEqSymFunc {
+    public static class ConstCheckColumnFunc extends ConstEqSymFunc {
         private int valueIndex;
 
         public ConstCheckColumnFunc(SymbolFunction arg, CharSequence constant) {
@@ -102,6 +102,10 @@ public class EqSymStrFunctionFactory implements FunctionFactory {
         @Override
         public boolean getBool(Record rec) {
             return negated != (arg.getInt(rec) == valueIndex);
+        }
+
+        public int getValueIndex() {
+            return valueIndex;
         }
 
         @Override
@@ -153,7 +157,7 @@ public class EqSymStrFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class ConstSymIntCheckFunc extends ConstEqSymFunc {
+    public static class ConstSymIntCheckFunc extends ConstEqSymFunc {
         private boolean exists;
         private int valueIndex;
 
@@ -164,6 +168,10 @@ public class EqSymStrFunctionFactory implements FunctionFactory {
         @Override
         public boolean getBool(Record rec) {
             return negated != (exists && arg.getInt(rec) == valueIndex);
+        }
+
+        public int getValueIndex() {
+            return valueIndex;
         }
 
         @Override

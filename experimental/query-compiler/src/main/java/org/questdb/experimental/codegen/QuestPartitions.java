@@ -86,7 +86,7 @@ final class QuestPartitions {
             // COUNT(argument) must still produce a zero-count group for entirely NULL input.
             group.when(binary(Op.EITHER, eq(load(state), i64(0)), eq(load(state), i64(Long.MIN_VALUE))),
                     empty -> append.accept(empty, i64(Long.MIN_VALUE)));
-            NestedDistinct.forEach(group, state, append);
+            NestedDistinct.LONG.forEach(group, state, append);
         });
         b.store(at(COLUMNS, EXPORTED_ROWS_OFFSET), emitted);
         b.exit(0);

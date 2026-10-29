@@ -187,6 +187,9 @@ final class ScanLowering {
             int source = sourceIndexes == null ? column.index() : sourceIndexes[column.index()];
             addresses.add(b.let(new Load(MemoryType.ADDRESS, at(descriptors, source * 8L))));
         }
+        List<Expr> parameters = new ArrayList<>();
+        for (Parameter parameter : plan.parameters())
+            parameters.add(b.let(new Load(parameter.width(), at(descriptors, (plan.input().size() + parameter.index()) * 8L))));
         Var start = b.let(begin);
         Var index = b.let(start);
         if (!(plan.predicate() instanceof All) && mode == Mode.MASKED) {
@@ -201,7 +204,7 @@ final class ScanLowering {
                     if (visited != null) batch.assign(visited, add(index, i64(lanes)));
                     if (cancellable) batch.when(eq(binary(Op.AND, index, i64(4095)), i64(0)), Builder::poll);
                     Var mask = batch.let(i64(lanes == 64 ? -1L : (1L << lanes) - 1));
-                    predicateMask(batch, mask, plan.predicate(), row(plan.input(), addresses, index, false), lanes);
+                    predicateMask(batch, mask, plan.predicate(), row(plan.input(), addresses, index, false, parameters), lanes);
                     batch.when(binary(Op.LT, index, start), resumed -> resumed.assign(mask, binary(Op.AND, mask,
                             binary(Op.XOR, i64(-1), binary(Op.USHR, i64(-1), binary(Op.SUB, i64(64), binary(Op.SUB, start, index)))))));
                     if (consumeMask != null) {
@@ -209,7 +212,7 @@ final class ScanLowering {
                     } else {
                         batch.loop(ne(mask, i64(0)), selected -> {
                             Var rowIndex = selected.let(add(index, new TrailingZeros(mask)));
-                            consume(plan, selected, row(plan.input(), addresses, rowIndex, true), rowIndex, consume);
+                            consume(plan, selected, row(plan.input(), addresses, rowIndex, true, parameters), rowIndex, consume);
                             selected.assign(mask, binary(Op.AND, mask, binary(Op.SUB, mask, i64(1))));
                         });
                     }
@@ -223,12 +226,12 @@ final class ScanLowering {
         b.loop(binary(Op.LT, index, ROWS), loop -> {
             if (visited != null) loop.assign(visited, add(index, i64(1)));
             if (cancellable) loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
-            Row raw = row(plan.input(), addresses, index, true);
+            Row raw = row(plan.input(), addresses, index, true, parameters);
             if (mode == Mode.EAGER && !(plan.predicate() instanceof All)) {
                 // Discover demands while generating the body, then bind inputs in
                 // source-column order before the predicate, as the original scan did.
                 Builder[] loads = new Builder[plan.input().size()];
-                Row source = lazy(plan.input(), i -> {
+                Row source = lazy(plan.input(), parameters, i -> {
                     loads[i] = loop.fork();
                     return materializeColumn(loads[i], plan.input().get(i), raw.values().get(i));
                 });
@@ -244,7 +247,7 @@ final class ScanLowering {
             var predicateColumns = plan.predicateColumns();
             for (int i = predicateColumns.nextSetBit(0); i >= 0; i = predicateColumns.nextSetBit(i + 1))
                 available.set(i, materializeColumn(loop, plan.input().get(i), available.get(i)));
-            Row source = new Row(plan.input(), available);
+            Row source = new Row(plan.input(), available, parameters);
             if (plan.predicate() instanceof All) consume(plan, loop, source, index, consume);
             else loop.when(plan.predicate().emit(source), accepted -> consume(plan, accepted, source, index, consume));
             loop.assign(index, add(index, i64(1)));
@@ -288,8 +291,8 @@ final class ScanLowering {
      */
     private static void consume(ScanPlan plan, Builder parent, Row source, Expr index, RowConsumer consumer) {
         Builder prologue = parent.fork(), body = parent.fork();
-        Row inputs = lazy(plan.input(), i -> materializeColumn(prologue, plan.input().get(i), source.values().get(i)));
-        Row projected = lazy(plan.output(), i -> {
+        Row inputs = lazy(plan.input(), source.parameters(), i -> materializeColumn(prologue, plan.input().get(i), source.values().get(i)));
+        Row projected = lazy(plan.output(), source.parameters(), i -> {
             Value value = plan.bindings().get(i).emit(inputs);
             if (value.data() instanceof Var) return value;
             return new Value(prologue.let(value.data()), prologue.let(value.isNull()));
@@ -302,7 +305,7 @@ final class ScanLowering {
         Var data = b.let(value.data());
         return new Value(data, column.nullable() ? eq(data, i64(column.nullValue())) : bool(false));
     }
-    private static Row lazy(List<Column> columns, IntFunction<Value> producer) {
+    private static Row lazy(List<Column> columns, List<Expr> parameters, IntFunction<Value> producer) {
         Value[] cache = new Value[columns.size()];
         return new Row(columns, new AbstractList<>() {
             @Override public int size() { return cache.length; }
@@ -310,10 +313,14 @@ final class ScanLowering {
                 if (cache[index] == null) cache[index] = producer.apply(index);
                 return cache[index];
             }
-        });
+        }, parameters);
     }
 
     private static Row row(List<Column> columns, List<Var> addresses, Expr index, boolean guardTops) {
+        return row(columns, addresses, index, guardTops, List.of());
+    }
+
+    private static Row row(List<Column> columns, List<Var> addresses, Expr index, boolean guardTops, List<Expr> parameters) {
         List<Value> values = new ArrayList<>();
         for (Column column : columns) {
             Var base = addresses.get(column.index());
@@ -324,6 +331,6 @@ final class ScanLowering {
             // and consumer columns appear only inside the selected-row region.
             values.add(new Value(data, column.nullable() ? eq(data, i64(column.nullValue())) : bool(false)));
         }
-        return new Row(columns, values);
+        return new Row(columns, values, parameters);
     }
 }

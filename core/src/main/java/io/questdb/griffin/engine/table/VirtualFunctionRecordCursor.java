@@ -190,6 +190,9 @@ public class VirtualFunctionRecordCursor implements RecordCursor {
     }
 
     @Override
+    public boolean limitGroups(long requiredGroups) { return baseCursor.limitGroups(requiredGroups); }
+
+    @Override
     public boolean sortLong(io.questdb.std.DirectLongList entries, io.questdb.std.DirectLongList scratch,
                             int columnIndex, boolean ascending, long maxEntries) {
         int baseColumn = getLongTopKColumnIndex(columnIndex);

@@ -4821,3 +4821,524 @@ and unordered maps, a nonzero aggregate offset, cancellation and pending-state
 rejection. The final builder also passes all four repeated 500M-row SQL controls.
 Measured reads/major faults and memory PSI are zero; one CPU model is tested.
 Evidence and passing hardware gate: `/tmp/query-reconcile-20261029/study.json`.
+
+## 2026-10-29: one billion official 1BRC rows
+
+Imported one billion rows from the unchanged official Java generator: 413 stations,
+zero import errors. Stock/LLVM share the same data, eight physical cores and
+default query settings. All 112 main responses match the official Java answer
+after challenge rounding. These are post-import query timings, not text-parsing
+contest timings.
+
+SYMBOL is the primary layout: both engines use existing vectorized Rosti, with
+no LLVM gain. First SYMBOL/DOUBLE requests take 0.95-0.99 s, but cached repeats
+take about 2.35 s. Rosti starts at 1,024 slots, shrinks after execution, then grows
+to only 512 for 413 groups. A separate fresh-factory capacity-only experiment
+reproduces 0.82-0.92 s at 1,024 slots versus 2.14-2.33 s at 512. No production
+change or benchmark capacity override is retained.
+
+The additional VARCHAR/SHORT control exercises LLVM aggregation: 3.142 -> 2.058 s
+(1.53x). User cycles/input fall 132 -> 87, instructions 482 -> 270; about 45 saved
+cycles/input over eight cores predict the observed 1.08 s gain. Controller traffic
+falls only 24.69 -> 23.04 GB/query; bandwidth is not saturated. Sorting/division
+remain Java. VARCHAR/DOUBLE falls back; SYMBOL remains Rosti. This is a narrower
+compiler win, not a win over fresh stock SYMBOL execution. Measured major faults
+and memory PSI are zero. Report: `target/1brc.md`; raw evidence and imported data:
+`/run/media/jara/test/questdb-1brc-20261029`.
+
+## 2026-10-29: generated SYMBOL arrays and direct array merge
+
+The vector factory can now use the current reader snapshot's bounded SYMBOL IDs
+as array indexes. Existing workers, page-frame pools, cancellation and query memory
+tracking remain in charge. Generated updates and generated array-to-array merges
+reuse aggregate expressions; only final groups enter Rosti for finalization and
+output. No Rosti aggregation merge on this path, no new setting. Large dictionaries
+and unsupported functions retain Rosti. Current scope: integer MIN/MAX, COUNT,
+SUM(SHORT/INT), AVG(SHORT); DOUBLE remains unsupported.
+
+Official 1BRC, one billion rows, eight physical cores, same SYMBOL/SHORT data:
+fresh factories in warm processes, including construction/execution, improve
+0.856 -> 0.176 s (4.86x). Reused HTTP factories improve 2.231 -> 0.166 s (13.41x),
+but that ratio includes stock's map-capacity regression. First-process embedded
+queries are 0.952 -> 0.327 s. The gain is not dependent on the degraded cached
+baseline. All aggregate results match the official answer after required rounding.
+
+500M-row independent controls improve 0.437 -> 0.083 s for uniform symbols and
+0.398 -> 0.096 s with 99% single-key skew. The 8,191-symbol domain falls back and
+stays near parity (0.534 -> 0.531 s). An independent C++ oracle validates these
+results. Billion-row COUNT alone improves 0.480 -> 0.075 s, separating direct
+indexing's benefit from multi-aggregate fusion. Four/sixteen-core array times are
+0.312/0.100 s. A matched read-only two-column stream takes 0.103/0.092 s.
+
+Eight-core user cycles/input fall 94 -> 6.7, instructions 217 -> 38, controller
+traffic 12.03 -> 6.62 GB/query. About 87 saved cycles/input at eight cores near
+5.3 GHz correspond to the observed 2.06 s saving. Native samples locate 99.5% of
+stock work in three Rosti loops and 92.2% of candidate work in a 261-byte scalar
+kernel. Both direct indexing and fusion contribute. The 16-core result approaches
+the measured streaming floor; no precise eight-core stall classification or
+cross-machine claim. Measured major faults/process reads and memory PSI are zero.
+
+Sixteen focused compiler cases and 24 existing core cases pass. Tests also found
+an independent all-negative MAX(SHORT) bug in stock; recorded in TODO, unchanged.
+Current report: `target/1brc.md`. Evidence and scratch controls:
+`/run/media/jara/test/questdb-1brc-20261029/symbol-array` and sibling `results/`.
+
+## 2026-10-29: unordered LIMIT finalizes partitions on demand
+
+Q17 reads 99,997,497 rows and returns ten groups. Before this change the generated
+pipeline merged all 256 partitions and retained 24,070,560 complete groups before LIMIT.
+Phase measurements put scan/local aggregation/partitioning at about 360 ms,
+final merge at 209 ms, and cleanup at 61 ms. Matching DuckDB source finalizes
+partitions as its output pipeline requests them; its Q17 profile scans all input
+but emits only 16,384 aggregate rows upstream of LIMIT. This follows the partition
+pipeline described in [DuckDB's aggregation paper](https://duckdb.org/pdf/ICDE2024-kuiper-boncz-muehleisen-out-of-core.pdf).
+
+Demand-aware merge is now integrated in AsyncGroupByRecordCursor and
+GroupByShardingContext. It completes one partition (94,240 groups) for Q17.
+Existing parallel jobs handle larger demands, using observed group counts to size
+batches. The full scan finishes first; actual completed counts govern stopping.
+Completed maps never move or merge twice. Partial cursors report unknown size;
+exact size, ordinary iteration, ordering and shared cursors finish the remaining
+partitions. Deferred DISTINCT and partition Top-K retain full finalization.
+Existing snapshot, allocator, budget and cancellation ownership remain in charge.
+There is no new setting.
+
+Eight physical cores, balanced fresh-process order, four warmups/five measurements:
+pre-change LLVM 633 -> 406 ms (1.56x), clean stock 1,210 ms, uncompressed DuckDB
+294-296 ms. Warm diagnostics include output and cleanup; these replace no ClickBench
+HTML results. Clean stock independently recomputes all 250 returned rows from
+the final five-arm comparison. Every generated query still scans the full input.
+
+User cycles/input fall 220 -> 145, instructions 407 -> 324, and minor faults about
+700k -> 286k. Earlier phase-gated experiments measured controller traffic falling
+18.63 -> 9.91 GB/query, merge to 6 ms and cleanup to about 37 ms.
+Removing roughly 1.65 CPU seconds of parallel merge over
+eight cores, plus 24 ms of serial cleanup, predicts about 230 ms saved, matching
+the observed 227 ms. Generated symbols locate scan, flush and merge separately;
+PMUs have 100% scheduling. Reads, major faults and memory PSI are zero. Both
+frontend and backend stall counts fall. This is avoided hash-table/allocation work,
+not proof of bandwidth saturation or a cross-machine gain.
+
+Independent 500M-row COUNT + nullable SUM controls, ordinary Java SQL oracle:
+small LIMIT 885 -> 503 ms; offset needing three partitions 884 -> 509 ms; 31 groups
+with LIMIT 100 stays 224 -> 222 ms. The initial sequential experiment regressed a
+large offset from 882 ms to 3.34 s. Reusing existing parallel merge jobs after the
+first partition removes that regression: integrated code measures 878 -> 884 ms
+for 245 partitions, within process variation. The earlier ordered Q16 control
+remains within process variation and never takes this path.
+
+Validation: 24 focused compiler cases and two core HORIZON JOIN ownership cases
+pass. New tests cover growing demand without rescanning, stable row IDs, exact
+size, rewind/reopen, offsets, empty input, cancellation and query-budget cleanup.
+Four broader join assertions still expect a now-supported join to fall back to
+Java; the same four failures reproduce with the pre-change core classes.
+
+Continuation: the remaining scan retires about 324 instructions and mispredicts
+2.53 branches/input row. Branch-miss samples locate 81% in the generated scan and
+18% in its partition flush; sampling skid prevents attribution to a particular
+branch. Nearly all dispatched ops come from the op cache. Existing direct-loop
+control (`prefetchRows=0`, no source change) measures 402 -> 349 ms in a separate
+balanced comparison, with scan 360-365 -> 310-316 ms. Instructions fall 324 -> 292,
+mispredictions 2.54 -> 1.65 and user cycles 145 -> 123 per input row. Scan dispatched
+minus retired ops fall 256 -> 200/input; empty-op-queue cycles fall 34.7 -> 22.1.
+Load-incomplete cycles fall 45.7 -> 40.3; controller traffic stays 9.84 -> 9.81 GB.
+The evidence supports excess staging/control-flow cost here, with residual load
+stalls; it does not establish one exclusive hardware bottleneck.
+
+Do not disable staging globally: independent 500M-row tests show 490 -> 495 ms
+for high cardinality and 224 -> 297 ms for 31 groups. All results validate, but the
+latter is a 33% regression. Next compare direct and staged local aggregation
+through the existing adaptive policy, including full growth/flush costs and
+phase changes, rather than a query-specific rule or another tuning switch.
+
+Evidence: `/tmp/query-q17-20261029/integrated-summary.json`,
+`integrated-quality.json`, `integrated-identity.json` and sibling drivers/raw files.
+Four/five-event groups could not schedule; all reported new counters were rerun
+in groups of at most three with 100% scheduling. Global I/O pressure was outside
+the query cgroup (at most 133 us within it); measured query reads/major faults were
+zero, available memory exceeded 76 GB, background CPU stayed below 0.55 cores.
+Earlier SYMBOL work is intact.
+
+## 2026-10-29: group admission before aggregation — promising upper bound
+
+An unordered GROUP BY with a positive LIMIT needs complete aggregates for any
+requested number of groups. Instead of building every group, discover enough
+keys in a bounded prefix, freeze that selection globally, and aggregate all
+input rows belonging to those keys. All workers must use the same selection:
+[ClickHouse's investigation](https://github.com/ClickHouse/ClickHouse/issues/114637)
+documents why independent per-worker caps produce incorrect aggregates.
+
+The first experiment uses existing SQL/LLVM operators: group a 65,536-row prefix,
+choose ten distinct integer grouping-key values, then apply their IN predicate
+before the original aggregation. With composite grouping this selects a superset
+of ten complete groups; it does **not** bound the full group state to ten entries.
+Both queries use immutable fixtures. This is an explicit harness rewrite with
+data-dependent constants, not an automatic planner optimization or proof of
+snapshot safety under concurrent writes.
+
+Eight physical cores, balanced ABBA, four warmups/five measured executions per
+process; medians averaged across the two processes, including repeated discovery,
+output and cleanup. Warm diagnostic, not the standard ClickBench protocol:
+
+| Workload | Current LLVM | Admission experiment |
+| --- | ---: | ---: |
+| Q17, 99,997,497 rows, HTTP request time | 408.7 ms | 18.1 ms |
+| 500M rows, 8.39M groups, COUNT + nullable SUM | 503.6 ms | 70.0 ms |
+| 500M rows, 31 groups, LIMIT 10 | 221.3 ms | 97.3 ms |
+| 500M rows, 31 groups, LIMIT 100: discovery declines | 223.3 ms | 223.7 ms |
+
+Clean stock Q17 takes 1,216.3 ms in the same run. Generated filter counters cover
+every input row; Q17 admits just 145 rows and emits no partition records, versus
+about 58.2M partial records previously. Returned groups are recomputed independently
+with ordinary/clean-stock SQL, including nullable sums and changing selected keys.
+The experiment preserves complete group values; unordered subsets may differ.
+
+Q17 user cycles/input fall 144.3 -> 6.65, instructions 324.5 -> 7.43 and branch
+mispredictions 2.54 -> 0.019. Separate controller measurements fall 9.57 -> 0.90
+GB/query. Native samples place 78.4% in the generated SIMD membership loop;
+disassembly shows eight LONG keys loaded per vector, ten comparisons and a
+combined selection mask. The 800 MB key-column scan is unavoidable for this
+algorithm; avoiding most string decoding/hashing, map probes and partial writes
+explains the reduction. These measurements do not establish an exclusive
+bandwidth bottleneck or a result on another CPU architecture.
+As a rough CPU budget, 100M rows at 6.65 cycles/row across eight 5 GHz cores
+cost about 17 ms, consistent with the complete observed request time.
+
+Do not hide constant specialization's cost: changing the discovered keys on every
+execution and compiling a fresh query takes about **145 ms end to end**, versus
+400 ms for the cached current query. Compilation accounts for about 125 ms.
+HTTP `execute` already includes compilation; do not add those fields together.
+Runtime parameters are therefore the next necessary experiment. A retained
+implementation also needs discovery from the scan's existing snapshot and an
+explicit exclusive-consumer contract, not a destructive change to `selectRows`.
+See TODO.md. No execution defaults changed.
+
+PMU events scheduled 100%; measured process reads and major faults were zero.
+Available memory exceeded 78 GB, query-cgroup I/O pressure was zero. One short
+candidate window had 1.6 background cores, so the longer repeat is kept separately;
+two fresh processes with 50 measurements each reproduce 17.1/17.3 ms including
+discovery, and all returned groups validate. Sampling itself is excluded from
+timing claims. Evidence and runnable scratch
+drivers: `/tmp/query-q17-20261029/admission-*`, `AdmissionExperiment.java`,
+`run-admission-controls.py` and `changing-admission-profile.py`.
+
+## 2026-10-29: runtime group admission in the ordinary LLVM pipeline
+
+The unchanged SQL now discovers one immutable key set from its already prepared
+page-frame snapshot, then passes those keys to generated membership code as
+runtime parameters. Discovery, publication, full scan, merge, output and cleanup
+are inside execution time. Cached executions with different selected keys do not
+recompile. The existing worker slots, scheduler, maps and allocators own the work.
+
+An explicit exclusive `limitGroups` cursor contract authorizes discarding whole
+unrequested groups. Existing `selectRows`, cursor replay and full-result contracts
+remain intact. Planning enables this automatically for constant nonnegative
+unordered LIMIT/OFFSET requiring 1-16 groups, when a generated aggregate has a
+direct integral grouping column. Cardinality-preserving projections can forward
+the request. ORDER BY, post-aggregate filters, output DISTINCT, windows and shared
+consumers do not. Unbound filters and any Parquet frame decline. Every worker uses
+the same selection and every admitted group receives all its input contributions.
+
+Discovery examines at most 4,096 rows in 64 contiguous blocks spread across the
+snapshot. It needs enough distinct keys and less than 50% sampled admission.
+This is a cost guard, never a correctness assumption. Generated eight-lane
+membership avoids materializing row IDs while a frame is entirely accepted;
+filtered input compacts existing row IDs in place. Column tops/lazy casts use the
+ordinary typed record getters. Cancellation is checked in discovery and scanning.
+
+Eight physical cores on the Ryzen 9950X, warm data, balanced ABBA, four warmups
+and five measurements per process; table values average the process medians.
+These are focused diagnostics, not a new full ClickBench protocol run:
+
+| Workload | Previous LLVM | Integrated admission |
+| --- | ---: | ---: |
+| Q17, 99,997,497 rows, complete server execution | 406.0 ms | 16.6 ms |
+| 500M rows, 8.39M groups, COUNT + nullable SUM, LIMIT 10 | 504.7 ms | 69.8 ms |
+| Same 500M input, LIMIT 5,15 | 497.1 ms | 68.6 ms |
+| 500M rows, 31 groups, LIMIT 10 | 223.3 ms | 112.8 ms |
+| Same 31 groups, LIMIT 100: decline | 222.4 ms | 224.1 ms |
+| 500M rows, 99% hot key: decline | 137.5 ms | 137.9 ms |
+
+Clean stock Q17 is 1,221.7 ms in the same comparison. HTTP request medians are
+406.9 -> 17.3 ms. First SQL compilation rises from about 160 to 181 ms; this is
+paid once per cached plan, not hidden in repeated discovery. The server execution
+timer includes compilation on the first request. All returned groups are checked
+against ordinary SQL; Q17 uses the clean-stock binary for independent recomputation.
+Unordered group subsets can legitimately differ.
+
+Hardware evidence agrees with avoided work. Q17 checks all 99,997,497 rows but
+passes only 774 rows to aggregation and emits no partition records. User cycles
+fall 144.3 -> 6.53/input, instructions 324.2 -> 9.15 and branch misses 2.54 ->
+0.0141. Separate 20-execution controller measurements fall 9.86 -> 0.858 GB/query.
+The required LONG column alone is 0.800 GB. At eight 5 GHz cores, 6.53 cycles/input
+budgets about 16.3 ms, consistent with observed execution. This supports removing
+string processing, map probes and partial writes; it does not establish an
+exclusive bandwidth bottleneck or performance on another CPU architecture.
+
+The pathological phase-change control mattered: first 4,096 rows diverse, then
+almost 500M rows equal the tenth admitted key. Prefix-only sampling was correct
+but regressed 115 -> 174 ms. Distributed sampling declines before dispatch. Its
+first short comparison was 114 -> 122 ms; a longer balanced recheck with 20
+measurements/process gives 117.1 -> 117.3 ms, 60.18 -> 60.18 instructions/input
+and 9.53 -> 9.55 user cycles/input. All admission counters are zero in that
+recheck. Preserve the short-run variation; do not infer a new bottleneck from it.
+
+Limits remain explicit: selecting numeric prefixes of composite keys does not
+bound full group state to K. A high-fanout prefix still uses ordinary partitioned
+aggregation. An adversarial distribution can fool finite sampling and incur the
+extra membership pass; complete values remain correct. Larger limits, unsupported
+keys and unsafe consumer shapes retain the existing path. Only Q17 in this
+ClickBench checkout has the relevant unordered GROUP BY/LIMIT shape, so this is
+an operator-family gain supported by independent data, not a broad suite win.
+
+Validation: 24 focused admission/lifecycle cases in both LEGACY/FIBER_HOST modes,
+18 related aggregate cases, and all 48 existing core LIMIT cases pass. Covers
+NULLs, signed BYTE/SHORT/INT keys, column tops, offsets/reversed bounds, zero/empty
+limits, skew, dense later frames, composite fanout, filters, later Parquet frames,
+DISTINCT/windows/shared consumers, cancellation, budget failure, reuse without
+recompilation, and append between cursor acquisition and discovery. Full-cursor
+consumption after merely preparing LIMIT still returns all groups.
+
+PMU scheduling was 100%. Measured process reads/major faults were zero and
+available memory exceeded 78 GB. Query-cgroup I/O pressure was zero except 558 us
+in the longer stock control. One short candidate interval had 1.18 background
+cores; the independent longer run (0.41 background cores) reproduces 15.5 ms.
+Raw evidence/drivers: `/tmp/query-group-admission-20261029/` and
+`/tmp/query-q17-20261029/admission-final-*`. No result archive or new toggle.
+
+
+## 2026-10-29: static SYMBOL predicates use initialized dictionary IDs
+
+Added literal SYMBOL equality/inequality and IN/NOT IN of up to 16 values to the
+shared generated filter. IN also accepts the runtime constants already resolved
+by `InSymbolFunctionFactory`. Boolean composition, NULL, absent values and
+non-ASCII literals retain ordinary function semantics. The binder accepts direct
+static symbol columns; dynamic symbol sources, runtime equality expressions and
+larger sets keep ordinary execution.
+
+The ordinary functions still own initialization, dictionary resolution, bind-type
+checking and lifecycle. Small read-only getters expose their resolved IDs. A
+parameterized ScanPlan loads those IDs once before the generated row loop;
+per-frame descriptors borrow initialized function state. No value is frozen into
+cached code and no row calls back to Java for symbol lookup. Selection/count,
+aggregate selection and VARCHAR Top-K reuse this binding. The experimental
+map-fused ABI remains pointer-only, so parameterized aggregate filters use the
+existing selection-vector path. No scheduler, map, allocator or toggle was added.
+
+Ten focused LLVM/AsmJit cases pass, including cached factories after changed bind
+values, append and truncate/reinsert with different dictionary IDs, no extra
+compilations on reopen, NULL/absent/duplicate keys, OR/NOT, short frame tails,
+column tops, Parquet, aggregate filtering, Top-K descriptor relocation, bounded
+selection and large-set fallback. The same tests fail against the saved old
+classes on native-coverage assertions. All 60 existing scan/composition/fusion
+cases and four existing core IN-symbol cases pass. Column-top frames deliberately
+retain the executor's ordinary fallback in either storage format.
+
+Performance control: immutable 500M-row `symbol_controls`, eight physical cores
+on one CCD of the Ryzen 9950X, unchanged server settings, resident data. Balanced
+process order stock/before/after/after/before/stock; two warmups and five measured
+executions per case/process. Every one of the 168 full results matches an
+independent arithmetic oracle over the fixture's modular sequences. No process
+reads or major faults occurred in measured intervals.
+
+| Mechanism | Stock ms | Previous pipeline ms | Parameterized pipeline ms |
+| --- | ---: | ---: | ---: |
+| Three-value SYMBOL IN, SHORT group key, COUNT | 54.50 | 43.14 | 43.42 |
+| SYMBOL equality, SHORT group key, COUNT | 38.19 | 38.25 | 38.69 |
+| Three-value SYMBOL IN, filtered COUNT | 36.67 | 35.98 | 36.91 |
+| Dense skewed NOT IN, SHORT group key, COUNT | 611.45 | 259.48 | 261.33 |
+
+These four cases establish coverage without a demonstrated new speedup; process
+ranges overlap. Earlier gains over stock belong to the existing aggregation.
+The first case moves 51.01 -> 50.85 GB/s at the controllers. A matched raw read of
+its 2GB symbol column takes ~34ms (58.4 GB/s); the complete query takes ~43ms.
+Four/eight/sixteen-core query scaling is sublinear, at 40/51/59 GB/s. Baseline load
+completion blocks retirement in 76% of cycles; the follow-up candidate sample is
+68%. This supports substantial streaming pressure, not an exclusive explanation
+for every case. Capacity, I/O, quota and visible kernel-error checks are clear;
+20ms monitoring cannot exclude shorter scheduling disturbances.
+
+Equality selection retires more instructions (2.07 -> 2.99/input) despite similar
+elapsed time. Filtered COUNT retires fewer (1.81 -> 1.58/input), also without a
+clear latency gain. A representative optimized parameterized LLVM kernel still
+widens I32 before vector comparison; LLVM 21 llc reproduces qword comparisons.
+Record this as a general vector-lowering follow-up, not proof of the whole delta.
+Raw evidence and scratch drivers: `/tmp/query-symbol-predicates-20261029/`;
+complete query results under the existing 1BRC workspace's
+`results/symbol-predicate-*`. No permanent results archive was added.
+
+
+The admission boundary adds a narrower positive result. Three independent
+500M-row count controls use 16 present IDs, one present plus 15 absent IDs, and
+NOT IN over 16 IDs. Repeated balanced processes with 20 warmups and 10 measured
+executions give:
+
+| 16-value control | Previous pipeline, process medians ms | New pipeline, process medians ms |
+| --- | ---: | ---: |
+| IN, all values present | 91.43 / 91.74 | 36.03 / 35.56 |
+| IN, mostly absent | 84.33 / 85.19 | 36.48 / 35.36 |
+| NOT IN | 106.52 / 105.90 | 36.10 / 36.66 |
+
+All 540 complete results, including the default-stock arms, match the arithmetic
+oracle. For the first case, instructions fall 36.57 -> 4.49/input and cycles
+7.70 -> 3.01/input. EXPLAIN confirms that the old filter is Java and the new
+filter is generated. This is reduced work from replacing per-row set lookup
+with vector comparisons; no exclusive resource classification was established
+for that old Java path. Default stock varied across processes (92.06 / 141.67ms
+for the first case), including retired instruction counts, even with 20 warmups;
+do not base the speedup claim on its slower process.
+
+A necessary counterfactual separates eligibility from backend quality:
+`CompiledFilterIRSerializer` declines lists above the existing
+`cairo.sql.jit.max.in.list.size.threshold` default of 10. A separate diagnostic
+process raises only that existing setting to 32. Stock then uses its JIT and
+runs the three controls in 35.43 / 34.78 / 34.91ms, matching LLVM. All 90 diagnostic
+results agree. The main comparisons retain default configuration; no persistent
+configuration was changed. The 16-value gain is expanded compiled coverage,
+not evidence of superior LLVM filter code. These controls also falsify a large
+regression at the new binder's capacity and for mostly absent values.
+
+
+## 2026-10-29: COUNT(symbol) binds to the existing count lifecycle
+
+Eight binding lines admit direct static SYMBOL arguments to ordinary CountValue.
+The resolved CountSymbolGroupByFunction keeps its LONG state, zero/NULL rules and
+merge contract. Keyed and scalar generated paths reuse existing update, map,
+allocator and merge code. Dynamic symbol expressions retain ordinary evaluation.
+Six focused LLVM/AsmJit/C cases pass for NULL-only groups, mixed aggregates,
+filters, scalar merge, changing dictionaries, column tops, Parquet and empty input.
+
+500M rows, eight physical cores, balanced stock/before/after/after/before/stock:
+SHORT-key grouping falls from 540.2/541.0ms to 239.0/237.7ms (stock 562.0/546.1ms).
+Instructions/input fall ~255 -> 97.6 and cycles 45.5 -> 19.8. The unsupported count
+previously excluded the whole generated map path: JFR attributes most samples to
+OrderedMap probing, key hashing and memeq. Retiring uses 64% of dispatch slots,
+branch misses are only .012/input, and memory reads are ~6.2GB/s against the local
+58GB/s streaming control. Specialization reduces generic probing/update work;
+this is a core-execution gain, not a new count or map algorithm.
+
+Filtered grouping improves 59.1 -> 49.4ms; sparse scalar COUNT stays ~35.8ms.
+The existing fast single-SYMBOL-key case regresses 108.7 -> 115.3ms (~6%); its
+instructions fall slightly but cycles rise. Keep that limitation visible when
+extending direct-array/state representation work; do not claim all COUNT shapes
+improve. All 168 complete results match an independent arithmetic oracle, with no
+measured process reads/major faults. Baselines, PMU/USE study and JFR source
+attribution: `/tmp/query-type-coverage-20261029/count-*`.
+
+## 2026-10-29: INT and static SYMBOL DISTINCT share ordinary set state
+
+The existing LONG emitter now selects the ordinary 12-byte/32-bit or 16-byte/64-bit
+set layout at compilation. Hashing, singleton promotion, insertion order, growth,
+size-directed merge and allocator ownership remain QuestDB's algorithms. INT hashing
+zero-extends before the avalanche. In this checkout SYMBOL and INT both use
+`INT_MIN`; exact slot tests caught and removed an incorrect `-1` assumption.
+Resolved merge now consumes the already-adjusted initial capacity without rounding
+it twice. INT-set union remains serial within existing parallel shard tasks; the
+separate deferred union stays LONG-only. Finalized INT/SYMBOL count getters are
+safe for existing parallel Top-K, and generated ranking is exercised.
+
+Focused LLVM/AsmJit/C checks cover every slot after mixed Java/generated updates,
+all merge ownership branches, negative/extreme keys, NULLs, column tops, Parquet,
+reopen, empty input and dynamic-symbol fallback. Existing large deferred-union,
+cancellation and query-memory-limit checks pass, including a mixed INT/LONG query.
+The reopen fixture uses explicit dictionary capacity: automatic symbol-capacity
+scaling legitimately invalidates cached metadata and is not a generated-state bug.
+
+500M immutable rows, eight physical cores, two warmups and five measured executions
+per process, balanced stock/before/after/after/before/stock. Process-median ranges:
+
+| General shape | Stock ms | Before ms | Generated ms |
+| --- | ---: | ---: | ---: |
+| SHORT groups, SYMBOL distinct | 2062–2086 | 2180–2222 | 508–520 |
+| SYMBOL groups, INT distinct | 1073–1086 | 1108–1132 | 436–439 |
+| SYMBOL groups, nearly singleton SYMBOL distinct | 342–364 | 344–348 | 282–283 |
+| DISTINCT plus COUNT and SUM | 2454–2479 | 2450–2540 | 538–541 |
+
+All 168 complete results match independent arithmetic expectations, and measured
+process reads/major faults are zero. Main-case instructions/input fall ~468 ->156,
+cycles ~189 ->43, and no-retire cycles waiting for load data ~107 ->19. Backend
+stalls fall 62% ->47% of dispatch slots. Controller reads rise from6 to13.6GB/s
+as execution accelerates; both are below the measured58GB/s stream ceiling.
+The same generated code with existing prefetch batches disabled takes990ms despite
+only115 instructions/input; load-wait cycles rise to61/input. This counterfactual
+supports overlap of dependent probes as well as reduced generic work. Same set
+layout does not imply the same instruction stream or memory-access schedule.
+The3GB input-only streaming lower bound is ~51ms and excludes aggregation;
+there is substantial remaining headroom, not a claim that this workload is now
+bandwidth-limited. No ClickBench-wide or cross-machine result is implied.
+Evidence: `/tmp/query-type-coverage-20261029/distinct`, including validated USE/PMU
+study, source profile, complete responses, balanced summary and prefetch control.
+
+## 2026-10-29: ordinary integer AVG shares generated lifecycle
+
+SHORT retains its LONG sum; INT/LONG retain ordinary DOUBLE sums and LONG counts.
+Resolved offsets also cover the unkeyed owner's 32-byte slots. NULL-first updates
+normalize empty state so later ordinary Java updates remain valid. Grouped output
+finalizes once; scalar and join owners retain their ordinary AVG getters. No
+floating-point reassociation or alternative summation algorithm is introduced.
+Mixed Java/generated state checks cover NULLs, extreme values, rounding and every
+empty/nonempty merge branch. Focused LLVM/AsmJit/C SQL checks cover scalar, grouped,
+join, filter/expression, column-top, Parquet, reopen and empty-input paths.
+
+500M immutable typed rows, eight physical cores, balanced six-process comparison,
+two warmups and five measured executions. All 168 complete results match an
+independent integer-sum/count oracle; the sums fit exactly in DOUBLE. Median ranges:
+
+| General shape | Stock ms | Before ms | Generated ms |
+| --- | ---: | ---: | ---: |
+| SHORT groups, AVG(INT), AVG(LONG) | 653–681 | 655–666 | 329–331 |
+| Same plus COUNT and SUM | 727–752 | 732–734 | 352–355 |
+| Filtered scalar averages | 305–313 | 274–291 | 266–268 |
+| Filtered grouped arithmetic inputs | 868–882 | 880–894 | 350–351 |
+
+Main-case instructions/input fall 311 -> 128 and cycles 55 -> 27. Retired ops fall
+281 -> 113/input. Controller reads remain about 7.4 GB/query while throughput
+rises 11 -> 22 GB/s: the grouped gain removes core work, not input bytes. Measured
+process reads and major faults are zero. The optimistic 7 GB input-only floor at
+the measured 58 GB/s read ceiling is 120 ms and excludes aggregate accesses.
+
+Scalar instructions fall 93 -> 42/input but cycles remain about 23. Separate
+controller diagnostics show about 13.6 GB reads plus 2.8 GB writes/query, around
+50 GB/s reads plus 10 GB/s writes. Four workers take 285 ms versus eight's 264 ms;
+all 21 diagnostic results agree and native-row counters confirm generated work.
+This supports investigating selection-vector/data movement next; a read-only
+ceiling does not prove saturation for this mixed traffic, and the four-worker
+run itself moves fewer bytes. Do not call the scalar case a large speedup.
+Evidence: `/tmp/query-type-coverage-20261029/average`; isolated typed fixture and
+complete responses under `/run/media/jara/test/questdb-types-20261029`.
+
+## 2026-10-29: integer aggregates complete the SYMBOL array path
+
+SUM(LONG) and AVG(INT) reuse zero-initialized LONG sum/count state. AVG(LONG)
+adds the existing Rosti signed 128-bit sum as two words plus count; generated
+addition and merge preserve unsigned carry and sign extension. Existing Rosti
+wrapUp performs the final conversion. Dictionary admission, budgets, worker
+ownership, linear array merge and export are unchanged; no new IR type or toggle.
+Twenty-six focused backend/scheduling cases pass, including exact word checks,
+extremes, NULLs, column tops, reopen, oversized-domain fallback and allocation failure.
+
+The extreme INT fixture exposed a stock defect: keyedIntSumIntMerge loads a LONG
+sum through jint*, producing partition-dependent truncation. The generated array
+merge keeps all 64 bits. That case uses ordinary scalar SQL as its independent
+oracle; LONG's 128-bit path uses the vector oracle. The stock defect is recorded
+in TODO and was not patched or reproduced in generated code.
+
+500M rows, eight physical cores, balanced stock/before/after/after/before/stock:
+
+| SYMBOL-key aggregate | Stock ms | Before ms | Generated ms |
+| --- | ---: | ---: | ---: |
+| SUM(LONG), AVG(INT), AVG(LONG) | 449–452 | 460–464 | 143–144 |
+| SUM(LONG) | 135 | 134–137 | 106–108 |
+| AVG(INT) | 134 | 132–133 | 70–71 |
+| AVG(LONG) | 178–183 | 177–187 | 104–105 |
+
+All 168 complete results match independent integer-sum/count expectations; measured
+process reads and major faults are zero. The primary baseline spends 97% of sampled
+cycles in three Rosti hash/update loops. Fusion reduces instructions/input 224 ->55,
+cycles 38 ->12 and retired ops 199 ->44. Controller reads fall 11.76 ->8.18 GB/query,
+while throughput rises 25.7 ->55.7 GB/s, near the measured 58.4 GB/s read ceiling.
+The unique input is 8 GB: its optimistic streaming floor is 137 ms. This explains
+both the multi-aggregate gain and the smaller single-SUM gain; these controls are
+now close to the local read roof. No cross-machine or ClickBench-wide claim.
+Evidence: `/tmp/query-type-coverage-20261029/vector-integers` and the isolated typed
+fixture's complete responses. Existing stock configuration and binaries unchanged.

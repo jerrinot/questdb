@@ -11202,9 +11202,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                         throw e;
                     }
 
-                    return generateFill(
-                            model,
-                            new GroupByRecordCursorFactory(
+                    GroupByRecordCursorFactory vectorFactory = new GroupByRecordCursorFactory(
                                     executionContext.getCairoEngine(),
                                     configuration,
                                     factory,
@@ -11215,9 +11213,10 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                     tempKeyIndexesInBase.getQuick(0),
                                     tempKeyIndex.getQuick(0),
                                     tempSymbolSkewIndexes
-                            ),
-                            executionContext
-                    );
+                            );
+                    factory = vectorFactory;
+                    vectorFactory.compile(executionContext.getQueryCodeGenerator());
+                    return generateFill(model, vectorFactory, executionContext);
                 }
 
                 // Free the vector aggregate functions since we didn't use them.

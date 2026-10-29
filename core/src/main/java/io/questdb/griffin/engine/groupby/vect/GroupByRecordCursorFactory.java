@@ -101,6 +101,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
     private final WorkStealingStrategy workStealingStrategy;
     private final int workerCount;
     private RecordCursorFactory base;
+    private CompiledVectorAggregate compiled;
+    private boolean compiledActive;
     private ObjList<PageFrameMemoryPool> frameMemoryPools; // per worker pools
     private long[] pRosti;
     private ObjList<RostiSharedCursor> sharedCursors;
@@ -212,6 +214,14 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         }
     }
 
+    public void compile(io.questdb.griffin.engine.QueryCodeGenerator generator) {
+        if (generator != null) {
+            compiled = generator.compileVectorAggregate(base.getMetadata(), keyColumnIndex, vafList, pRosti[0], workerCount);
+        }
+    }
+
+    public CompiledVectorAggregate getCompiledAggregate() { return compiled; }
+
     @Override
     public RecordCursorFactory getBaseFactory() {
         return base;
@@ -242,13 +252,21 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             vafList.getQuick(i).clear();
         }
         final PageFrameCursor pageFrameCursor = base.getPageFrameCursor(executionContext, ORDER_ASC);
-        return cursor.of(
+        try {
+            compiledActive = compiled != null && compiled.open(
+                    pageFrameCursor.getSymbolTable(keyColumnIndex).getSymbolCount(), executionContext.getMemoryTracker());
+            return cursor.of(
                 base.getMetadata(),
                 pageFrameCursor,
                 executionContext.getMessageBus(),
                 executionContext.getCircuitBreaker(),
                 executionContext.getMemoryTracker()
-        );
+            );
+        } catch (Throwable failure) {
+            Misc.free(pageFrameCursor);
+            if (compiled != null) compiled.clear();
+            throw failure;
+        }
     }
 
     @Override
@@ -287,6 +305,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         sink.type("GroupBy");
         sink.meta("vectorized").val(true);
         sink.meta("workers").val(workerCount);
+        if (compiled != null) sink.meta("compiledSymbolArray").val(compiled.getName());
         sink.attr("keys").val("[").putBaseColumnName(keyColumnIndex).val("]");
         sink.optAttr("values", vafList, true);
         sink.child(base);
@@ -393,6 +412,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
 
         Throwable failure = Misc.freeObjListAndKeepObjectsBestEffort(null, frameMemoryPools);
         failure = Misc.freeObjListBestEffort(failure, vafList);
+        failure = Misc.freeBestEffort(failure, compiled);
+        compiled = null;
         if (pRosti != null) {
             for (int i = 0, n = pRosti.length; i < n; i++) {
                 final long pointer = pRosti[i];
@@ -458,6 +479,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             Misc.free(frameAddressCache);
             frameCursor = Misc.free(frameCursor);
             raf.reset(pRostiBig, ROSTI_MINIMIZED_SIZE);
+            if (compiled != null) compiled.clear();
         }
 
         @Override
@@ -614,7 +636,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 dispatch:
                 for (int frameIndex = 0; frameIndex < frameCount; frameIndex++) {
                     final long frameRowCount = frameAddressCache.getFrameSize(frameIndex);
-                    for (int vafIndex = 0; vafIndex < vafCount; vafIndex++) {
+                    for (int vafIndex = 0; vafIndex < (compiledActive ? 1 : vafCount); vafIndex++) {
                         final VectorAggregateFunction vaf = vafList.getQuick(vafIndex);
                         // when column index = -1 we assume that vector function does not have value
                         // argument, and it can only derive count via memory size
@@ -634,7 +656,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                                     raf,
                                     vaf,
                                     perWorkerLocks,
-                                    circuitBreaker
+                                    circuitBreaker,
+                                    compiledActive ? compiled : null
                             );
                             ownCount++;
                             total++;
@@ -662,7 +685,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                                             raf,
                                             vaf,
                                             perWorkerLocks,
-                                            circuitBreaker
+                                            circuitBreaker,
+                                            compiledActive ? compiled : null
                                     );
                                     ownCount++;
                                     total++;
@@ -690,7 +714,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                                         raf,
                                         perWorkerLocks,
                                         sharedCircuitBreaker,
-                                        progressState
+                                        progressState,
+                                        compiledActive ? compiled : null
                                 );
                                 queue.get(cursor).of(entry);
                                 pubSeq.done(cursor);
@@ -748,6 +773,17 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 // rather than return a partial aggregate.
                 circuitBreaker.statefulThrowExceptionIfTrippedNoThrottleOrYield();
                 throw CairoException.queryCancelled();
+            }
+
+            if (compiledActive) {
+                long oldSize = Rosti.getAllocMemory(pRosti[0]);
+                try {
+                    if (!compiled.mergeAndExport(pRosti[0], circuitBreaker)) {
+                        throw CairoException.nonCritical().put("could not export symbol array").setOutOfMemory(true);
+                    }
+                } finally {
+                    raf.updateMemoryUsage(pRosti[0], oldSize);
+                }
             }
 
             // merge maps only when cursor was fetched successfully

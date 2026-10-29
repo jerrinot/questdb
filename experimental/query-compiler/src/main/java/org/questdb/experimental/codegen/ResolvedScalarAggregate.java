@@ -63,9 +63,10 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
         long base = layout.getAddress(0);
         var updates = AggregateUpdates.bind(inputs, values, functions, index -> layout.getAddress(index) - base, false);
         if (updates == null) return null;
-        // Only single-slot, nonallocating aggregates can use this register reduction.
+        // Promote only the known fixed-width states; allocating aggregates need an allocator-aware path.
         for (var update : updates.updates()) {
-            if (!(update instanceof AggregateUpdates.ScalarUpdate || update instanceof AggregateUpdates.IntegerExtremum)) return null;
+            if (!(update instanceof AggregateUpdates.ScalarUpdate || update instanceof AggregateUpdates.IntegerExtremum
+                    || update instanceof AggregateUpdates.AverageUpdate)) return null;
         }
         CompiledKernel code = backend.compile(scan(updates), artifacts);
         try {
@@ -79,8 +80,11 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
     private static List<Load> stateLoads(AggregateUpdates updates, Expr base) {
         var result = new ArrayList<Load>();
         for (var update : updates.updates()) {
-            var width = update instanceof AggregateUpdates.IntegerExtremum extrema ? extrema.width() : MemoryType.I64;
+            var width = update instanceof AggregateUpdates.IntegerExtremum extrema ? extrema.width()
+                    : update instanceof AggregateUpdates.AverageUpdate average ? average.sumType() : MemoryType.I64;
             result.add(new Load(width, at(base, update.offset())));
+            if (update instanceof AggregateUpdates.AverageUpdate average)
+                result.add(new Load(MemoryType.I64, at(base, average.countOffset())));
         }
         return result;
     }
@@ -138,6 +142,7 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
             case Load load -> register(registers, load);
             case Binary binary -> new Binary(binary.op(), promote(binary.left(), registers), promote(binary.right(), registers));
             case Select select -> new Select(promote(select.condition(), registers), promote(select.yes(), registers), promote(select.no(), registers));
+            case ToDouble cast -> new ToDouble(promote(cast.value(), registers));
             default -> throw new IllegalArgumentException("Unsupported scalar aggregate expression: " + expression);
         };
     }

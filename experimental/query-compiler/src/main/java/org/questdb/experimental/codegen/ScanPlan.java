@@ -32,17 +32,24 @@ import java.util.Map;
 import static org.questdb.experimental.codegen.Pipeline.*;
 
 /** Typed scan/filter/project stage, before row access and execution strategy are chosen. */
-record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, List<Scalar> bindings) {
+record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, List<Scalar> bindings, List<Parameter> parameters) {
     // Bounds expression duplication during projection substitution, independent of data.
     static final int MAX_FUSED_EXPRESSION_NODES = 256;
 
+    ScanPlan(List<Column> input, Predicate predicate, List<Column> output, List<Scalar> bindings) {
+        this(input, predicate, output, bindings, List.of());
+    }
+
     ScanPlan {
         input = List.copyOf(input); output = List.copyOf(output); bindings = List.copyOf(bindings);
+        parameters = List.copyOf(parameters);
+        for (int i = 0; i < parameters.size(); i++)
+            if (parameters.get(i).index() != i) throw new IllegalArgumentException("Parameter order mismatch");
         if (output.size() != bindings.size()) throw new IllegalArgumentException("Binding arity mismatch");
         // Validate all references, including currently unused projected expressions.
         var checked = new IdentityHashMap<Scalar, Boolean>();
-        validate(predicate, input, checked);
-        for (Scalar expression : bindings) validate(expression, input, checked);
+        validate(predicate, input, parameters, checked);
+        for (Scalar expression : bindings) validate(expression, input, parameters, checked);
     }
     static ScanPlan of(List<Column> columns, Predicate filter) {
         return new ScanPlan(columns, filter, columns, new ArrayList<Scalar>(columns));
@@ -55,13 +62,13 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
                 if (child == null) yield null;
                 Predicate next = rewrite(filter.predicate(), child.output, child.bindings);
                 Predicate combined = child.predicate instanceof All ? next : new And(child.predicate, next);
-                yield fits(combined, child.bindings) ? new ScanPlan(child.input, combined, child.output, child.bindings) : null;
+                yield fits(combined, child.bindings) ? new ScanPlan(child.input, combined, child.output, child.bindings, child.parameters) : null;
             }
             case PhysicalPlan.Project project -> {
                 ScanPlan child = from(project.input());
                 if (child == null) yield null;
                 var expressions = project.expressions().stream().map(e -> rewrite(e, child.output, child.bindings)).toList();
-                yield fits(child.predicate, expressions) ? new ScanPlan(child.input, child.predicate, project.columns(), expressions) : null;
+                yield fits(child.predicate, expressions) ? new ScanPlan(child.input, child.predicate, project.columns(), expressions, child.parameters) : null;
             }
             default -> null;
         };
@@ -99,27 +106,28 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case And a -> Math.min(MAX_FUSED_EXPRESSION_NODES + 1, 1 + cost(a.left(), memo) + cost(a.right(), memo));
         };
     }
-    private static void validate(Scalar s, List<Column> schema, Map<Scalar, Boolean> checked) {
+    private static void validate(Scalar s, List<Column> schema, List<Parameter> parameters, Map<Scalar, Boolean> checked) {
         if (checked.put(s, true) != null) return;
         switch (s) {
             case Column c -> { if (c.index() >= schema.size() || !c.equals(schema.get(c.index()))) throw new IllegalArgumentException("Foreign column: " + c); }
-            case Add a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
-            case Multiply a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
-            case IPv4Subtract a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
-            case Subtract a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
-            case TimestampPart a -> validate(a.argument(), schema, checked);
+            case Add a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
+            case Multiply a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
+            case IPv4Subtract a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
+            case Subtract a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
+            case TimestampPart a -> validate(a.argument(), schema, parameters, checked);
+            case Parameter p -> { if (p.index() >= parameters.size() || !p.equals(parameters.get(p.index()))) throw new IllegalArgumentException("Foreign parameter: " + p); }
             case Constant ignored -> { }
         }
     }
-    private static void validate(Predicate p, List<Column> schema, Map<Scalar, Boolean> checked) {
+    private static void validate(Predicate p, List<Column> schema, List<Parameter> parameters, Map<Scalar, Boolean> checked) {
         switch (p) {
             case All ignored -> { }
-            case Compare c -> { validate(c.left(), schema, checked); validate(c.right(), schema, checked); }
-            case SqlCompare c -> { validate(c.left(), schema, checked); validate(c.right(), schema, checked); }
-            case IsNotNull n -> validate(n.value(), schema, checked);
-            case Not n -> validate(n.value(), schema, checked);
-            case Or a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
-            case And a -> { validate(a.left(), schema, checked); validate(a.right(), schema, checked); }
+            case Compare c -> { validate(c.left(), schema, parameters, checked); validate(c.right(), schema, parameters, checked); }
+            case SqlCompare c -> { validate(c.left(), schema, parameters, checked); validate(c.right(), schema, parameters, checked); }
+            case IsNotNull n -> validate(n.value(), schema, parameters, checked);
+            case Not n -> validate(n.value(), schema, parameters, checked);
+            case Or a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
+            case And a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
         }
     }
 
@@ -130,6 +138,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
                 yield bindings.get(c.index());
             }
             case Constant c -> c;
+            case Parameter p -> p;
             case TimestampPart a -> new TimestampPart(rewrite(a.argument(), schema, bindings), a.unitTicks(), a.period());
             case Add a -> new Add(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
             case Multiply a -> new Multiply(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
@@ -157,6 +166,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case IPv4Subtract a -> { collect(a.left(), used); collect(a.right(), used); }
             case Subtract a -> { collect(a.left(), used); collect(a.right(), used); }
             case Constant ignored -> { }
+            case Parameter ignored -> { }
         }
     }
     private static void collect(Predicate p, BitSet used) {

@@ -38,6 +38,7 @@ import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.StatefulAtom;
 import io.questdb.cairo.sql.SymbolTableSource;
+import io.questdb.cairo.sql.async.UnorderedPageFrameSequence;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.Plannable;
@@ -250,6 +251,7 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
     @Override
     public void clear() {
         shardingCtx.clear();
+        if (compiledAggregates != null) compiledAggregates.clearGroupLimit();
         Misc.clearObjList(ownerGroupByFunctions);
         if (perWorkerGroupByFunctions != null) {
             for (int i = 0, n = perWorkerGroupByFunctions.size(); i < n; i++) {
@@ -419,6 +421,18 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
 
     public boolean prepareRowLimit() {
         return compiledAggregates != null && compiledAggregates.prepareRowLimit();
+    }
+
+    public boolean prepareGroupLimit(long requiredGroups) {
+        // Compiled predicates are total and side-effect free; discovery may evaluate them again.
+        return compiledAggregates != null && (filterCtx.getFilter(-1) == null || compiledAggregates.hasCompiledFilter())
+                && compiledAggregates.prepareGroupLimit(requiredGroups);
+    }
+
+    public boolean limitGroups(long requiredGroups, UnorderedPageFrameSequence<?> frames,
+                               SqlExecutionCircuitBreaker circuitBreaker) {
+        return compiledAggregates != null && compiledAggregates.limitGroups(requiredGroups, frames,
+                filterCtx.getOwnerMemoryPool(), filterCtx.getFilter(-1), circuitBreaker);
     }
 
     public boolean prepareLongSort(Function function) {

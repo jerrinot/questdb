@@ -46,7 +46,7 @@ final class ResolvedStandaloneFilter {
                                                         Backend backend, Path artifacts) throws IOException {
         var binding = ResolvedFilter.bind(types, function);
         if (binding == null) return null;
-        boolean descriptors = binding.varcharColumns().length != 0;
+        boolean descriptors = binding.varcharColumns().length != 0 || !binding.parameters().isEmpty();
         CompiledKernel rows = backend.compile(descriptors
                 ? ScanLowering.selection(binding.plan(), binding.residual(), false)
                 : ScanLowering.selection(binding.plan(), binding.sourceIndexes(), false), artifacts);
@@ -158,7 +158,7 @@ final class ResolvedStandaloneFilter {
             return count;
         }
         @Override public long call(long data, long columnCount, long aux, long vars, long variableCount, long output, long rows) {
-            if (binding != null) throw new IllegalStateException("VARCHAR filtering requires frame metadata");
+            if (binding != null) throw new IllegalStateException("Descriptor-based filtering requires frame metadata");
             long count = code.run(data, rows, output);
             inputRows.add(rows);
             return count;
@@ -187,7 +187,7 @@ final class ResolvedStandaloneFilter {
             return count;
         }
         @Override public long call(long data, long columnCount, long aux, long vars, long variableCount, long rows) {
-            if (binding != null) throw new IllegalStateException("VARCHAR filtering requires frame metadata");
+            if (binding != null) throw new IllegalStateException("Descriptor-based filtering requires frame metadata");
             long count = code.run(data, rows, 0);
             inputRows.add(rows);
             return count;

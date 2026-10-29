@@ -79,10 +79,12 @@ class AsyncGroupByRecordCursor implements RecordCursor {
     private final VirtualRecord recordB;
     private final ObjList<Function> recordFunctions;
     private final ShardedMapCursor shardedCursor = new ShardedMapCursor();
+    private boolean areFramesPrepared;
     private SqlExecutionCircuitBreaker circuitBreaker;
     private UnorderedPageFrameSequence<AsyncGroupByAtom> frameSequence;
     private boolean isDataMapBuilt;
     private boolean isOpen;
+    private boolean isScanComplete;
     private MapRecordCursor mapCursor;
     private Map ownerMap;
     private ObjList<Map> shards;
@@ -158,10 +160,23 @@ class AsyncGroupByRecordCursor implements RecordCursor {
 
     @Override
     public boolean selectRows(io.questdb.std.DirectLongList rows, long skip, long take) {
-        buildMapConditionally();
+        if (skip < 0 || take < 0) {
+            throw new IllegalArgumentException("Positive LIMIT bounds required");
+        }
+        if (!isDataMapBuilt) {
+            long demand = take > Long.MAX_VALUE - skip ? Long.MAX_VALUE : skip + take;
+            buildMap(Math.max(1, demand));
+        }
         var updater = frameSequence.getAtom().getCompiledUpdater(-1);
         return updater != null && updater.selectRows(ownerMap, shards, rows, skip, take,
                 circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled);
+    }
+
+    @Override
+    public boolean limitGroups(long requiredGroups) {
+        if (isScanComplete || requiredGroups <= 0) return false;
+        prepareFrames();
+        return frameSequence.getAtom().limitGroups(requiredGroups, frameSequence, circuitBreaker);
     }
 
     @Override
@@ -221,22 +236,24 @@ class AsyncGroupByRecordCursor implements RecordCursor {
         }
     }
 
-    private void buildMap() {
-        // Consult the breaker before dispatching frames, so an empty base scan still observes cancellation.
-        circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottledOrYield();
-        frameSequence.prepareForDispatch();
-        frameSequence.getAtom().getFilterContext().initMemoryPools(frameSequence.getPageFrameAddressCache(), frameSequence.getMemoryTracker());
-        frameSequence.dispatchAndAwait();
-
+    private void buildMap(long requiredGroups) {
         final AsyncGroupByAtom atom = frameSequence.getAtom();
-
         final GroupByShardingContext shardingCtx = atom.getShardingContext();
-        shardingCtx.finishScan();
+        // An unordered consumer may need only a prefix of complete partitions. The
+        // scan still drains in full; its immutable partial states live until close().
+        circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottledOrYield();
+        if (!isScanComplete) {
+            prepareFrames();
+            frameSequence.dispatchAndAwait();
+            shardingCtx.finishScan();
+            isScanComplete = true;
+        }
         if (!atom.isSharded()) {
             // No sharding was necessary, so the maps are small, and we merge them ourselves.
             ownerMap = shardingCtx.mergeOwnerMap(circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
             mapCursor = ownerMap.getCursor();
             shards = null;
+            isDataMapBuilt = true;
         } else {
             // We had to shard the maps, so they must be big.
             shards = shardingCtx.mergeShards(
@@ -245,7 +262,8 @@ class AsyncGroupByRecordCursor implements RecordCursor {
                     circuitBreaker,
                     postAggregationCircuitBreaker,
                     postAggregationDoneLatch,
-                    postAggregationStartedCounter
+                    postAggregationStartedCounter,
+                    requiredGroups
             );
             if (postAggregationCircuitBreaker.checkIfTrippedOrYield()) {
                 throwPostAggregationException();
@@ -254,11 +272,11 @@ class AsyncGroupByRecordCursor implements RecordCursor {
             shardedCursor.of(shards);
             mapCursor = shardedCursor;
             ownerMap = null;
+            isDataMapBuilt = shardingCtx.isMergeComplete();
         }
 
         recordA.of(mapCursor.getRecord());
         recordB.of(mapCursor.getRecordB());
-        isDataMapBuilt = true;
     }
 
     private void parallelLongTopK(DirectLongLongSortedList destList, Function longFunc) {
@@ -406,7 +424,16 @@ class AsyncGroupByRecordCursor implements RecordCursor {
 
     void buildMapConditionally() {
         if (!isDataMapBuilt) {
-            buildMap();
+            buildMap(Long.MAX_VALUE);
+        }
+    }
+
+    private void prepareFrames() {
+        if (!areFramesPrepared) {
+            frameSequence.prepareForDispatch();
+            frameSequence.getAtom().getFilterContext().initMemoryPools(
+                    frameSequence.getPageFrameAddressCache(), frameSequence.getMemoryTracker());
+            areFramesPrepared = true;
         }
     }
 
@@ -468,5 +495,7 @@ class AsyncGroupByRecordCursor implements RecordCursor {
         // per-function classification scan.
         Function.init(nonGroupByFunctions, frameSequence.getSymbolTableSource(), executionContext, null);
         isDataMapBuilt = false;
+        isScanComplete = false;
+        areFramesPrepared = false;
     }
 }

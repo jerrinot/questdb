@@ -435,7 +435,7 @@ public class ResolvedSqlAggregateTest {
                 + "case when x%97=0 then null else x end v,"
                 + "case when x%101=0 then null else x%400003 end d,cast(x%311 as short) s "
                 + "from long_sequence(2000000))", context);
-        assertMatches("select k,count_distinct(v),count_distinct(d),sum(v),avg(s) from unions where k>=0 group by k", true);
+        assertMatches("select k,count_distinct(v),count_distinct(d),count_distinct(g),sum(v),avg(s) from unions where k>=0 group by k", true);
         assertMatches("select k,count_distinct(v),sum(v) from unions where k=0 group by k", true);
         assertTrue("Parallel union was not exercised", compiler.parallelUnionTasks.get() > 0);
         assertTrue("Parallel initialization was not exercised", compiler.parallelZeroTasks.get() > 0);
@@ -1075,11 +1075,11 @@ public class ResolvedSqlAggregateTest {
         assertScalarMatches("select min(v),sum(w),count(v),min(s) from t where k<0", true);
         engine.execute("create table empty_scalar (v long,w int,s short)", context);
         assertScalarMatches("select min(v+1),max(w-1),sum(s),count() from empty_scalar where v>0", true);
+        assertScalarMatches("select avg(v) from t where k>=0", true);
         // Existing vector and metadata specializations retain priority, and unsupported functions decline.
         assertScalarMatches("select min(v),max(w),sum(s) from t", false);
         assertScalarMatches("select sum(v+1) from t", false);
         assertScalarMatches("select count() from t", false);
-        assertScalarMatches("select avg(v) from t where k>=0", false);
         assertTrue(compiler.scalarRows.get() > rows);
     }
 

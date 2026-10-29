@@ -112,7 +112,7 @@ public class ResolvedSqlJoinTest {
     @Test
     public void serialAndPartitionedBuildsUseNativeUpdatesAndOrdinaryCursor() throws Exception {
         long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
-        String aggregates = "select count(),count(p.v),sum(p.v),sum(p.w),sum(p.s) from p join d on p.k=d.k";
+        String aggregates = "select count(),count(p.v),sum(p.v),sum(p.w),sum(p.s),avg(p.v),avg(p.w),avg(p.s) from p join d on p.k=d.k";
         for (long threshold : new long[]{Long.MAX_VALUE, 1}) {
             buildThreshold = threshold;
             matches(aggregates, true);
@@ -181,7 +181,7 @@ public class ResolvedSqlJoinTest {
         for (int threshold : new int[]{Integer.MAX_VALUE, 4}) {
             shardThreshold = threshold;
             buildThreshold = threshold == 4 ? 1 : Long.MAX_VALUE;
-            matches("select p.k,count(),sum(d.v),sum(p.v) from p join d on p.k=d.k group by p.k", true, 1);
+            matches("select p.k,count(),sum(d.v),sum(p.v),avg(d.v),avg(p.w) from p join d on p.k=d.k group by p.k", true, 1);
             matches("select p.k,count(),min(p.w),max(d.v),min(p.v),max(p.w) from p join d on p.k=d.k group by p.k", true, 1);
             matches("select count(),min(p.w),max(d.v),min(p.v),max(p.w) from p join d on p.k=d.k", true);
             matches("select d.v,count(),sum(p.v) from p join d on p.k=d.k group by d.v", true, 1);

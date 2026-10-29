@@ -59,7 +59,8 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
         long right = hiFunction == null ? 0 : hiFunction.isConstant() ? hiFunction.getLong(null) : -1;
         compiled = left >= 0 && right >= 0 && Math.abs(left - right) <= MAX_COMPILED_ROWS
                 && base.recordCursorSupportsRandomAccess() && base.prepareRowLimit();
-        this.cursor = new LimitRecordCursor(loFunction, hiFunction, argPos, compiled);
+        this.cursor = new LimitRecordCursor(loFunction, hiFunction, argPos, compiled,
+                compiled && base.prepareGroupLimit(Math.max(left, right)));
     }
 
     @Override
@@ -125,6 +126,7 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
     public void toPlan(PlanSink sink) {
         sink.type("Limit");
         if (compiled) sink.attr("compiledSelection").val(true);
+        if (cursor.groupAdmission) sink.attr("groupAdmission").val(true);
         Function leftFunc = cursor.leftFunction;
         Function rightFunc = cursor.rightFunction;
         boolean isCursorOpen = cursor.base != null;
@@ -190,6 +192,7 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
     private static class LimitRecordCursor implements RecordCursor {
         private final int argPos;
         private final io.questdb.std.DirectLongList compiledRows;
+        private final boolean groupAdmission;
         private boolean selected;
         private long selectedPosition;
         private final RecordCursor.Counter counter = new Counter();
@@ -205,7 +208,8 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
         private long remaining;
         private long size;
 
-        public LimitRecordCursor(Function leftFunction, Function rightFunction, int argPos, boolean compiled) {
+        public LimitRecordCursor(Function leftFunction, Function rightFunction, int argPos, boolean compiled, boolean groupAdmission) {
+            this.groupAdmission = groupAdmission;
             compiledRows = compiled ? new io.questdb.std.DirectLongList(0, io.questdb.std.MemoryTag.NATIVE_RECORD_CHAIN, true) : null;
             this.leftFunction = leftFunction;
             this.rightFunction = rightFunction;
@@ -341,6 +345,9 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
             if (compiledRows != null) {
                 if (!selected) {
                     compiledRows.clear();
+                    if (groupAdmission && baseRowsToTake > 0) {
+                        base.limitGroups(baseRowsToSkip + baseRowsToTake);
+                    }
                     if (baseRowsToTake > 0 && !base.selectRows(compiledRows, baseRowsToSkip, baseRowsToTake)) {
                         throw new IllegalStateException("Prepared native LIMIT declined selection");
                     }

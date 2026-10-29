@@ -1,5 +1,10 @@
 # Compiler experiment plan: own the parallel program
 
+Current instruction (2026-10-29): expand SYMBOL and INT/LONG/DOUBLE coverage,
+then VARCHAR, then pursue another measured architectural experiment. Profiling
+has resumed. The older checkpoint and pause statements below describe their
+original dates; current work is tracked in TODO.md and PROGRESS.md.
+
 Updated 2026-10-28 against committed checkpoint `9df4de643d`. The immediate work
 is the maintainability sequence below, before further operator expansion. E0 has
 500M-row measurements, and E1's first adaptive partial-record representation and

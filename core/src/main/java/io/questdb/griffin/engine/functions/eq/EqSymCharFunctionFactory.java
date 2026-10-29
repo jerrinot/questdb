@@ -80,7 +80,7 @@ public class EqSymCharFunctionFactory implements FunctionFactory {
         return new Func(symFunc, chrFunc);
     }
 
-    private static class ConstCheckColumnFunc extends NegatableBooleanFunction implements UnaryFunction {
+    public static class ConstCheckColumnFunc extends NegatableBooleanFunction implements UnaryFunction {
         private final SymbolFunction arg;
         private final char constant;
         private int valueIndex;
@@ -98,6 +98,10 @@ public class EqSymCharFunctionFactory implements FunctionFactory {
         @Override
         public boolean getBool(Record rec) {
             return negated != (arg.getInt(rec) == valueIndex);
+        }
+
+        public int getValueIndex() {
+            return valueIndex;
         }
 
         @Override

@@ -93,6 +93,14 @@ public class GroupByIntHashSet {
         return ptr != 0 ? Unsafe.getInt(ptr) : 0;
     }
 
+    public int getInitialCapacity() {
+        return initialCapacity;
+    }
+
+    public double getLoadFactor() {
+        return loadFactor;
+    }
+
     public int keyAt(long index) {
         return Unsafe.getInt(ptr + HEADER_SIZE + 4L * index);
     }

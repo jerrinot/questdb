@@ -31,11 +31,14 @@ import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.griffin.engine.functions.bool.AndFunctionFactory;
 import io.questdb.griffin.engine.functions.bool.InLongFunctionFactory;
+import io.questdb.griffin.engine.functions.bool.InSymbolFunctionFactory;
 import io.questdb.griffin.engine.functions.bool.OrFunctionFactory;
 import io.questdb.griffin.engine.functions.bool.NotFunctionFactory;
 import io.questdb.griffin.engine.functions.eq.EqIntFunctionFactory;
 import io.questdb.griffin.engine.functions.eq.EqDoubleFunctionFactory;
 import io.questdb.griffin.engine.functions.eq.EqSymLongFunctionFactory;
+import io.questdb.griffin.engine.functions.eq.EqSymCharFunctionFactory;
+import io.questdb.griffin.engine.functions.eq.EqSymStrFunctionFactory;
 import io.questdb.griffin.engine.functions.eq.EqIntStrCFunctionFactory;
 import io.questdb.griffin.engine.functions.eq.EqLongFunctionFactory;
 import io.questdb.griffin.engine.functions.constants.*;
@@ -60,9 +63,11 @@ import io.questdb.griffin.engine.functions.date.SecondOfMinuteFunctionFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.IntSupplier;
 
 /** Compiler-time bindings shared by resolved predicates and aggregate arguments. */
 final class ResolvedInputs {
+    private final List<IntSupplier> parameters;
     private final ColumnTypes types;
     private final int columnOffset;
     private final ArrayList<Pipeline.Column> columns = new ArrayList<>();
@@ -73,8 +78,17 @@ final class ResolvedInputs {
     }
 
     ResolvedInputs(ColumnTypes types, int columnOffset) {
+        this(types, columnOffset, null);
+    }
+
+    ResolvedInputs(ColumnTypes types, List<IntSupplier> parameters) {
+        this(types, 0, parameters);
+    }
+
+    private ResolvedInputs(ColumnTypes types, int columnOffset, List<IntSupplier> parameters) {
         this.types = types;
         this.columnOffset = columnOffset;
+        this.parameters = parameters;
     }
 
     ColumnTypes types() { return types; }
@@ -178,6 +192,36 @@ final class ResolvedInputs {
             var value = predicate(((NotFunctionFactory.Func) function).getArg(), depth + 1);
             return value == null ? null : new Pipeline.Not(value);
         }
+        if (parameters != null) {
+            IntSupplier key = null;
+            if (implementation == EqSymStrFunctionFactory.ConstCheckColumnFunc.class)
+                key = ((EqSymStrFunctionFactory.ConstCheckColumnFunc) function)::getValueIndex;
+            else if (implementation == EqSymStrFunctionFactory.ConstSymIntCheckFunc.class)
+                key = ((EqSymStrFunctionFactory.ConstSymIntCheckFunc) function)::getValueIndex;
+            else if (implementation == EqSymCharFunctionFactory.ConstCheckColumnFunc.class)
+                key = ((EqSymCharFunctionFactory.ConstCheckColumnFunc) function)::getValueIndex;
+            if (key != null) {
+                var value = column(((UnaryFunction) function).getArg(), ColumnType.SYMBOL);
+                if (value == null) return null;
+                return new Pipeline.SqlCompare(((NegatableBooleanFunction) function).isNegated() ? Ir.Op.NE : Ir.Op.EQ,
+                        value, parameter(key));
+            }
+            if (implementation == InSymbolFunctionFactory.Func.class) {
+                var set = (InSymbolFunctionFactory.Func) function;
+                int size = set.getValueCount();
+                // Same bound as integer IN: retain the existing hash lookup for larger sets.
+                if (size > 16) return null;
+                var value = column(set.getArg(), ColumnType.SYMBOL);
+                if (value == null) return null;
+                Pipeline.Predicate member = null;
+                for (int i = 0; i < size; i++) {
+                    int index = i;
+                    var equal = new Pipeline.SqlCompare(Ir.Op.EQ, value, parameter(() -> set.getValueIndex(index)));
+                    member = member == null ? equal : new Pipeline.Or(member, equal);
+                }
+                return member == null ? new Pipeline.Not(new Pipeline.All()) : member;
+            }
+        }
         int type;
         boolean equality;
         if (implementation == io.questdb.griffin.engine.functions.eq.EqSymStrFunctionFactory.NullCheckFunc.class) {
@@ -242,6 +286,12 @@ final class ResolvedInputs {
         return new Pipeline.SqlCompare(equality ? (negated ? Ir.Op.NE : Ir.Op.EQ) : (negated ? Ir.Op.GE : Ir.Op.LT), left, right);
     }
 
+    private Pipeline.Parameter parameter(IntSupplier key) {
+        var parameter = new Pipeline.Parameter(parameters.size(), ColumnType.SYMBOL);
+        parameters.add(key);
+        return parameter;
+    }
+
     private Pipeline.Predicate conjunction(int depth, Function... functions) {
         Pipeline.Predicate result = null;
         for (Function function : functions) {
@@ -264,6 +314,10 @@ final class ResolvedInputs {
             return new Pipeline.Constant(readType == ColumnType.BYTE || readType == ColumnType.SHORT ? 0 : Long.MIN_VALUE);
         }
         int type = function.getType();
+        if (type == ColumnType.SYMBOL && readType == ColumnType.SYMBOL) {
+            // Only direct static dictionaries have stable IDs shared by frame and merge paths.
+            return column(function, readType);
+        }
         if (type == ColumnType.IPv4 && readType == ColumnType.IPv4) {
             if (implementation == io.questdb.griffin.engine.functions.columns.IPv4Column.class)
                 return column(((io.questdb.griffin.engine.functions.columns.IPv4Column) function).getColumnIndex(), type);

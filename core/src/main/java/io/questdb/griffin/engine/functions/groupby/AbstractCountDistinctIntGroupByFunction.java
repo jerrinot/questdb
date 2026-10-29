@@ -105,6 +105,14 @@ public abstract class AbstractCountDistinctIntGroupByFunction extends LongFuncti
         return GroupByFunction.SAMPLE_BY_FILL_ALL;
     }
 
+    public int getSetInitialCapacity() {
+        return setA.getInitialCapacity();
+    }
+
+    public double getSetLoadFactor() {
+        return setA.getLoadFactor();
+    }
+
     @Override
     public int getValueIndex() {
         return valueIndex;
@@ -132,6 +140,12 @@ public abstract class AbstractCountDistinctIntGroupByFunction extends LongFuncti
     @Override
     public boolean isThreadSafe() {
         return false;
+    }
+
+    @Override
+    public boolean isReadThreadSafe() {
+        // The finalized getter reads only the count, never the mutable set flyweights.
+        return true;
     }
 
     @Override

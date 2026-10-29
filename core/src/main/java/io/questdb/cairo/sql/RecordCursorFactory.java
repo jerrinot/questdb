@@ -412,6 +412,9 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
     /** Optional bounded selection over finalized native state; preserves ordinary cursor order. */
     default boolean prepareRowLimit() { return false; }
 
+    /** Prepare optional group admission for an exclusive, unordered positive LIMIT consumer. */
+    default boolean prepareGroupLimit(long requiredGroups) { return false; }
+
     /** Prepare selection from borrowed sorted (value, row ID) pairs. */
     default boolean prepareSortedRowLimit() { return false; }
 

@@ -40,6 +40,12 @@ import org.jetbrains.annotations.Nullable;
 
 /** Optional compilation of resolved operators. Core has no dependency on a backend. */
 public interface QueryCodeGenerator {
+    /** Borrows resolved vector functions and their initialized Rosti layout during binding. */
+    default @Nullable io.questdb.griffin.engine.groupby.vect.CompiledVectorAggregate compileVectorAggregate(
+            io.questdb.cairo.sql.RecordMetadata inputs, int keyColumn,
+            ObjList<io.questdb.griffin.engine.groupby.vect.VectorAggregateFunction> functions,
+            long rosti, int workerCount) { return null; }
+
     /** Borrows resolved functions and the actual unkeyed state layout during compilation only. */
     default @Nullable CompiledScalarAggregate compileScalarAggregate(ColumnTypes inputs, ColumnTypes values,
             ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue layout) { return null; }

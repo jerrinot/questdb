@@ -1,5 +1,31 @@
 # Deferred aggregation performance work
 
+Active 2026-10-29: autonomous type expansion through 2026-10-30 05:57 UTC.
+Controlled profiling is authorized. Work one gap at a time, preserving ordinary
+function/state contracts and exact results before measuring 500M-row controls.
+
+- [x] Static SYMBOL literal equality and bounded IN, including initialized runtime values.
+- [x] Static SYMBOL COUNT in keyed and unkeyed generated aggregates.
+- [x] Keyed SYMBOL/INT DISTINCT using the ordinary integer-set ABI; retain static-dictionary scope.
+  Scalar DISTINCT and parallel deferred INT-set union remain separate gaps.
+- [x] Ordinary INT/LONG AVG and scalar SHORT/INT/LONG AVG, including join consumers.
+- [x] Add SUM(LONG), AVG(INT) and 128-bit AVG(LONG) to the existing SYMBOL array path.
+- [ ] Add DOUBLE scan/filter and aggregate lifecycles.
+- [ ] Correct ordinary Rosti `keyedIntSumIntMerge`: `vec_int_key_agg.cpp` reads
+  the source LONG sum through `jint*`, truncating large INT sums before merge.
+  The 2026-10-29 extreme-value SYMBOL test reproduces partition-dependent AVG(INT)
+  answers. Generated arrays retain full LONG sums; compare that case against
+  ordinary scalar SQL. Fix and validate the native stock path separately.
+- [ ] Revisit scalar filter selection-vector traffic: generated AVG cuts instructions
+  by more than half but improves only about 5% at eight cores; controller traffic
+  stays about 16 GB/query. Test fused selection/reduction before changing policy.
+- [ ] Extend VARCHAR aggregate/expression coverage after those fixed-width types.
+- [ ] Select the next moonshot from measured residual cost, study primary research,
+  and test a general reduction in state, data movement or dependent accesses.
+  Keep hardware budgets discovered, snapshots/query ownership intact, and complete
+  compilation/build/merge/output costs visible. Do not turn this host's winner into
+  a universal policy.
+
 Recorded 2026-10-26. Continue compiler coverage first; this is a later experiment,
 not a change to execution defaults.
 
@@ -318,3 +344,72 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
   this schedule, including cross-cache placement, skew and other architectures.
   Earlier accepted profiles and one/four-core checks are encouraging; subsequent
   contaminated/interrupted desktop runs are excluded. No new coverage claim.
+
+## 2026-10-29: vector MAX(SHORT) with all-negative groups
+
+- [ ] Fix `kIntMaxShort` in `core/src/main/c/share/vec_int_key_agg.cpp`:
+  when another aggregate already created the group, the initial LONG_NULL
+  accumulator is narrowed to SHORT zero before MAX. An all-negative group
+  can therefore return zero. `kIntMinShort` already checks the sentinel.
+  Reproduced with SYMBOL grouping and MIN/AVG/MAX over negative SHORT values;
+  scalar SQL and the generated array agree on the negative maximum. Keep this
+  separate from the symbol-array performance experiment and add a focused
+  native/vector regression when fixing it.
+
+## 2026-10-29: unordered group admission
+
+- [x] Replace the successful constant-key experiment with a runtime key set;
+  reuse generated predicate/selection and aggregate-update lowering. Measure
+  discovery, parameter publication, scan, merge, output and cleanup together.
+  No recompilation when the selected values change. See PROGRESS.md for the
+  measured upper bound and the independent 500M-row controls.
+- [x] Discover keys from the existing prepared page-frame sequence and reader
+  snapshot before dispatch, with bounded work and cancellation. Publish one
+  immutable selection to every worker. If discovery cannot supply enough keys,
+  use the existing complete aggregation without discarding contributions.
+  A numeric grouping-key subset is a cheap prefilter, not a bound on the number
+  of composite groups; skew needs exact full-key membership or a measured decline.
+- [x] Admit only an explicit nonnegative SQL LIMIT/OFFSET consuming the aggregate
+  exclusively, through cardinality-preserving projections. Reject ORDER BY,
+  HAVING, output DISTINCT, windows, shared consumers and negative limits. Existing
+  `prepareRowLimit`/`selectRows` only promises selection: callers can subsequently
+  request the full cursor or exact size. Do not silently weaken that contract.
+- [x] Validate cross-worker contributions, NULL/composite keys, selective input
+  filters, changing snapshots/parameters, insufficient discovery, hot prefixes,
+  offsets and cancellation/reopen. Add only focused contract tests; extend the
+  existing maps, allocator and scheduler rather than introducing parallel owners.
+
+The runtime implementation and 500M-row controls are in the 2026-10-29 PROGRESS
+entry below the upper-bound experiment. It samples 64 small blocks across the
+same snapshot, caps required groups at 16, and declines unselective samples and
+mixed/Parquet input. No new configuration switch.
+
+- [ ] Exact full-key admission for high composite fanout, if measurements justify
+  it. A selected numeric prefix can still contain arbitrarily many full groups;
+  the existing partition allocator remains responsible for those states.
+  Finite sampling can also miss a hostile distribution. Current admission stays
+  correct but can add an unprofitable membership pass. Do not claim a hard state
+  bound or a universal no-regression guarantee.
+
+## 2026-10-29: SYMBOL predicate coverage
+
+- [x] Bind static SYMBOL literal equality/inequality and bounded IN/NOT IN through
+  the existing functions' initialized IDs. Keep dictionary lookup and bind-value
+  type checking in ordinary cursor initialization; refresh on reopen. Reuse
+  selection/count, aggregate selection and VARCHAR Top-K descriptors.
+- [ ] Preserve narrow comparisons through vector broadcast of runtime parameters.
+  The new equality selection retires 2.99 versus 2.07 instructions/input for the
+  previous path on the 500M-row control. A representative parameterized count
+  kernel still widens I32 to I64 before vector comparison (optimized LLVM and
+  llc output inspected). This is a code-generation lead, not proof that widening
+  explains the whole instruction delta. Validate it independently across widths,
+  backends and CPUs before changing vector lowering; keep full-query comparisons.
+- [ ] Bind COUNT(symbol) and COUNT DISTINCT(symbol) through the ordinary aggregate
+  contracts, preserving NULL semantics, dictionary scope and worker merge. Reuse
+  bounded symbol-domain arrays where admitted; do not create a separate symbol
+  aggregation framework.
+
+The predicate extension improves coverage. The measured gain for 16-value sets
+comes from avoiding the default Java fallback; enabling the existing stock JIT
+for those sets closes the timing gap. See PROGRESS for that diagnostic and the
+near-parity small-set cases.

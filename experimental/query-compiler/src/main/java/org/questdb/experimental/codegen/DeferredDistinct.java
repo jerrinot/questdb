@@ -131,7 +131,7 @@ final class DeferredDistinct {
             serial.loop(ne(node, nil()), next -> {
                 next.poll();
                 // Every deferred input is an ordinary count/payload pair, never another context.
-                NestedDistinct.merge(next, at(node, 8), at(COLUMNS, 80), 16, .5);
+                NestedDistinct.LONG.merge(next, at(node, 8), at(COLUMNS, 80), 16, .5);
                 next.assign(node, pointer(node));
             });
             serial.exit(0);

@@ -216,6 +216,11 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
     public boolean prepareRowLimit() { return frameSequence.getAtom().prepareRowLimit(); }
 
     @Override
+    public boolean prepareGroupLimit(long requiredGroups) {
+        return sharedRecordFunctions == null && frameSequence.getAtom().prepareGroupLimit(requiredGroups);
+    }
+
+    @Override
     public boolean prepareSortedRowLimit() { return frameSequence.getAtom().prepareSortedRowLimit(); }
 
     @Override
@@ -322,7 +327,17 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
             record.setRowIndex(0);
             long baseRowId = record.getRowId();
 
-            if (fragment.isNotSharded()) {
+            final GroupByKernel.Updater compiledUpdater = atom.getCompiledUpdater(slotId);
+            final DirectLongList rows = filterCtx.getFilteredRows(slotId);
+            long selected = compiledUpdater == null ? -1
+                    : compiledUpdater.filterGroups(record, frameRowCount, false, rows, circuitBreaker);
+            if (selected >= 0) {
+                if (fragment.isNotSharded()) {
+                    aggregateFilteredNonShardedBatched(record, rows, baseRowId, atom, slotId, fragment, mapSink, circuitBreaker);
+                } else if (!aggregateShardedCompiled(record, rows.size(), rows.getAddress(), atom, slotId, fragment, mapSink, circuitBreaker)) {
+                    aggregateFilteredSharded(record, rows, baseRowId, functionUpdater, fragment, mapSink);
+                }
+            } else if (fragment.isNotSharded()) {
                 aggregateNonShardedBatched(record, frameRowCount, baseRowId, atom, slotId, fragment, mapSink, circuitBreaker);
             } else if (!aggregateShardedCompiled(record, frameRowCount, 0, atom, slotId, fragment, mapSink, circuitBreaker)) {
                 aggregateSharded(record, frameRowCount, baseRowId, functionUpdater, fragment, mapSink);
@@ -642,6 +657,9 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
                 );
             }
 
+            if (compiledUpdater != null) {
+                compiledUpdater.filterGroups(record, rows.size(), true, rows, circuitBreaker);
+            }
             if (isParquetFrame) {
                 filterCtx.getSelectivityStats(slotId).update(rows.size(), frameRowCount);
             }

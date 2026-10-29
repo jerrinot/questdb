@@ -25,8 +25,13 @@
 package org.questdb.experimental.codegen;
 
 import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Record;
+import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.functions.columns.IntColumn;
 import io.questdb.griffin.engine.functions.columns.LongColumn;
+import io.questdb.griffin.engine.functions.groupby.CountDistinctIntGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.CountDistinctSymbolGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountDistinctLongGroupByFunction;
 import io.questdb.griffin.engine.groupby.FastGroupByAllocator;
 import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
@@ -48,13 +53,25 @@ import static org.questdb.experimental.codegen.Ir.*;
 public class NestedMergeTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
     private final Backend backend;
-    public NestedMergeTest(String name, Backend backend) { this.backend=backend; }
+    private final NestedDistinct layout;
+    private final int type;
+    public NestedMergeTest(String name, Backend backend, int type) {
+        this.backend = backend;
+        this.type = type;
+        this.layout = type == ColumnType.LONG ? NestedDistinct.LONG : NestedDistinct.INT;
+    }
     @Parameterized.Parameters(name="{0}") public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm",new LlvmBackend()},new Object[]{"c",new NativeBackend()},new Object[]{"asmjit",new AsmJitBackend()});
+        var cases = new java.util.ArrayList<Object[]>();
+        for (var backend : List.of(new LlvmBackend(), new NativeBackend(), new AsmJitBackend())) {
+            cases.add(new Object[]{backend.getClass().getSimpleName() + "-long", backend, ColumnType.LONG});
+            cases.add(new Object[]{backend.getClass().getSimpleName() + "-int", backend, ColumnType.INT});
+            cases.add(new Object[]{backend.getClass().getSimpleName() + "-symbol", backend, ColumnType.SYMBOL});
+        }
+        return cases;
     }
 
     @Test public void generatedMergeMatchesJavaBranchesLayoutGrowthAndAllocatorOwnership() throws Exception {
-        Builder b=new Builder();NestedDistinct.merge(b,COLUMNS,STATE,3,0.7);b.exit(0);
+        Builder b=new Builder();layout.mergeWithCapacity(b,COLUMNS,STATE,NestedDistinct.initialCapacity(3,0.7),0.7);b.exit(0);
         try(var code=backend.compile(new Program(b.block()),temporary.getRoot().toPath())) {
             for(int dstSize:new int[]{-1,0,1,2,3,4,17,127}) {
                 for(int srcSize:new int[]{-1,0,1,2,3,4,17,127}) {
@@ -64,11 +81,65 @@ public class NestedMergeTest {
         }
     }
 
-    private static void compare(CompiledKernel code,int dstSize,int srcSize) {
+    @Test public void generatedAndOrdinaryUpdatesShareEverySlotIncludingSignedKeys() throws Exception {
+        long nullValue = type == ColumnType.LONG ? Long.MIN_VALUE : type == ColumnType.INT ? Integer.MIN_VALUE : io.questdb.cairo.sql.SymbolTable.VALUE_IS_NULL;
+        var b = new Builder();
+        layout.emitWithCapacity(b, new Pipeline.Value(load(COLUMNS), eq(load(COLUMNS), i64(nullValue))), STATE,
+                NestedDistinct.initialCapacity(3, .7), .7);
+        b.exit(0);
+        long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_GROUP_BY_FUNCTION);
+        try (var code = backend.compile(new Program(b.block()), temporary.newFolder().toPath());
+             var arena = Arena.ofConfined(); var ordinary = allocator(); var mixed = allocator()) {
+            var function = function();
+            var types = new ArrayColumnTypes(); function.initValueTypes(types);
+            var expected = state(function, types, arena, ordinary, 0, 0, 1);
+            var actual = state(function, types, arena, mixed, 0, 0, 1);
+            long input = arena.allocate(8, 8).address();
+            try (var memory = KernelMemory.bind(mixed, () -> { })) {
+                for (int i = 0; i < 600; i++) {
+                    long key = i % 13 == 0 ? nullValue : input(i % 257);
+                    var record = record(key);
+                    function.setAllocator(ordinary);
+                    function.computeNext(expected.value, record, i);
+                    if (i % 3 == 0) {
+                        function.setAllocator(mixed);
+                        function.computeNext(actual.value, record, i);
+                    } else {
+                        Unsafe.getUnsafe().putLong(input, key);
+                        assertEquals(0, code.run(input, 1, actual.address));
+                        memory.throwIfFailed();
+                    }
+                    assertState(expected.value, actual.value);
+                }
+            }
+        }
+        assertEquals(before, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_GROUP_BY_FUNCTION));
+    }
+
+    private GroupByFunction function() {
+        if (layout == NestedDistinct.LONG) return new CountDistinctLongGroupByFunction(LongColumn.newInstance(0), 3, .7);
+        if (type == ColumnType.INT) return new CountDistinctIntGroupByFunction(IntColumn.newInstance(0), 3, .7);
+        return new CountDistinctSymbolGroupByFunction(IntColumn.newInstance(0), 3, .7);
+    }
+
+    private long input(int value) {
+        if (type == ColumnType.SYMBOL || value == 0) return value;
+        if (layout == NestedDistinct.INT) return value % 2 == 0 ? Integer.MIN_VALUE + value : Integer.MAX_VALUE - value;
+        return value % 2 == 0 ? Long.MIN_VALUE + value : Long.MAX_VALUE - value;
+    }
+
+    private static Record record(long value) {
+        return new Record() {
+            @Override public long getLong(int ignored) { return value; }
+            @Override public int getInt(int ignored) { return (int) value; }
+        };
+    }
+
+    private void compare(CompiledKernel code,int dstSize,int srcSize) {
         long before=Unsafe.getMemUsedByTag(MemoryTag.NATIVE_GROUP_BY_FUNCTION);
         try(var arena=Arena.ofConfined();var javaDst=allocator();var javaSrc=allocator();var javaMerge=allocator();
             var nativeDst=allocator();var nativeSrc=allocator();var nativeMerge=allocator()) {
-            var function=new CountDistinctLongGroupByFunction(LongColumn.newInstance(0),3,0.7);
+            var function=function();
             var types=new ArrayColumnTypes();function.initValueTypes(types);
             var dst=state(function,types,arena,javaDst,dstSize,1,1);
             var src=state(function,types,arena,javaSrc,srcSize,0,2);
@@ -94,21 +165,21 @@ public class NestedMergeTest {
     }
 
     private record State(long address,FlyweightPackedMapValue value) { }
-    private static State state(CountDistinctLongGroupByFunction function,ArrayColumnTypes types,Arena arena,
+    private State state(GroupByFunction function,ArrayColumnTypes types,Arena arena,
                                FastGroupByAllocator allocator,int size,int start,int stride) {
         long address=arena.allocate(16,8).address();
         var value=new FlyweightPackedMapValue(types);value.of(address);function.setAllocator(allocator);
         if(size<0)function.setNull(value);
         else if(size==0)function.setEmpty(value);
         else for(int i=0;i<size;i++) {
-            long input=start+(long)i*stride;
-            Record record=new Record(){@Override public long getLong(int ignored){return input;}};
+            long input=input(start+i*stride);
+            Record record=record(input);
             if(i==0)function.computeFirst(value,record,i);else function.computeNext(value,record,i);
         }
         return new State(address,value);
     }
     private static FastGroupByAllocator allocator(){return new FastGroupByAllocator(64,1L<<30);}
-    private static void assertState(FlyweightPackedMapValue expected,FlyweightPackedMapValue actual) {
+    private void assertState(FlyweightPackedMapValue expected,FlyweightPackedMapValue actual) {
         assertEquals(expected.getLong(0),actual.getLong(0));
         long expectedPtr=expected.getLong(1),actualPtr=actual.getLong(1);
         if(expected.getLong(0)<=1){assertEquals(expectedPtr,actualPtr);return;}
@@ -117,7 +188,13 @@ public class NestedMergeTest {
         }
         int capacity=Unsafe.getUnsafe().getInt(expectedPtr);
         for(int slot=0;slot<capacity;slot++) {
-            assertEquals("set slot "+slot,Unsafe.getUnsafe().getLong(expectedPtr+16+slot*8L),Unsafe.getUnsafe().getLong(actualPtr+16+slot*8L));
+            if (layout == NestedDistinct.LONG) {
+                assertEquals("set slot " + slot, Unsafe.getUnsafe().getLong(expectedPtr + 16 + slot * 8L),
+                        Unsafe.getUnsafe().getLong(actualPtr + 16 + slot * 8L));
+            } else {
+                assertEquals("set slot " + slot, Unsafe.getUnsafe().getInt(expectedPtr + 12 + slot * 4L),
+                        Unsafe.getUnsafe().getInt(actualPtr + 12 + slot * 4L));
+            }
         }
     }
 }

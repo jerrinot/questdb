@@ -46,6 +46,7 @@ import io.questdb.griffin.engine.PerWorkerLocks;
 import io.questdb.griffin.engine.groupby.GroupByLongTopKJob;
 import io.questdb.griffin.engine.groupby.GroupByMergeShardJob;
 import io.questdb.griffin.engine.groupby.PostAggregationCircuitBreaker;
+import io.questdb.griffin.engine.groupby.vect.CompiledVectorAggregate;
 import io.questdb.griffin.engine.groupby.vect.CountVectorAggregateFunction;
 import io.questdb.griffin.engine.groupby.vect.GroupByRecordCursorFactory;
 import io.questdb.griffin.engine.groupby.vect.VectorAggregateEntry;
@@ -4868,11 +4869,12 @@ public class QueryParallelFiberDispatcherTest extends AbstractTest {
                         "of", int.class, long.class, int.class, int.class, VectorAggregateFunction.class,
                         long[].class, ObjList.class, AtomicInteger.class, CountDownLatchSPI.class,
                         AtomicInteger.class, AsyncQueryErrorState.class, RostiAllocFacade.class,
-                        PerWorkerLocks.class, SqlExecutionCircuitBreaker.class, AsyncQueryProgressState.class
+                        PerWorkerLocks.class, SqlExecutionCircuitBreaker.class, AsyncQueryProgressState.class,
+                        CompiledVectorAggregate.class
                 );
                 of.setAccessible(true);
                 of.invoke(entry, 0, 42L, -1, -1, function, null, pools, started, latch, oomCounter,
-                        error, null, locks, breaker, new AsyncQueryProgressState());
+                        error, null, locks, breaker, new AsyncQueryProgressState(), null);
             } catch (Throwable th) {
                 pool.close();
                 throw th;

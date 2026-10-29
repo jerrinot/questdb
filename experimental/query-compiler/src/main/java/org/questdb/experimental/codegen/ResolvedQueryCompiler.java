@@ -30,7 +30,10 @@ import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameMemoryPool;
 import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.async.UnorderedPageFrameSequence;
 import io.questdb.griffin.engine.CompiledCounter;
 import io.questdb.griffin.engine.CompiledProjection;
 import io.questdb.griffin.engine.CompiledScalarAggregate;
@@ -112,6 +115,14 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
 
     static long[] topKCounters(Updater updater) {
         return updater instanceof AggregateSlot slot ? slot.topKCounters() : new long[2];
+    }
+
+    @Override
+    public io.questdb.griffin.engine.groupby.vect.CompiledVectorAggregate compileVectorAggregate(
+            io.questdb.cairo.sql.RecordMetadata inputs, int keyColumn,
+            ObjList<io.questdb.griffin.engine.groupby.vect.VectorAggregateFunction> functions,
+            long rosti, int workerCount) {
+        return handwritten ? null : ResolvedSymbolAggregate.bind(inputs, keyColumn, functions, rosti, workerCount, backend, artifacts);
     }
 
     @Override
@@ -246,6 +257,24 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
 
         @Override
         public boolean prepareSortedRowLimit() { return prepareRowLimit(); }
+
+        @Override
+        public boolean prepareGroupLimit(long requiredGroups) {
+            try { return prepared.prepareGroupLimit(requiredGroups); }
+            catch (IOException failure) { throw CairoException.nonCritical().put("Group admission compilation failed: ").put(failure.getMessage()); }
+        }
+
+        @Override
+        public boolean limitGroups(long requiredGroups, UnorderedPageFrameSequence<?> frames,
+                                   PageFrameMemoryPool pool, Function filter, SqlExecutionCircuitBreaker circuitBreaker) {
+            return prepared.groupAdmission != null
+                    && prepared.groupAdmission.discover(requiredGroups, frames, pool, filter, circuitBreaker);
+        }
+
+        @Override
+        public void clearGroupLimit() {
+            if (prepared.groupAdmission != null) prepared.groupAdmission.clear();
+        }
 
         @Override
         public boolean prepareRowLimit() {

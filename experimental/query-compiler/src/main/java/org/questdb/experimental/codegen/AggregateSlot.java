@@ -53,7 +53,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     // 128KiB of row IDs bounds the stage independently of frame/task scheduling.
     private static final int FILTER_STAGE_ROWS = 16 * 1024;
     // Rehash arguments, map views and sort/selection controls reuse this region by phase.
-    private static final int PHASE_SCRATCH_BYTES = 128;
+    private static final int PHASE_SCRATCH_BYTES = Math.max(128, GroupAdmission.SCRATCH_BYTES);
     private static final boolean PROFILE = Boolean.getBoolean("query.codegen.profile");
     private final Prepared prepared;
     private final long addressBytes;
@@ -65,6 +65,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private long updatedRows;
     private long fusedInputRows;
     private long fusedSelectedRows;
+    private long admissionInputRows;
+    private long admissionSelectedRows;
     private long sharedRows;
     private long finalizedRows;
     private int sampledGroupLowerBound;
@@ -817,8 +819,22 @@ public final class AggregateSlot implements GroupByKernel.Updater {
 
     long fusedInputRows() { return fusedInputRows; }
 
+    long[] groupAdmissionCounters() { return new long[]{admissionInputRows, admissionSelectedRows}; }
+
+    @Override
+    public long filterGroups(PageFrameMemoryRecord record, long rowCount, boolean filtered, DirectLongList rows,
+                             SqlExecutionCircuitBreaker circuitBreaker) {
+        var admission = prepared.groupAdmission;
+        if (admission == null || !admission.active()) return -1;
+        long selected = admission.select(record, rowCount, filtered, rows, scratchAddress, memory, circuitBreaker);
+        admissionInputRows += rowCount;
+        admissionSelectedRows += selected < 0 ? rowCount : selected;
+        return selected;
+    }
+
     @Override
     public boolean hasFusedFilter() {
+        if (prepared.groupAdmission != null && prepared.groupAdmission.active()) return false;
         return prepared.fusedFilterCode != null || (filter != null && prepared.filter.fusedPlan() != null
                 && prepared.localCapacity > 0 && prepared.sharedMaps == null && prepared.probe.mutable()
                 && !prepared.probe.varchar() && !prepared.probe.variable());

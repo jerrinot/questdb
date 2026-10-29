@@ -30,9 +30,11 @@ import io.questdb.cairo.ListColumnFilter;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameMemoryPool;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.async.UnorderedPageFrameSequence;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.DirectLongLongSortedList;
@@ -65,6 +67,16 @@ public interface GroupByKernel extends QuietCloseable {
 
     default boolean prepareRowLimit() { return false; }
 
+    default boolean prepareGroupLimit(long requiredGroups) { return false; }
+
+    /** Runs on the owner before dispatch, borrowing the prepared snapshot and its memory pool. */
+    default boolean limitGroups(long requiredGroups, UnorderedPageFrameSequence<?> frames,
+                               PageFrameMemoryPool pool, @Nullable Function filter,
+                               SqlExecutionCircuitBreaker circuitBreaker) { return false; }
+
+    /** Called only after every worker has drained. */
+    default void clearGroupLimit() { }
+
     default boolean prepareSortedRowLimit() { return false; }
 
     default boolean prepareLongSort(Function function) { return false; }
@@ -87,6 +99,10 @@ public interface GroupByKernel extends QuietCloseable {
     record MergeTask(long address, long index, int phase) { }
 
     interface Updater extends QuietCloseable {
+        /** Restrict a full frame or compact existing row IDs in place. -1 leaves the input unchanged. */
+        default long filterGroups(PageFrameMemoryRecord record, long rowCount, boolean filtered,
+                                  DirectLongList rows, SqlExecutionCircuitBreaker circuitBreaker) { return -1; }
+
         /**
          * Opt into shared final maps before frame dispatch. The supplier opens a map under
          * the existing query tracker; callers serialize initialization of each shard.

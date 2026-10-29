@@ -30,11 +30,17 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.griffin.engine.functions.columns.DoubleColumn;
+import io.questdb.griffin.engine.functions.groupby.AbstractCountDistinctIntGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.AvgIntGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.AvgLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.AvgShortGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.CountDistinctIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountDistinctLongGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.CountDistinctSymbolGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongConstGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.CountSymbolGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxShortGroupByFunction;
@@ -85,7 +91,8 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             GroupByFunction function = functions.getQuick(i);
             Class<?> implementation = function.getClass();
             int argumentType;
-            int stateType = ColumnType.LONG;
+            boolean average = isAverage(implementation);
+            int stateType = average && implementation != AvgShortGroupByFunction.class ? ColumnType.DOUBLE : ColumnType.LONG;
             boolean sum;
             boolean minimum = implementation == MinLongGroupByFunction.class || implementation == MinIntGroupByFunction.class
                     || implementation == MinShortGroupByFunction.class;
@@ -101,13 +108,17 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
                 argumentType = ColumnType.UNDEFINED;
                 sum = false;
             } else if (implementation == CountLongGroupByFunction.class || implementation == SumLongGroupByFunction.class
-                    || implementation == CountDistinctLongGroupByFunction.class) {
+                    || implementation == CountDistinctLongGroupByFunction.class || implementation == AvgLongGroupByFunction.class) {
                 argumentType = ColumnType.LONG;
                 sum = implementation == SumLongGroupByFunction.class;
-            } else if (implementation == CountIntGroupByFunction.class || implementation == SumIntGroupByFunction.class) {
+            } else if (implementation == CountIntGroupByFunction.class || implementation == SumIntGroupByFunction.class
+                    || implementation == CountDistinctIntGroupByFunction.class || implementation == AvgIntGroupByFunction.class) {
                 argumentType = ColumnType.INT;
                 sum = implementation == SumIntGroupByFunction.class;
-            } else if (implementation == SumShortGroupByFunction.class || (mutableMap && implementation == AvgShortGroupByFunction.class)) {
+            } else if (implementation == CountSymbolGroupByFunction.class || implementation == CountDistinctSymbolGroupByFunction.class) {
+                argumentType = ColumnType.SYMBOL;
+                sum = false;
+            } else if (implementation == SumShortGroupByFunction.class || implementation == AvgShortGroupByFunction.class) {
                 argumentType = ColumnType.SHORT;
                 sum = true;
             } else if (mutableMap && (implementation == MinVarcharGroupByFunction.class || implementation == MaxVarcharGroupByFunction.class)) {
@@ -121,20 +132,19 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
                     || valueTypes.getColumnType(valueIndex) != stateType || !assignedSlots.add(valueIndex)) {
                 throw new IllegalArgumentException("Resolved aggregate state does not match its assigned slot");
             }
-            CountDistinctLongGroupByFunction distinct = implementation == CountDistinctLongGroupByFunction.class
-                    ? (CountDistinctLongGroupByFunction) function : null;
-            if (distinct != null && !allowDistinct) return null;
+            boolean distinct = implementation == CountDistinctLongGroupByFunction.class
+                    || implementation == CountDistinctIntGroupByFunction.class || implementation == CountDistinctSymbolGroupByFunction.class;
+            if (distinct && !allowDistinct) return null;
             if (argumentType == ColumnType.VARCHAR) {
                 var expression = strings.bind(((UnaryFunction) function).getArg());
                 if (expression == null) return null;
                 updates.add(new VarcharExtremum(expression, offsets.applyAsLong(valueIndex), implementation == MinVarcharGroupByFunction.class));
                 continue;
             }
-            boolean average = implementation == AvgShortGroupByFunction.class;
-            if ((distinct != null || average) && (valueIndex + 1 >= valueTypes.getColumnCount()
+            if ((distinct || average) && (valueIndex + 1 >= valueTypes.getColumnCount()
                     || valueTypes.getColumnType(valueIndex + 1) != ColumnType.LONG || !assignedSlots.add(valueIndex + 1)
-                    || offsets.applyAsLong(valueIndex + 1) != offsets.applyAsLong(valueIndex) + 8)) {
-                throw new IllegalArgumentException("Resolved aggregate state requires contiguous LONG slots");
+                    || (distinct && offsets.applyAsLong(valueIndex + 1) != offsets.applyAsLong(valueIndex) + 8))) {
+                throw new IllegalArgumentException("Resolved aggregate count or payload state does not match its assigned slots");
             }
             Pipeline.RowAggregate operation;
             if (argumentType == ColumnType.UNDEFINED) {
@@ -149,11 +159,19 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
                     continue;
                 }
                 if (average) {
-                    updates.add(new AverageUpdate(expression, offsets.applyAsLong(valueIndex)));
+                    updates.add(new AverageUpdate(expression, offsets.applyAsLong(valueIndex), offsets.applyAsLong(valueIndex + 1),
+                            stateType == ColumnType.DOUBLE ? MemoryType.F64 : MemoryType.I64));
                     continue;
                 }
-                if (distinct != null) {
-                    updates.add(new DistinctUpdate(expression, offsets.applyAsLong(valueIndex), distinct.getSetInitialCapacity(), distinct.getSetLoadFactor()));
+                if (distinct) {
+                    if (function instanceof CountDistinctLongGroupByFunction count) {
+                        updates.add(new DistinctUpdate(expression, offsets.applyAsLong(valueIndex), NestedDistinct.LONG,
+                                count.getSetInitialCapacity(), count.getSetLoadFactor()));
+                    } else {
+                        var count = (AbstractCountDistinctIntGroupByFunction) function;
+                        updates.add(new DistinctUpdate(expression, offsets.applyAsLong(valueIndex), NestedDistinct.INT,
+                                count.getSetInitialCapacity(), count.getSetLoadFactor()));
+                    }
                     continue;
                 }
                 operation = sum ? new Pipeline.Sum(expression) : new Pipeline.CountValue(expression);
@@ -222,11 +240,16 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         }
     }
 
+    private static boolean isAverage(Class<?> implementation) {
+        return implementation == AvgShortGroupByFunction.class || implementation == AvgIntGroupByFunction.class
+                || implementation == AvgLongGroupByFunction.class;
+    }
+
     static Function outputFunction(Function function) {
-        return function.getClass() == AvgShortGroupByFunction.class
+        return isAverage(function.getClass())
                 ? DoubleColumn.newInstance(((GroupByFunction) function).getValueIndex()) : function;
     }
-    sealed interface Update permits ScalarUpdate, IntegerExtremum, DistinctUpdate, AverageUpdate, VarcharExtremum {
+    sealed interface Update permits ScalarUpdate, IntegerExtremum, DistinctUpdate, AverageUpdate, VarcharExtremum, VectorSumUpdate, VectorLongAverageUpdate {
         long offset();
         void initialize(Builder b, Expr destination);
         void merge(Builder b, Expr source, Expr destination);
@@ -236,6 +259,51 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         default boolean deferredMerge() { return false; }
         default void finish(Builder b, Expr destination, boolean deferred) { }
         default void prefetch(Builder b, java.util.function.Function<Pipeline.Scalar, Pipeline.Value> input, Expr destination) { }
+    }
+
+    /** Rosti integer SUM and AVG(INT/SHORT): zero-initialized LONG sum and non-null count. */
+    record VectorSumUpdate(Pipeline.Scalar argument, long offset) implements Update {
+        @Override public void initialize(Builder b, Expr destination) {
+            b.store(at(destination, offset), i64(0));
+            b.store(at(destination, offset + 8), i64(0));
+        }
+        @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            var value = argument.emit(frame.numeric());
+            b.when(eq(value.isNull(), bool(false)), valid -> {
+                valid.store(at(destination, offset), add(load(at(destination, offset)), value.data()));
+                valid.store(at(destination, offset + 8), add(load(at(destination, offset + 8)), i64(1)));
+            });
+        }
+        @Override public void merge(Builder b, Expr source, Expr destination) {
+            b.store(at(destination, offset), add(load(at(destination, offset)), load(at(source, offset))));
+            b.store(at(destination, offset + 8), add(load(at(destination, offset + 8)), load(at(source, offset + 8))));
+        }
+    }
+
+    /** Rosti AVG(LONG): signed 128-bit sum (low, high), then non-null count. */
+    record VectorLongAverageUpdate(Pipeline.Scalar argument, long offset) implements Update {
+        @Override public void initialize(Builder b, Expr destination) {
+            for (int i = 0; i < 3; i++) b.store(at(destination, offset + i * 8), i64(0));
+        }
+        @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            var value = argument.emit(frame.numeric());
+            b.when(eq(value.isNull(), bool(false)), valid -> {
+                addSum(valid, destination, value.data(), new Select(binary(Op.LT, value.data(), i64(0)), i64(-1), i64(0)));
+                valid.store(at(destination, offset + 16), add(load(at(destination, offset + 16)), i64(1)));
+            });
+        }
+        @Override public void merge(Builder b, Expr source, Expr destination) {
+            addSum(b, destination, load(at(source, offset)), load(at(source, offset + 8)));
+            b.store(at(destination, offset + 16), add(load(at(destination, offset + 16)), load(at(source, offset + 16))));
+        }
+        private void addSum(Builder b, Expr destination, Expr low, Expr high) {
+            Var previous = b.let(load(at(destination, offset)));
+            Var sum = b.let(add(previous, low));
+            // Bias both operands for an unsigned carry comparison using the signed IR.
+            Expr carry = binary(Op.LT, binary(Op.XOR, sum, i64(Long.MIN_VALUE)), binary(Op.XOR, previous, i64(Long.MIN_VALUE)));
+            b.store(at(destination, offset + 8), add(add(load(at(destination, offset + 8)), high), new Select(carry, i64(1), i64(0))));
+            b.store(at(destination, offset), sum);
+        }
     }
 
     record ScalarUpdate(Pipeline.RowAggregate operation, long offset) implements Update {
@@ -280,65 +348,82 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         }
     }
 
-    /** AvgShortGroupByFunction's LONG sum/count state, including its sentinel and merge rules. */
-    record AverageUpdate(Pipeline.Scalar argument, long offset) implements Update {
+    /** Ordinary integer averages: SHORT has a LONG sum; INT/LONG accumulate in DOUBLE. */
+    record AverageUpdate(Pipeline.Scalar argument, long offset, long countOffset, MemoryType sumType) implements Update {
         @Override public boolean finalizesResult() { return true; }
         @Override public void initialize(Builder b, Expr destination) {
-            b.store(at(destination, offset), i64(Long.MIN_VALUE));
-            b.store(at(destination, offset + 8), i64(0));
+            b.store(sumType, at(destination, offset), sumType == MemoryType.F64 ? f64(0) : i64(Long.MIN_VALUE));
+            b.store(at(destination, countOffset), i64(0));
         }
         @Override
         public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
-            Expr sumAddress = at(destination, offset), countAddress = at(destination, offset + 8);
+            Expr sumAddress = at(destination, offset), countAddress = at(destination, countOffset);
             Var count = b.let(load(countAddress));
-            Expr value = argument.emit(frame.numeric()).data();
-            b.store(sumAddress, new Select(eq(count, i64(0)), value, add(load(sumAddress), value)));
-            b.store(countAddress, add(count, i64(1)));
+            var input = argument.emit(frame.numeric());
+            if (sumType == MemoryType.F64) {
+                // Ordinary computeFirst(NULL) stores (0,0). A later Java computeNext
+                // adds directly, so leaving the empty etalon's NaN here is unsafe.
+                b.when(binary(Op.BOTH, input.isNull(), eq(count, i64(0))), missing ->
+                        missing.store(MemoryType.F64, sumAddress, f64(0)));
+            }
+            b.when(eq(input.isNull(), bool(false)), present -> {
+                Expr value = sumType == MemoryType.F64 ? new ToDouble(input.data()) : input.data();
+                Expr sum = binary(sumType == MemoryType.F64 ? Op.FADD : Op.ADD, new Load(sumType, sumAddress), value);
+                present.store(sumType, sumAddress, new Select(eq(count, i64(0)), value, sum));
+                present.store(countAddress, add(count, i64(1)));
+            });
         }
 
         @Override public void merge(Builder b, Expr source, Expr destination) {
-            Var count = b.let(load(at(source, offset + 8)));
+            Var count = b.let(load(at(source, countOffset)));
             b.when(binary(Op.LT, i64(0), count), nonempty -> {
-                Var destinationCount = nonempty.let(load(at(destination, offset + 8)));
-                Var sum = nonempty.let(load(at(source, offset)));
+                Var destinationCount = nonempty.let(load(at(destination, countOffset)));
+                Var sum = nonempty.let(new Load(sumType, at(source, offset)));
                 Var populated = nonempty.let(binary(Op.LT, i64(0), destinationCount));
-                nonempty.store(at(destination, offset), new Select(populated, add(load(at(destination, offset)), sum), sum));
-                nonempty.store(at(destination, offset + 8), new Select(populated, add(destinationCount, count), count));
+                Expr combined = binary(sumType == MemoryType.F64 ? Op.FADD : Op.ADD, new Load(sumType, at(destination, offset)), sum);
+                nonempty.store(sumType, at(destination, offset), new Select(populated, combined, sum));
+                nonempty.store(at(destination, countOffset), new Select(populated, add(destinationCount, count), count));
             });
         }
 
         @Override public void finish(Builder b, Expr destination, boolean deferred) {
-            Var sum = b.let(load(at(destination, offset)));
-            Var count = b.let(load(at(destination, offset + 8)));
+            Var sum = b.let(new Load(sumType, at(destination, offset)));
+            Var count = b.let(load(at(destination, countOffset)));
             Var value = b.let(f64(Double.NaN));
-            b.when(binary(Op.BOTH, ne(sum, i64(Long.MIN_VALUE)), binary(Op.LT, i64(0), count)), valid ->
-                    valid.assign(value, binary(Op.FDIV, new ToDouble(sum), new ToDouble(count))));
+            Expr valid = binary(Op.LT, i64(0), count);
+            if (sumType == MemoryType.I64) valid = binary(Op.BOTH, ne(sum, i64(Long.MIN_VALUE)), valid);
+            b.when(valid, nonempty -> nonempty.assign(value, binary(Op.FDIV,
+                    sumType == MemoryType.F64 ? sum : new ToDouble(sum), new ToDouble(count))));
             b.store(MemoryType.F64, at(destination, offset), value);
         }
     }
 
-    record DistinctUpdate(Pipeline.Scalar argument, long offset, int initialCapacity, double loadFactor) implements Update {
+    record DistinctUpdate(Pipeline.Scalar argument, long offset, NestedDistinct layout, int initialCapacity, double loadFactor) implements Update {
         @Override public boolean allocates() { return true; }
-        @Override public boolean deferredMerge() { return true; }
+        @Override public boolean deferredMerge() { return layout == NestedDistinct.LONG; }
         @Override public void initialize(Builder b, Expr destination) {
             b.store(at(destination, offset), i64(0));
             b.store(at(destination, offset + 8), i64(0));
         }
         @Override public void merge(Builder b, Expr source, Expr destination) {
-            NestedDistinct.merge(b, at(source, offset), at(destination, offset),
-                    initialCapacity, loadFactor, at(STATE, DeferredDistinct.CONTROL));
+            if (deferredMerge()) {
+                layout.mergeWithCapacity(b, at(source, offset), at(destination, offset),
+                        initialCapacity, loadFactor, at(STATE, DeferredDistinct.CONTROL));
+            } else {
+                layout.mergeWithCapacity(b, at(source, offset), at(destination, offset), initialCapacity, loadFactor);
+            }
         }
         @Override public void finish(Builder b, Expr destination, boolean deferred) {
-            if (deferred) DeferredDistinct.finish(b, at(destination, offset));
+            if (deferred && deferredMerge()) DeferredDistinct.finish(b, at(destination, offset));
         }
         @Override public void prefetch(Builder b, java.util.function.Function<Pipeline.Scalar, Pipeline.Value> input, Expr destination) {
-            NestedDistinct.prefetch(b, input.apply(argument), at(destination, offset));
+            layout.prefetch(b, input.apply(argument), at(destination, offset));
         }
         @Override
         public void emit(Builder builder, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
             Expr countAddress = at(destination, offset);
             Var before = builder.let(load(countAddress));
-            NestedDistinct.emitWithCapacity(builder, argument.emit(frame.numeric()), countAddress, initialCapacity, loadFactor);
+            layout.emitWithCapacity(builder, argument.emit(frame.numeric()), countAddress, initialCapacity, loadFactor);
             builder.when(ne(before, load(countAddress)), changed ->
                     changed.store(cardinalityAddress, add(load(cardinalityAddress), i64(1))));
         }

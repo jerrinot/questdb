@@ -27,6 +27,8 @@ Registration is absent by default. Core exposes `QueryCodeGenerator`; it has no
 LLVM dependency. The normal planner resolves functions and chooses factories.
 `ResolvedQueryCompiler` binds supported implementations, types and storage layouts.
 Existing metadata COUNT and vector specializations retain their planner gates.
+Eligible static-SYMBOL grouping uses bounded dictionary arrays for integer
+COUNT/SUM/MIN/MAX/AVG, including the vector AVG(LONG) 128-bit sum contract.
 Unsupported plans keep ordinary execution.
 
 | Responsibility | Code |
@@ -70,6 +72,12 @@ boundaries. This does not rewrite COUNT DISTINCT into a two-stage plan.
 
 Bounded aggregation retains partial states and can switch to compact input records
 when local combining does not reduce work. Existing workers merge partitions.
+An eligible unordered positive LIMIT/OFFSET finalizes only enough complete
+partitions to satisfy demand, after scanning all input. It merges the first
+partition on the owner and uses its group count to size subsequent parallel
+batches. Completed counts determine when to stop. Ordinary iteration, exact size,
+sorting, shared contexts and deferred DISTINCT merge still complete all partitions;
+partial cursors report unknown size and preserve row IDs as demand grows.
 Fixed-width key-only aggregation switches after its first full local map to an
 exact duplicate filter: remembered keys already have a partition record, and
 every miss is appended immediately. Collisions may add records but cannot lose
@@ -85,19 +93,30 @@ extrema until after ranking. Retained transient strings are copied into query-ow
 storage; stable frame payloads remain borrowed. These are eligibility-gated paths,
 not promises that every aggregation uses the same strategy.
 
+Static SYMBOL predicates borrow IDs already resolved by the ordinary functions
+at cursor initialization. Typed parameters load once per frame; dictionary lookup
+stays outside generated row loops. Reopening refreshes values without compiling
+new code. Standalone selection/count, aggregate selection and VARCHAR Top-K share
+this binding. Large sets, dynamic symbol sources and equality against runtime
+expressions retain ordinary filtering. Parameterized aggregate filters currently
+produce selection vectors; the experimental map-fused ABI still accepts only
+column pointers. No additional configuration is needed.
+
 ## Supported scope
 
 The binders and focused tests are authoritative. Current families include:
 
 - INT/LONG addition, subtraction and multiplication, widening casts, comparisons,
   boolean predicates and constant membership;
+  static SYMBOL equality/inequality against literals and small IN/NOT IN sets
+  (up to 16 values, including runtime constants), with AND/OR/NOT composition;
   direct VARCHAR null and literal substring predicates, including their negation;
   searched CASE string values.
 - Direct and computed fixed-width keys, SYMBOL IDs, VARCHAR keys and composite keys
   using existing map encodings. NULL and empty strings remain distinct.
-- Resolved COUNT, integer SUM/MIN/MAX, LONG DISTINCT, SHORT AVG and VARCHAR MIN/MAX
+- Resolved COUNT (including static SYMBOL), integer SUM/MIN/MAX, INT/LONG/static-SYMBOL DISTINCT, SHORT/INT/LONG AVG and VARCHAR MIN/MAX
   implementations. Supported overloads depend on the selected map/update path.
-- Unkeyed COUNT and integer SUM/MIN/MAX reductions over filtered frames and
+- Unkeyed COUNT and integer SUM/MIN/MAX/AVG reductions over filtered frames and
   unfiltered expressions whose plan uses row-by-row updates. Existing vector and
   metadata specializations retain priority. Worker-state copying/merging is generated.
 - Numeric projection, final COUNT reduction, LONG full sort and Top-K, and positive
@@ -109,7 +128,7 @@ The binders and focused tests are authoritative. Current families include:
   admission, worker-result merge, survivor heap packing, compaction/final sorting
   and final LIMIT prefix selection in the existing EncodedTopKBuffer. EXPLAIN uses
   `compiledTopK`; execution counters and result checks establish actual coverage.
-- INT inner-join probe pipelines with supported COUNT/integer SUM/MIN/MAX, post-join
+- INT inner-join probe pipelines with supported COUNT/integer SUM/MIN/MAX/AVG, post-join
   predicates and direct INT/LONG grouping. They borrow the existing frozen join;
   Java retains build and runtime ownership. Outer joins and general join-to-DISTINCT
   remain outside this binding.

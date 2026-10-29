@@ -29,6 +29,7 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
@@ -132,7 +133,7 @@ public class InSymbolFunctionFactory implements FunctionFactory {
         boolean test(Record rec);
     }
 
-    private static class Func extends BooleanFunction implements UnaryFunction {
+    public static class Func extends BooleanFunction implements UnaryFunction {
         private final SymbolFunction arg;
         private final CharSequenceHashSet deferredSet;
         private final IntList deferredValuePositions;
@@ -165,6 +166,18 @@ public class InSymbolFunctionFactory implements FunctionFactory {
         @Override
         public boolean getBool(Record rec) {
             return testFunc.test(rec);
+        }
+
+        /** Stable upper bound, including runtime constants which may change on reopen. */
+        public int getValueCount() {
+            return set.size() + (deferredValues == null ? 0 : deferredValues.size());
+        }
+
+        /** Read only after init(), and only for a static symbol table. */
+        public int getValueIndex(int index) {
+            assert testFunc == intTest;
+            // init() deduplicates resolved IDs; missing values cannot match a stored ID.
+            return index < intSet.size() ? intSet.get(index) : SymbolTable.VALUE_NOT_FOUND;
         }
 
         @Override

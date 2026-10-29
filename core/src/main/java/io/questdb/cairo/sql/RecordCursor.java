@@ -62,6 +62,13 @@ import java.io.Closeable;
  */
 public interface RecordCursor extends RecordRandomAccess, Closeable, SymbolTableSource {
 
+    /**
+     * Before consumption, permit an exclusive unordered LIMIT to retain any subset of complete
+     * groups sufficient for requiredGroups. A successful call narrows this cursor for its lifetime;
+     * it no longer promises the full group cardinality. False leaves the existing result unchanged.
+     */
+    default boolean limitGroups(long requiredGroups) { return false; }
+
     /** Exclusive borrowed output/scratch buffers; false is allowed only before output mutation. */
     /** Fill stable row IDs in cursor order. False is permitted only before changing the list. */
     default boolean selectRows(DirectLongList rows, long skip, long take) { return false; }

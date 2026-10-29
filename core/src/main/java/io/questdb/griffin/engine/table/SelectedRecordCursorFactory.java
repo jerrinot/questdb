@@ -245,6 +245,9 @@ public final class SelectedRecordCursorFactory extends AbstractRecordCursorFacto
     public boolean prepareRowLimit() { return base.prepareRowLimit(); }
 
     @Override
+    public boolean prepareGroupLimit(long requiredGroups) { return base.prepareGroupLimit(requiredGroups); }
+
+    @Override
     public boolean prepareSortedRowLimit() { return base.prepareSortedRowLimit(); }
 
     @Override

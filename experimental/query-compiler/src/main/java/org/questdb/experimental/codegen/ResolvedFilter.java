@@ -42,22 +42,20 @@ import io.questdb.std.Unsafe;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.function.IntSupplier;
 
 import static org.questdb.experimental.codegen.Ir.*;
 
 /** Resolved predicates shared by standalone filtering and aggregate selection. */
 final class ResolvedFilter implements AutoCloseable {
     private final CompiledKernel code;
-    private final ScanPlan plan;
-    private final int[] sourceIndexes;
-    private final int[] varcharColumns;
+    private final Binding binding;
     private boolean closed;
 
-    private ResolvedFilter(CompiledKernel code, int[] sourceIndexes, int[] varcharColumns, ScanPlan plan) {
-        this.plan = plan;
-        this.varcharColumns = varcharColumns;
+    private ResolvedFilter(CompiledKernel code, Binding binding) {
         this.code = code;
-        this.sourceIndexes = sourceIndexes;
+        this.binding = binding;
     }
 
     static ResolvedFilter compile(ColumnTypes types, Function function, Backend backend, Path artifacts) throws IOException {
@@ -65,12 +63,13 @@ final class ResolvedFilter implements AutoCloseable {
         if (binding == null) return null;
         var program = ScanLowering.selectionRange(binding.plan(), binding.residual(), binding.bytes());
         var code = backend.compile(program, artifacts);
-        try { return new ResolvedFilter(code, binding.sourceIndexes(), binding.varcharColumns(), binding.plan()); }
+        try { return new ResolvedFilter(code, binding); }
         catch (Throwable failure) { code.close(); throw failure; }
     }
 
     static Binding bind(ColumnTypes types, Function function) {
-        var inputs = new ResolvedInputs(types);
+        var parameters = new java.util.ArrayList<IntSupplier>();
+        var inputs = new ResolvedInputs(types, parameters);
         var leaves = new java.util.ArrayList<Function>();
         if (!conjuncts(function, leaves, 0)) return null;
         var strings = new java.util.ArrayList<Integer>();
@@ -115,7 +114,7 @@ final class ResolvedFilter implements AutoCloseable {
             }
         }
         // Admitted leaves are total and side-effect free. Reject numeric rows before decoding strings.
-        long stringOffset = inputs.columns().size() * 8L;
+        long stringOffset = (inputs.columns().size() + parameters.size()) * 8L;
         ScanLowering.RowPredicate residual = strings.isEmpty() ? null : (builder, descriptors, row) -> {
             Var accepted = builder.let(bool(true));
             for (int i = 0; i < strings.size(); i++) {
@@ -125,8 +124,12 @@ final class ResolvedFilter implements AutoCloseable {
             }
             return accepted;
         };
-        return new Binding(ScanPlan.of(inputs.columns(), numeric), inputs.indexes(),
-                strings.stream().mapToInt(Integer::intValue).toArray(), residual);
+        var parameterTypes = java.util.stream.IntStream.range(0, parameters.size())
+                .mapToObj(i -> new Pipeline.Parameter(i, ColumnType.SYMBOL)).toList();
+        var plan = new ScanPlan(inputs.columns(), numeric, inputs.columns(),
+                new java.util.ArrayList<Pipeline.Scalar>(inputs.columns()), parameterTypes);
+        return new Binding(plan, inputs.indexes(), strings.stream().mapToInt(Integer::intValue).toArray(), residual,
+                List.copyOf(parameters));
     }
 
     private static int varcharColumn(ColumnTypes types, Function function) {
@@ -135,38 +138,43 @@ final class ResolvedFilter implements AutoCloseable {
         return column >= 0 && column < types.getColumnCount() && types.getColumnType(column) == ColumnType.VARCHAR ? column : -1;
     }
 
-    private static boolean prepareRecord(PageFrameMemoryRecord record, int[] sourceIndexes, int[] varcharColumns, long addresses) {
-        if (record instanceof PageFrameFilteredMemoryRecord) return false;
-        for (int i = 0; i < sourceIndexes.length; i++) {
-            long address = record.getPageAddress(sourceIndexes[i]);
-            // Zero may denote a lazy cast or a column top: ordinary getters retain that contract.
-            if (address == 0) return false;
-            Unsafe.putLong(addresses + 8L * i, address);
-        }
-        for (int i = 0; i < varcharColumns.length; i++) {
-            if (!record.writeNativeVarcharView(varcharColumns[i], addresses + sourceIndexes.length * 8L + i * 48L)) return false;
-        }
-        return true;
-    }
-
     @FunctionalInterface
     private interface StringPredicate {
         Expr emit(Builder builder, Expr descriptor, Expr row);
     }
 
-    record Binding(ScanPlan plan, int[] sourceIndexes, int[] varcharColumns, ScanLowering.RowPredicate residual) {
-        long bytes() { return sourceIndexes.length * 8L + varcharColumns.length * 48L; }
+    record Binding(ScanPlan plan, int[] sourceIndexes, int[] varcharColumns, ScanLowering.RowPredicate residual,
+                   List<IntSupplier> parameters) {
+        long stringOffset() { return (sourceIndexes.length + parameters.size()) * 8L; }
+        long bytes() { return stringOffset() + varcharColumns.length * 48L; }
+
+        private void prepareParameters(long addresses) {
+            // Borrow resolved keys after Function.init; they are immutable while tasks run.
+            for (int i = 0; i < parameters.size(); i++)
+                Unsafe.putInt(addresses + (sourceIndexes.length + i) * 8L, parameters.get(i).getAsInt());
+        }
 
         boolean prepare(PageFrameMemoryRecord record, long addresses) {
-            return prepareRecord(record, sourceIndexes, varcharColumns, addresses);
+            if (record instanceof PageFrameFilteredMemoryRecord) return false;
+            for (int i = 0; i < sourceIndexes.length; i++) {
+                long address = record.getPageAddress(sourceIndexes[i]);
+                // Preserve ordinary getters for column tops and lazy casts.
+                if (address == 0) return false;
+                Unsafe.putLong(addresses + i * 8L, address);
+            }
+            prepareParameters(addresses);
+            for (int i = 0; i < varcharColumns.length; i++)
+                if (!record.writeNativeVarcharView(varcharColumns[i], addresses + stringOffset() + i * 48L)) return false;
+            return true;
         }
 
         void prepare(PageFrameMemory frame, long data, long aux, long rows, long addresses) {
             for (int i = 0; i < sourceIndexes.length; i++)
                 Unsafe.putLong(addresses + i * 8L, Unsafe.getLong(data + sourceIndexes[i] * 8L));
+            prepareParameters(addresses);
             for (int i = 0; i < varcharColumns.length; i++) {
                 int column = varcharColumns[i];
-                long descriptor = addresses + sourceIndexes.length * 8L + i * 48L;
+                long descriptor = addresses + stringOffset() + i * 48L;
                 // Latest-by can supply a shifted aux vector for a bounded row slice.
                 Unsafe.putLong(descriptor, Unsafe.getLong(aux + column * 8L));
                 Unsafe.putLong(descriptor + 8, Unsafe.getLong(data + column * 8L));
@@ -186,7 +194,10 @@ final class ResolvedFilter implements AutoCloseable {
         return true;
     }
 
-    ScanPlan fusedPlan() { return varcharColumns.length == 0 ? plan : null; }
+    ScanPlan fusedPlan() {
+        // The map-fused ABI currently carries column pointers only.
+        return binding.varcharColumns().length == 0 && binding.parameters().isEmpty() ? binding.plan() : null;
+    }
 
     long compilationNanos() { return code.compilationNanos(); }
 
@@ -202,7 +213,7 @@ final class ResolvedFilter implements AutoCloseable {
 
     final class Slot implements AutoCloseable {
         private final KernelMemory memory = KernelMemory.reusable((Runnable) null);
-        private final long bytes = sourceIndexes.length * 8L + varcharColumns.length * 48L + 8;
+        private final long bytes = binding.bytes() + 8;
         private long addresses = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
         private long inputRows;
         private long selectedRows;
@@ -210,7 +221,7 @@ final class ResolvedFilter implements AutoCloseable {
         /** Borrowed pointer array; zero declines before the caller mutates aggregate state. */
         long prepare(PageFrameMemoryRecord record) {
             if (closed || addresses == 0) throw new IllegalStateException("Filter slot is closed");
-            if (!prepareRecord(record, sourceIndexes, varcharColumns, addresses)) return 0;
+            if (!binding.prepare(record, addresses)) return 0;
             Unsafe.putLong(addresses + bytes - 8, 0);
             return addresses;
         }
