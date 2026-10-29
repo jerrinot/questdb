@@ -137,6 +137,20 @@ public class ResolvedSqlJoinTest {
     }
 
     @Test
+    public void doubleStatesUseDirectAndCopiedBuildPayloads() throws Exception {
+        engine.execute("alter table p add column f double", context);
+        engine.execute("update p set f=v*0.25", context);
+        engine.execute("alter table d add column f double", context);
+        engine.execute("insert into d select cast(x%131-65 as int),x,x*0.5 from long_sequence(50)", context);
+        for (long limit : new long[]{0, 128L << 20}) {
+            payloadCopyLimit = limit;
+            buildThreshold = limit == 0 ? Long.MAX_VALUE : 1;
+            matches("select count(p.f),sum(p.f),avg(p.f),min(d.f),max(d.f),avg(d.f) from p join d on p.k=d.k", true);
+            matches("select p.k,sum(p.f),avg(d.f),min(d.f),max(d.f) from p join d on p.k=d.k group by p.k", true, 1);
+        }
+    }
+
+    @Test
     public void buildPayloadsUseExistingDirectAndCopiedStorage() throws Exception {
         long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
         for (long limit : new long[]{0, 128L << 20}) {

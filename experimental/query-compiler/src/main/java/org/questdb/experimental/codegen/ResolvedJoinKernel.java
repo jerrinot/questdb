@@ -214,10 +214,10 @@ final class ResolvedJoinKernel {
                     direct.when(ne(page, nil()), present -> present.assign(address,
                             new Offset(page, binary(Op.MUL, binary(Op.AND, id, i64(0xfffffffffffL)), i64(column.width().bytes)))));
                 });
-                value = b.let(i64(column.nullable() ? column.nullValue() : 0));
+                value = b.let(column.nullLiteral());
                 b.when(ne(address, nil()), present -> present.assign(value, new Load(column.width(), address)));
             }
-            values.add(new Pipeline.Value(value, column.nullable() ? eq(value, i64(column.nullValue())) : bool(false)));
+            values.add(column.value(value));
         }
         return new Pipeline.Row(updates.columns(), values);
     }

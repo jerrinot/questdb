@@ -66,7 +66,8 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
         // Promote only the known fixed-width states; allocating aggregates need an allocator-aware path.
         for (var update : updates.updates()) {
             if (!(update instanceof AggregateUpdates.ScalarUpdate || update instanceof AggregateUpdates.IntegerExtremum
-                    || update instanceof AggregateUpdates.AverageUpdate)) return null;
+                    || update instanceof AggregateUpdates.AverageUpdate || update instanceof AggregateUpdates.DoubleSum
+                    || update instanceof AggregateUpdates.DoubleExtremum)) return null;
         }
         CompiledKernel code = backend.compile(scan(updates), artifacts);
         try {
@@ -81,7 +82,8 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
         var result = new ArrayList<Load>();
         for (var update : updates.updates()) {
             var width = update instanceof AggregateUpdates.IntegerExtremum extrema ? extrema.width()
-                    : update instanceof AggregateUpdates.AverageUpdate average ? average.sumType() : MemoryType.I64;
+                    : update instanceof AggregateUpdates.AverageUpdate average ? average.sumType()
+                    : update instanceof AggregateUpdates.DoubleSum || update instanceof AggregateUpdates.DoubleExtremum ? MemoryType.F64 : MemoryType.I64;
             result.add(new Load(width, at(base, update.offset())));
             if (update instanceof AggregateUpdates.AverageUpdate average)
                 result.add(new Load(MemoryType.I64, at(base, average.countOffset())));
@@ -143,6 +145,7 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
             case Binary binary -> new Binary(binary.op(), promote(binary.left(), registers), promote(binary.right(), registers));
             case Select select -> new Select(promote(select.condition(), registers), promote(select.yes(), registers), promote(select.no(), registers));
             case ToDouble cast -> new ToDouble(promote(cast.value(), registers));
+            case BitCast cast -> new BitCast(promote(cast.value(), registers));
             default -> throw new IllegalArgumentException("Unsupported scalar aggregate expression: " + expression);
         };
     }

@@ -65,6 +65,7 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
                     case ColumnType.SHORT -> MemoryType.I16;
                     case ColumnType.INT, ColumnType.SYMBOL, ColumnType.IPv4 -> MemoryType.I32;
                     case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> MemoryType.I64;
+                    case ColumnType.DOUBLE -> MemoryType.F64;
                     default -> null;
                 };
                 if (width == null) return null;

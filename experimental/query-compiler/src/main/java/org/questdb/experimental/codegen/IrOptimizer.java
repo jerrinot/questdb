@@ -141,6 +141,11 @@ public final class IrOptimizer {
                 Expr value = simplify(c.value(), facts);
                 yield value instanceof Literal l ? f64((double) l.value()) : new ToDouble(value);
             }
+            case BitCast c -> {
+                Expr value = simplify(c.value(), facts);
+                yield value instanceof Literal l ? new Literal(l.value(), c.type())
+                        : value instanceof BitCast inner ? inner.value() : new BitCast(value);
+            }
             case VectorMask m -> new VectorMask(m.lanes(), simplify(m.predicate(), facts));
             case SelectRows s -> new SelectRows(s.lanes(), simplify(s.mask(), facts), simplify(s.base(), facts), simplify(s.destination(), facts));
             case PopulationCount z -> { Expr v = simplify(z.value(), facts); yield v instanceof Literal l ? i64(Long.bitCount(l.value())) : new PopulationCount(v); }
@@ -175,6 +180,10 @@ public final class IrOptimizer {
         if (left instanceof Literal a && right instanceof Literal b) {
             long x = a.value(), y = b.value();
             return switch (op) {
+                case FEQ -> bool(Double.longBitsToDouble(x) == Double.longBitsToDouble(y));
+                case FNE -> bool(Double.longBitsToDouble(x) != Double.longBitsToDouble(y));
+                case FLT -> bool(Double.longBitsToDouble(x) < Double.longBitsToDouble(y));
+                case FGE -> bool(Double.longBitsToDouble(x) >= Double.longBitsToDouble(y));
                 case FADD -> f64(Double.longBitsToDouble(x) + Double.longBitsToDouble(y));
                 case FSUB -> f64(Double.longBitsToDouble(x) - Double.longBitsToDouble(y));
                 case FMUL -> f64(Double.longBitsToDouble(x) * Double.longBitsToDouble(y));
@@ -266,6 +275,7 @@ public final class IrOptimizer {
             case Allocate ignored -> false;
             case Reallocate ignored -> false;
             case ToDouble c -> discardable(c.value());
+            case BitCast c -> discardable(c.value());
             case Binary b -> discardable(b.left()) && discardable(b.right());
             case Offset o -> discardable(o.address()) && discardable(o.bytes());
             case Select s -> discardable(s.condition()) && discardable(s.yes()) && discardable(s.no());

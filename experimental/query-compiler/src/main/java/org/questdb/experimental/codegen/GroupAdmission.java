@@ -211,6 +211,7 @@ final class GroupAdmission implements AutoCloseable {
             case ColumnType.INT, ColumnType.SYMBOL -> record.getInt(column);
             case ColumnType.IPv4 -> record.getIPv4(column);
             case ColumnType.DATE -> record.getDate(column);
+            case ColumnType.DOUBLE -> Double.doubleToRawLongBits(record.getDouble(column));
             case ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> record.getTimestamp(column);
             default -> record.getLong(column);
         };

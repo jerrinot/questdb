@@ -5342,3 +5342,202 @@ both the multi-aggregate gain and the smaller single-SUM gain; these controls ar
 now close to the local read roof. No cross-machine or ClickBench-wide claim.
 Evidence: `/tmp/query-type-coverage-20261029/vector-integers` and the isolated typed
 fixture's complete responses. Existing stock configuration and binaries unchanged.
+
+## 2026-10-29: IEEE primitives for DOUBLE bindings
+
+Typed IR now has IEEE equality/inequality/order comparisons and reversible I64/F64
+bit casts. Separate floating operations keep integer comparison identities from
+folding NaN cases incorrectly. LLVM, C and AsmJit preserve NaNs, infinities, signed
+zero and subnormals without fast-math; the AsmJit wire version advances with its
+new opcodes. Three focused backend tests check all 196 exceptional-value pairs,
+self comparisons, constant folding and exact bit round trips. This is compiler
+infrastructure; SQL DOUBLE coverage and performance remain the next checkpoint.
+
+## 2026-10-29: direct DOUBLE aggregate lifecycles
+
+Direct DOUBLE columns now feed ordinary COUNT/SUM/AVG/MIN/MAX in generated grouped,
+scalar and join consumers. A column owns typed loading/NULL construction across
+frame, join and retained-input producers. COUNT uses Numbers.isFinite; SUM/AVG
+skip only NaNs; extrema preserve the ordinary nonfinite-current replacement rule.
+Shared AVG retains DOUBLE/LONG state and the scalar owner's resolved slot stride.
+The existing join payload view now admits DOUBLE, already supported by its frame
+reader and copy storage. Integer projection retains its explicit type boundary.
+
+Focused LLVM/AsmJit/C checks compare every state after mixed ordinary/generated
+updates and merges, including infinities, NaN payloads, signed zero, subnormals
+and overflow. SQL checks cover NULL-only groups, column tops, Parquet, reopen,
+empty input, keyed/scalar merge and direct/copied join payloads. The join tests
+assert native row counters, which caught the remaining payload eligibility gate.
+
+500M rows, eight physical cores, balanced six-process comparison:
+
+| General shape | Stock ms | Before ms | Generated ms |
+| --- | ---: | ---: | ---: |
+| SHORT groups, five DOUBLE aggregates | 740–744 | 729–731 | 339–340 |
+| Filtered scalar five-aggregate reduction | 518–534 | 398–439 | 255–260 |
+| SYMBOL vector control, still fallback | 703 | 704–711 | 698–714 |
+| Arithmetic/filter control, still fallback | 354–364 | 350–360 | 347–349 |
+
+All 168 complete results match an independent exact quarter-valued oracle; no
+measured process reads/major faults. Arbitrary floating sums can still depend on
+parallel merge order; fixed-sequence state tests cover that semantic boundary.
+Main-case instructions/input fall about 343 ->144, cycles 61 ->28 and retired
+ops 314 ->131. Controller reads fall modestly 5.82 ->5.33 GB/query; throughput
+rises 7.9 ->15.4 GB/s. JFR attributes the baseline to OrderedMap probing/hashing
+plus separate aggregate batches. The gain removes core work and repeated passes;
+it is not a bandwidth-floor result (5 GB input-only floor is about 86 ms).
+Scalar before runs vary materially, so report their range instead of attributing
+the larger stock delta entirely to this increment. No new DOUBLE vector,
+expression, key, projection or ranking coverage is implied.
+Evidence: `/tmp/query-type-coverage-20261029/double`, with validated study, complete
+responses, native execution audits and unchanged stock settings/binary.
+
+## 2026-10-29: DOUBLE aggregates in bounded SYMBOL arrays
+
+The existing dictionary-array path now binds vector COUNT/SUM/AVG/MIN/MAX(DOUBLE).
+It shares the same worker slots, snapshot domain, budget, generated merge and
+Rosti result export. Floating SUM/AVG use the actual DOUBLE-sum/LONG-count state;
+COUNT excludes NaNs but counts infinities, and extrema retain infinite sentinels.
+These differ from ordinary scalar functions, so binding follows the selected
+physical function rather than imposing a new floating-point contract.
+
+Floating plans delegate missing-key pages to the existing vector functions'
+unkeyed accumulators and wrap-up. An initial attempt to do this for integer-only
+plans exposed an existing integer AVG wrap-up bug; those plans keep their working
+generated NULL-key path. The stock issue is recorded in TODO. Signed-zero output
+can depend on which vector task first creates a group and on worker merge order;
+SQL comparisons accept either zero sign, with no tolerance for other values.
+Fixed-state interoperation tests still compare exact bits after every generated
+or ordinary update/merge. All 27 focused cases pass across LLVM, AsmJit and C,
+including column tops, Parquet, snapshot reuse, memory failure and exceptional
+floating values. No new execution toggle.
+
+500M rows, eight physical cores, balanced stock/before/after/after/before/stock:
+
+| SYMBOL-grouped DOUBLE shape | Stock ms | Before ms | Generated ms |
+| --- | ---: | ---: | ---: |
+| COUNT, SUM, AVG, MIN, MAX | 714–717 | 707–709 | 108–110 |
+| COUNT | 124–125 | 129–130 | 107–109 |
+| SUM, AVG | 303–305 | 305–314 | 106–107 |
+| MIN, MAX | 275–276 | 276–282 | 104–105 |
+
+All 168 complete results match the independent quarter-valued oracle. Native
+execution audits confirm every input row; measured process reads/major faults
+are zero. Baseline samples attribute 98% of cycles to separate Rosti loops.
+Fusion cuts instructions/input 372 ->51, cycles about60 ->9 and retired ops
+349 ->46. Controller reads fall 8.90 ->6.22 GB/query while read throughput rises
+12.5 ->54.9 GB/s. Six GB of unique input has an optimistic 103ms streaming floor
+at this host's measured 58.4 GB/s read roof. The five-aggregate result is close to
+that floor, explaining why even COUNT alone ends near the same time. This is a
+specific measured bandwidth fit, not a universal CPU policy or mixed-traffic roof.
+Evidence: `/tmp/query-type-coverage-20261029/vector-double` and the isolated typed
+fixture's complete responses, PMU captures and execution audits.
+
+## 2026-10-29: DOUBLE expressions and SIMD predicates
+
+Existing numeric expression nodes now admit DOUBLE addition/subtraction/multiply;
+typed constants, integer widening and SQL division complete their operand paths.
+Binding uses exact resolved function classes. Integer arithmetic wraps at its
+source width before conversion, NULL becomes NaN, and division normalizes a
+nonfinite result. SQL floating comparisons preserve Numbers.equals' tolerance
+and nonfinite rules. The shared lane verifier and LLVM vector emitter admit
+floating arithmetic, comparisons and bit casts; existing bounded reads, tails
+and cancellation remain. No fast-math, expression-specific loop or new toggle.
+
+Twenty-seven focused backend/type cases pass, including exact arithmetic bits,
+source-width overflow, nonfinite inputs, guarded SIMD tails, column tops,
+Parquet, reopen, empty results and grouped/scalar consumers. Additional resolved
+binary equality/inequality checks cover mixed integer/floating operands.
+Projection, grouping-key encoding and ranking are still separate gaps.
+
+500M rows, eight physical cores, six balanced processes; all 168 full responses
+match independent integer-derived quarter-valued expectations:
+
+| General shape | Stock ms | Before ms | Generated ms |
+| --- | ---: | ---: | ---: |
+| Filtered grouped arithmetic SUM + AVG | 347–349 | 351–353 | 155–156 |
+| Unfiltered grouped arithmetic SUM + AVG | 646–647 | 647–672 | 289–291 |
+| Filtered grouped direct SUM + AVG | 345–353 | 190–193 | 154 |
+| Filtered scalar arithmetic SUM + AVG | 188–190 | 176–179 | 143–144 |
+
+The primary stock filter was already JIT compiled. JFR attributes remaining work
+to generic OrderedMap probing/hashing and separate aggregate batches; PMU retiring
+is 62% with 161 instructions/input. Generated execution reduces instructions to 60,
+cycles 29.5 ->13 and retired operations 149 ->54. Controller reads fall 8.30 ->4.71 GB,
+writes 0.86 ->0.038 GB/query, while read throughput rises 23 ->30 GB/s. Fusing selection
+avoids intermediate traffic; expression binding also removes generic per-aggregate
+passes. Five GB of unique input has an optimistic 86 ms floor on this machine, so
+this result still has core-work headroom. Scalar instructions fall 70 ->15 but time
+improves much less; retained selection traffic remains a separate experiment.
+Warm runs have no process reads, major faults or full memory/IO stalls. Evidence:
+`/tmp/query-type-coverage-20261029/double-expressions`, validated study and complete
+responses/execution counters. Stock binary and settings remain unchanged.
+
+The next DOUBLE-key probe exposed an AVG fallback regression: a supported update
+with an unsupported key tried to generate a final map scan without a map binding.
+Three backend cases reproduce the failure before the fix and pass afterward.
+Generated finalization now requires a mutable native map; update-only execution
+keeps ordinary AVG getters/finalization. The failed probe runs are excluded from
+performance evidence. This also covers unsupported computed integer keys such as
+ABS without broadening their compiler eligibility.
+
+
+## 2026-10-30: DOUBLE grouping and cache-aware packed local state
+
+Direct, computed and composite DOUBLE keys now use the existing map's raw IEEE
+bit encoding. Signed zero and distinct NaN payloads remain distinct groups;
+column tops use the DOUBLE getter's NaN rather than a LONG null sentinel.
+Focused tests cover raw bits, nearby unequal values, integer/SYMBOL/VARCHAR
+composites, bounded admission, reopen, column tops, Parquet and empty input.
+
+Merely admitting these keys made generated execution worse: an 8,192-group,
+roughly 448 KiB packed state exceeded the old 256 KiB/count heuristic, repeatedly
+materializing almost every input. The primary 500M-row case took 934–968 ms and
+moved 49.5 GB through the controller. Disabling bounded materialization reduced
+it to 375 ms and 10.7 GB, establishing the counterfactual. Four/eight/sixteen-core
+runs and a separate mixed streaming calibration support bandwidth as a substantial
+constraint: eight-core query traffic reached 53 GB/s against a measured 63 GB/s
+mixed controller roof. Allocation and partition CPU work were additional costs.
+
+Packed OrderedMap state now gets a conservative L2 budget from existing topology
+discovery, bounded by half the cache and its allowed-CPU share. Generated checks
+account for both used packed bytes and the actual offset table. The count guard
+allows a stable set exactly at capacity to keep combining; Java's final scheduling
+check uses the same boundary. Missing metadata retains 256 KiB. Inline maps keep
+their prior limit. No new toggle or query/cardinality-specific choice.
+
+A full-cache budget was rejected: it improved uniform packed cases further, but
+regressed 99%-hot-key controls by 8–16%. L2 data misses doubled on the inline case
+while instructions barely changed. Keeping the inline policy and leaving packed
+cache headroom removed those regressions. The final policy is deliberately the
+measured compromise; one CPU family plus physical-core/SMT controls does not prove
+an optimal cache policy on every machine.
+
+500M rows, eight physical cores, two warmups/five measurements per process:
+
+| General grouping shape | Stock ms | Final generated ms |
+| --- | ---: | ---: |
+| DOUBLE key, COUNT + integer SUM/AVG | 621–627 | 371–376 |
+| Arithmetic DOUBLE key, COUNT + SUM | 691–703 | 270–275 |
+| INT/DOUBLE composite, COUNT + SUM | 972–973 | 388–391 |
+| DOUBLE/computed VARCHAR composite, COUNT + SUM | 1262–1277 | 780–783 |
+
+The primary generated case uses 114 instructions and 31 cycles/input, versus
+about 148 and 72–78 for the prematurely partitioning version. Controller traffic
+is now 10.7 GB/query; ten GB of unique input has an optimistic 171 ms read-only
+floor on this host. Final four/eight/sixteen-physical-core times are 714/373/210 ms;
+four physical cores with eight SMT workers take 573 ms. More headroom remains.
+The exact-capacity scheduler fix removed unnecessary final partitioning but did
+not explain the residual timing difference from the rejected full-cache policy.
+
+All 105 final full responses match an independent oracle. Another 168 responses
+validate balanced high-cardinality, variable-key and skew controls: inline skew
+stays ~124 ms, packed skew ~152 ms, million-group inline COUNT ~532–536 ms versus
+~528–530 before. A small packed-state control improves ~325 to297 ms. No claim of
+a fresh full ClickBench win. Focused backend and partition/resume tests pass.
+
+The design follows the bounded-local-state tradeoff described in [Robust External
+Hash Aggregation](https://hannes.muehleisen.org/publications/icde2024-out-of-core-kuiper-boncz-muehleisen.pdf),
+but uses QuestDB's existing maps, compact partitions and scheduler. Evidence and
+validated studies: `/tmp/query-type-coverage-20261029/double-keys` and `cache-policy`;
+full temporary responses remain with the isolated typed fixture.

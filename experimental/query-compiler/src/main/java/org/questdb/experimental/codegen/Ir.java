@@ -58,14 +58,14 @@ public final class Ir {
         }
     }
 
-    public enum Op { ADD, SUB, MUL, AND, XOR, USHR, EQ, NE, LT, GE, BOTH, EITHER, FADD, FSUB, FMUL, FDIV, SDIV }
+    public enum Op { ADD, SUB, MUL, AND, XOR, USHR, EQ, NE, LT, GE, BOTH, EITHER, FADD, FSUB, FMUL, FDIV, SDIV, FEQ, FNE, FLT, FGE }
 
-    public sealed interface Expr permits Var, Literal, Binary, Load, Offset, Select, Allocate, Reallocate, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, AtomicLoad, CompareExchange, AtomicAdd {
+    public sealed interface Expr permits Var, Literal, Binary, Load, Offset, Select, Allocate, Reallocate, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, BitCast, AtomicLoad, CompareExchange, AtomicAdd {
         Type type();
     }
 
     /**
-     * Bit j is the predicate for lane j. Every integer load reads its address plus
+     * Bit j is the predicate for lane j. Every numeric load reads its address plus
      * j * width. Other values are invariant. The caller must establish that ALL
      * lanes of EVERY load are readable, including both arms of a select.
      * This is a read effect, not pure scalar arithmetic.
@@ -95,6 +95,15 @@ public final class Ir {
     public record ToDouble(Expr value) implements Expr {
         public ToDouble { require(value, Type.I64); }
         @Override public Type type() { return Type.F64; }
+    }
+
+    /** Preserve all 64 bits, including NaN payloads and signed zero. */
+    public record BitCast(Expr value) implements Expr {
+        public BitCast {
+            if (value.type() != Type.I64 && value.type() != Type.F64)
+                throw new IllegalArgumentException("Bit cast requires I64 or F64");
+        }
+        @Override public Type type() { return value.type() == Type.I64 ? Type.F64 : Type.I64; }
     }
 
     public record TrailingZeros(Expr value) implements Expr {
@@ -138,9 +147,9 @@ public final class Ir {
             }
             switch (op) {
                 case EQ, NE -> {
-                    if (left.type() == Type.F64) throw new IllegalArgumentException("Floating comparisons are not bound yet");
+                    if (left.type() == Type.F64) throw new IllegalArgumentException("Use IEEE floating comparison operations");
                 }
-                case FADD, FSUB, FMUL, FDIV -> require(left, Type.F64);
+                case FADD, FSUB, FMUL, FDIV, FEQ, FNE, FLT, FGE -> require(left, Type.F64);
                 case BOTH, EITHER -> require(left, Type.BOOL);
                 default -> require(left, Type.I64);
             }
@@ -149,7 +158,7 @@ public final class Ir {
         @Override
         public Type type() {
             return switch (op) {
-                case EQ, NE, LT, GE, BOTH, EITHER -> Type.BOOL;
+                case EQ, NE, LT, GE, BOTH, EITHER, FEQ, FNE, FLT, FGE -> Type.BOOL;
                 case FADD, FSUB, FMUL, FDIV -> Type.F64;
                 default -> Type.I64;
             };
@@ -406,6 +415,7 @@ public final class Ir {
             case Allocate a -> collectReads(a.bytes(), reads);
             case Reallocate r -> { collectReads(r.address(), reads); collectReads(r.oldBytes(), reads); collectReads(r.newBytes(), reads); }
             case ToDouble c -> collectReads(c.value(), reads);
+            case BitCast c -> collectReads(c.value(), reads);
             case VectorMask m -> collectReads(m.predicate(), reads);
             case SelectRows s -> { collectReads(s.mask(), reads); collectReads(s.base(), reads); collectReads(s.destination(), reads); }
             case PopulationCount z -> collectReads(z.value(), reads);
@@ -479,6 +489,7 @@ public final class Ir {
             case Allocate a -> verify(a.bytes(), scope);
             case Reallocate r -> { verify(r.address(), scope); verify(r.oldBytes(), scope); verify(r.newBytes(), scope); }
             case ToDouble c -> verify(c.value(), scope);
+            case BitCast c -> verify(c.value(), scope);
             case VectorMask m -> verify(m.predicate(), scope);
             case PopulationCount z -> verify(z.value(), scope);
             case TrailingZeros z -> verify(z.value(), scope);

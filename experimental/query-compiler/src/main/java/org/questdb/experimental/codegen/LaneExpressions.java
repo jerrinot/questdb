@@ -33,12 +33,14 @@ final class LaneExpressions {
 
     static void verify(Expr e) {
         switch (e) {
-            case Literal l -> { if (l.type() == Type.ADDRESS || l.type() == Type.F64) reject(); }
-            case Var v -> { if (v.type() == Type.ADDRESS || v.type() == Type.F64) reject(); }
+            case Literal l -> { if (l.type() == Type.ADDRESS) reject(); }
+            case Var v -> { if (v.type() == Type.ADDRESS) reject(); }
             case Binary b -> { verify(b.left()); verify(b.right()); }
             case Select s -> { verify(s.condition()); verify(s.yes()); verify(s.no()); }
+            case ToDouble c -> verify(c.value());
+            case BitCast c -> verify(c.value());
             case Load l -> {
-                if (l.width() == MemoryType.ADDRESS || l.width() == MemoryType.F64) reject();
+                if (l.width() == MemoryType.ADDRESS) reject();
                 invariantAddress(l.address());
             }
             default -> reject();
@@ -61,11 +63,13 @@ final class LaneExpressions {
             case Load l -> mapper.apply(l);
             case Binary b -> new Binary(b.op(), mapLoads(b.left(), mapper), mapLoads(b.right(), mapper));
             case Select s -> new Select(mapLoads(s.condition(), mapper), mapLoads(s.yes(), mapper), mapLoads(s.no(), mapper));
+            case ToDouble c -> new ToDouble(mapLoads(c.value(), mapper));
+            case BitCast c -> new BitCast(mapLoads(c.value(), mapper));
             case Var v -> v;
             case Literal l -> l;
             default -> throw new IllegalArgumentException("Not a lane expression: " + e);
         };
     }
 
-    private static void reject() { throw new IllegalArgumentException("Lane predicates require pure arithmetic and consecutive integer reads"); }
+    private static void reject() { throw new IllegalArgumentException("Lane predicates require pure arithmetic and consecutive numeric reads"); }
 }

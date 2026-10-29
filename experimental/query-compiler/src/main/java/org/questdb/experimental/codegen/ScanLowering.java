@@ -303,7 +303,7 @@ final class ScanLowering {
     private static Value materializeColumn(Builder b, Column column, Value value) {
         if (value.data() instanceof Var) return value;
         Var data = b.let(value.data());
-        return new Value(data, column.nullable() ? eq(data, i64(column.nullValue())) : bool(false));
+        return column.value(data);
     }
     private static Row lazy(List<Column> columns, List<Expr> parameters, IntFunction<Value> producer) {
         Value[] cache = new Value[columns.size()];
@@ -326,10 +326,10 @@ final class ScanLowering {
             Var base = addresses.get(column.index());
             Expr address = new Offset(base, binary(Op.MUL, index, i64(column.width().bytes)));
             Expr data = new Load(column.width(), address);
-            if (guardTops) data = new Select(eq(base, nil()), i64(column.nullValue()), data);
+            if (guardTops) data = new Select(eq(base, nil()), column.nullLiteral(), data);
             // Keep the read as an expression. Unused columns generate no loads,
             // and consumer columns appear only inside the selected-row region.
-            values.add(new Value(data, column.nullable() ? eq(data, i64(column.nullValue())) : bool(false)));
+            values.add(column.value(data));
         }
         return new Row(columns, values, parameters);
     }

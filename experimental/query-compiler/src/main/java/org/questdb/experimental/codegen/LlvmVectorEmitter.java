@@ -43,7 +43,7 @@ final class LlvmVectorEmitter {
         return lanes == 64 ? bits : temp.apply("zext i" + lanes + " " + bits + " to i64");
     }
     private String vector(Type type) { return "<" + lanes + " x " + scalarType(type) + ">"; }
-    private static String scalarType(Type type) { return type == Type.BOOL ? "i1" : "i64"; }
+    private static String scalarType(Type type) { return type == Type.BOOL ? "i1" : type == Type.F64 ? "double" : "i64"; }
     private String value(Expr e) {
         String old = values.get(e); if (old != null) return old;
         String result = switch (e) {
@@ -51,7 +51,7 @@ final class LlvmVectorEmitter {
             case Literal ignored -> splat(e);
             case Load l -> {
                 String pointer = temp.apply("inttoptr i64 " + invariant(l.address()) + " to ptr");
-                String memoryType = "<" + lanes + " x i" + l.width().bytes * 8 + ">";
+                String memoryType = "<" + lanes + " x " + (l.width() == MemoryType.F64 ? "double" : "i" + l.width().bytes * 8) + ">";
                 String loaded = temp.apply("load " + memoryType + ", ptr " + pointer + ", align 1");
                 yield l.width().bytes == 8 ? loaded : temp.apply("sext " + memoryType + " " + loaded + " to " + vector(Type.I64));
             }
@@ -62,6 +62,8 @@ final class LlvmVectorEmitter {
             }
             case Select s -> temp.apply("select " + vector(Type.BOOL) + " " + value(s.condition()) + ", "
                     + vector(s.type()) + " " + value(s.yes()) + ", " + vector(s.type()) + " " + value(s.no()));
+            case ToDouble c -> temp.apply("sitofp " + vector(Type.I64) + " " + value(c.value()) + " to " + vector(Type.F64));
+            case BitCast c -> temp.apply("bitcast " + vector(c.value().type()) + " " + value(c.value()) + " to " + vector(c.type()));
             default -> throw new IllegalArgumentException("Not a lane expression: " + e);
         };
         values.put(e, result); return result;
@@ -75,7 +77,8 @@ final class LlvmVectorEmitter {
         String old = invariants.get(e); if (old != null) return old;
         String result = switch (e) {
             case Var v -> "%" + v.name();
-            case Literal l -> l.type() == Type.BOOL ? Boolean.toString(l.value() != 0) : Long.toString(l.value());
+            case Literal l -> l.type() == Type.BOOL ? Boolean.toString(l.value() != 0)
+                    : l.type() == Type.F64 ? "0x" + String.format("%016X", l.value()) : Long.toString(l.value());
             case Offset o -> temp.apply("add i64 " + invariant(o.address()) + ", " + invariant(o.bytes()));
             case Binary b -> {
                 String left = invariant(b.left()), right = invariant(b.right());
@@ -90,7 +93,8 @@ final class LlvmVectorEmitter {
     }
     private static String op(Op op) {
         return switch (op) {
-            case FADD, FSUB, FMUL, FDIV -> throw new IllegalArgumentException("Floating lanes are not bound yet");
+            case FADD -> "fadd"; case FSUB -> "fsub"; case FMUL -> "fmul"; case FDIV -> "fdiv";
+            case FEQ -> "fcmp oeq"; case FNE -> "fcmp une"; case FLT -> "fcmp olt"; case FGE -> "fcmp oge";
             case ADD -> "add"; case SUB -> "sub"; case MUL -> "mul"; case SDIV -> "sdiv";
             case AND, BOTH -> "and"; case XOR -> "xor"; case EITHER -> "or"; case USHR -> "lshr";
             case EQ -> "icmp eq"; case NE -> "icmp ne"; case LT -> "icmp slt"; case GE -> "icmp sge";

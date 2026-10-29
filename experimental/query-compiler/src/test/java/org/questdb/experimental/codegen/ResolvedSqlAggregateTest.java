@@ -1214,6 +1214,31 @@ public class ResolvedSqlAggregateTest {
     }
 
     @Test
+    public void localMapsKeepCombiningAtExactCapacity() throws Exception {
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(8192, 8192);
+            mapEntrySize = 64;
+            for (int groups : new int[]{64, 65}) {
+                // Inline maps keep zero in a separate slot, outside their occupied-bucket count.
+                engine.execute("create table boundary_" + groups + " as (select cast(x%" + groups + "+1 as int) k,"
+                        + "cast('key-'||cast(x%" + groups + " as string) as varchar) tag,x v "
+                        + "from long_sequence(32768))", context);
+                for (String keys : List.of("k", "k,tag")) {
+                    long before = compiler.delegates.values().stream().mapToLong(value -> ((AggregateSlot) value).partitionRows()).sum();
+                    assertMatches("select " + keys + ",count(),sum(v) from boundary_" + groups
+                            + " where v>=0 group by " + keys, true);
+                    long partials = compiler.delegates.values().stream().mapToLong(value -> ((AggregateSlot) value).partitionRows()).sum() - before;
+                    if (groups == 64) assertEquals("Resident groups should not enter the partition path", 0, partials);
+                    else assertTrue("New groups beyond the limit must still flush: " + keys + "=" + partials, partials > 65 * 6);
+                }
+            }
+        } finally {
+            System.clearProperty("query.codegen.localCapacity");
+        }
+    }
+
+    @Test
     public void inputPartitionsAdaptAcrossFramesAndPreserveReopen() throws Exception {
         System.setProperty("query.codegen.localCapacity", "64");
         try {

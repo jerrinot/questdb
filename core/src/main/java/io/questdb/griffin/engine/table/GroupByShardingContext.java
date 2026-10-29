@@ -721,7 +721,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
         if (bounded) {
             for (int i = 0; i < compiledUpdaters.size(); i++) {
                 GroupByKernel.Updater updater = compiledUpdaters.getQuick(i);
-                if (updater.hasPartitions() || getFragment(i - 1).getMap().size() >= updater.localMapCapacity()) {
+                if (updater.hasPartitions() || getFragment(i - 1).getMap().size() > updater.localMapCapacity()) {
                     sharded = true;
                     break;
                 }

@@ -292,7 +292,7 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
         public Pipeline.Value emit(Builder b, Expr entry) {
             Var value = b.let(new Load(width, at(entry, offset)));
             Pipeline.Column column = new Pipeline.Column(0, "stored", type);
-            return new Pipeline.Value(value, column.nullable() ? eq(value, i64(column.nullValue())) : bool(false));
+            return column.value(value);
         }
     }
 

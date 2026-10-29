@@ -14,7 +14,7 @@ namespace {
 struct Header { uint32_t magic,version,registers,labels,count,reserved; };
 struct Instruction { int32_t op,dst,a,b; int64_t immediate; };
 static_assert(sizeof(Header)==24 && sizeof(Instruction)==24);
-enum Opcode { Const=1,Move,Add,Sub,Mul,And,Xor,Ushr,Eq,Ne,Lt,Ge,Load,Store,Bind,Jump,BranchFalse,Allocate,Free,Poll,Return,CompareBranch,BranchTrue,Ctz,Prefetch,FAdd,FSub,FMul,FDiv,ToDouble,SDiv,AtomicLoad,CompareExchange,AtomicStore,AtomicAdd,ByteEqMask,Reallocate };
+enum Opcode { Const=1,Move,Add,Sub,Mul,And,Xor,Ushr,Eq,Ne,Lt,Ge,Load,Store,Bind,Jump,BranchFalse,Allocate,Free,Poll,Return,CompareBranch,BranchTrue,Ctz,Prefetch,FAdd,FSub,FMul,FDiv,ToDouble,SDiv,AtomicLoad,CompareExchange,AtomicStore,AtomicAdd,ByteEqMask,Reallocate,FEq,FNe,FLt,FGe };
 JitRuntime runtime;
 std::atomic<int64_t> live_functions{0};
 struct Errors : ErrorHandler {
@@ -23,7 +23,7 @@ struct Errors : ErrorHandler {
 };
 void require(bool condition,const char* message) { if(!condition)throw std::invalid_argument(message); }
 void validate(const Header& h,const Instruction* code) {
-    require(h.magic==0x51444952 && h.version==8 && h.reserved==0,"incompatible query IR ABI");
+    require(h.magic==0x51444952 && h.version==9 && h.reserved==0,"incompatible query IR ABI");
     require(h.registers>=3 && h.registers<=1000000 && h.labels<=1000000 && h.count>0 && h.count<=1000000,"invalid IR dimensions");
     std::vector<bool> bound(h.labels),referenced(h.labels);
     auto reg=[&](int id){require(id>=0 && uint32_t(id)<h.registers,"invalid register");};
@@ -37,7 +37,7 @@ void validate(const Header& h,const Instruction* code) {
                 require(i.immediate>=0&&i.immediate<=255,"invalid byte mask constant");break;
             case Const:reg(i.dst);break;
             case AtomicLoad:case Move:case Load:case Allocate:case Ctz:case ToDouble:reg(i.dst);reg(i.a);break;
-            case AtomicAdd:case SDiv:case FAdd:case FSub:case FMul:case FDiv:case Add:case Sub:case Mul:case And:case Xor:case Ushr:case Eq:case Ne:case Lt:case Ge:reg(i.dst);reg(i.a);reg(i.b);break;
+            case FEq:case FNe:case FLt:case FGe:case AtomicAdd:case SDiv:case FAdd:case FSub:case FMul:case FDiv:case Add:case Sub:case Mul:case And:case Xor:case Ushr:case Eq:case Ne:case Lt:case Ge:reg(i.dst);reg(i.a);reg(i.b);break;
             case CompareExchange:reg(i.dst);reg(i.a);reg(i.b);require(i.immediate>=0&&uint64_t(i.immediate)<h.registers,"invalid CAS value");break;
             case Reallocate:reg(i.dst);reg(i.a);reg(i.b);require(i.immediate>=0&&uint64_t(i.immediate)<h.registers,"invalid reallocation size register");break;
             case AtomicStore:case Store:case Free:reg(i.a);reg(i.b);break;
@@ -76,7 +76,7 @@ void* compile(const Header& h,const Instruction* instructions) {
     definitions[0]=definitions[1]=definitions[2]=1;
     for(uint32_t n=0;n<h.count;n++) {
         const auto& i=instructions[n];
-        if((i.op>=Const&&i.op<=Load)||i.op==Allocate||i.op==Reallocate||i.op==Ctz||i.op==AtomicAdd||i.op==ByteEqMask||(i.op>=FAdd&&i.op<=CompareExchange)) {
+        if((i.op>=Const&&i.op<=Load)||i.op==Allocate||i.op==Reallocate||i.op==Ctz||i.op==AtomicAdd||i.op==ByteEqMask||(i.op>=FEq&&i.op<=FGe)||(i.op>=FAdd&&i.op<=CompareExchange)) {
             definitions[i.dst]++;if(i.op==Const){constant[i.dst]=true;value[i.dst]=i.immediate;}
         }
     }
@@ -126,6 +126,18 @@ void* compile(const Header& h,const Instruction* instructions) {
                         case Mul:c.imul(r[i.dst],right);break;case And:c.and_(r[i.dst],right);break;case Xor:c.xor_(r[i.dst],right);break;
                     }
                 }break;
+            case FEq:case FNe:case FLt:case FGe: {
+                auto left=c.new_xmm(),right=c.new_xmm();
+                auto ordered=c.new_gp32();
+                c.movq(left,source(i.a));c.movq(right,source(i.b));c.ucomisd(left,right);
+                switch(i.op) {
+                    case FEq:c.sete(r[i.dst].r8());c.setnp(ordered.r8());c.and_(r[i.dst].r8(),ordered.r8());break;
+                    case FNe:c.setne(r[i.dst].r8());c.setp(ordered.r8());c.or_(r[i.dst].r8(),ordered.r8());break;
+                    case FLt:c.setb(r[i.dst].r8());c.setnp(ordered.r8());c.and_(r[i.dst].r8(),ordered.r8());break;
+                    case FGe:c.setae(r[i.dst].r8());break;
+                }
+                c.movzx(r[i.dst],r[i.dst].r8());break;
+            }
             case Eq:case Ne:case Lt:case Ge:
                 compare(i.a,i.b);
                 switch(i.op) {

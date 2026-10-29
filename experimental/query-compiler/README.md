@@ -27,8 +27,8 @@ Registration is absent by default. Core exposes `QueryCodeGenerator`; it has no
 LLVM dependency. The normal planner resolves functions and chooses factories.
 `ResolvedQueryCompiler` binds supported implementations, types and storage layouts.
 Existing metadata COUNT and vector specializations retain their planner gates.
-Eligible static-SYMBOL grouping uses bounded dictionary arrays for integer
-COUNT/SUM/MIN/MAX/AVG, including the vector AVG(LONG) 128-bit sum contract.
+Eligible static-SYMBOL grouping uses bounded dictionary arrays for integer/DOUBLE
+COUNT/SUM/MIN/MAX/AVG, including vector floating-state and AVG(LONG) 128-bit sum contracts.
 Unsupported plans keep ordinary execution.
 
 | Responsibility | Code |
@@ -113,10 +113,14 @@ The binders and focused tests are authoritative. Current families include:
   direct VARCHAR null and literal substring predicates, including their negation;
   searched CASE string values.
 - Direct and computed fixed-width keys, SYMBOL IDs, VARCHAR keys and composite keys
-  using existing map encodings. NULL and empty strings remain distinct.
-- Resolved COUNT (including static SYMBOL), integer SUM/MIN/MAX, INT/LONG/static-SYMBOL DISTINCT, SHORT/INT/LONG AVG and VARCHAR MIN/MAX
+  using existing map encodings. DOUBLE grouping preserves raw IEEE bits, including
+  signed zero and NaN payloads. NULL and empty strings remain distinct.
+- DOUBLE arithmetic (+, -, *, /), integer-to-DOUBLE widening, tolerance-aware
+  comparisons and NULL predicates in scan/filter/aggregate expressions
+- Resolved COUNT (including static SYMBOL and DOUBLE), integer/DOUBLE SUM/MIN/MAX/AVG,
+  INT/LONG/static-SYMBOL DISTINCT and VARCHAR MIN/MAX
   implementations. Supported overloads depend on the selected map/update path.
-- Unkeyed COUNT and integer SUM/MIN/MAX/AVG reductions over filtered frames and
+- Unkeyed COUNT and integer/DOUBLE SUM/MIN/MAX/AVG reductions over filtered frames and
   unfiltered expressions whose plan uses row-by-row updates. Existing vector and
   metadata specializations retain priority. Worker-state copying/merging is generated.
 - Numeric projection, final COUNT reduction, LONG full sort and Top-K, and positive
@@ -128,7 +132,7 @@ The binders and focused tests are authoritative. Current families include:
   admission, worker-result merge, survivor heap packing, compaction/final sorting
   and final LIMIT prefix selection in the existing EncodedTopKBuffer. EXPLAIN uses
   `compiledTopK`; execution counters and result checks establish actual coverage.
-- INT inner-join probe pipelines with supported COUNT/integer SUM/MIN/MAX/AVG, post-join
+- INT inner-join probe pipelines with supported COUNT and integer/DOUBLE SUM/MIN/MAX/AVG, post-join
   predicates and direct INT/LONG grouping. They borrow the existing frozen join;
   Java retains build and runtime ownership. Outer joins and general join-to-DISTINCT
   remain outside this binding.

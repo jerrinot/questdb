@@ -86,6 +86,7 @@ final class ResolvedProjection implements CompiledProjection {
                 if (column.getColumnIndex() < offset) return null;
                 continue;
             }
+            if (function.getType() == ColumnType.DOUBLE) return null;
             Pipeline.Scalar expression = inputs.scalar(function, function.getType());
             if (expression == null) return null;
             outputs[i] = expressions.size();

@@ -140,6 +140,7 @@ final class PortableVectorLowering {
                 yield new Reallocate(address, oldBytes, expr(r.newBytes(), out));
             }
             case ToDouble c -> new ToDouble(expr(c.value(), out));
+            case BitCast c -> new BitCast(expr(c.value(), out));
             case PopulationCount z -> {
                 Var value = let(out, expr(z.value(), out));
                 out.add(new Assign(value, binary(Op.SUB, value, binary(Op.AND, binary(Op.USHR, value, i64(1)), i64(0x5555555555555555L)))));
@@ -173,6 +174,7 @@ final class PortableVectorLowering {
             case Allocate a -> contains(a.bytes());
             case Reallocate r -> contains(r.address()) || contains(r.oldBytes()) || contains(r.newBytes());
             case ToDouble c -> contains(c.value());
+            case BitCast c -> contains(c.value());
             case PopulationCount ignored -> true;
             case TrailingZeros z -> contains(z.value());
             default -> false;

@@ -68,8 +68,8 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
 
     public record Value(Expr data, Expr isNull) {
         public Value {
-            if (data.type() != Type.I64 || isNull.type() != Type.BOOL) {
-                throw new IllegalArgumentException("Expected an integer value and null flag");
+            if ((data.type() != Type.I64 && data.type() != Type.F64) || isNull.type() != Type.BOOL) {
+                throw new IllegalArgumentException("Expected a numeric value and null flag");
             }
         }
     }
@@ -84,7 +84,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    public sealed interface Scalar permits Column, Constant, Parameter, Add, Subtract, Multiply, TimestampPart, IPv4Subtract {
+    public sealed interface Scalar permits Column, Constant, FloatingConstant, ToFloating, Parameter, Add, Subtract, Multiply, Divide, TimestampPart, IPv4Subtract {
         Value emit(Row row);
     }
 
@@ -106,6 +106,11 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
 
         public long nullValue() { return nullValueOf(columnType); }
+        public Expr nullLiteral() { return columnType == ColumnType.DOUBLE ? f64(Double.NaN) : i64(nullValue()); }
+        public Value value(Expr data) {
+            return new Value(data, columnType == ColumnType.DOUBLE ? doubleNull(data)
+                    : nullable() ? eq(data, i64(nullValue())) : bool(false));
+        }
         public boolean nullable() { return isNullable(columnType); }
         public MemoryType width() { return widthOf(columnType); }
     }
@@ -113,6 +118,18 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
     public record Constant(long value) implements Scalar {
         @Override
         public Value emit(Row row) { return new Value(i64(value), bool(value == Long.MIN_VALUE)); }
+    }
+
+    public record FloatingConstant(double value) implements Scalar {
+        @Override public Value emit(Row row) { return new Value(f64(value), bool(!Double.isFinite(value))); }
+    }
+
+    /** Integer getters widen their already wrapped value, replacing the source NULL with NaN. */
+    public record ToFloating(Scalar argument) implements Scalar {
+        @Override public Value emit(Row row) {
+            Value value = argument.emit(row);
+            return new Value(new Select(value.isNull(), f64(Double.NaN), new ToDouble(value.data())), value.isNull());
+        }
     }
 
     /** A cursor-time value, loaded once before the row loop. */
@@ -141,7 +158,12 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
 
     private static boolean isNullable(int type) {
         return type == ColumnType.INT || type == ColumnType.LONG || type == ColumnType.SYMBOL
-                || type == ColumnType.IPv4 || type == ColumnType.DATE || ColumnType.isTimestamp(type);
+                || type == ColumnType.IPv4 || type == ColumnType.DATE || type == ColumnType.DOUBLE || ColumnType.isTimestamp(type);
+    }
+
+    /** Numbers.isNull(double): NaNs and both infinities have an all-ones exponent. */
+    static Expr doubleNull(Expr value) {
+        return eq(binary(Op.AND, new BitCast(value), i64(0x7ff0000000000000L)), i64(0x7ff0000000000000L));
     }
 
     private static int storageType(Scalar value) {
@@ -154,7 +176,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         public Add { checkArithmeticType(columnType); }
         @Override
         public Value emit(Row row) {
-            return integerArithmetic(Op.ADD, left.emit(row), right.emit(row), columnType);
+            return arithmetic(Op.ADD, left.emit(row), right.emit(row), columnType);
         }
     }
 
@@ -178,7 +200,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         public Subtract { checkArithmeticType(columnType); }
         @Override
         public Value emit(Row row) {
-            return integerArithmetic(Op.SUB, left.emit(row), right.emit(row), columnType);
+            return arithmetic(Op.SUB, left.emit(row), right.emit(row), columnType);
         }
     }
 
@@ -186,7 +208,16 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         public Multiply { checkArithmeticType(columnType); }
         @Override
         public Value emit(Row row) {
-            return integerArithmetic(Op.MUL, left.emit(row), right.emit(row), columnType);
+            return arithmetic(Op.MUL, left.emit(row), right.emit(row), columnType);
+        }
+    }
+
+    /** SQL division returns NaN for any nonfinite result. */
+    public record Divide(Scalar left, Scalar right) implements Scalar {
+        @Override public Value emit(Row row) {
+            Expr result = binary(Op.FDIV, left.emit(row).data(), right.emit(row).data());
+            Expr absent = doubleNull(result);
+            return new Value(new Select(absent, f64(Double.NaN), result), absent);
         }
     }
 
@@ -204,10 +235,16 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
     }
 
     private static void checkArithmeticType(int type) {
-        if (type != ColumnType.INT && type != ColumnType.LONG) throw new IllegalArgumentException("Integer arithmetic type required");
+        if (type != ColumnType.INT && type != ColumnType.LONG && type != ColumnType.DOUBLE)
+            throw new IllegalArgumentException("INT, LONG or DOUBLE arithmetic type required");
     }
 
-    private static Value integerArithmetic(Op op, Value left, Value right, int type) {
+    private static Value arithmetic(Op op, Value left, Value right, int type) {
+        if (type == ColumnType.DOUBLE) {
+            Expr result = binary(switch (op) { case ADD -> Op.FADD; case SUB -> Op.FSUB; case MUL -> Op.FMUL;
+                default -> throw new IllegalArgumentException("Not floating arithmetic: " + op); }, left.data(), right.data());
+            return new Value(result, doubleNull(result));
+        }
         Expr result = binary(op, left.data(), right.data());
         // IntFunction.getLong sign-extends the already wrapped INT result. Preserve that
         // width at every expression node, including when its parent reads LONG.
@@ -218,7 +255,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
                 eq(result, i64(type == ColumnType.INT ? Integer.MIN_VALUE : Long.MIN_VALUE))));
     }
 
-    public sealed interface Predicate permits All, Compare, SqlCompare, IsNotNull, And, Or, Not {
+    public sealed interface Predicate permits All, Compare, SqlCompare, FloatingCompare, IsNotNull, And, Or, Not {
         Expr emit(Row row);
     }
 
@@ -266,6 +303,24 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
             if (op == Op.EQ || op == Op.NE) { return binary(op, x, y); }
             Expr ordered = binary(Op.BOTH, eq(binary(Op.EITHER, a.isNull(), b.isNull()), bool(false)), binary(op, x, y));
             return op == Op.GE ? binary(Op.EITHER, eq(x, y), ordered) : ordered;
+        }
+    }
+
+    /** Numbers.equals and LtDoubleVV's tolerance-aware order, including nonfinite NULLs. */
+    public record FloatingCompare(Op op, Scalar left, Scalar right) implements Predicate {
+        public FloatingCompare { new Compare(op, left, right); }
+        @Override public Expr emit(Row row) {
+            Value a = left.emit(row), b = right.emit(row);
+            Expr distance = new BitCast(binary(Op.AND, new BitCast(binary(Op.FSUB, a.data(), b.data())), i64(Long.MAX_VALUE)));
+            Expr equal = binary(Op.EITHER, binary(Op.BOTH, a.isNull(), b.isNull()),
+                    binary(Op.FGE, f64(io.questdb.std.Numbers.DOUBLE_TOLERANCE), distance));
+            return switch (op) {
+                case EQ -> equal;
+                case NE -> eq(equal, bool(false));
+                case LT -> binary(Op.BOTH, eq(equal, bool(false)), binary(Op.FLT, a.data(), b.data()));
+                case GE -> binary(Op.EITHER, equal, binary(Op.FLT, b.data(), a.data()));
+                default -> throw new IllegalArgumentException("Not a floating comparison: " + op);
+            };
         }
     }
 
@@ -541,6 +596,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
             case ColumnType.SHORT -> MemoryType.I16;
             case ColumnType.INT, ColumnType.SYMBOL, ColumnType.IPv4 -> MemoryType.I32;
             case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> MemoryType.I64;
+            case ColumnType.DOUBLE -> MemoryType.F64;
             default -> throw new IllegalArgumentException("Prototype does not support " + ColumnType.nameOf(columnType));
         };
     }

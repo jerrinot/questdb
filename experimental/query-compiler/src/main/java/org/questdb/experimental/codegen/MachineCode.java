@@ -36,10 +36,10 @@ import static org.questdb.experimental.codegen.Ir.*;
 /** Backend-neutral register/label stream. No SQL operators or query shapes reach the native bridge. */
 final class MachineCode {
     // Wire ABI shared with asmjit_backend.cpp. A version guards mismatched native builds.
-    static final int MAGIC=0x51444952, VERSION=8, HEADER_BYTES=24, INSTRUCTION_BYTES=24;
+    static final int MAGIC=0x51444952, VERSION=9, HEADER_BYTES=24, INSTRUCTION_BYTES=24;
     static final int CONST=1,MOVE=2,ADD=3,SUB=4,MUL=5,AND=6,XOR=7,USHR=8,
             EQ=9,NE=10,LT=11,GE=12,LOAD=13,STORE=14,LABEL=15,JUMP=16,
-            BR_FALSE=17,ALLOC=18,FREE=19,POLL=20,RETURN=21,COMPARE_BRANCH=22,BR_TRUE=23,CTZ=24,PREFETCH=25,FADD=26,FSUB=27,FMUL=28,FDIV=29,TO_DOUBLE=30,SDIV=31,ATOMIC_LOAD=32,COMPARE_EXCHANGE=33,ATOMIC_STORE=34,ATOMIC_ADD=35,BYTE_EQ_MASK=36,REALLOC=37;
+            BR_FALSE=17,ALLOC=18,FREE=19,POLL=20,RETURN=21,COMPARE_BRANCH=22,BR_TRUE=23,CTZ=24,PREFETCH=25,FADD=26,FSUB=27,FMUL=28,FDIV=29,TO_DOUBLE=30,SDIV=31,ATOMIC_LOAD=32,COMPARE_EXCHANGE=33,ATOMIC_STORE=34,ATOMIC_ADD=35,BYTE_EQ_MASK=36,REALLOC=37,FEQ=38,FNE=39,FLT=40,FGE=41;
     private record Instruction(int op,int dst,int a,int b,long immediate) { }
     private final List<Instruction> code=new ArrayList<>();
     private final Map<Integer,Integer> variables=new HashMap<>(Map.of(0,0,1,1,2,2));
@@ -120,6 +120,7 @@ final class MachineCode {
                 if(b.op()==Op.EITHER)yield select(b.left(),bool(true),b.right());
                 int left=expression(b.left()),right=expression(b.right()),result=reg();
                 int op=switch(b.op()) {
+                    case FEQ->FEQ;case FNE->FNE;case FLT->FLT;case FGE->FGE;
                     case FADD->FADD;case FSUB->FSUB;case FMUL->FMUL;case FDIV->FDIV;case SDIV->SDIV;
                     case ADD->ADD;case SUB->SUB;case MUL->MUL;case AND->AND;case XOR->XOR;case USHR->USHR;
                     case EQ->EQ;case NE->NE;case LT->LT;case GE->GE;
@@ -137,6 +138,7 @@ final class MachineCode {
             case CompareExchange c -> {int address=expression(c.address()),expected=expression(c.expected()),value=expression(c.value()),result=reg();emit(COMPARE_EXCHANGE,result,address,expected,value);yield result;}
             case SelectRows ignored -> throw new IllegalArgumentException("Selection requires portable lowering");
             case Select s -> select(s.condition(),s.yes(),s.no());
+            case BitCast c -> expression(c.value());
             case ToDouble c -> {int input=expression(c.value()),result=reg();emit(TO_DOUBLE,result,input,0,0);yield result;}
             case Allocate a -> {int bytes=expression(a.bytes()),result=reg();emit(ALLOC,result,bytes,0,0);yield result;}
             case Reallocate r -> {int address=expression(r.address()),oldBytes=expression(r.oldBytes()),newBytes=expression(r.newBytes()),result=reg();emit(REALLOC,result,address,oldBytes,newBytes);yield result;}

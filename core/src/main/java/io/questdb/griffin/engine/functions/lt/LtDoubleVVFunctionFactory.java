@@ -52,7 +52,7 @@ public class LtDoubleVVFunctionFactory implements FunctionFactory {
         return new FuncVV(args.getQuick(0), args.getQuick(1));
     }
 
-    private static class FuncVV extends NegatableBooleanFunction implements BinaryFunction {
+    public static class FuncVV extends NegatableBooleanFunction implements BinaryFunction {
         private final Function left;
         private final Function right;
 

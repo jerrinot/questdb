@@ -25,6 +25,7 @@
 package org.questdb.experimental.codegen;
 
 import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.DefaultCairoConfiguration;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlExecutionContextImpl;
@@ -92,8 +93,10 @@ public class ResolvedSymbolAggregateTest {
     @Test public void fusedUpdatesPreserveNullsMultipleColumnsAndReuse() throws Exception {
         engine.execute("create table t as (select cast(case when x%19=0 then null else cast(x%31 as string) end as symbol) k,"
                 + "cast(x%131-65 as short) s,cast(case when x%31=0 then null else x%1001 end as int) v,"
-                + "case when x%31=0 then null else x*17 end w from long_sequence(30001))", context);
-        String sql = "select k,min(s),avg(s),max(s),sum(s),sum(v),sum(w),avg(v),avg(w),count(v),count(w),min(v),max(v),min(w),max(w),count() from t group by k";
+                + "case when x%31=0 then null else x*17 end w,"
+                + "case when x%31=0 then null else (x%97-48)*0.25 end d from long_sequence(30001))", context);
+        String sql = "select k,min(s),avg(s),max(s),sum(s),sum(v),sum(w),avg(v),avg(w),count(v),count(w),min(v),max(v),min(w),max(w),"
+                + "count(d),sum(d),avg(d),min(d),max(d),count() from t group by k";
         long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
         context.setQueryCodeGenerator(compiler);
         try (var candidate = engine.select(sql, context)) {
@@ -105,6 +108,63 @@ public class ResolvedSymbolAggregateTest {
             }
         }
         assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+    }
+
+    @Test public void vectorDoublesKeepNonfiniteSignedZeroAndMissingKeyContracts() throws Exception {
+        engine.execute("create table doubles (d double,ts timestamp) timestamp(ts) partition by day bypass wal", context);
+        try (var writer = engine.getWriter(engine.verifyTableName("doubles"), "test")) {
+            for (double value : new double[]{Double.POSITIVE_INFINITY, 17, Double.NaN}) {
+                var row = writer.newRow(0); row.putDouble(0, value); row.append();
+            }
+            writer.commit();
+        }
+        engine.execute("alter table doubles add column k symbol", context);
+        String sql = "select k,count(),count(d),sum(d),avg(d),min(d),max(d) from doubles group by k";
+        context.setQueryCodeGenerator(compiler);
+        try (var candidate = engine.select(sql, context)) {
+            assertMatchesVector(sql, candidate);
+            assertEquals(0, vector(candidate).getCompiledAggregate().getNativeRows());
+            String[] keys = {"zero","zero","null","null","positive","negative","cancel","cancel","cancel","finite",null};
+            double[] values = {-0.0,-0.0,Double.NaN,Double.longBitsToDouble(0x7ff8000000001234L),
+                    Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY,Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY,17,
+                    Double.MIN_VALUE,42};
+            try (var writer = engine.getWriter(engine.verifyTableName("doubles"), "test")) {
+                for (int i = 0; i < values.length; i++) {
+                    var row = writer.newRow(86400000000L); row.putDouble(0, values[i]); row.putSym(2, keys[i]); row.append();
+                }
+                writer.commit();
+            }
+            assertMatchesVector(sql, candidate);
+            assertEquals(values.length, vector(candidate).getCompiledAggregate().getNativeRows());
+        }
+        engine.execute("alter table doubles convert partition to parquet list '1970-01-01'", context);
+        try (var candidate = engine.select(sql, context)) { assertMatchesVector(sql, candidate); }
+        for (String aggregate : List.of("sum(d)", "avg(d)")) {
+            String single = "select k," + aggregate + " from doubles group by k";
+            try (var candidate = engine.select(single, context)) {
+                assertMatchesVector(single, candidate);
+                assertTrue(vector(candidate).getCompiledAggregate().getNativeRows() > 0);
+            }
+        }
+    }
+
+    private void assertMatchesVector(String sql, RecordCursorFactory candidate) throws Exception {
+        context.setQueryCodeGenerator(null);
+        try (var ordinary = engine.select(sql, context)) {
+            var expected = Demo.readSql(ordinary, context, 1);
+            var actual = Demo.readSql(candidate, context, 1);
+            assertEquals(expected.size(), actual.size());
+            for (int i = 0; i < expected.size(); i++) {
+                assertEquals(expected.get(i).keys(), actual.get(i).keys());
+                for (int j = 0; j < expected.get(i).values().size(); j++) {
+                    Long left = expected.get(i).values().get(j), right = actual.get(i).values().get(j);
+                    if (ordinary.getMetadata().getColumnType(j + 1) == ColumnType.DOUBLE) {
+                        // Rosti's first group creator and worker merge order can change zero's sign.
+                        assertEquals(Double.longBitsToDouble(left), Double.longBitsToDouble(right), 0.0);
+                    } else assertEquals(left, right);
+                }
+            }
+        } finally { context.setQueryCodeGenerator(compiler); }
     }
 
     @Test public void wideIntegerStatesPreserveRostiOverflowAndColumnTops() throws Exception {

@@ -101,6 +101,7 @@ public final class NativeBackend implements Backend {
                 #include <stdbool.h>
                 #include <string.h>
                 static inline double query_f64(uint64_t bits) { double v; memcpy(&v, &bits, 8); return v; }
+                static inline int64_t query_i64(double v) { int64_t bits; memcpy(&bits, &v, 8); return bits; }
                 static inline int64_t query_ctz(uint64_t v) { return v ? __builtin_ctzll(v) : 64; }
                 static inline int64_t query_cas(uint64_t p, int64_t expected, int64_t value) {
                     __atomic_compare_exchange_n((int64_t*)(uintptr_t)p, &expected, value, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);

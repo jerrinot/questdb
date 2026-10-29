@@ -49,6 +49,8 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
     private final int keyColumn;
     private final int[] indexes;
     private final AggregateUpdates updates;
+    private final ObjList<VectorAggregateFunction> functions; // borrowed from the vector factory
+    private final boolean floatingInputs;
     private final int stride;
     private final long maxSlotBytes;
     private final long[] slots;
@@ -78,37 +80,45 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
                 continue;
             }
             boolean min = type == MinShortVectorAggregateFunction.class || type == MinIntVectorAggregateFunction.class
-                    || type == MinLongVectorAggregateFunction.class;
+                    || type == MinLongVectorAggregateFunction.class || type == MinDoubleVectorAggregateFunction.class;
             boolean max = type == MaxShortVectorAggregateFunction.class || type == MaxIntVectorAggregateFunction.class
-                    || type == MaxLongVectorAggregateFunction.class;
+                    || type == MaxLongVectorAggregateFunction.class || type == MaxDoubleVectorAggregateFunction.class;
             boolean sum = type == SumShortVectorAggregateFunction.class || type == SumIntVectorAggregateFunction.class
                     || type == SumLongVectorAggregateFunction.class || type == AvgShortVectorAggregateFunction.class
-                    || type == AvgIntVectorAggregateFunction.class;
+                    || type == AvgIntVectorAggregateFunction.class || type == SumDoubleVectorAggregateFunction.class
+                    || type == AvgDoubleVectorAggregateFunction.class;
             boolean wideSum = type == AvgLongVectorAggregateFunction.class;
-            boolean count = type == CountIntVectorAggregateFunction.class || type == CountLongVectorAggregateFunction.class;
+            boolean count = type == CountIntVectorAggregateFunction.class || type == CountLongVectorAggregateFunction.class
+                    || type == CountDoubleVectorAggregateFunction.class;
             if (!min && !max && !sum && !wideSum && !count) return null;
             int index = function.getColumnIndex();
             int inputType = inputs.getColumnType(index);
-            if (inputType != ColumnType.SHORT && inputType != ColumnType.INT && inputType != ColumnType.LONG) return null;
+            if (inputType != ColumnType.SHORT && inputType != ColumnType.INT && inputType != ColumnType.LONG
+                    && inputType != ColumnType.DOUBLE) return null;
             var column = resolved.column(index, inputType);
             if (min || max) {
                 var width = inputType == ColumnType.INT ? MemoryType.I32 : MemoryType.I64;
-                operations.add(new AggregateUpdates.IntegerExtremum(column, offset, width, min));
+                operations.add(inputType == ColumnType.DOUBLE ? new AggregateUpdates.VectorDoubleExtremum(column, offset, min)
+                        : new AggregateUpdates.IntegerExtremum(column, offset, width, min));
             } else if (wideSum) operations.add(new AggregateUpdates.VectorLongAverageUpdate(column, offset));
-            else if (sum) operations.add(new AggregateUpdates.VectorSumUpdate(column, offset));
+            else if (sum) operations.add(new AggregateUpdates.VectorSumUpdate(column, offset,
+                    inputType == ColumnType.DOUBLE ? MemoryType.F64 : MemoryType.I64));
+            else if (inputType == ColumnType.DOUBLE) operations.add(new AggregateUpdates.VectorDoubleCount(column, offset));
             else operations.add(new AggregateUpdates.ScalarUpdate(new Pipeline.CountValue(column), offset));
         }
         if (operations.isEmpty()) return null;
         var updates = new AggregateUpdates(new ResolvedVarchar.Binding(resolved.indexes(), resolved.columns(),
                 new int[0], new byte[0]), List.copyOf(operations));
-        return new ResolvedSymbolAggregate(keyColumn, resolved.indexes(), updates, rosti, workers, backend, artifacts);
+        return new ResolvedSymbolAggregate(keyColumn, resolved.indexes(), updates, functions, rosti, workers, backend, artifacts);
     }
 
     private ResolvedSymbolAggregate(int keyColumn, int[] indexes, AggregateUpdates updates,
-            long rosti, int workers, Backend backend, Path artifacts) {
+            ObjList<VectorAggregateFunction> functions, long rosti, int workers, Backend backend, Path artifacts) {
         this.keyColumn = keyColumn;
         this.indexes = indexes;
         this.updates = updates;
+        this.functions = functions;
+        floatingInputs = updates.columns().stream().anyMatch(column -> column.columnType() == ColumnType.DOUBLE);
         stride = Math.toIntExact(Rosti.getSlotSize(rosti));
         // Bound array replication by the slot storage the ordinary factory already allocated.
         maxSlotBytes = Math.multiplyExact(Rosti.getCapacity(rosti) + 1, stride);
@@ -150,6 +160,17 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
     public void aggregate(PageFrameMemory frame, long rows, int slot, ExecutionCircuitBreaker breaker) {
         long state = slots[slot], args = state + argsOffset;
         long keys = frame.getPageAddress(keyColumn);
+        if (keys == 0 && floatingInputs) {
+            // Floating missing-key pages use the vector functions' unkeyed accumulators,
+            // whose reduction and wrapUp contracts can differ from keyed state.
+            for (int i = 0; i < functions.size(); i++) {
+                if (breaker.checkIfTripped()) throw CairoException.queryCancelled();
+                var function = functions.getQuick(i);
+                int column = function.getColumnIndex();
+                function.aggregate(column < 0 ? 0 : frame.getPageAddress(column), rows, slot);
+            }
+            return;
+        }
         Unsafe.putLong(args + (indexes.length + 1L) * 8, state + seenOffset);
         Unsafe.putLong(args + (indexes.length + 2L) * 8, symbolCount);
         for (long lo = 0; lo < rows; lo += 65536) {
@@ -262,14 +283,12 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
             var values = new ArrayList<Pipeline.Value>();
             for (int i = 0; i < indexes.length; i++) {
                 var column = updates.columns().get(i);
-                Var value = loop.let(i64(column.nullValue()));
+                Var value = loop.let(column.nullLiteral());
                 Var address = addresses.get(i);
                 loop.when(ne(address, nil()), present -> present.assign(value,
                         new Load(column.width(), new Offset(address, binary(Op.MUL, row, i64(column.width().bytes))))));
                 // SHORT has no NULL representation: a column top reads as zero.
-                Expr isNull = column.nullable()
-                        ? binary(Op.EITHER, eq(address, nil()), eq(value, i64(column.nullValue()))) : bool(false);
-                values.add(new Pipeline.Value(value, isNull));
+                values.add(column.value(value));
             }
             updates.emit(loop, new Pipeline.Row(updates.columns(), values), destination, nil());
             loop.assign(row, add(row, i64(1)));

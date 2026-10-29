@@ -10,12 +10,21 @@ function/state contracts and exact results before measuring 500M-row controls.
   Scalar DISTINCT and parallel deferred INT-set union remain separate gaps.
 - [x] Ordinary INT/LONG AVG and scalar SHORT/INT/LONG AVG, including join consumers.
 - [x] Add SUM(LONG), AVG(INT) and 128-bit AVG(LONG) to the existing SYMBOL array path.
-- [ ] Add DOUBLE scan/filter and aggregate lifecycles.
+- [x] Direct DOUBLE ordinary COUNT/SUM/MIN/MAX/AVG, scalar and join consumers.
+- [x] DOUBLE vector/SYMBOL-array COUNT/SUM/AVG/MIN/MAX contracts.
+- [x] DOUBLE binary arithmetic, integer widening and SQL comparisons/NULL predicates.
+- [x] DOUBLE raw-bit grouping keys, including computed/composite keys and column tops.
+  Generated DOUBLE projection and ranking remain separate encoding gaps.
 - [ ] Correct ordinary Rosti `keyedIntSumIntMerge`: `vec_int_key_agg.cpp` reads
   the source LONG sum through `jint*`, truncating large INT sums before merge.
   The 2026-10-29 extreme-value SYMBOL test reproduces partition-dependent AVG(INT)
   answers. Generated arrays retain full LONG sums; compare that case against
   ordinary scalar SQL. Fix and validate the native stock path separately.
+- [ ] Correct ordinary Rosti integer AVG missing-key wrap-up: `kIntAvgLongWrapUp<T>`
+  writes the unkeyed average through `jdouble*` into the raw integer sum before
+  the final division. Integer-only generated arrays retain their working NULL-key
+  path. Newly admitted floating plans reuse ordinary missing-key handling; mixed
+  floating/integer AVG plans inherit the stock boundary until fixed separately.
 - [ ] Revisit scalar filter selection-vector traffic: generated AVG cuts instructions
   by more than half but improves only about 5% at eight cores; controller traffic
   stays about 16 GB/query. Test fused selection/reduction before changing policy.
@@ -404,7 +413,7 @@ mixed/Parquet input. No new configuration switch.
   llc output inspected). This is a code-generation lead, not proof that widening
   explains the whole instruction delta. Validate it independently across widths,
   backends and CPUs before changing vector lowering; keep full-query comparisons.
-- [ ] Bind COUNT(symbol) and COUNT DISTINCT(symbol) through the ordinary aggregate
+- [x] Bind COUNT(symbol) and keyed COUNT DISTINCT(symbol) through the ordinary aggregate
   contracts, preserving NULL semantics, dictionary scope and worker merge. Reuse
   bounded symbol-domain arrays where admitted; do not create a separate symbol
   aggregation framework.

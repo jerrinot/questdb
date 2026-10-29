@@ -35,8 +35,13 @@ import java.util.List;
 /** Conservative share of the last data cache reachable by this process. Missing metadata disables subdivision. */
 final class CacheSizing {
     private static final List<Cache> CACHES = discover(0);
+    private static final List<Cache> L2_CACHES = discover(2);
     // Admission hint only: a large allocation can still have a small hot working set.
-    static final long L2_DATA_BYTES = discover(2).stream().mapToLong(Cache::bytes).max().orElse(0);
+    static final long L2_DATA_BYTES = L2_CACHES.stream().mapToLong(Cache::bytes).max().orElse(0);
+    // Leave room for the scan and probe scratch when a worker owns a cache.
+    // Allowed siblings share it; use the smallest budget on heterogeneous CPUs.
+    static final long LOCAL_AGGREGATE_BYTES = L2_CACHES.stream()
+            .mapToLong(cache -> cache.bytes / Math.max(2, cache.processors)).min().orElse(256 * 1024);
 
     static long perWorker(int parallelism) {
         long result = Long.MAX_VALUE;

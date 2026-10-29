@@ -131,6 +131,7 @@ final class LlvmEmitter {
                     case ADD -> "add"; case SUB -> "sub"; case MUL -> "mul";
                     case FADD -> "fadd"; case FSUB -> "fsub"; case FMUL -> "fmul"; case FDIV -> "fdiv"; case SDIV -> "sdiv";
                     case AND, BOTH -> "and"; case XOR -> "xor"; case EITHER -> "or"; case USHR -> "lshr";
+                    case FEQ -> "fcmp oeq"; case FNE -> "fcmp une"; case FLT -> "fcmp olt"; case FGE -> "fcmp oge";
                     case EQ -> "icmp eq"; case NE -> "icmp ne"; case LT -> "icmp slt"; case GE -> "icmp sge";
                 };
                 line(result + " = " + op + " " + type(b.left().type()) + " " + left + ", " + right);
@@ -158,6 +159,7 @@ final class LlvmEmitter {
             case TrailingZeros z -> line(result + " = call i64 @llvm.cttz.i64(i64 " + operand(z.value()) + ", i1 false)");
             case SelectRows s -> selectRows(result, s);
             case ToDouble c -> line(result + " = sitofp i64 " + operand(c.value()) + " to double");
+            case BitCast c -> line(result + " = bitcast " + type(c.value().type()) + " " + operand(c.value()) + " to " + type(c.type()));
             case Allocate a -> line(result + " = call i64 %alloc_fn(i64 " + operand(a.bytes()) + ")");
             case Reallocate r -> line(result + " = call i64 %realloc_fn(i64 " + operand(r.address()) + ", i64 " + operand(r.oldBytes()) + ", i64 " + operand(r.newBytes()) + ")");
             default -> throw new IllegalArgumentException("Unexpected SSA expression: " + expression);

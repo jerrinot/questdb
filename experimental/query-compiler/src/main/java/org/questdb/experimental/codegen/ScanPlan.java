@@ -88,7 +88,9 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
     }
     private static int cost(Scalar s, Map<Scalar, Integer> memo) {
         Integer previous = memo.get(s); if (previous != null) return previous;
-        int value = s instanceof Add a ? 1 + cost(a.left(), memo) + cost(a.right(), memo)
+        int value = s instanceof ToFloating a ? 2 + cost(a.argument(), memo)
+                : s instanceof Divide a ? 3 + cost(a.left(), memo) + cost(a.right(), memo)
+                : s instanceof Add a ? 1 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof Multiply a ? 1 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof IPv4Subtract a ? 4 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof TimestampPart a ? 12 + cost(a.argument(), memo)
@@ -100,6 +102,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case All ignored -> 1;
             case Compare c -> 1 + cost(c.left(), memo) + cost(c.right(), memo);
             case SqlCompare c -> 1 + cost(c.left(), memo) + cost(c.right(), memo);
+            case FloatingCompare c -> 8 + cost(c.left(), memo) + cost(c.right(), memo);
             case IsNotNull n -> 1 + cost(n.value(), memo);
             case Not n -> 1 + cost(n.value(), memo);
             case Or a -> Math.min(MAX_FUSED_EXPRESSION_NODES + 1, 1 + cost(a.left(), memo) + cost(a.right(), memo));
@@ -115,8 +118,11 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case IPv4Subtract a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
             case Subtract a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
             case TimestampPart a -> validate(a.argument(), schema, parameters, checked);
+            case ToFloating a -> validate(a.argument(), schema, parameters, checked);
+            case Divide a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
             case Parameter p -> { if (p.index() >= parameters.size() || !p.equals(parameters.get(p.index()))) throw new IllegalArgumentException("Foreign parameter: " + p); }
             case Constant ignored -> { }
+            case FloatingConstant ignored -> { }
         }
     }
     private static void validate(Predicate p, List<Column> schema, List<Parameter> parameters, Map<Scalar, Boolean> checked) {
@@ -124,6 +130,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case All ignored -> { }
             case Compare c -> { validate(c.left(), schema, parameters, checked); validate(c.right(), schema, parameters, checked); }
             case SqlCompare c -> { validate(c.left(), schema, parameters, checked); validate(c.right(), schema, parameters, checked); }
+            case FloatingCompare c -> { validate(c.left(), schema, parameters, checked); validate(c.right(), schema, parameters, checked); }
             case IsNotNull n -> validate(n.value(), schema, parameters, checked);
             case Not n -> validate(n.value(), schema, parameters, checked);
             case Or a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
@@ -138,6 +145,9 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
                 yield bindings.get(c.index());
             }
             case Constant c -> c;
+            case FloatingConstant c -> c;
+            case ToFloating a -> new ToFloating(rewrite(a.argument(), schema, bindings));
+            case Divide a -> new Divide(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings));
             case Parameter p -> p;
             case TimestampPart a -> new TimestampPart(rewrite(a.argument(), schema, bindings), a.unitTicks(), a.period());
             case Add a -> new Add(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
@@ -151,6 +161,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case All a -> a;
             case Compare c -> new Compare(c.op(), rewrite(c.left(), schema, bindings), rewrite(c.right(), schema, bindings));
             case SqlCompare c -> new SqlCompare(c.op(), rewrite(c.left(), schema, bindings), rewrite(c.right(), schema, bindings));
+            case FloatingCompare c -> new FloatingCompare(c.op(), rewrite(c.left(), schema, bindings), rewrite(c.right(), schema, bindings));
             case IsNotNull n -> new IsNotNull(rewrite(n.value(), schema, bindings));
             case Not n -> new Not(rewrite(n.value(), schema, bindings));
             case Or a -> new Or(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings));
@@ -161,11 +172,14 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
         switch (e) {
             case Column c -> used.set(c.index());
             case TimestampPart a -> collect(a.argument(), used);
+            case ToFloating a -> collect(a.argument(), used);
+            case Divide a -> { collect(a.left(), used); collect(a.right(), used); }
             case Add a -> { collect(a.left(), used); collect(a.right(), used); }
             case Multiply a -> { collect(a.left(), used); collect(a.right(), used); }
             case IPv4Subtract a -> { collect(a.left(), used); collect(a.right(), used); }
             case Subtract a -> { collect(a.left(), used); collect(a.right(), used); }
             case Constant ignored -> { }
+            case FloatingConstant ignored -> { }
             case Parameter ignored -> { }
         }
     }
@@ -174,6 +188,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case All ignored -> { }
             case Compare c -> { collect(c.left(), used); collect(c.right(), used); }
             case SqlCompare c -> { collect(c.left(), used); collect(c.right(), used); }
+            case FloatingCompare c -> { collect(c.left(), used); collect(c.right(), used); }
             case IsNotNull n -> collect(n.value(), used);
             case Not n -> collect(n.value(), used);
             case Or a -> { collect(a.left(), used); collect(a.right(), used); }

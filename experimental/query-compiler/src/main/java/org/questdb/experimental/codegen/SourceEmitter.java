@@ -115,6 +115,7 @@ abstract class SourceEmitter {
             case Allocate a -> allocate(expression(a.bytes()));
             case Reallocate r -> reallocate(expression(r.address()), expression(r.oldBytes()), expression(r.newBytes()));
             case ToDouble c -> "((double)(" + expression(c.value()) + "))";
+            case BitCast c -> (c.type() == Type.F64 ? "query_f64(" : "query_i64(") + expression(c.value()) + ")";
             case SelectRows s -> "selectRows[" + s.lanes() + "](" + expression(s.mask()) + ", " + expression(s.base()) + ", " + expression(s.destination()) + ")";
             case VectorMask m -> "mask[" + m.lanes() + "](" + expression(m.predicate()) + ")";
             case PopulationCount z -> "__builtin_popcountll((uint64_t)(" + expression(z.value()) + "))";
@@ -135,10 +136,10 @@ abstract class SourceEmitter {
             case AND -> "&";
             case XOR -> "^";
             case USHR -> ">>>";
-            case EQ -> "==";
-            case NE -> "!=";
-            case LT -> "<";
-            case GE -> ">=";
+            case EQ, FEQ -> "==";
+            case NE, FNE -> "!=";
+            case LT, FLT -> "<";
+            case GE, FGE -> ">=";
             case BOTH -> "&&";
             case EITHER -> "||";
         };

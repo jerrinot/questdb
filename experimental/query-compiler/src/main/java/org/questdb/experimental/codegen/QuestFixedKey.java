@@ -51,7 +51,7 @@ record QuestFixedKey(int[] columns, java.util.List<Pipeline.Column> inputs,
                 case ColumnType.BYTE -> MemoryType.I8;
                 case ColumnType.SHORT -> MemoryType.I16;
                 case ColumnType.INT, ColumnType.SYMBOL, ColumnType.IPv4 -> MemoryType.I32;
-                case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> MemoryType.I64;
+                case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO, ColumnType.DOUBLE -> MemoryType.I64;
                 default -> null;
             };
             if (widths[i] == null) return null;
@@ -83,6 +83,8 @@ record QuestFixedKey(int[] columns, java.util.List<Pipeline.Column> inputs,
 
     private Expr storedKey(Pipeline.Row row, int index) {
         var value = expressions.get(index).emit(row);
+        // RecordSink.putDouble stores raw IEEE bits, including NaN payloads and zero's sign.
+        if (value.data().type() == Type.F64) return new BitCast(value.data());
         // Widening casts retain the input expression's NULL flag, but the packed key
         // must use the result width's sentinel (INT NULL is not LONG NULL).
         long nullValue = widths[index] == MemoryType.I64 ? Long.MIN_VALUE

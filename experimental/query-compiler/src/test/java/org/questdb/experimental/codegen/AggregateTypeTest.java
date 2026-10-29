@@ -201,6 +201,142 @@ public class AggregateTypeTest {
         try (var candidate = compile(sql)) { check(sql, candidate); }
     }
 
+    @Test public void doubleAggregatesPreserveNullableStateAcrossFramesAndMerges() throws Exception {
+        engine.execute("create table doubles as (select cast(x%7 as short) g,cast(x%17 as int) k,"
+                + "case when x%7=0 or x<31 then null else (x%257-128)*0.25 end d,"
+                + "case when x%13=0 then null else (x%31-15)*1024.0 end e,"
+                + "timestamp_sequence('2024-01-01',1000000) ts from long_sequence(2003)) timestamp(ts) partition by day bypass wal", context);
+        for (String sql : List.of("select g,count(d),sum(d),avg(d),min(d),max(d),avg(e) from doubles group by g",
+                "select k,sum(d),avg(e),min(d),max(d) from doubles where k>=0 group by k",
+                "select count(d),sum(d),avg(d),min(d),max(d) from doubles where k>=0")) {
+            try (var candidate = compile(sql)) {
+                check(sql, candidate);
+                assertTrue(sql, nativeRows(candidate) > 0);
+                check(sql, candidate);
+            }
+        }
+        engine.execute("alter table doubles add column late double", context);
+        String sql = "select g,count(late),sum(d),avg(late),min(late),max(late) from doubles group by g";
+        try (var candidate = compile(sql)) {
+            check(sql, candidate);
+            engine.execute("insert into doubles values (1,1,17.25,1024,'2024-01-02',42.5)", context);
+            check(sql, candidate);
+        }
+        engine.execute("alter table doubles convert partition to parquet list '2024-01-01'", context);
+        try (var candidate = compile(sql)) { check(sql, candidate); }
+        engine.execute("truncate table doubles", context);
+        sql = "select count(d),sum(d),avg(d),min(d),max(d) from doubles where k>=0";
+        try (var candidate = compile(sql)) { check(sql, candidate); }
+    }
+
+    @Test public void doubleExpressionsFuseWithFilteredGroupedAndScalarConsumers() throws Exception {
+        engine.execute("create table expressions as (select cast(x%7 as short) g,cast(x%17 as int) k,"
+                + "case when x%7=0 or x<31 then null else (x%257-128)*0.25 end d,"
+                + "cast(case when x%13=0 then null else x%101-50 end as int) i,"
+                + "timestamp_sequence('2024-01-01',1000000) ts from long_sequence(2003)) timestamp(ts) partition by day bypass wal", context);
+        for (String sql : List.of("select g,sum(d*1.5+0.25),avg(d) from expressions where d>1.0 and d<30.0 group by g",
+                "select g,sum(d-cast(i as double)),avg(cast(i+1 as double)),count(d/0.0) from expressions group by g",
+                "select g,sum(d/2.0),avg(d+0.25),count(d) from expressions where d!=null group by g",
+                "select g,count() from expressions where d=i*0.25 group by g",
+                "select g,count() from expressions where d!=i*0.25 group by g",
+                "select sum(d*2.0),avg(d) from expressions where d>=0.0 or d=null")) {
+            try (var candidate = compile(sql)) {
+                check(sql, candidate);
+                assertTrue(sql, nativeRows(candidate) > 0);
+                check(sql, candidate);
+            }
+        }
+        engine.execute("alter table expressions add column late double", context);
+        String sql = "select g,sum(d+late),avg(late/2.0) from expressions where late=null or late>=0.0 group by g";
+        try (var candidate = compile(sql)) {
+            check(sql, candidate);
+            engine.execute("insert into expressions values (1,1,17.25,42,'2024-01-02',1.5)", context);
+            check(sql, candidate);
+        }
+        engine.execute("alter table expressions convert partition to parquet list '2024-01-01'", context);
+        try (var candidate = compile(sql)) { check(sql, candidate); }
+        engine.execute("truncate table expressions", context);
+        try (var candidate = compile(sql)) { check(sql, candidate); }
+    }
+
+    @Test public void unsupportedComputedKeyRetainsOrdinaryAverageFinalization() throws Exception {
+        engine.execute("create table fallback as (select cast(x%17-8 as int) i,(x%31-15)*0.25 d from long_sequence(1003))", context);
+        String sql = "select abs(i) k,avg(i),avg(d) from fallback group by k";
+        try (var candidate = compile(sql)) { check(sql, candidate); check(sql, candidate); }
+    }
+
+    @Test public void doubleKeysPreserveRawBitsCompositeLayoutsAndColumnTops() throws Exception {
+        engine.execute("create table keys (v long,i int,s symbol,label varchar,ts timestamp) timestamp(ts) partition by day bypass wal", context);
+        engine.execute("insert into keys select x,cast(x%3 as int),cast(x%3 as symbol),'old'::varchar,"
+                + "timestamp_sequence('2024-01-01',1000000) from long_sequence(33)", context);
+        engine.execute("alter table keys add column d double", context);
+        double[] values = {0.0,-0.0,Double.NaN,Double.longBitsToDouble(0x7ff8000000001234L),
+                Double.longBitsToDouble(0x7ff8000000005678L),Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY,
+                Double.MIN_VALUE,-Double.MIN_VALUE,1,1.00000000005,-17.25};
+        try (var writer = engine.getWriter(engine.verifyTableName("keys"), "test")) {
+            for (int n = 0; n < 5003; n++) {
+                var row = writer.newRow(1704153600000000L + n);
+                row.putLong(0, n); row.putInt(1, n%3); row.putSym(2, Integer.toString(n%3));
+                row.putVarchar(3, new io.questdb.std.str.Utf8String(n%2==0 ? "ascii" : "žluť"));
+                row.putDouble(5, values[n%values.length]); row.append();
+            }
+            writer.commit();
+        }
+        String direct = "select d,count() n,sum(v) total from keys group by d";
+        context.setQueryCodeGenerator(null);
+        java.util.Map<Long,List<Long>> expected;
+        try (var ordinary = engine.select(direct, context)) { expected = rawDoubleGroups(ordinary); }
+        assertEquals(values.length, expected.size()); // Canonical NULL shares the column-top group.
+        for (String sql : List.of(direct,
+                "select d*2.0+0.25 k,count(),sum(v) from keys group by k",
+                "select i,d,count(),sum(v) from keys group by i,d",
+                "select d,s,count(),sum(v) from keys group by d,s",
+                "select d,label,count(),sum(v) from keys group by d,label")) {
+            try (var candidate = compile(sql)) {
+                check(sql, candidate); check(sql, candidate);
+                assertTrue(sql, nativeMapRows(candidate) > 0);
+                if (sql.equals(direct)) assertEquals(expected, rawDoubleGroups(candidate));
+            }
+        }
+        try (var candidate = compile(direct + " limit 2")) {
+            var selected = rawDoubleGroups(candidate);
+            assertEquals(2, selected.size());
+            for (var entry : selected.entrySet()) assertEquals(expected.get(entry.getKey()), entry.getValue());
+            assertTrue(nativeMapRows(candidate) > 0);
+            assertTrue("Admission retains only complete selected groups", nativeMapRows(candidate) < 5036);
+        }
+        engine.execute("alter table keys convert partition to parquet list '2024-01-01'", context);
+        try (var candidate = compile(direct)) { assertEquals(expected, rawDoubleGroups(candidate)); }
+        engine.execute("alter table keys convert partition to parquet list '2024-01-02'", context);
+        context.setQueryCodeGenerator(null);
+        try (var ordinary = engine.select(direct, context)) { expected = rawDoubleGroups(ordinary); }
+        try (var candidate = compile(direct)) { assertEquals(expected, rawDoubleGroups(candidate)); }
+        engine.execute("truncate table keys", context);
+        try (var candidate = compile(direct)) { assertTrue(rawDoubleGroups(candidate).isEmpty()); }
+    }
+
+    private java.util.Map<Long,List<Long>> rawDoubleGroups(RecordCursorFactory factory) throws Exception {
+        var result = new java.util.TreeMap<Long,List<Long>>();
+        try (var cursor = factory.getCursor(context)) {
+            var record = cursor.getRecord();
+            while (cursor.hasNext()) assertNull(result.put(Double.doubleToRawLongBits(record.getDouble(0)),
+                    List.of(record.getLong(1), record.getLong(2))));
+        }
+        return result;
+    }
+
+    private long nativeMapRows(RecordCursorFactory factory) {
+        for (; factory != null; factory = factory.getBaseFactory()) {
+            if (factory instanceof AsyncGroupByRecordCursorFactory group) {
+                long rows = 0;
+                for (int i = -1; i < 2; i++)
+                    if (group.getAtom().getCompiledUpdater(i) instanceof AggregateSlot slot) rows += slot.getNativeMapRows();
+                return rows;
+            }
+        }
+        return 0;
+    }
+
     private RecordCursorFactory compile(String sql) throws Exception {
         context.setQueryCodeGenerator(compiler);
         return Demo.compileSql(engine, context, sql, true);

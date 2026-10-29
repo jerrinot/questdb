@@ -49,6 +49,11 @@ import io.questdb.griffin.engine.functions.columns.LongColumn;
 import io.questdb.griffin.engine.functions.columns.ShortColumn;
 import io.questdb.griffin.engine.functions.lt.LtIntFunctionFactory;
 import io.questdb.griffin.engine.functions.lt.LtLongFunctionFactory;
+import io.questdb.griffin.engine.functions.lt.LtDoubleVVFunctionFactory;
+import io.questdb.griffin.engine.functions.math.AddDoubleFunctionFactory;
+import io.questdb.griffin.engine.functions.math.SubDoubleFunctionFactory;
+import io.questdb.griffin.engine.functions.math.MulDoubleFunctionFactory;
+import io.questdb.griffin.engine.functions.math.DivDoubleFunctionFactory;
 import io.questdb.griffin.engine.functions.math.AddIntFunctionFactory;
 import io.questdb.griffin.engine.functions.math.AddLongFunctionFactory;
 import io.questdb.griffin.engine.functions.math.MulIntFunctionFactory;
@@ -99,7 +104,7 @@ final class ResolvedInputs {
             var column = columns.get(i);
             Ir.Expr base = new Ir.Load(Ir.MemoryType.ADDRESS, Ir.at(pointers, i * 8L));
             var value = b.let(new Ir.Load(column.width(), new Ir.Offset(base, Ir.binary(Ir.Op.MUL, row, Ir.i64(column.width().bytes)))));
-            values.add(new Pipeline.Value(value, column.nullable() ? Ir.eq(value, Ir.i64(column.nullValue())) : Ir.bool(false)));
+            values.add(column.value(value));
         }
         return new Pipeline.Row(columns, values);
     }
@@ -110,6 +115,9 @@ final class ResolvedInputs {
         if (function.getClass() == LongColumn.class) {
             index = ((LongColumn) function).getColumnIndex();
             type = ColumnType.LONG;
+        } else if (function.getClass() == io.questdb.griffin.engine.functions.columns.DoubleColumn.class && readType == ColumnType.DOUBLE) {
+            index = ((io.questdb.griffin.engine.functions.columns.DoubleColumn) function).getColumnIndex();
+            type = ColumnType.DOUBLE;
         } else if (function.getClass() == IntColumn.class) {
             index = ((IntColumn) function).getColumnIndex();
             type = ColumnType.INT;
@@ -272,18 +280,28 @@ final class ResolvedInputs {
             return new Pipeline.SqlCompare(((NegatableBooleanFunction) function).isNegated() ? Ir.Op.NE : Ir.Op.EQ,
                     value, new Pipeline.Constant(Long.MIN_VALUE));
         }
+        if (implementation == EqDoubleFunctionFactory.FuncDoubleIsNaN.class) {
+            var value = scalar(((UnaryFunction) function).getArg(), ColumnType.DOUBLE);
+            if (value == null) return null;
+            var present = new Pipeline.IsNotNull(value);
+            return ((NegatableBooleanFunction) function).isNegated() ? present : new Pipeline.Not(present);
+        }
         if (implementation == LtLongFunctionFactory.LtLongFunction.class) { type = ColumnType.LONG; equality = false; }
         else if (implementation == LtIntFunctionFactory.LtIntFunction.class) { type = ColumnType.INT; equality = false; }
         else if (implementation == EqLongFunctionFactory.Func.class) { type = ColumnType.LONG; equality = true; }
         else if (implementation == EqIntFunctionFactory.Func.class) { type = ColumnType.INT; equality = true; }
+        else if (implementation == LtDoubleVVFunctionFactory.FuncVV.class) { type = ColumnType.DOUBLE; equality = false; }
+        else if (implementation == EqDoubleFunctionFactory.Func.class) { type = ColumnType.DOUBLE; equality = true; }
         else return null;
         var binary = (BinaryFunction) function;
         var left = scalar(binary.getLeft(), type);
         var right = scalar(binary.getRight(), type);
         if (left == null || right == null) return null;
         boolean negated = ((NegatableBooleanFunction) function).isNegated();
+        Ir.Op op = equality ? (negated ? Ir.Op.NE : Ir.Op.EQ) : (negated ? Ir.Op.GE : Ir.Op.LT);
+        if (type == ColumnType.DOUBLE) return new Pipeline.FloatingCompare(op, left, right);
         // Numbers.lessThan treats two nulls as equal for the negated (>=) form.
-        return new Pipeline.SqlCompare(equality ? (negated ? Ir.Op.NE : Ir.Op.EQ) : (negated ? Ir.Op.GE : Ir.Op.LT), left, right);
+        return new Pipeline.SqlCompare(op, left, right);
     }
 
     private Pipeline.Parameter parameter(IntSupplier key) {
@@ -310,10 +328,13 @@ final class ResolvedInputs {
         if (depth > 64) return null;
         Class<?> implementation = function.getClass();
         if (implementation == NullConstant.class) {
+            if (readType == ColumnType.DOUBLE) return new Pipeline.FloatingConstant(Double.NaN);
             // BYTE/SHORT have no NULL sentinel; NullConstant's narrow getters return zero.
             return new Pipeline.Constant(readType == ColumnType.BYTE || readType == ColumnType.SHORT ? 0 : Long.MIN_VALUE);
         }
         int type = function.getType();
+        if (readType == ColumnType.DOUBLE) return floating(function, depth);
+        if (type == ColumnType.DOUBLE) return null;
         if (type == ColumnType.SYMBOL && readType == ColumnType.SYMBOL) {
             // Only direct static dictionaries have stable IDs shared by frame and merge paths.
             return column(function, readType);
@@ -380,5 +401,33 @@ final class ResolvedInputs {
             }
         }
         return column(function, readType);
+    }
+
+    private Pipeline.Scalar floating(Function function, int depth) {
+        int type = function.getType();
+        if (type != ColumnType.DOUBLE) {
+            if (type != ColumnType.BYTE && type != ColumnType.SHORT && type != ColumnType.INT && type != ColumnType.LONG) return null;
+            var value = scalar(function, type, depth + 1);
+            return value == null ? null : new Pipeline.ToFloating(value);
+        }
+        Class<?> implementation = function.getClass();
+        if (implementation == DoubleConstant.class) return new Pipeline.FloatingConstant(function.getDouble(null));
+        if (Boolean.parseBoolean(System.getProperty("query.codegen.expressions", "true"))) {
+            if (implementation == CastByteToDoubleFunctionFactory.Func.class || implementation == CastShortToDoubleFunctionFactory.Func.class
+                    || implementation == CastIntToDoubleFunctionFactory.Func.class || implementation == CastLongToDoubleFunctionFactory.Func.class)
+                return scalar(((UnaryFunction) function).getArg(), ColumnType.DOUBLE, depth + 1);
+            if (implementation == AddDoubleFunctionFactory.Func.class || implementation == SubDoubleFunctionFactory.Func.class
+                    || implementation == MulDoubleFunctionFactory.Func.class || implementation == DivDoubleFunctionFactory.Func.class) {
+                var binary = (BinaryFunction) function;
+                var left = scalar(binary.getLeft(), ColumnType.DOUBLE, depth + 1);
+                var right = scalar(binary.getRight(), ColumnType.DOUBLE, depth + 1);
+                if (left == null || right == null) return null;
+                if (implementation == AddDoubleFunctionFactory.Func.class) return new Pipeline.Add(left, right, ColumnType.DOUBLE);
+                if (implementation == SubDoubleFunctionFactory.Func.class) return new Pipeline.Subtract(left, right, ColumnType.DOUBLE);
+                if (implementation == MulDoubleFunctionFactory.Func.class) return new Pipeline.Multiply(left, right, ColumnType.DOUBLE);
+                return new Pipeline.Divide(left, right);
+            }
+        }
+        return column(function, ColumnType.DOUBLE);
     }
 }

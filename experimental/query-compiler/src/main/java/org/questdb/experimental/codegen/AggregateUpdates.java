@@ -31,24 +31,29 @@ import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.griffin.engine.functions.columns.DoubleColumn;
 import io.questdb.griffin.engine.functions.groupby.AbstractCountDistinctIntGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.AvgDoubleGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.AvgIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.AvgLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.AvgShortGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountDistinctIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountDistinctLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountDistinctSymbolGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.CountDoubleGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongConstGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountSymbolGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MaxDoubleGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxShortGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxVarcharGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MinDoubleGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MinIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MinLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MinShortGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MinVarcharGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.SumDoubleGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.SumIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.SumLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.SumShortGroupByFunction;
@@ -92,7 +97,9 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             Class<?> implementation = function.getClass();
             int argumentType;
             boolean average = isAverage(implementation);
-            int stateType = average && implementation != AvgShortGroupByFunction.class ? ColumnType.DOUBLE : ColumnType.LONG;
+            boolean floating = implementation == SumDoubleGroupByFunction.class || implementation == MinDoubleGroupByFunction.class
+                    || implementation == MaxDoubleGroupByFunction.class || implementation == AvgDoubleGroupByFunction.class;
+            int stateType = floating || average && implementation != AvgShortGroupByFunction.class ? ColumnType.DOUBLE : ColumnType.LONG;
             boolean sum;
             boolean minimum = implementation == MinLongGroupByFunction.class || implementation == MinIntGroupByFunction.class
                     || implementation == MinShortGroupByFunction.class;
@@ -106,6 +113,9 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
                 sum = false;
             } else if (implementation == CountLongConstGroupByFunction.class) {
                 argumentType = ColumnType.UNDEFINED;
+                sum = false;
+            } else if (floating || implementation == CountDoubleGroupByFunction.class) {
+                argumentType = ColumnType.DOUBLE;
                 sum = false;
             } else if (implementation == CountLongGroupByFunction.class || implementation == SumLongGroupByFunction.class
                     || implementation == CountDistinctLongGroupByFunction.class || implementation == AvgLongGroupByFunction.class) {
@@ -163,6 +173,12 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
                             stateType == ColumnType.DOUBLE ? MemoryType.F64 : MemoryType.I64));
                     continue;
                 }
+                if (floating) {
+                    long offset = offsets.applyAsLong(valueIndex);
+                    updates.add(implementation == SumDoubleGroupByFunction.class ? new DoubleSum(expression, offset)
+                            : new DoubleExtremum(expression, offset, implementation == MinDoubleGroupByFunction.class));
+                    continue;
+                }
                 if (distinct) {
                     if (function instanceof CountDistinctLongGroupByFunction count) {
                         updates.add(new DistinctUpdate(expression, offsets.applyAsLong(valueIndex), NestedDistinct.LONG,
@@ -194,7 +210,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             var column = columns.get(i);
             Var value = b.let(new Load(column.width(), new Offset(addresses.get(i),
                     binary(Op.MUL, rowIndex, i64(column.width().bytes)))));
-            values.add(new Pipeline.Value(value, column.nullable() ? eq(value, i64(column.nullValue())) : bool(false)));
+            values.add(column.value(value));
         }
         return new Pipeline.Row(columns, values);
     }
@@ -242,14 +258,14 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
 
     private static boolean isAverage(Class<?> implementation) {
         return implementation == AvgShortGroupByFunction.class || implementation == AvgIntGroupByFunction.class
-                || implementation == AvgLongGroupByFunction.class;
+                || implementation == AvgLongGroupByFunction.class || implementation == AvgDoubleGroupByFunction.class;
     }
 
     static Function outputFunction(Function function) {
         return isAverage(function.getClass())
                 ? DoubleColumn.newInstance(((GroupByFunction) function).getValueIndex()) : function;
     }
-    sealed interface Update permits ScalarUpdate, IntegerExtremum, DistinctUpdate, AverageUpdate, VarcharExtremum, VectorSumUpdate, VectorLongAverageUpdate {
+    sealed interface Update permits ScalarUpdate, IntegerExtremum, DoubleSum, DoubleExtremum, DistinctUpdate, AverageUpdate, VarcharExtremum, VectorSumUpdate, VectorLongAverageUpdate, VectorDoubleCount, VectorDoubleExtremum {
         long offset();
         void initialize(Builder b, Expr destination);
         void merge(Builder b, Expr source, Expr destination);
@@ -261,22 +277,99 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         default void prefetch(Builder b, java.util.function.Function<Pipeline.Scalar, Pipeline.Value> input, Expr destination) { }
     }
 
-    /** Rosti integer SUM and AVG(INT/SHORT): zero-initialized LONG sum and non-null count. */
-    record VectorSumUpdate(Pipeline.Scalar argument, long offset) implements Update {
+    /** SUM(DOUBLE) ignores NaN inputs and replaces a NaN accumulator on the next value. */
+    record DoubleSum(Pipeline.Scalar argument, long offset) implements Update {
+        @Override public void initialize(Builder b, Expr destination) { b.store(MemoryType.F64, at(destination, offset), f64(Double.NaN)); }
+        @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            combine(b, destination, argument.emit(frame.numeric()).data());
+        }
+        @Override public void merge(Builder b, Expr source, Expr destination) {
+            combine(b, destination, new Load(MemoryType.F64, at(source, offset)));
+        }
+        private void combine(Builder b, Expr destination, Expr value) {
+            Var incoming = b.let(value);
+            b.when(binary(Op.FEQ, incoming, incoming), present -> {
+                Expr address = at(destination, offset);
+                Var current = present.let(new Load(MemoryType.F64, address));
+                present.store(MemoryType.F64, address, new Select(binary(Op.FEQ, current, current),
+                        binary(Op.FADD, current, incoming), incoming));
+            });
+        }
+    }
+
+    /** Preserve the ordinary extrema rule: a nonfinite current value is replaceable. */
+    record DoubleExtremum(Pipeline.Scalar argument, long offset, boolean minimum) implements Update {
+        @Override public void initialize(Builder b, Expr destination) { b.store(MemoryType.F64, at(destination, offset), f64(Double.NaN)); }
+        @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            combine(b, destination, argument.emit(frame.numeric()).data());
+        }
+        @Override public void merge(Builder b, Expr source, Expr destination) {
+            combine(b, destination, new Load(MemoryType.F64, at(source, offset)));
+        }
+        private void combine(Builder b, Expr destination, Expr value) {
+            Var incoming = b.let(value), current = b.let(new Load(MemoryType.F64, at(destination, offset)));
+            Expr better = minimum ? binary(Op.FLT, incoming, current) : binary(Op.FLT, current, incoming);
+            b.when(binary(Op.EITHER, better, Pipeline.doubleNull(current)), replace ->
+                    replace.store(MemoryType.F64, at(destination, offset), incoming));
+        }
+    }
+
+    /** Rosti SUM/AVG with a single-word sum and non-NaN/non-null count. */
+    record VectorSumUpdate(Pipeline.Scalar argument, long offset, MemoryType sumType) implements Update {
+        VectorSumUpdate(Pipeline.Scalar argument, long offset) { this(argument, offset, MemoryType.I64); }
         @Override public void initialize(Builder b, Expr destination) {
-            b.store(at(destination, offset), i64(0));
+            b.store(sumType, at(destination, offset), sumType == MemoryType.F64 ? f64(0) : i64(0));
             b.store(at(destination, offset + 8), i64(0));
         }
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
             var value = argument.emit(frame.numeric());
+            if (sumType == MemoryType.F64) {
+                Expr present = binary(Op.FEQ, value.data(), value.data());
+                b.store(MemoryType.F64, at(destination, offset), binary(Op.FADD,
+                        new Load(MemoryType.F64, at(destination, offset)), new Select(present, value.data(), f64(0))));
+                b.store(at(destination, offset + 8), add(load(at(destination, offset + 8)), new Select(present, i64(1), i64(0))));
+                return;
+            }
             b.when(eq(value.isNull(), bool(false)), valid -> {
                 valid.store(at(destination, offset), add(load(at(destination, offset)), value.data()));
                 valid.store(at(destination, offset + 8), add(load(at(destination, offset + 8)), i64(1)));
             });
         }
         @Override public void merge(Builder b, Expr source, Expr destination) {
-            b.store(at(destination, offset), add(load(at(destination, offset)), load(at(source, offset))));
+            b.store(sumType, at(destination, offset), binary(sumType == MemoryType.F64 ? Op.FADD : Op.ADD,
+                    new Load(sumType, at(destination, offset)), new Load(sumType, at(source, offset))));
             b.store(at(destination, offset + 8), add(load(at(destination, offset + 8)), load(at(source, offset + 8))));
+        }
+    }
+
+    /** The vector COUNT(DOUBLE) implementation counts infinities and excludes NaNs. */
+    record VectorDoubleCount(Pipeline.Scalar argument, long offset) implements Update {
+        @Override public void initialize(Builder b, Expr destination) { b.store(at(destination, offset), i64(0)); }
+        @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            Expr value = argument.emit(frame.numeric()).data();
+            b.store(at(destination, offset), add(load(at(destination, offset)), new Select(binary(Op.FEQ, value, value), i64(1), i64(0))));
+        }
+        @Override public void merge(Builder b, Expr source, Expr destination) {
+            b.store(at(destination, offset), add(load(at(destination, offset)), load(at(source, offset))));
+        }
+    }
+
+    /** Rosti normalizes NaNs to an infinite sentinel and takes the incoming value on ties. */
+    record VectorDoubleExtremum(Pipeline.Scalar argument, long offset, boolean minimum) implements Update {
+        private Expr empty() { return f64(minimum ? Double.POSITIVE_INFINITY : Double.NEGATIVE_INFINITY); }
+        @Override public void initialize(Builder b, Expr destination) { b.store(MemoryType.F64, at(destination, offset), empty()); }
+        @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            combine(b, destination, argument.emit(frame.numeric()).data());
+        }
+        @Override public void merge(Builder b, Expr source, Expr destination) {
+            combine(b, destination, new Load(MemoryType.F64, at(source, offset)));
+        }
+        private void combine(Builder b, Expr destination, Expr value) {
+            Var raw = b.let(value);
+            Var incoming = b.let(new Select(binary(Op.FEQ, raw, raw), raw, empty()));
+            Var current = b.let(new Load(MemoryType.F64, at(destination, offset)));
+            Expr replace = minimum ? binary(Op.FGE, current, incoming) : binary(Op.FGE, incoming, current);
+            b.store(MemoryType.F64, at(destination, offset), new Select(replace, incoming, current));
         }
     }
 
@@ -348,7 +441,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         }
     }
 
-    /** Ordinary integer averages: SHORT has a LONG sum; INT/LONG accumulate in DOUBLE. */
+    /** Ordinary averages: SHORT has a LONG sum; INT/LONG/DOUBLE accumulate in DOUBLE. */
     record AverageUpdate(Pipeline.Scalar argument, long offset, long countOffset, MemoryType sumType) implements Update {
         @Override public boolean finalizesResult() { return true; }
         @Override public void initialize(Builder b, Expr destination) {
@@ -360,14 +453,15 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             Expr sumAddress = at(destination, offset), countAddress = at(destination, countOffset);
             Var count = b.let(load(countAddress));
             var input = argument.emit(frame.numeric());
+            Expr missing = input.data().type() == Type.F64 ? binary(Op.FNE, input.data(), input.data()) : input.isNull();
             if (sumType == MemoryType.F64) {
                 // Ordinary computeFirst(NULL) stores (0,0). A later Java computeNext
                 // adds directly, so leaving the empty etalon's NaN here is unsafe.
-                b.when(binary(Op.BOTH, input.isNull(), eq(count, i64(0))), missing ->
-                        missing.store(MemoryType.F64, sumAddress, f64(0)));
+                b.when(binary(Op.BOTH, missing, eq(count, i64(0))), absent ->
+                        absent.store(MemoryType.F64, sumAddress, f64(0)));
             }
-            b.when(eq(input.isNull(), bool(false)), present -> {
-                Expr value = sumType == MemoryType.F64 ? new ToDouble(input.data()) : input.data();
+            b.when(eq(missing, bool(false)), present -> {
+                Expr value = sumType == MemoryType.F64 && input.data().type() == Type.I64 ? new ToDouble(input.data()) : input.data();
                 Expr sum = binary(sumType == MemoryType.F64 ? Op.FADD : Op.ADD, new Load(sumType, sumAddress), value);
                 present.store(sumType, sumAddress, new Select(eq(count, i64(0)), value, sum));
                 present.store(countAddress, add(count, i64(1)));

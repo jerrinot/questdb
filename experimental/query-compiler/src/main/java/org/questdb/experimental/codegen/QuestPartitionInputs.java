@@ -199,7 +199,7 @@ final class QuestPartitionInputs {
         long offset = 0;
         for (var column : layout.columns()) {
             Var value = b.let(new Load(column.width(), at(address, offset)));
-            values.add(new Pipeline.Value(value, column.nullable() ? eq(value, i64(column.nullValue())) : bool(false)));
+            values.add(column.value(value));
             offset += column.width().bytes;
         }
         return new Pipeline.Row(layout.columns(), values);
