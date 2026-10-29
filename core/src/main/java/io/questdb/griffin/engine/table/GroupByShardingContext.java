@@ -475,16 +475,16 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
             if (postAggregationCircuitBreaker.checkIfTrippedOrYield()) return destShards;
             if (deferred) {
                 Runnable checkpoint = circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled;
-                int states = 0;
-                for (int i = 0; i < compiledUpdaters.size(); i++) states += compiledUpdaters.getQuick(i).getPendingMergeCount();
-                int parallelism = Math.max(1, compiledUpdaters.size() / Math.max(1, states));
+                long work = 0;
+                for (int i = 0; i < compiledUpdaters.size(); i++) work += compiledUpdaters.getQuick(i).getPendingMergeWork();
+                long targetTaskWork = Math.max(1, work / compiledUpdaters.size());
                 mergePhase = 1;
                 boolean more;
                 do {
                     postMergeTasks.clear();
                     more = false;
                     for (int i = 0; i < compiledUpdaters.size(); i++) {
-                        more |= compiledUpdaters.getQuick(i).prepareMergeTasks(postMergeTasks, parallelism, checkpoint);
+                        more |= compiledUpdaters.getQuick(i).prepareMergeTasks(postMergeTasks, targetTaskWork, checkpoint);
                     }
                     if (postMergeTasks.size() > 0) {
                         executeMergeTasks(postMergeTasks.size(), messageBus, workStealingStrategy, circuitBreaker,
@@ -492,7 +492,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
                         if (postAggregationCircuitBreaker.checkIfTrippedOrYield()) return destShards;
                     }
                 } while (more);
-                for (int i = 0; i < compiledUpdaters.size(); i++) compiledUpdaters.getQuick(i).endParallelMerge(states > 0);
+                for (int i = 0; i < compiledUpdaters.size(); i++) compiledUpdaters.getQuick(i).endParallelMerge(work > 0);
                 mergePhase = 2;
                 executeMergeTasks(NUM_SHARDS, messageBus, workStealingStrategy, circuitBreaker,
                         postAggregationCircuitBreaker, postAggregationDoneLatch, postAggregationStartedCounter);

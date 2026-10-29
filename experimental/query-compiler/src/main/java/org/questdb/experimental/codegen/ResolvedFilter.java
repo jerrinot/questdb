@@ -116,12 +116,12 @@ final class ResolvedFilter implements AutoCloseable {
         }
         // Admitted leaves are total and side-effect free. Reject numeric rows before decoding strings.
         long stringOffset = inputs.columns().size() * 8L;
-        ScanLowering.RowPredicate residual = strings.isEmpty() ? null : (builder, row) -> {
+        ScanLowering.RowPredicate residual = strings.isEmpty() ? null : (builder, descriptors, row) -> {
             Var accepted = builder.let(bool(true));
             for (int i = 0; i < strings.size(); i++) {
                 long offset = stringOffset + i * 48L;
                 StringPredicate test = tests.get(i);
-                builder.when(accepted, check -> check.assign(accepted, test.emit(check, at(COLUMNS, offset), row)));
+                builder.when(accepted, check -> check.assign(accepted, test.emit(check, at(descriptors, offset), row)));
             }
             return accepted;
         };
@@ -135,6 +135,20 @@ final class ResolvedFilter implements AutoCloseable {
         return column >= 0 && column < types.getColumnCount() && types.getColumnType(column) == ColumnType.VARCHAR ? column : -1;
     }
 
+    private static boolean prepareRecord(PageFrameMemoryRecord record, int[] sourceIndexes, int[] varcharColumns, long addresses) {
+        if (record instanceof PageFrameFilteredMemoryRecord) return false;
+        for (int i = 0; i < sourceIndexes.length; i++) {
+            long address = record.getPageAddress(sourceIndexes[i]);
+            // Zero may denote a lazy cast or a column top: ordinary getters retain that contract.
+            if (address == 0) return false;
+            Unsafe.putLong(addresses + 8L * i, address);
+        }
+        for (int i = 0; i < varcharColumns.length; i++) {
+            if (!record.writeNativeVarcharView(varcharColumns[i], addresses + sourceIndexes.length * 8L + i * 48L)) return false;
+        }
+        return true;
+    }
+
     @FunctionalInterface
     private interface StringPredicate {
         Expr emit(Builder builder, Expr descriptor, Expr row);
@@ -142,6 +156,10 @@ final class ResolvedFilter implements AutoCloseable {
 
     record Binding(ScanPlan plan, int[] sourceIndexes, int[] varcharColumns, ScanLowering.RowPredicate residual) {
         long bytes() { return sourceIndexes.length * 8L + varcharColumns.length * 48L; }
+
+        boolean prepare(PageFrameMemoryRecord record, long addresses) {
+            return prepareRecord(record, sourceIndexes, varcharColumns, addresses);
+        }
 
         void prepare(PageFrameMemory frame, long data, long aux, long rows, long addresses) {
             for (int i = 0; i < sourceIndexes.length; i++)
@@ -192,16 +210,7 @@ final class ResolvedFilter implements AutoCloseable {
         /** Borrowed pointer array; zero declines before the caller mutates aggregate state. */
         long prepare(PageFrameMemoryRecord record) {
             if (closed || addresses == 0) throw new IllegalStateException("Filter slot is closed");
-            if (record instanceof PageFrameFilteredMemoryRecord) return 0;
-            for (int i = 0; i < sourceIndexes.length; i++) {
-                long address = record.getPageAddress(sourceIndexes[i]);
-                // Zero may denote a lazy cast or a column top: ordinary getters retain that contract.
-                if (address == 0) return 0;
-                Unsafe.putLong(addresses + 8L * i, address);
-            }
-            for (int i = 0; i < varcharColumns.length; i++) {
-                if (!record.writeNativeVarcharView(varcharColumns[i], addresses + sourceIndexes.length * 8L + i * 48L)) return 0;
-            }
+            if (!prepareRecord(record, sourceIndexes, varcharColumns, addresses)) return 0;
             Unsafe.putLong(addresses + bytes - 8, 0);
             return addresses;
         }

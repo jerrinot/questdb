@@ -172,6 +172,28 @@ public class ScanStageTest {
         }
     }
 
+    @Test public void resumedSelectionKeepsSourceOrderAcrossMasksAndTails() throws Throwable {
+        var column = new Column(0, "value", ColumnType.LONG);
+        var plan = ScanPlan.of(List.of(column), new Compare(Op.GE, column, new Constant(0)));
+        try (var code = backend.compile(ScanLowering.selectionRange(plan, null, 8), temporary.getRoot().toPath());
+             var arena = Arena.ofConfined(); var memory = KernelMemory.bind(null, () -> { })) {
+            long descriptor = arena.allocate(16, 8).address(), output = arena.allocate(258 * 8, 8).address();
+            for (int rows : new int[]{0, 1, 7, 8, 9, 64, 65, 257}) try (var input = new GuardedPage(rows * 8)) {
+                Unsafe.putLong(descriptor, input.address);
+                for (int i = 0; i < rows; i++) Unsafe.putLong(input.address + i * 8L, i % 3 == 0 ? i : -1);
+                for (int begin = 0; begin <= rows; begin++) {
+                    Unsafe.putLong(descriptor + 8, begin);
+                    long count = code.run(descriptor, rows, output), expected = 0;
+                    for (int i = begin; i < rows; i++) if (i % 3 == 0) {
+                        assertTrue(expected < count);
+                        assertEquals(i, Unsafe.getLong(output + expected++ * 8));
+                    }
+                    assertEquals(expected, count);
+                }
+            }
+        }
+    }
+
     @Test public void byteMasksNeverReadOutsideTheSlice() throws Throwable {
         for (int lanes : new int[]{8, 16, 32, 64}) {
             Builder b = new Builder();

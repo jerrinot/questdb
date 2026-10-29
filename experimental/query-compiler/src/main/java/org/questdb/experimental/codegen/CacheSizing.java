@@ -34,7 +34,9 @@ import java.util.List;
 
 /** Conservative share of the last data cache reachable by this process. Missing metadata disables subdivision. */
 final class CacheSizing {
-    private static final List<Cache> CACHES = discover();
+    private static final List<Cache> CACHES = discover(0);
+    // Admission hint only: a large allocation can still have a small hot working set.
+    static final long L2_DATA_BYTES = discover(2).stream().mapToLong(Cache::bytes).max().orElse(0);
 
     static long perWorker(int parallelism) {
         long result = Long.MAX_VALUE;
@@ -42,7 +44,7 @@ final class CacheSizing {
         return result == Long.MAX_VALUE ? 0 : result;
     }
 
-    private static List<Cache> discover() {
+    private static List<Cache> discover(int targetLevel) {
         try {
             BitSet allowed = null;
             for (String line : Files.readAllLines(Path.of("/proc/self/status"))) {
@@ -58,7 +60,8 @@ final class CacheSizing {
                     for (Path entry : entries) {
                         String type = read(entry, "type");
                         int candidate = Integer.parseInt(read(entry, "level"));
-                        if ((type.equals("Unified") || type.equals("Data")) && candidate > level) {
+                        if ((type.equals("Unified") || type.equals("Data")) && candidate > level
+                                && (targetLevel == 0 || candidate == targetLevel)) {
                             last = entry;
                             level = candidate;
                         }

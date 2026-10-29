@@ -34,6 +34,7 @@ Unsupported plans keep ordinary execution.
 | SQL binding and capability checks | [ResolvedQueryCompiler](src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java) |
 | Shared expression and input binding | [ResolvedInputs](src/main/java/org/questdb/experimental/codegen/ResolvedInputs.java), [ResolvedVarchar](src/main/java/org/questdb/experimental/codegen/ResolvedVarchar.java) |
 | Aggregate initialization, update, merge and finalization | [AggregateUpdates](src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java) |
+| Finalized map rows feeding another aggregation | [ResolvedMapAggregate](src/main/java/org/questdb/experimental/codegen/ResolvedMapAggregate.java) |
 | Unkeyed reduction and worker-state merge | [ResolvedScalarAggregate](src/main/java/org/questdb/experimental/codegen/ResolvedScalarAggregate.java) |
 | Kernel preparation and ownership | [ResolvedAggregateKernel.Prepared](src/main/java/org/questdb/experimental/codegen/ResolvedAggregateKernel.java) |
 | Acquired-slot scratch, resumable calls and publication | [AggregateSlot](src/main/java/org/questdb/experimental/codegen/AggregateSlot.java) |
@@ -60,8 +61,25 @@ All worker calls must finish before the code owner closes. Native callbacks reco
 allocation/cancellation failures for Java to rethrow; Java exceptions do not
 unwind through native code.
 
+Eligible numeric aggregate subqueries can feed a second keyed COUNT/SUM/MIN/MAX
+without a Java row loop. `ResolvedMapAggregate` evaluates supported projections
+and consumes each finalized input map in its existing merge task. Slot-owned
+ordinary maps feed a generated final merge and LONG Top-K; the ordinary result
+cursor retains ownership. Filters and limits between the two aggregations remain
+boundaries. This does not rewrite COUNT DISTINCT into a two-stage plan.
+
 Bounded aggregation retains partial states and can switch to compact input records
 when local combining does not reduce work. Existing workers merge partitions.
+Fixed-width key-only aggregation switches after its first full local map to an
+exact duplicate filter: remembered keys already have a partition record, and
+every miss is appended immediately. Collisions may add records but cannot lose
+distinct values. Small sets retain their original map; predicates reuse the
+shared scan lowering.
+Large numeric DISTINCT state can separate dependent prefetches; the existing
+adaptive-kernel policy selects the measured winner after cache-based admission.
+Large fixed-key partition maps reuse the staged variable-key merge loop. Both
+paths use discovered cache geometry and retain their original generated loops
+when it is absent.
 Eligible LONG Top-K can subdivide large partitions and defer independent VARCHAR
 extrema until after ranking. Retained transient strings are copied into query-owned
 storage; stable frame payloads remain borrowed. These are eligibility-gated paths,

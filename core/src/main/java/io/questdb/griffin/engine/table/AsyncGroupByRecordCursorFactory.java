@@ -31,6 +31,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.ListColumnFilter;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
@@ -55,6 +56,7 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.groupby.CompiledMapAggregate;
 import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.GroupByKernel;
@@ -152,6 +154,14 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
             Misc.free(this, th);
             throw th;
         }
+    }
+
+    public CompiledMapAggregate compileMapAggregate(
+            ObjList<RecordCursorFactory> projections,
+            ColumnTypes keys, ListColumnFilter keyColumns, ObjList<Function> keyFunctions,
+            ColumnTypes values, ObjList<GroupByFunction> functions, Map layout) {
+        return frameSequence.getAtom().compileMapAggregate(getMetadata(), recordFunctions, projections,
+                keys, keyColumns, keyFunctions, values, functions, layout);
     }
 
     @Override

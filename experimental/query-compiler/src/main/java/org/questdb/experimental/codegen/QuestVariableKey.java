@@ -124,8 +124,8 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
             Expr field = new Offset(key, offset);
             if (part.width != null) {
                 var value = part.scalar.emit(source);
-                long nullValue = part.scalar instanceof Pipeline.Column column ? column.nullValue()
-                        : part.width == MemoryType.I32 ? Integer.MIN_VALUE : Long.MIN_VALUE;
+                long nullValue = part.width == MemoryType.I64 ? Long.MIN_VALUE
+                        : part.scalar instanceof Pipeline.Column column ? column.nullValue() : Integer.MIN_VALUE;
                 Expr data = part.width == MemoryType.I32 || part.width == MemoryType.I64
                         ? new Select(value.isNull(), i64(nullValue), value.data()) : value.data();
                 b.store(part.width, field, data);

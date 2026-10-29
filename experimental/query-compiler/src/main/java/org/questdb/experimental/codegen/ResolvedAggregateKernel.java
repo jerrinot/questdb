@@ -93,7 +93,7 @@ public final class ResolvedAggregateKernel {
             // Capture the exact output slot and type while resolved functions are borrowed.
             readers.add(new ResultRead(function.getClass(), function.getValueIndex(), layout.getOffset(function.getValueIndex()), function.getType()));
         }
-        return new Binding(new Program(b.block()), allocates, probe, prefetchRows, countSumReference, resolved, layout.getSizeInBytes(), List.copyOf(readers));
+        return new Binding(new Program(b.block()), allocates, probe, prefetchRows, countSumReference, resolved, layout.getSizeInBytes(), valueTypes.getColumnCount(), List.copyOf(readers));
     }
 
     static final int NEED_CAPACITY = 5;
@@ -104,6 +104,11 @@ public final class ResolvedAggregateKernel {
 
     private static Program mapProgram(AggregateUpdates updates, QuestMapProbe probe, long valueBytes,
                                       int prefetchRows, int localCapacity, ScanPlan filter) {
+        return mapProgram(updates, probe, valueBytes, prefetchRows, localCapacity, filter, false);
+    }
+
+    private static Program mapProgram(AggregateUpdates updates, QuestMapProbe probe, long valueBytes,
+                                      int prefetchRows, int localCapacity, ScanPlan filter, boolean stagedDistinct) {
         var columns = updates.columns();
         Builder b = new Builder();
         var addresses = new ArrayList<Var>();
@@ -123,7 +128,7 @@ public final class ResolvedAggregateKernel {
         Var index = b.let(load(STATE));
         Var batchEnd = b.let(probe.mutable() && !probe.variable() ? new Select(eq(load(at(STATE, 56)), i64(0)), index, ROWS) : ROWS);
         if (prefetchRows > 0) {
-            emitPrefetched(b, index, batchEnd, rowIds, addresses, updates, cardinalityAddress, probe, valueBytes, prefetchRows, localCapacity, filter, filterAddresses, accepted);
+            emitPrefetched(b, index, batchEnd, rowIds, addresses, updates, cardinalityAddress, probe, valueBytes, prefetchRows, localCapacity, filter, filterAddresses, accepted, stagedDistinct);
         } else b.loop(binary(Op.LT, index, ROWS), loop -> {
             checkLocalBound(loop, probe, index, localCapacity);
             reserveBatch(loop, probe, index, batchEnd);
@@ -165,8 +170,8 @@ public final class ResolvedAggregateKernel {
     private static void emitPrefetched(Builder b, Var index, Var batchEnd, Var rowIds,
                                       List<Var> addresses, AggregateUpdates updates, Expr cardinalityAddress,
                                       QuestMapProbe probe, long valueBytes, int batchRows, int localCapacity,
-                                      ScanPlan filter, List<Var> filterAddresses, Var accepted) {
-        boolean stagedState = probe.varchar() && updates.updates().stream().anyMatch(Update::allocates);
+                                      ScanPlan filter, List<Var> filterAddresses, Var accepted, boolean stagedDistinct) {
+        boolean stagedState = stagedDistinct || (probe.varchar() && updates.updates().stream().anyMatch(Update::allocates));
         Var batches = b.let(i64(0));
         b.loop(binary(Op.LT, index, ROWS), batch -> {
             checkLocalBound(batch, probe, index, localCapacity);
@@ -222,21 +227,36 @@ public final class ResolvedAggregateKernel {
                 if (filter != null) prepare.assign(remaining, binary(Op.AND, remaining, binary(Op.SUB, remaining, i64(1))));
             });
             if (stagedState) {
-                // Issue independent map prefetches before reading their allocated state pointers.
-                // No mutation occurs until consumption; a growth exit rebuilds the remaining batch.
-                batch.assign(position, index);
-                if (filter != null) batch.assign(remaining, mask);
-                batch.assign(scratch, at(STATE, prefetchScratch(probe)));
-                batch.loop(filter == null ? binary(Op.LT, position, limit) : ne(remaining, i64(0)), hints -> {
-                    if (filter != null) hints.assign(position, add(batchStart, new TrailingZeros(remaining)));
-                    Var row = hints.let(load(scratch));
-                    Var entry = hints.let(new Load(MemoryType.ADDRESS, at(scratch, 16)));
-                    hints.when(ne(load(entry), i64(0)), occupied ->
-                            updates.prefetch(occupied, row, addresses, at(entry, probe.keyBytes())));
-                    hints.assign(position, add(position, i64(1)));
-                    if (filter != null) hints.assign(remaining, binary(Op.AND, remaining, binary(Op.SUB, remaining, i64(1))));
-                    hints.assign(scratch, at(scratch, probe.prefetchRowBytes()));
-                });
+                // Prefetch outer entries before dereferencing their allocated state. For large
+                // numeric maps, prefetch set headers in their own pass before reading capacities.
+                // Only hints cross stages: consumption reloads all mutable pointers after growth.
+                for (int phase = 0, phases = stagedDistinct ? 2 : 1; phase < phases; phase++) {
+                    boolean headers = stagedDistinct && phase == 0;
+                    batch.assign(position, index);
+                    if (filter != null) batch.assign(remaining, mask);
+                    batch.assign(scratch, at(STATE, prefetchScratch(probe)));
+                    batch.loop(filter == null ? binary(Op.LT, position, limit) : ne(remaining, i64(0)), hints -> {
+                        if (filter != null) hints.assign(position, add(batchStart, new TrailingZeros(remaining)));
+                        Var row = hints.let(load(scratch));
+                        Var entry = hints.let(new Load(MemoryType.ADDRESS, at(scratch, 16)));
+                        if (probe.varchar()) {
+                            hints.when(ne(load(entry), i64(0)), occupied ->
+                                    updates.prefetch(occupied, row, addresses, at(entry, probe.keyBytes())));
+                        } else {
+                            hints.when(ne(entry, nil()), candidate -> {
+                                Expr occupied = binary(Op.EITHER, eq(load(at(scratch, 8)), i64(0)),
+                                        ne(new Load(probe.keyBytes() == 4 ? MemoryType.I32 : MemoryType.I64, entry), i64(0)));
+                                candidate.when(occupied, present -> {
+                                    if (headers) updates.prefetchHeaders(present, at(entry, probe.keyBytes()));
+                                    else updates.prefetch(present, row, addresses, at(entry, probe.keyBytes()));
+                                });
+                            });
+                        }
+                        hints.assign(position, add(position, i64(1)));
+                        if (filter != null) hints.assign(remaining, binary(Op.AND, remaining, binary(Op.SUB, remaining, i64(1))));
+                        hints.assign(scratch, at(scratch, probe.prefetchRowBytes()));
+                    });
+                }
             }
             batch.assign(scratch, at(STATE, prefetchScratch(probe)));
             if (filter != null) batch.assign(remaining, mask);
@@ -320,12 +340,14 @@ public final class ResolvedAggregateKernel {
         final QuestMapProbe probe;
         final int prefetchRows;
         private final boolean countSumReference;
-        private final AggregateUpdates updates;
+        final AggregateUpdates updates;
+        final int valueColumnCount;
         final long valueBytes;
         private final List<ResultRead> readers;
 
-        private Binding(Program program, boolean allocates, QuestMapProbe probe, int prefetchRows, boolean countSumReference, AggregateUpdates updates, long valueBytes, List<ResultRead> readers) {
+        private Binding(Program program, boolean allocates, QuestMapProbe probe, int prefetchRows, boolean countSumReference, AggregateUpdates updates, long valueBytes, int valueColumnCount, List<ResultRead> readers) {
             this.readers = readers;
+            this.valueColumnCount = valueColumnCount;
             this.program = program;
             this.inputs = updates.inputs();
             this.allocates = allocates;
@@ -364,6 +386,13 @@ public final class ResolvedAggregateKernel {
                 prepared.code = prepared.compile(program);
                 if (activeProbe != null) {
                     prepared.mapCode = prepared.compile(mapProgram(updates, activeProbe, valueBytes, prefetchRows, localCapacity));
+                    if (activeProbe.mutable() && !activeProbe.ordered() && !activeProbe.varchar() && prefetchRows > 0 && localCapacity == 0
+                            && updates.updates().stream().anyMatch(u -> u instanceof AggregateUpdates.DistinctUpdate)
+                            && updates.updates().stream().allMatch(u -> !u.allocates() || u instanceof AggregateUpdates.DistinctUpdate)) {
+                        prepared.stagedMapCode = prepared.defer(() -> mapProgram(updates, activeProbe, valueBytes,
+                                prefetchRows, localCapacity, null, true));
+                        prepared.mapChoice = new AdaptiveKernel(prepared.mapCode, prepared.stagedMapCode, System::nanoTime);
+                    }
                     if (activeProbe.mutable()) {
                         prepared.rehashCode = prepared.compile(activeProbe.varchar() ? QuestVarchar.rehash(valueBytes) : activeProbe.orderedNative() ? QuestOrderedMap.rehash() : QuestMapMutation.rehash(activeProbe, valueBytes));
                         prepared.mergeCode = prepared.compile(activeProbe.varchar() ? QuestVarchar.entries(activeProbe, updates, valueBytes) : activeProbe.orderedNative() ? QuestOrderedMap.entries(activeProbe, updates, valueBytes) : QuestMapMutation.entries(activeProbe, updates, valueBytes));
@@ -391,8 +420,15 @@ public final class ResolvedAggregateKernel {
                     prepared.finalizeCode = prepared.compile(new Program(finish.block()));
                 }
                 if (prepared.localCapacity > 0) {
+                    if (valueBytes == 0 && updates.updates().isEmpty() && !activeProbe.variable() && !activeProbe.varchar()) {
+                        prepared.keyFilterCode = prepared.defer(() -> QuestKeyFilter.program(activeProbe, localCapacity, null));
+                    }
                     prepared.flushCode = prepared.defer(() -> QuestPartitions.flush(activeProbe, valueBytes));
                     prepared.partitionMergeCode = prepared.defer(() -> QuestPartitions.merge(activeProbe, updates, valueBytes, prefetchRows));
+                    if (activeProbe.orderedNative() && !activeProbe.variable() && prefetchRows > 0) {
+                        prepared.stagedPartitionMergeCode = prepared.defer(() -> QuestPartitions.mergeStaged(
+                                activeProbe, updates, valueBytes, prefetchRows, null, false));
+                    }
                     if (prepared.inputPartitionRowBytes > 0 && (activeProbe.variable()
                             ? QuestPartitionInputs.numericBytes(updates) < valueBytes
                             : prepared.inputPartitionRowBytes < prepared.partitionRowBytes)) {
@@ -454,8 +490,15 @@ public final class ResolvedAggregateKernel {
         CompiledKernel rowLimitCode;
         CompiledKernel flushCode;
         CompiledKernel partitionMergeCode;
+        CompiledKernel stagedPartitionMergeCode;
         CompiledKernel inputPartitionCode;
         CompiledKernel inputPartitionMergeCode;
+        AdaptiveKernel mapChoice;
+        AdaptiveKernel filterChoice;
+        CompiledKernel stagedMapCode;
+        CompiledKernel stagedFilterCode;
+        CompiledKernel keyFilterCode;
+        CompiledKernel filteredKeyFilterCode;
         CompiledKernel unionPrepareCode;
         CompiledKernel unionCode;
         CompiledKernel unionZeroCode;
@@ -548,6 +591,14 @@ public final class ResolvedAggregateKernel {
                         && sharedMaps == null && binding.prefetchRows > 0 && binding.prefetchRows <= 64) {
                     fusedFilterCode = compile(mapProgram(binding.updates, probe, binding.valueBytes,
                             binding.prefetchRows, localCapacity, filter.fusedPlan()));
+                    if (stagedMapCode != null) {
+                        stagedFilterCode = defer(() -> mapProgram(binding.updates, probe, binding.valueBytes,
+                                binding.prefetchRows, localCapacity, filter.fusedPlan(), true));
+                        filterChoice = new AdaptiveKernel(fusedFilterCode, stagedFilterCode, System::nanoTime);
+                    }
+                    if (keyFilterCode != null) {
+                        filteredKeyFilterCode = defer(() -> QuestKeyFilter.program(probe, localCapacity, filter.fusedPlan()));
+                    }
                 }
             }
         }
@@ -624,13 +675,21 @@ public final class ResolvedAggregateKernel {
             }
         }
 
-        long resultOffset(Function function) {
+        Prepared compileConsumer(Binding consumer) throws IOException { return consumer.compile(backend, artifacts); }
+        CompiledKernel compileConsumer(Program program) throws IOException { return backend.compile(program, artifacts); }
+
+        long numericResultOffset(Function function) {
             if (function instanceof GroupByFunction aggregate) {
                 for (var reader : binding.readers) {
-                    if (reader.type() == ColumnType.LONG && reader.implementation() == function.getClass() && reader.index() == aggregate.getValueIndex()) return reader.offset();
+                    if (reader.type() == function.getType() && reader.implementation() == function.getClass()
+                            && reader.index() == aggregate.getValueIndex()) return reader.offset();
                 }
             }
             return -1;
+        }
+
+        long resultOffset(Function function) {
+            return function.getType() == ColumnType.LONG ? numericResultOffset(function) : -1;
         }
 
         public long compilationNanos() {

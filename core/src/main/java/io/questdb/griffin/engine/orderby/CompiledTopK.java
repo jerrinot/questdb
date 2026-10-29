@@ -41,6 +41,10 @@ public interface CompiledTopK extends QuietCloseable {
     boolean encodeFrame(PageFrameMemoryRecord record, int frameIndex, DirectLongList rows, long frameRows,
                         EncodedTopKBuffer buffer, SqlExecutionCircuitBreaker breaker);
 
+    /** Evaluates an admitted predicate and Top-K together; false leaves the buffer unchanged. */
+    default boolean filterAndEncodeFrame(PageFrameMemoryRecord record, int frameIndex, long frameRows,
+                                        EncodedTopKBuffer buffer, SqlExecutionCircuitBreaker breaker) { return false; }
+
     /**
      * Packs sorted survivors, restoring heap offsets. Invoked inside encodeFrame/merge's execution
      * scope; the caller publishes count and threshold. Failure invalidates the execution's buffers.
@@ -60,5 +64,6 @@ public interface CompiledTopK extends QuietCloseable {
     long sortEntries(long entries, long count, long heap, long limit, DirectLongList scratch);
 
     CharSequence getName();
+    /** Source rows consumed by generated code, including predicate rejections in a fused scan. */
     long getNativeRows();
 }

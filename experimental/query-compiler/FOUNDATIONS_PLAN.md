@@ -693,6 +693,96 @@ For each active query, write down its measured work and an optimistic bound:
   compiler contention in tiering. A 200ms compile premium for 20ms/run savings
   needs more than ten uses. Compilation that finishes after the query does not help.
 
+## Bounded retained partition memory: next implementation slice
+
+The 2026-10-28 spill probe validates the representation and ownership transition,
+not production admission. On 500M unique variable composite keys, the committed
+pipeline fails under an 8 GiB query limit. A temporary implementation completes
+under 4 GiB, and under 2 GiB with smaller scan windows, with exact stock results.
+The generated merge, subdivision and Top-K kernels are unchanged. The probe is
+outside the production classpath; its source and commands are recorded in
+PROGRESS.md. Do not copy its fixed watermark into execution policy.
+
+Verified contracts:
+
+- `AsyncGroupByRecordCursor.buildMap()` calls `dispatchAndAwait()` before
+  `finishScan()` and `mergeShards()`. There is currently no scan/merge overlap or
+  drainable epoch. A partial group's rank cannot justify dropping it early.
+- `AggregateSlot` owns each producer's partition roots. Variable records contain
+  copied key bytes and either numeric inputs or raw aggregate state. Their page
+  links are pointers, but eligible payloads need no pointer repair on relocation.
+  This does not cover direct VARCHAR-map pointers or allocating aggregate states.
+- `GroupByShardingContext.mergeShard()` acquires a destination slot and reads the
+  same partition from every producer. Different merge workers can read different
+  partitions belonging to one producer at the same time. They cannot concurrently
+  mutate that producer's thread-unsafe `FastGroupByAllocator`.
+- `FastGroupByAllocator.free()` is best-effort. Partition pages are 64 KiB while
+  `PropServerConfiguration` defaults allocator chunks to 128 KiB; freeing a page
+  individually does not necessarily release its charge. The probe clears an
+  entire scan arena after saving the sketch. That shortcut is valid only for its
+  narrow allocation-free aggregate shape, not the general borrowed-allocator API.
+- `AsyncGroupByAtom.init()/reopen()` already bind the query tracker before worker
+  allocation. `clear()` drains state before allocator reuse. `GroupByKernel.Updater`
+  currently has no execution-start tracker binding for a separately owned page
+  arena. A small lifecycle hook here is preferable to reading private allocator
+  fields or creating a second query-memory accounting system.
+- `FilesFacade` supplies positional read/write, close and removal. There is no
+  aggregation spill store or generic query-temporary-file lifecycle in this path.
+  COPY work directories and table-recovery directories have different owners.
+
+Implement one step at a time:
+
+1. **Make page ownership independently releasable.** Separate retained partition
+   pages from live sketch/aggregate/scratch allocations, using existing allocator
+   and tracker contracts. Explicitly distinguish writable tails, sealed pages and
+   immutable spilled runs. Keep the in-memory generated record format. First
+   validate owner-only release, charge balance and fresh-address replay; avoid a
+   general buffer-pool abstraction or changing map allocation.
+2. **Add admission before mutation.** Derive available space from the existing
+   query limit and concurrent worker/merge reservations. Keep the resident path
+   when there is headroom. The 256 MiB per-slot probe fails at a 2 GiB query limit
+   before a frame-boundary check can drain it; 64 MiB completes. Therefore a fixed
+   per-slot watermark or checking after a whole frame is insufficient. Reserve
+   space for page allocation and flush before changing aggregate/row state.
+   Compact-input production already saves a resumable row position; map-to-page
+   flushing needs either a bounded reservation or an explicit resumable cursor.
+   Account for oversized keys, page tails, sketches, descriptors and map growth.
+3. **Spill sealed runs under their producer owner.** Use `FilesFacade` and the
+   existing breaker, with exact positional I/O and explicit short-I/O handling.
+   Keep run references as offsets, not persisted addresses. Bound directory memory
+   too: the probe's heap list of run offsets still grows with input. Reuse one
+   append file per owner with an on-disk run index and a bounded partition directory.
+   Write live page bytes, not unused tail capacity: the 2 GiB probe cuts spill
+   volume from 21.05 to about 16.4 GB and removes sampled dirty-page throttling.
+   Establish temporary-path creation, quota/ENOSPC and cleanup ownership before
+   enabling this path; normal completion and cancellation must remove files.
+4. **Stream replay through existing shard tasks.** Borrow a bounded input window
+   owned by the destination slot, then return it after generated consumption.
+   Preserve the original source/run order and raw AVG state. Do not reload a whole
+   outer partition as the probe does: skew or wide keys can exceed the budget.
+   Repartition oversized runs before building maps, charging child runs and
+   concurrent tasks. Sampling guides sizing; actual allocation is authoritative.
+   Stop safely when further hash subdivision cannot make progress. Select only
+   complete groups and keep selected keys owned by destination maps.
+5. **Validate the capacity path and protect the fast path.** Reuse the 500M unique,
+   repeated and small-domain controls; add wide/skewed keys under explicit limits.
+   Check failure/reopen, I/O faults, cancellation while tasks drain and cleanup.
+   Include all write/read/copy/merge/output/cleanup work. Measure physical memory
+   pressure separately: the current probe's reads hit the OS page cache, so its
+   query-allocation cap is not proof of completion under physical RAM exhaustion.
+
+The first integration scope is pointer-free variable-key partitions with an
+already eligible partition-local Top-K consumer. Ordinary aggregation still has
+output proportional to group count; it needs streaming/materialized output under
+the same budget before claiming bounded end-to-end execution. Allocating states
+need explicit relocation contracts. Neither boundary should be hidden by fallback
+after generated state has already changed.
+
+This follows the separation of small local aggregation from spillable retained
+pages described in [DuckDB's external aggregation design](https://duckdb.org/2024/03/29/external-aggregation).
+QuestDB's existing ownership, allocator and scheduling contracts determine the
+integration; that article's buffer manager is not an available QuestDB component.
+
 ## Measurement, correctness and generalization
 
 Use the current Ryzen 9950X first: 16 physical cores, two 32MiB LLC domains. Start

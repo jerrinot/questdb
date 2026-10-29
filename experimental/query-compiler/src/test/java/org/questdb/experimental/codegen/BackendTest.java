@@ -54,6 +54,34 @@ public class BackendTest {
     }
 
     @Test
+    public void fixedSizeCopiesPreserveExactUnalignedRanges() throws Exception {
+        Builder b = new Builder();
+        for (int size = 0; size <= 31; size++) {
+            QuestMapMutation.copy(b, COLUMNS, at(STATE, size * 64L), size);
+        }
+        b.exit(0);
+        try (var code = backend.compile(new Program(b.block()), temporary.getRoot().toPath());
+             Arena arena = Arena.ofConfined()) {
+            var source = arena.allocate(64, 8);
+            var target = arena.allocate(32 * 64 + 16, 8);
+            for (int i = 0; i < 64; i++) source.set(ValueLayout.JAVA_BYTE, i, (byte) (i * 37 + 129));
+            for (int inputOffset = 0; inputOffset < 8; inputOffset++) {
+                for (int outputOffset = 1; outputOffset <= 8; outputOffset++) {
+                    target.fill((byte) 0x5a);
+                    assertEquals(0, code.run(source.address() + inputOffset, 0, target.address() + outputOffset));
+                    for (int i = 0; i < target.byteSize(); i++) {
+                        int relative = i - outputOffset;
+                        int size = relative / 64;
+                        byte expected = relative >= 0 && size <= 31 && relative % 64 < size
+                                ? source.get(ValueLayout.JAVA_BYTE, inputOffset + relative % 64) : (byte) 0x5a;
+                        assertEquals("byte " + i, expected, target.get(ValueLayout.JAVA_BYTE, i));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     public void sharedHelperPreservesArgumentsEffectsAndFailureExits() throws Exception {
         var parameters = List.of(new Var(0, Type.ADDRESS), new Var(1, Type.I64), new Var(2, Type.I64));
         Builder body = new Builder(parameters);

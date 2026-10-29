@@ -4066,3 +4066,758 @@ Desktop activity and testing on one CPU model limit precision and portability
 claims. Coverage and the standard ClickBench HTML are unchanged. Evidence:
 `/tmp/query-variable-cache-20261028`, plus `variable-cache-*`, `variable-nosplit-*`
 and `variable-final-*` under `/tmp/query-generality-20261028/q16`.
+
+## 2026-10-28: bounded-memory spill/replay feasibility
+
+Committed variable-key cache subdivision as `b1f1094b8b`. The next gap is retained
+input, not local map size. The unchanged pipeline fails halfway through the 500M
+unique composite-key workload under an 8 GiB query limit. Source tracing confirms
+that scan finishes before merge starts, and merge workers cannot safely free a
+different producer's thread-unsafe allocator. Partial-group Top-K is not valid.
+
+A disposable classpath experiment spills packed state/input pages from their
+producer owner at frame boundaries. It preserves the HLL, clears the scan arena,
+then reloads each complete outer partition at fresh addresses into its merge
+worker's allocator. Existing generated merge, cache subdivision, selected-key
+copying and final Top-K execute unchanged. Every completed run processes all 500M
+rows and matches the existing clean-stock oracle.
+
+Eight physical cores, warmed data, three measured executions after two warmups:
+
+| Unique-group execution | Query allocation limit | Process medians | Peak RSS |
+| --- | ---: | ---: | ---: |
+| Committed resident LLVM | Unlimited | 3.263 / 3.274 s | 28.4–28.8 GB |
+| Full-page spill, 256 MiB producer watermark | 4 GiB | 5.344 / 5.324 s | 13.0 GB |
+| Full-page spill, 64 MiB producer watermark | 2 GiB | 6.630 / 6.778 s | 12.9 GB |
+| Live-byte spill, same 64 MiB watermark | 2 GiB | 5.435 / 5.787 s | 12.7–13.0 GB |
+
+The first pair and final pair each use balanced ABBA process order. These are
+query-allocation limits, not whole-process or physical-RAM caps. Spill reads hit
+the OS page cache; the input remains mapped. This does not establish performance
+when physical RAM is exhausted. There is no speedup over the resident path.
+
+The larger-watermark probe moves about 270 GB/query through the controllers versus
+146 GB for resident execution, with cycles/row rising from 273 to 413. Copying to
+and from the page cache costs memory traffic and kernel work; the extra 124 GB
+alone corresponds to 1.94 s at the earlier 64 GB/s streaming ceiling. This is a
+traffic lower-bound calculation, not proof of bandwidth saturation.
+
+Smaller windows initially write 21.05 GB despite about 16.6 GB of live records:
+unused page tails become significant. Worker wait-channel samples show
+`balance_dirty_pages` and `inode_wait_for_writeback`; dirty cache reaches about
+15.5 GB. Writing only live bytes reduces spill volume to 16.34–16.48 GB. In the
+matched final comparison, average process-median latency falls 6.70 to 5.61 s,
+while cycles/row fall only 438 to 422 and instructions rise 519 to 533. Sampled
+dirty-page waits disappear; whole-process cgroup I/O pressure falls from
+1.55/2.35 s to 0.002/0.060 s. The larger elapsed gain is consistent with removing
+writeback backpressure, not just faster generated instructions. System-wide
+physical writes remain asynchronous and include background work.
+
+The 4 GiB full-page probe also completes the independent 500M-row repeated-key
+control in 4.55 s; the small-domain control stays near 0.525 s and spills nothing.
+The earlier resident repeated-key result is about 2.46 s, not a fresh matched
+comparison here. Twelve focused checks pass across LLVM/AsmJit/C and both worker
+modes with forced tiny spill windows: raw AVG, NULL/empty/Unicode keys, oversized
+records, selected-key ownership, failure/reopen and ordinary final collection.
+The 2 GiB rejection at the larger watermark and all successful/test executions
+leave no spill files behind. Hot samples have zero major faults, disk reads and
+GC time; memory PSI is zero. Writeback and desktop activity limit timing precision;
+one earlier 4 GiB sample took 7.54 s. No benchmark-suite or cross-machine claim.
+
+Do not integrate the probe as-is: fixed watermarks, whole-partition reloads,
+unbounded run-index metadata, missing short-I/O/cancellation coverage and clearing
+a borrowed arena are not general storage contracts. The code-grounded next steps
+are in FOUNDATIONS_PLAN.md: independent page ownership, admission before mutation,
+bounded run metadata, streamed replay and existing query-budget/lifecycle reuse.
+The resident runtime and ClickBench HTML remain unchanged. Temporary source,
+commands, raw counters and correctness logs: `/tmp/query-variable-spill-20261028`
+(`src`, `matrix.py`, `budget.py`, `live-bytes.py`, `summary.json`, `quality.json`,
+`live-bytes-tests.log`). Full-page baseline classes remain in `full-pages`;
+`classes` contains the live-byte variant. Large spill files were removed on close.
+
+## 2026-10-28: ClickBench queries without a speedup
+
+Ranked the current standard HTML by raw hot time (minimum of runs two and three,
+without the UI's 10 ms ratio stabilizer). Its stock/LLVM commits are
+`8da4e347f9`/`ad57ff9e48`; coverage is 34 full, two partial and seven fallback.
+Q28 and Q27 account for 95.5% of stock time among queries gaining less than 10%.
+That bucket is 11.1% of total stock hot time, not the whole remaining workload.
+
+| Query | Stock hot ms | LLVM-mode hot ms | Generated execution |
+| --- | ---: | ---: | --- |
+| Q28: regex key, AVG, COUNT, VARCHAR MIN | 2090.4 | 2052.3 | None |
+| Q27: AVG of VARCHAR length by integer key | 291.7 | 286.8 | None |
+| Q25: filtered VARCHAR Top-K | 54.8 | 57.4 | Full, with a materialized filter boundary |
+
+Fresh diagnostics use committed `b1f1094b8b`, the same clean-stock jar, the actual
+99,997,497 rows, eight physical cores on one 9950X CCD and read-only fixture roots.
+They are focused hot-query experiments, not replacement ClickBench submissions.
+
+- **Q28:** balanced stock/LLVM process medians average 2.050/2.070 s; results match
+  exactly and all LLVM execution counters are zero. Regex evaluation accounts for
+  53.1% of CPU samples. Stock already uses its anchored single-capture specialization
+  and borrows the captured bytes; this is not a per-row StringBuilder problem.
+  About 3,070 instructions and 840–876 cycles/input row, 5.24 branch misses/row,
+  and 26.3 GB of controller traffic/query at 12.8 GB/s describe substantial work
+  below the earlier same-affinity 64 GB/s streaming ceiling. Load-not-complete
+  cycles are 31.4%. These signals do not establish one dominant CPU resource;
+  regex, probing, copying and MIN comparisons remain separate costs. Even removing
+  all sampled regex CPU work gives only a rough 2.1x CPU-work Amdahl bound, not a
+  promised elapsed speedup. Any regex experiment must support a general expression
+  subset and preserve capture/no-match/Unicode semantics, not recognize URL SQL.
+- **Q27:** current fallback takes about 284 ms. UTF-8 length accounts for 69.2% of
+  CPU samples; controller traffic is 13.3 GB/query at 46.8 GB/s. A reader-backed
+  metadata pass finds 99.93M non-null URLs, 84.97M with the ASCII flag, and 3.29 GB
+  of values without that flag. `Utf8s.length()` already returns the stored byte
+  count for flagged ASCII and counts code points otherwise. Replacing it with
+  byte length is incorrect. The 13.3 GB is whole-query traffic, not solely string
+  payload. Missing bindings include VARCHAR length and AvgInt's DOUBLE-sum/LONG-count
+  state; full coverage also needs the post-aggregate predicate and DOUBLE ordering.
+  AVG_SHORT's integer state is not a substitute. This expression/state work also
+  benefits Q28, which additionally needs the computed regex key.
+- **Q25:** balanced three-warmup comparisons give 52.9/55.9 ms, with exact results.
+  Some payload pages still fault; preloading all SearchPhrase values removes major
+  faults and gives 53.7/55.0 ms. Treat the regression as a few percent, not a precise
+  universal ratio. Initial fixed-work counters show 42% more instructions and 2.39x
+  the branches in LLVM; extra prewarming changes stock's JIT profile and narrows the
+  instruction gap. Both paths move about 2.9 GB/query. LLVM reaches 53 GB/s; four to
+  eight physical cores improves 74.7 to 54.9 ms, far short of doubling throughput.
+  At the calibrated ceiling, the observed traffic alone needs about 45 ms.
+  Filtering first writes 13,172,392 row IDs (105 MB), then Top-K reads those IDs and
+  revisits VARCHAR metadata. The mandatory auxiliary scan is only 1.60 GB. Fusion
+  could reduce this traffic; the lower-bound arithmetic is not an achieved speedup.
+  Optimized filter IR also retains scalar NULL tests and per-row descriptor bounds
+  checks/reloads. Tune those separately after measuring fusion: Q25's CPU profile
+  resolves the Top-K caller, but native leaves need better instruction attribution.
+
+First experiment: fuse an admitted predicate into generated Top-K's row consumer,
+reusing resolved predicate bindings, existing buffers and scheduling. Predict fewer
+selection-buffer bytes and metadata rereads, lower controller bytes/query, and a
+larger eight-core benefit than instruction-only tuning. Reject the hypothesis if
+traffic and complete latency do not improve together. Test other predicates,
+selectivities, K values, NULL/Unicode data and non-ClickBench inputs. Then extend
+length/AVG/post-aggregate consumers; investigate regex lowering separately.
+Metadata COUNT, already-vectorized scalar aggregates and Q29's algebraically
+collapsed SUMs are lower-priority fallback controls, not evidence of poor LLVM code.
+
+USE limitations: desktop activity remains present; Q25 is sensitive to warmup and
+JIT history. Prewarmed Q25 has zero major faults and no measured GC-time growth;
+about 0.4 MB of process reads remains across each measured process. Q28/Q27 also
+have small runtime reads. Memory capacity is ample, cgroup throttling is zero,
+and measured cgroup I/O pressure is small despite background system-wide I/O.
+The four-event retirement group failed to schedule; PipelineL1 was 75% multiplexed.
+Neither is used for precise attribution. No validated production-optimization gate
+or cross-machine improvement claim follows from this exploration. Runtime code,
+canonical data and the standard HTML are unchanged. Raw commands, outputs, PMU
+data, profiles and metadata probe: `/tmp/query-clickbench-gaps-20261028`.
+
+## 2026-10-29: filter-to-Top-K fusion removes a materialized boundary
+
+Admitted predicates now feed generated VARCHAR Top-K directly on native frames.
+The binding and scan lowering are shared with existing filters; the same Top-K
+buffer, compaction, merge, sort and scheduler retain ownership. No query matching
+or new toggle. Parquet late materialization, column tops, casts and unsupported
+predicates retain the existing two-stage path. All frame views are prepared before
+buffer mutation; the ordinary encode kernel is deferred until fallback needs it.
+
+Actual ClickBench Q25, 99,997,497 rows, eight physical cores on one Ryzen 9950X CCD:
+
+| Path | Hot execution ms | Controller GB/query |
+| --- | ---: | ---: |
+| Clean stock (`8da4e347f9`) | 51.5 | 2.86 |
+| LLVM before fusion (`b1f1094b8b`) | 54.6 | 2.90 |
+| LLVM fused | 31.8 | 1.69 |
+
+These are averages of process medians in a stock/before/after/after/before/stock
+run, with five warmups and twelve measured executions per process. The final fused
+path is 1.62x faster than stock and 1.72x faster than the previous LLVM path.
+Controller traffic falls 42%, matching the elapsed reduction against old LLVM;
+both sustain about 53 GB/s. The mandatory 16-byte auxiliary scan is 1.60 GB:
+at the observed bandwidth it needs about 30 ms, versus 32 ms measured. At the
+independently calibrated 64 GB/s ceiling the traffic-only floor is about 25 ms.
+The removed boundary wrote 105 MB of selected row IDs, read them back and revisited
+metadata. This gain removes traffic; it does not establish faster instruction
+execution. USE and hardware gates passed before integration. Final hot samples
+have no major faults, about 0.4 MB of process reads per twelve queries, and fully
+scheduled counters. Desktop activity remains; this is one CPU model.
+
+Independent 500M-row controls, complete cursor consumption against clean-stock
+results, also improve: dense non-null filtering 397 to 166 ms (24.2 to 8.2 GB),
+substring filtering 669 to 507 ms (39.2 to 29.6 GB), Unicode filtering with K=5000
+554 to 510 ms (32.4 to 29.8 GB). The initial 64-row numeric-mask variant failed a
+sparse conjunction control: 82 to 113 ms, 4.64 to 6.41 GB. Wider AND windows read
+the next column more often; shifted resume windows also touch extra cache lines.
+Preserving the existing eight-row windows and masking already-consumed rows fixes
+this. Final fully prewarmed sparse ABBA medians are 83.5 versus 81.1 ms, with
+4.73 versus 4.52 GB/query and zero measured reads/faults. Do not claim a substantial
+sparse-predicate win. No selectivity heuristic or machine-specific knob was added.
+
+The full repository ClickBench protocol also ran: one cache drop then three
+executions per query, server alive, all 43 queries for stock/before/after. All 387
+responses validate, including independent tie-group checks and bounded parallel
+floating-point differences. Q25 stock/before/after times are respectively
+127.05/53.52/52.79, 670.51/56.90/56.83 and 633.23/33.27/30.93 ms. First-request cost
+still loses badly to stock. The measured SQL compiler timer is only 38.6 ms for
+fused Q25; it does not isolate deferred native compilation or JVM warmup, so do not
+label the remaining cost LLVM compilation. This suite preceded the numeric-window
+correction; Q25 is its only compiled VARCHAR Top-K plan and has no numeric predicate.
+The final build was remeasured above. Total hot suite time is effectively unchanged:
+9.868 to 9.867 s. Q25 saves 25.9 ms, offset by single-pass changes elsewhere. Q16's
+18.8 ms single-pass increase did not separate from process drift in a final ABBA
+check: before medians 573/597 ms bracket after 589/590 ms; instructions/query differ
+by only 0.06% between arm averages. Other increases over 5% or 10 ms are Q1 +0.44 ms,
+Q6 +1.19 ms, Q24 +0.02 ms and Q42 +0.63 ms. No suite-wide speedup claim.
+
+Final build and sixteen focused checks pass: LLVM legacy/fiber Top-K lifecycle,
+mixed predicates on C/AsmJit, and guarded resumed-scan boundaries on all backends.
+Compile/execution failure cleanup was then rerun on both LLVM worker modes. The
+existing Parquet test had converted an active partition, which QuestDB skips;
+it now seals that partition and asserts its actual format before testing fallback.
+Canonical data and the standard HTML are untouched. Raw commands, fixed-work
+counters, correctness outputs and the validated study are in
+`/tmp/query-topk-fusion-20261028` (`final-*`, `suite`, `study.json`). Next shared
+prerequisites remain VARCHAR code-point length, AvgInt state, post-aggregate
+predicates and DOUBLE ordering; regex lowering is a separate experiment.
+
+## 2026-10-29: distribute DISTINCT merge work by input cardinality
+
+Q8's deferred inner-set union exposed a scheduling blind spot: 15–16 pending
+states and nine updater slots gave every state one task, despite input estimates
+ranging from about 0.22M to 4.15M entries. The last task took 110–118 ms of a
+111–122 ms union phase; only one or two of eight cores remained busy during the
+tail. Four to eight cores shortened scanning from about 485 to 276 ms but increased
+the largest union from 82 to 111 ms as more partial sets had to be combined.
+The validated bottleneck is task imbalance in this phase, about 23% of Q8 elapsed
+time. These observations do not classify the entire query's hardware bottleneck.
+
+The scheduler now divides total estimated input work by the existing updater slots.
+Each deferred set gets a power-of-two number of ranges according to its share of
+that work, capped by the existing eight-part limit. The estimate is already stored
+in the deferred context. This reuses the same generated union/initialization kernels,
+queue, worker slots, allocator, serial fallback and 256 MiB per-target bound. No
+query recognition, new pool or toggle. The production change is confined to the
+updater contract, sharding coordinator and aggregate slot.
+
+Actual ClickBench, 99,997,497 rows, eight physical cores on one Ryzen 9950X CCD:
+
+| Q8 hot execution | Before | After |
+| --- | ---: | ---: |
+| Balanced process-order median average | 480.5 ms | 404.6 ms |
+| CPU time/query | 2.974 s | 2.968 s |
+| Controller traffic/query | 14.42 GB | 13.93 GB |
+| Deferred union phase, diagnostic | about 115 ms | about 46 ms |
+
+Elapsed time falls 15.8% while CPU work stays nearly unchanged: the scheduler
+overlaps work that previously left cores idle. The longest union task falls to
+about 35 ms; scanning remains about 277 ms. The warm comparison used five warmups
+and seven measured queries per process, before/after/after/before. Counters were
+fully scheduled, with zero major faults and about 0.4 MB runtime reads per process.
+Memory pressure and cgroup throttling were absent; desktop activity still exists.
+A four-core repeat improves 691 to 659 ms. This is evidence at two core counts on
+one processor, not a cross-machine result.
+
+The repository protocol also ran all 43 queries before/after: one cache drop then
+three executions per query, server alive. Q8 hot time falls 482.1 to 415.0 ms;
+Q9 falls 511.2 to 436.5 ms. Q8 first execution falls 823.9 to 747.2 ms. Summed hot
+suite time falls 9.971 to 9.778 s (1.9%); Q8/Q9 account for about 142 ms. Q10's
+single-pass 43.2 to 50.4 ms increase did not reproduce in a balanced repeat:
+46.06 versus 45.84 ms, with similar traffic. Other increases over 5% or 10 ms were
+Q25 +2.35 ms and Q28 +29.42 ms; their execution paths are unchanged. All 387
+responses validate, including the retained clean-stock reference suite, tie groups
+and bounded parallel floating-point differences. Stock was not rerun as a full
+suite in this experiment; separate fresh Q8 controls measured about 778 ms.
+
+Independent 500M-row controls retain exact clean-stock results: 31 medium states
+1062 to 1064 ms, 31 large states 5472 to 5433 ms, and a skewed 32-group distribution
+1146 to 1132 ms. Treat these as neutral/small effects, not another large win.
+The skew control increases traffic about 2.8%; splitting more states is not free.
+All groups also match stock exactly for Q8/Q9/Q10/Q11/Q13/Q22, including Q13's
+6,019,102 groups. Build and twelve focused checks pass across LLVM/AsmJit/C and
+legacy/fiber workers, covering multiple aggregates, reopening, memory limits and
+worker failure; the final split-range assertion was rechecked in six cases.
+
+DuckDB 2.0.0 on the same data, eight-core affinity and uncompressed native storage
+still takes about 171 ms, moving 5.09 GB/query. Its plan deduplicates 17,996,642
+(RegionID, UserID) pairs, then counts into 9,040 groups. Our unchanged 277 ms scan
+already exceeds its complete query time. A diagnostic pair-dedup SQL rewrite took
+about 470 ms: its inner aggregation was generated but its outer aggregation used
+serial Java. This does not establish that a flat representation is inherently
+better; a useful next experiment needs a generated intermediate consumer and
+fixed-work evidence for scan/state traffic. Overlap-aware capacity remains open.
+Raw commands, profiles, counters, study and compact full-group hashes are under
+`/tmp/query-q8-20261029`; the disposable 6 GB skew fixture and large duplicate
+result arrays were removed after validation. Canonical data and HTML are unchanged.
+
+## 2026-10-29: morsel scheduling exists; smaller scan tasks regress Q8
+
+`FwdTableReaderPageFrameCursor` bounds native frames by partition size, worker
+count and configured row limits. `UnorderedPageFrameSequence` publishes these to
+the shared queue; workers claim frames dynamically and the owner helps while
+waiting. LLVM executes inside this path and retains aggregation state per updater
+slot. This supplies the basic morsel mechanism. It does not supply HyPer's explicit
+NUMA-local data/state placement; this one-NUMA-node machine cannot validate that.
+The reference is [Leis et al., Morsel-Driven Parallelism](https://15721.courses.cs.cmu.edu/spring2016/papers/p743-leis.pdf),
+also described in [Neumann's engine survey](https://www.vldb.org/pvldb/vol7/p1734-neumann.pdf).
+
+Actual Q8, eight physical cores, current work-weighted merge, five warmups/seven
+measured executions per process, forward/reverse configuration order:
+
+| Maximum frame rows | Hot ms | CPU seconds/query | Controller GB/query |
+| --- | ---: | ---: | ---: |
+| 1,000,000 (default) | 412.0 | 2.980 | 13.91 |
+| 250,000 | 443.3 | 3.179 | 15.18 |
+| 100,000 | 446.1 | 3.275 | 15.80 |
+| 25,000 | 473.6 | 3.464 | 17.45 |
+
+Instrumented repeats explain the tradeoff. Default sizing produces 180 frames;
+100K produces 990 (partition tail adjustment can exceed the configured maximum).
+The final scan drain shrinks from about 8 ms to 2 ms, but scan CPU work grows from
+about 2.13 to 2.31 seconds and scan elapsed from 273 to 298 ms. Estimated input
+cardinality of deferred large unions grows from about 11.3M to 13.9M entries.
+Smaller tasks change duplicate distribution among local sets as well as dispatch
+cost. Traffic rises 14%; this is not just queue overhead. The traces show no
+within-frame carrier migration. CPU occupancy near 97% bounds the potential of
+load balancing at unchanged work; it does not identify a microarchitectural limit.
+
+A separate balanced sweep of 1M/2M/4M/8M maxima gives 409/405/413/410 ms: no
+repeatable larger-frame gain. Every result matches the clean-stock Q8 oracle;
+native counters account for all 99,997,497 rows/query, and measured major faults
+are zero. Counters are fully scheduled. These are warm diagnostic configuration
+experiments, not a fresh standard ClickBench suite or a cross-operator claim.
+No scheduler/default change is justified. Temporary task instrumentation and
+configuration changes stay outside the checkout; evidence is in
+`/tmp/query-morsel-20261029`. Next study aggregation work/state and generated
+intermediate consumers, retaining the existing scheduler. A measured imbalance or
+multi-NUMA experiment can reopen scheduler work.
+
+## 2026-10-29: intermediate consumer experiment and fixed-key forwarding stalls
+
+An isolated final-map consumer reuses `QuestMapScan`, `AggregateUpdates`, actual
+QuestDB maps and the existing merge workers. On complete Q8-equivalent aggregation,
+pair deduplication followed by serial Java aggregation takes 462 ms; parallel Java
+consumption takes about 340 ms, generated consumption 329 ms, and the current
+nested-DISTINCT path about 398 ms. These direct runs use seven workers plus owner
+on eight physical cores and validate every one of the 9,040 groups against clean
+stock. Most consumer benefit is removal of a serial phase, not code generation.
+Controller traffic falls from roughly 13.7 to 5.05 GB/query with the different
+DISTINCT strategy. The [DuckDB aggregation paper](https://duckdb.org/pdf/ICDE2024-kuiper-boncz-muehleisen-out-of-core.pdf)
+describes bounded preaggregation and partition output feeding the next pipeline.
+
+Do not make that strategy universal: independent 500M-row controls improve
+5.54 -> 3.78 s for 31 large sets, but regress 0.956 -> 1.462 s for medium sets
+and 0.147 -> 0.552 s for tiny sets. These numbers precede the packing fix below.
+The consumer and SQL rewrite remain outside the checkout; no new scheduler or
+planner choice was installed. The controls also caught a shared lowering bug:
+nullable INT-to-LONG grouping keys stored the INT null sentinel. Fixed and
+variable packed keys now store LONG NULL; focused tests failed before both fixes
+and pass across LLVM/AsmJit/C, legacy/fiber workers, and cursor reopen.
+
+The remaining pair-plan cost exposed a compiler defect in mechanical sympathy.
+Field-wise INT+LONG stores were immediately followed by an overlapping 8-byte
+hash load. Native samples landed just after that load. The dedicated non-forwardable
+store/load conflict counter measured 2.32 events/input row; almost all sampled
+loads hit L1. [AMD's optimization guidance](https://gpuopen.com/download/GDC-2023-AMD-Ryzen-Processor-Software-Optimization.pdf)
+identifies the counter and forwarding hazard. Fixed-key staging now assembles
+8/4/2/1-byte words from scalar values, preserving exact RecordSink bytes, hash,
+NULLs and map layout. Big-endian hosts retain field-wise encoding. No tuning
+parameter or query recognition was added.
+
+Balanced complete-query runs: 320 -> 262 ms; user cycles/input row 123.4 -> 95.7;
+instructions 164.1 -> 168.5; forwarding conflicts 2.32 -> 0.21; backend stalled
+slots roughly 461 -> 237. Optimized assembly hashes registers instead of reloading
+the overlapping stores. A separate dependent pack/hash chain, three 500M-iteration
+runs with identical checksums, takes 25.1 -> 13.0 cycles/iteration. Saving about
+2.8 billion cycles over eight roughly 5 GHz cores predicts around 70 ms of headroom,
+consistent with the measured ~60 ms. This is a store/load dependency result, not
+a DRAM-bandwidth claim. All cited PMU events are fully scheduled; initial oversized
+event groups and multiplexed PipelineL1 results are excluded.
+
+Retained after independent 500M-row grouping controls: SHORT+INT improves
+1.642 -> 1.075 s, while INT+SHORT and LONG+LONG remain essentially unchanged.
+The four-core SHORT+INT control improves 3.060 -> 1.902 s. Twelve focused checks
+cover mixed signed widths, nullable casts, fixed/variable keys, map growth,
+sharding, output/Top-K, reopen and code lifetime across all backends/worker modes.
+Existing SQL Q30 improves about 97 -> 86 ms, with tied output rows independently
+recomputed on stock; Q11 and Q32 are essentially unchanged. The original Q8 plan
+still uses nested sets: the 262 ms result is the isolated alternative, not an
+installed automatic Q8 speedup. The stock/pre-packing/current full protocol
+completed all 43 queries, one cache drop and three executions each. All 387
+responses validate (independent recomputation for tied outputs). Warm-minimum
+suite totals are 22.50/9.75/9.65 seconds; Q30 is 95.8 -> 81.4 ms. Small timing
+swings in unaffected scan queries show why this single suite is a regression
+screen, not proof of every individual gain. The balanced Q30 diagnostic above
+is the packing acceptance measurement.
+
+Evidence and validated hardware study: `/tmp/query-q8-work-20261029/stage-study.json`.
+Warm measured queries have zero major faults/read bytes and low background CPU;
+system-wide I/O PSI remains nonzero, so these diagnostic gains are not cold-I/O
+claims. Only one CPU model has been measured. A separate wider-copy-tail experiment
+saved roughly 2% and remains isolated; it is not part of the retained change.
+
+
+Further isolated controls after packing: pair aggregation versus nested sets is
+1.138/0.955 s for medium sets, 0.191/0.148 s for tiny sets, and 3.394/5.369 s
+for large sets (500M rows, every group validated). Reusing the variable-key
+pipeline's staged probes for fixed-key partition merging changes Q8 little and
+adds CPU work, but improves the large-set control 3.40 -> 2.61 s. Backend stalled
+slots fall about 45%; controller traffic falls roughly 118 -> 103 GB/query.
+Demand-load sampling points to the offset-table -> entry dependency. Software
+prefetch samples are excluded from demand-load latency summaries. This remains
+an isolated counterfactual: a universal staging policy has not passed regression
+controls. Hoisting fixed-key input pointers and changing scan batch widths offer
+only small gains here and remain isolated. No new runtime settings were added.
+
+## 2026-10-29: bounded aggregation-cache counterfactual
+
+An isolated direct-mapped partial aggregation cache follows the collision-eviction
+algorithm described in the [Gigascope paper](https://www.vldb.org/archives/website/2005/program/paper/tue/p1079-johnson.pdf).
+Evicted states use the existing partition pages, allocator, merge workers and
+aggregate lowering. A full ordinary-map window still decides whether compact raw
+inputs are cheaper; the cache drains at frame boundaries so the next frame can
+reassess. No query recognition or scheduler change.
+
+The alternative Q8 pair/consumer plan improves about 262 -> 204 ms, with all
+9,040 groups checked against stock. Instructions/input fall about 169 -> 102 and
+branch misses 1.54 -> 0.80; frontend empty slots and speculative discarded work
+fall, while backend stalls rise slightly and controller traffic stays near 4.8 GB.
+This is less control/speculation work, not less DRAM traffic. The dispatch-slot
+budget predicts roughly 22 saved cycles/input, consistent with the measured gain.
+It remains an alternative plan; original SQL Q8 still uses nested sets.
+
+Reject this as a general aggregation replacement. A held-out 500M-row distribution
+with 90% hot keys, nullable SUM/COUNT/MIN/MAX and computed composite keys regresses
+about 445 -> 528 ms. Two hot keys collide and partial records grow 50.2M -> 78.0M.
+Two-way caching restores the record count but is slower still (~571 ms), so excess
+spilling is not the whole explanation. Backend stalled slots roughly double;
+scan demand loads almost all hit L1. Batching key hashes also fails to recover the
+regression. Conversely, key-only deduplication on the same skewed input improves
+about 270 -> 224 ms despite more partial records. Fewer instructions alone do not
+establish a faster aggregate implementation. Wide-state uniform controls also
+require preserving the existing compact-input choice.
+
+All cache variants remain outside the checkout. No cache admission policy has
+passed the generality gate; do not install the Q8 winner by itself. Commands,
+isolated sources, exact-stock oracles and fixed-work profiles are under
+`/tmp/query-q8-work-20261029/cache*`; the separate 500M-row skew fixture is
+`/tmp/query-q8-cache-skew-20261029`. These are warm eight-core results on one CPU.
+
+
+Further DISTINCT counterfactuals remain isolated. SIMD windows of 2/4/8 adjacent
+set slots do not improve the existing nested-set plan: balanced actual-data runs
+are roughly 394 ms scalar, 400 ms with 2/4 lanes and 429 ms with 8. Every group
+matches stock; focused nested-set checks pass across the three backends. An early
+incorrect variant advanced both the probe address and a load-valued needle across
+SIMD lanes; freezing the needle fixes correctness, and those invalid timings are
+excluded. The [SIMD hash-table study](https://www.vldb.org/pvldb/vol16/p2755-bother.pdf)
+also distinguishes short linear probes from layouts designed for vector comparisons.
+A separate exclusive hash-subset union avoids atomic insertions but rereads source
+sets and takes roughly 407–424 ms versus 391 ms for the existing union. Neither
+counterfactual justifies changing the algorithm or scheduler. Current nested-plan
+profiles put about three quarters of CPU samples in the scan kernel, with almost
+all sampled scan loads hitting L1; this rules out calling Q8 a simple DRAM-streaming
+problem. Evidence: `/tmp/query-q8-work-20261029/vector*-valid*`, `nested-resource-*`
+and `owned-high-*`.
+
+## 2026-10-29: generated consumers of finalized aggregate maps
+
+Integrated numeric aggregate-to-aggregate consumption through `CompiledMapAggregate`
+and `ResolvedMapAggregate`. The ordinary planner and resolved functions still choose
+the operators. Existing merge tasks consume their finalized input maps into slot-owned
+ordinary maps; the owner performs a generated final merge. Reuse `QuestMapScan`,
+resolved expression/key lowering, aggregate lifecycle code, map growth and LONG
+Top-K. Transparent supported projections are evaluated; intermediate filters/limits
+remain boundaries. No new queue, worker pool, query recognition or runtime setting.
+This does not automatically rewrite grouped COUNT DISTINCT.
+
+Same Q8-equivalent pair SQL, all 9,040 groups validated, eight physical cores:
+serial Java consumption takes about 395 ms versus 266 ms in the cleaned candidate.
+Earlier prototype repeats were 387/252 ms. Phase instrumentation attributes about
+127 ms wall and owner CPU time to the serial consumer; total process CPU during
+that phase is only about 132 ms. Distributed generated consumption adds about 6 ms
+to the producer phase and leaves a 0.8 ms owner merge. Tail-only PMU measurement
+finds about 0.73B cycles and 4.15B instructions/query, about 59% of dispatch slots
+retiring, 36% backend stalled, 3% frontend empty and 1% speculative discarded work.
+That predicts roughly 120 ms saved critical-path time, consistent with the complete
+query. Total CPU falls much less than elapsed time. Controller bytes fall only
+5.12 -> 4.70 GB/query; this is not a DRAM-bandwidth breakthrough.
+
+Independent 500M-row same-plan controls: medium intermediate output 1.217 -> 1.158 s,
+tiny output 0.189 -> 0.189 s, large intermediate output 7.66 -> 3.41 s. A separate
+8.39M-output-group control takes 32.28 -> 5.63 s, including final merge and selection.
+The normal rebuilt classes retain 3.44 s and 5.61 s in the two large controls. Q8
+placement controls give roughly599 -> 473 ms at four cores, 395 -> 265 ms across two
+L3s at eight cores, and 302 -> 148 ms at sixteen physical cores. These are warm
+single-machine diagnostics, not a new standard-suite or cross-machine claim.
+
+Twelve focused checks pass across LLVM/AsmJit/C and legacy/fiber workers, covering
+computed projections/keys, NULLs, aggregate result readers, growth, empty input,
+reopening, generated Top-K, opaque limits/filters, worker failure and memory limits.
+An additional actual-data source COUNT DISTINCT test validates all 1,192 downstream
+groups after deferred union. The normal Maven reactor compile passes. Hardware/USE
+gate: `/tmp/query-q8-work-20261029/map-study.json`; temporary controls and raw profiles
+remain in the same directory. Measured warm queries have zero major faults/read
+bytes; unrelated global IO PSI remains nonzero. The previous cache and SIMD
+experiments remain isolated.
+
+## 2026-10-29: exact duplicate filtering for key-only grouping
+
+Retain `QuestKeyFilter` for fixed-width aggregation with no aggregate values. After
+the first full local map is flushed, a bounded direct-mapped cache remembers full
+keys already appended to the ordinary partitions. A miss appends immediately;
+collisions cause extra records, never missing distinct values. Small sets keep
+their existing map. Reuse the slot allocator, memory budget, partition merge and
+`ScanLowering.filteredRange`; there is no new scheduler or setting.
+
+Actual Q4, eight physical cores, balanced diagnostics: about 187 -> 128 ms.
+Instructions fall 108.5 -> 60.1/input row, branch misses 1.454 -> 0.706 and
+frontend-empty dispatch slots 254.6 -> 146.0. Backend stalls rise slightly;
+controller traffic barely changes, 2.965 -> 2.872 GB/query, below the measured
+63.5 GB/s streaming ceiling. Native samples attribute the saving to fewer local
+probes and elimination of repeated flush scans/re-hashing; final merge samples
+are essentially unchanged. The dispatch-slot budget predicts about 64 ms saved,
+consistent with complete execution. Eager full-key comparison adds no clear gain.
+
+Independent 500M-row key-only controls, keeping the same generated downstream
+consumer in both arms: medium domain 1.16 -> 0.81 s, large domain 3.45 -> 3.23 s,
+skewed domain 0.271 -> 0.233 s, tiny domain 0.190 -> 0.191 s. A filtered control
+accepting 235,289,413 rows takes 0.563 -> 0.417 s. Skew increases emitted partials
+49.65 -> 76.52M despite the net gain; the cache does not bound total retained memory.
+Alternative Q8 pair SQL improves about 476 -> 355 ms at four cores and 157 -> 132 ms
+at sixteen. Original Q8 still uses nested sets; no automatic rewrite is claimed.
+
+Normal Maven compile and six focused backend/worker checks pass, including NULLs,
+computed composite keys, fused predicates, selection vectors, injected worker
+failure and reopen. A complete stock/before/after repository protocol validates
+all 387 responses, including tied-group recomputation. Q4 warm minima are
+447.7/182.3/128.1 ms; summed warm minima are 22.463/9.729/9.650 s. First-request
+sums including compilation are 34.072/26.036/25.849 s. Apparent >3% slowdowns versus
+the previous LLVM pass occur at Q5/Q24/Q25/Q26/Q31/Q37/Q38/Q41; the largest,
+Q5 (+7.0 ms) and Q31 (+5.6 ms), do not reproduce in balanced seven-run checks.
+Those paths are ineligible for the filter. Attribute the gain to the deduplication
+family, not the whole suite. Warm HTTP reads are small and comparable, not zero;
+major faults and process block-IO ticks are zero, with no memory pressure.
+One CPU family is tested. Evidence/gate: `/tmp/query-q8-work-20261029/key-filter-study.json`,
+`key-filter-suite`, `key-filter-regressions.json` and the corresponding temporary
+500M-row controls. The wider aggregate-state cache remains rejected.
+
+Grouped DISTINCT memoization is also rejected for now. Exact group/argument tuple
+caches skip about 54–56% of updates on original Q8, yet a scalar cache loop takes
+567 ms versus about 400 ms. Preserving batch prefetching, with the cache either
+after or before the outer probe, takes about 416–434 ms. Scalar instructions fall
+209 -> 156/input, but backend-stalled slots double 416 -> 831/input; IBS attributes
+slow demand loads to unprefetched inner-set slots. The staged variant lowers
+backend stalls to 381 but raises frontend-empty slots 368 -> 451 and branch misses
+2.01 -> 2.38/input, erasing its modest instruction saving (209 -> 191). Traffic is
+13.64/16.57/14.17 GB/query for baseline/scalar/staged. All 9,040 result groups match.
+This is evidence against wrapping another lookup around this already-prefetched
+algorithm, not against deduplication generally. Code/profiles remain temporary
+under `/tmp/query-q8-work-20261029/distinct-memo-*`.
+
+## 2026-10-29: staged prefetching for large nested DISTINCT state
+
+Generated fixed-key DISTINCT can now separate outer-entry, set-header and set-slot
+prefetches. Only hints cross stages; updates reload pointers after growth. Reuse
+the existing `AdaptiveKernel` at complete invocation boundaries and `CacheSizing`
+for L2 admission. No new scheduler, allocator or setting. This is group prefetching,
+not [AMAC](https://www.vldb.org/pvldb/vol9/p252-kocberber.pdf)'s independently advancing lookups.
+
+Independent 500M-row controls, eight physical cores: 100,004 groups improve
+3.88 -> 2.77 s; a 90%-hot skew improves 1.43 -> 1.08 s. Static staging fails a
+cold-prefix/hot-tail control (444 -> 472 ms); the existing adaptive policy restores
+parity (448 -> 449 ms). Small states and actual Q8 retain their ordinary loop.
+Backend-stalled slots fall about 2,359 -> 1,559/input in the final adaptive run.
+The fixed staged loop moves set-capacity hint loads from about 459 to 72–91 sampled
+cycles, while controller traffic falls only 118 -> 111 GB/query. More overlap,
+not fewer instructions: instructions rise 155 -> 178/input. The dispatch-slot
+budget predicts roughly 1.1 s saved, matching execution. Expensive loads remain.
+The extra LLVM variant compiled in 47 ms in a diagnostic, included in first execution.
+Final-build controls retain the gain at four cores (6.21 -> 4.48 s) and sixteen
+cores (2.33 -> 1.96 s); these are core-count controls on one CPU model.
+
+Normal Maven compile and 12 focused checks pass across LLVM/AsmJit/C and legacy/fiber
+workers, including NULLs, multiple aggregates, growth, filters, failure and reopen.
+All 387 stock/before/after standard-protocol responses validate. Warm-minimum totals
+are 22.340/9.693/10.019 s; the apparent 326 ms LLVM regression is almost entirely
+Q28's Java fallback (+323 ms), which does not reproduce in balanced controls.
+Q7/Q11/Q35 also return to parity; Q40's small 1.5 ms suite difference was not repeated.
+First-request totals are 34.307/25.923/25.986 s. This is a large-state improvement,
+not a ClickBench-wide gain or an automatic grouped-DISTINCT strategy change.
+Gate and raw evidence: `/tmp/query-q8-work-20261029/staged-distinct-study.json`.
+Only one CPU model is tested; missing cache metadata keeps the ordinary kernel.
+
+
+## 2026-10-29: reuse staged partition merging for large fixed-key maps
+
+Fixed-key partial states can now use the existing variable-key merge stages:
+prefetch offsets, prefetch entries, then consume with full-key checks. Java selects
+the deferred variant only when the used heap plus offset table exceeds discovered
+L2; unknown cache geometry retains scalar merging. Growth restages the unconsumed
+row. No new setting, queue, allocator or map representation.
+
+Independent 500M-row large-state control: 3.23 -> 2.43 s on eight physical cores.
+Backend-stalled slots fall about 1,511 -> 832/input; instructions rise 178 -> 210.
+Metadata-load samples and emitted assembly confirm less exposed lookup latency.
+Traffic falls 119 -> 104 GB/query. The dispatch-slot budget predicts 0.8–0.9 s saved,
+consistent with execution. Universal staging regresses the medium control about
+6%; cache admission restores parity. Wider keys improve 3.11 -> 2.45 s; four cores
+5.22 -> 3.83 s; sixteen cores 2.18 -> 1.95 s. Tiny/skewed sets, the alternative Q8
+pair plan, and the large aggregate-chain control show no material regression.
+The latter already processes most records through staged compact-input merging.
+
+Normal build and 12 focused backend/worker checks pass, including forced raw-state
+merge, growth, NULLs, multiple aggregates, variable-layout sharing and reopen.
+All 387 full-protocol stock/before/after responses validate. Summed warm minima are
+22.375/9.708/9.770 s; first executions including compilation are 34.128/25.956/26.235 s.
+Q30's apparent 8% regression disappears in balanced controls. Q28 is a Java fallback;
+its 75 ms suite difference does not reproduce consistently. No suite-wide gain is
+attributed to this change. Evidence: `/tmp/query-q8-work-20261029/merge-study.json`.
+
+At sixteen cores, controller traffic is about 103 GB/query at 52 GB/s. Fresh streaming
+controls reach 63 GB/s mixed and 68 GB/s read traffic, so the same-traffic reference
+floor is roughly 1.63 s versus 1.97 s measured. This explains reduced headroom for
+prefetching; it is not proof that random aggregation can attain the streaming rate.
+Reducing retained/probed state remains more promising than finer scan morsels.
+
+
+## 2026-10-29: DISTINCT strategy must account for other aggregates
+
+Independent 500M-row COUNT DISTINCT + SUM controls, eight cores, exact stock
+results: nested/flat execution is 0.193/0.224 s for singleton sets, 1.03/1.47 s
+for the medium domain, 3.27/1.52 s for many groups, and 5.50/3.26 s for large state.
+This rejects automatic unconditional flattening even after downstream fusion.
+On the medium case, flat emits 474M partial states and cannot use key-only duplicate
+filtering. Instructions rise 149 -> 264/input and frontend-empty slots 119 -> 182;
+backend stalls change only 369 -> 385. Traffic falls 45 -> 39 GB/query, so increased
+DRAM traffic does not explain the regression. Native samples split the flat work
+across local grouping, flushing and final merge; nested samples are mostly scan.
+
+A useful next physical strategy separates regular aggregate state from key-only
+DISTINCT pairs in one scan, then combines distinct results with regular groups.
+[DuckDB's implementation](https://github.com/duckdb/duckdb/blob/main/src/execution/operator/aggregate/physical_hash_aggregate.cpp)
+provides a concrete reference: distinct input uses separate radix tables, regular
+aggregates consume the same chunk, and finalized distinct rows feed the main table.
+Our current map consumer helps with the last step but does not provide scan fan-out
+or automatic strategy selection. Preserve all-NULL groups, aggregate filters,
+query snapshots, native ownership and ordinary-function fallback. No planner
+rewrite is retained. Controls and profiles: `/tmp/query-q8-work-20261029/mixed-*`.
+
+
+## 2026-10-29: exact-width copies for fixed packed layouts
+
+Known-size copies now emit 8/4/2/1-byte chunks instead of 8/1. A 12-byte key needs
+two loads/stores rather than five; dynamic copies and exact byte ranges are unchanged.
+Independent 500M-row mixed aggregation: medium 1.47 -> 1.36 s, large 3.26 -> 3.15 s.
+Retired instructions fall 264 -> 253/input, dispatched loads 111 -> 104 and stores
+42.5 -> 35.1. Repeated backend stalls fall 385 -> 323 slots/input; frontend stalls
+rise 179 -> 187. Traffic is nearly unchanged at 39.6 -> 39.1 GB/query. STLF conflicts
+rise slightly, so this is less load/store work, not the earlier forwarding fix.
+The dispatch-slot budget predicts roughly 85 ms saved versus about 110 ms observed.
+
+A separate large key-only control improves about 5% at four cores; sixteen-core
+and 10-byte-key gains are smaller, while aligned 16-byte keys remain within noise.
+Normal Maven compile and one exact-range/alignment test across LLVM/AsmJit/C pass.
+Sizes 0–31, every source/destination alignment and high-bit bytes are checked.
+No runtime branch, setting or allocation is added. Gate/evidence:
+`/tmp/query-q8-work-20261029/copy-study.json`. One CPU model is tested.
+
+All 387 fresh stock/before/after standard-protocol responses validate, including
+independent tied-group recomputation. Summed warm minima are 22.396/9.705/9.667 s;
+first executions including compilation are 34.113/25.938/26.001 s. These totals are
+essentially neutral for this change. Q10's apparent 2.6 ms regression clears balanced
+checks; Q25's 1.1 ms difference clears longer reverse-order runs (about 32 ms both).
+All nine Q25 LLVM modules and object files are byte-identical across the two arms.
+Warm HTTP runs have zero major faults/block-IO ticks, small comparable reads, no
+memory pressure, and identical stock/LLVM server configuration. Original Q8 is
+about 413 ms versus 806 ms stock and still uses nested sets. The faster alternative
+pair plan remains a strategy experiment, not an automatic rewrite.
+
+
+## 2026-10-29: separate regular aggregate state from DISTINCT pairs
+
+Committed the validated compiler changes as `82f42db9f1`. The next isolated
+experiment feeds key-only pair deduplication and ordinary generated SUM from the
+same pinned frame and selection, using existing worker slots, MapFactory,
+allocators and generated merges. It runs two native loops per selected chunk;
+it is not a fused machine-code loop or an integrated physical-plan choice.
+
+500M rows, eight physical cores, balanced process order, warm execution including
+both merges and result assembly; every result exactly matches clean stock SQL:
+
+| Independent mixed COUNT DISTINCT + SUM control | Nested sets | Flat pairs carrying SUM | Separate SUM state |
+| --- | ---: | ---: | ---: |
+| Singleton sets | 0.229 s | 0.230 s | 0.318 s |
+| Medium distinct domain | 1.158 s | 1.362 s | 0.911 s |
+| Large distinct domain | 5.663 s | 3.198 s | 2.446 s |
+| Many groups | 3.437 s | 1.429 s | 1.336 s |
+
+On the medium case, nested/flat/separate use 98/105/67 user cycles per input row
+and move 57.2/39.3/26.3 GB through the controllers. Flat and separate emit about
+474M partition records, but their widths are 20 and 12 bytes: removing SUM avoids
+roughly 7.6 GB of logical writes/reads alone. The key-only filter also avoids full
+local aggregate-map maintenance. Flat -> separate retires 255 -> 193 instructions
+per input and reduces frontend-empty slots 187 -> 51; backend slots are similar
+at 323 -> 318. Relative to nested, backend slots fall 446 -> 318 despite more
+instructions. Against nested, the combined backend/frontend slot reduction
+predicts about 0.3 s saved, consistent with execution; this does not identify a
+specific cache or port limit.
+
+The large-state gain survives four cores (8.06 -> 3.84 s) and sixteen
+(5.52 -> 1.97 s); the medium case also improves at both counts. Singleton sets
+reject unconditional replacement: inline state is cheaper than a second map.
+Measured reads/major faults are zero, memory PSI is zero, more than 61 GB remains
+available, and there is no CPU throttling. Only one CPU model is tested.
+
+All arms use `v<=9223372036854775807 or v=null` to retain SUM's input column in
+the scratch pair plan; do not compare these timings directly with earlier
+unfiltered controls. No new setting or production routing is retained. Next prove
+conversion/reconciliation of ordinary inline/set DISTINCT state with native pairs,
+including fallback overlap and all-NULL groups, under existing query ownership and
+budgets. Only then test adaptive admission and phase changes. Evidence and passing
+hardware gate: `/tmp/query-fanout-20261029/study.json`; scratch sources are alongside
+it. Initial overlapping smoke/matrix timings are explicitly excluded.
+
+## 2026-10-29: reconcile Java DISTINCT state with native pairs
+
+The retained generated exporter reads ordinary inline/set DISTINCT state without
+changing it and appends `(group, argument)` records to existing pair partitions.
+The normal deduplication and COUNT consumer then handle overlapping native/Java
+values together. A NULL pair preserves all-NULL groups. It reuses map views,
+partition pages, allocation callbacks and cancellation; no new setting or pool.
+
+The scratch comparison forces the same 63M of 500M rows through the real Java
+COUNT DISTINCT function, with 437M through native pairs. Both also compute SUM
+from the same pinned frames. One alternative merges Java sets and checks each
+native pair against them; the other exports Java states before pair deduplication.
+Eight physical cores, balanced process order, repeated warm queries, exact clean
+stock SQL results including NULL keys, overlapping sets and all-NULL groups:
+
+| Reconciliation control | Membership checks | Export into pair partitions |
+| --- | ---: | ---: |
+| Medium distinct domain | 1.48 s | 1.69 s |
+| Large distinct domain | 5.68 s | 4.09 s |
+| Nullable/all-NULL groups | 1.30 s | 1.31 s |
+| Medium, all 500M rows through Java | 3.78 s | 4.01 s |
+
+On the large case, export replaces membership checks across 238M unique native
+pairs with about 61M exported partial values. Summed worker elapsed time in the
+final consumers falls about 13 -> 1.1 s; Java updates remain about 5.5 s in both.
+IBS attributes 624 samples averaging 453 cycles to the membership set-slot load.
+User cycles fall 348 -> 243/input, backend stalls 1788 -> 1185 slots/input, and
+controller traffic 155 -> 129 GB/query. The 28–32 GB/s rates are below the prior
+same-host streaming ceiling: this is evidence for exposed lookup latency, not
+bandwidth saturation. Saving 105 cycles/input over 500M rows, at roughly 5.4 GHz
+and six active cores, predicts about 1.6 s saved, consistent with execution.
+
+This closes the state-reconciliation experiment, not automatic strategy routing.
+Export regresses the medium control; preparation is serial in the scratch hook.
+Forced whole-frame routing uses an always-true predicate, and side-map query-budget
+integration is still absent. These timings compare reconciliation alternatives,
+not stock engine performance. Only the small export primitive is retained; the
+membership alternative and routing hooks stay outside the repository. Next bind
+fan-out and fallback to the real query lifecycle/budget, then test adaptive admission.
+
+Maven compile and 12 focused LLVM/AsmJit/C tests pass, including ordinary ordered
+and unordered maps, a nonzero aggregate offset, cancellation and pending-state
+rejection. The final builder also passes all four repeated 500M-row SQL controls.
+Measured reads/major faults and memory PSI are zero; one CPU model is tested.
+Evidence and passing hardware gate: `/tmp/query-reconcile-20261029/study.json`.

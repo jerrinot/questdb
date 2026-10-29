@@ -34,6 +34,7 @@ import io.questdb.cairo.RecordSinkFactory;
 import io.questdb.cairo.Reopenable;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.StatefulAtom;
 import io.questdb.cairo.sql.SymbolTableSource;
@@ -47,6 +48,7 @@ import io.questdb.griffin.engine.PerWorkerLocks;
 import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.PerWorkerFunctionList;
+import io.questdb.griffin.engine.groupby.CompiledMapAggregate;
 import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByAllocatorFactory;
@@ -325,6 +327,14 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
             }
             shardingCtx.setCompiledUpdaters(compiledUpdaters);
         }
+    }
+
+    CompiledMapAggregate compileMapAggregate(ColumnTypes inputs,
+            ObjList<Function> sourceFunctions, ObjList<RecordCursorFactory> projections,
+            ColumnTypes keys, ListColumnFilter keyColumns,
+            ObjList<Function> keyFunctions, ColumnTypes values, ObjList<GroupByFunction> functions, Map layout) {
+        return compiledAggregates == null ? null : compiledAggregates.compileMapAggregate(configuration,
+                inputs, sourceFunctions, compiledUpdaters, projections, keys, keyColumns, keyFunctions, values, functions, layout);
     }
 
     ObjList<Function> outputFunctions(ObjList<Function> functions) {

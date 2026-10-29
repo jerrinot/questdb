@@ -83,20 +83,51 @@ record QuestFixedKey(int[] columns, java.util.List<Pipeline.Column> inputs,
 
     private Expr storedKey(Pipeline.Row row, int index) {
         var value = expressions.get(index).emit(row);
-        long nullValue = expressions.get(index) instanceof Pipeline.Column column ? column.nullValue()
-                : widths[index] == MemoryType.I32 ? Integer.MIN_VALUE : Long.MIN_VALUE;
+        // Widening casts retain the input expression's NULL flag, but the packed key
+        // must use the result width's sentinel (INT NULL is not LONG NULL).
+        long nullValue = widths[index] == MemoryType.I64 ? Long.MIN_VALUE
+                : expressions.get(index) instanceof Pipeline.Column column ? column.nullValue() : Integer.MIN_VALUE;
         return widths[index] == MemoryType.I32 || widths[index] == MemoryType.I64
                 ? new Select(value.isNull(), i64(nullValue), value.data()) : value.data();
     }
 
-    Var scalar(Builder b, Expr index) { return b.let(storedKey(loadRow(b, index), 0)); }
+    Var scalar(Builder b, Expr index) { return scalar(b, loadRow(b, index)); }
+    Var scalar(Builder b, Pipeline.Row row) { return b.let(storedKey(row, 0)); }
 
-    Var stage(Builder b, Expr index, Expr destination) {
-        var row = loadRow(b, index);
-        int offset = 0;
-        for (int i = 0; i < widths.length; i++) {
-            b.store(widths[i], at(destination, offset), storedKey(row, i));
-            offset += widths[i].bytes;
+    Var stage(Builder b, Expr index, Expr destination) { return stage(b, loadRow(b, index), destination); }
+    Var stage(Builder b, Pipeline.Row row, Expr destination) {
+        if (java.nio.ByteOrder.nativeOrder() != java.nio.ByteOrder.LITTLE_ENDIAN) {
+            int offset = 0;
+            for (int i = 0; i < widths.length; i++) {
+                b.store(widths[i], at(destination, offset), storedKey(row, i));
+                offset += widths[i].bytes;
+            }
+            return b.let(destination);
+        }
+        // Hashing reads packed words, which can straddle SQL fields. Assemble those
+        // words in registers: a wide load spanning separate narrow stores cannot
+        // forward from the store queue. The RecordSink byte layout stays identical.
+        Var[] values = new Var[widths.length];
+        for (int i = 0; i < values.length; i++) values[i] = b.let(storedKey(row, i));
+        int field = 0, fieldByte = 0, offset = 0;
+        for (MemoryType wordWidth : new MemoryType[]{MemoryType.I64, MemoryType.I32, MemoryType.I16, MemoryType.I8}) {
+            while (offset + wordWidth.bytes <= bytes) {
+                Expr word = i64(0);
+                int wordByte = 0;
+                while (wordByte < wordWidth.bytes) {
+                    int take = Math.min(wordWidth.bytes - wordByte, widths[field].bytes - fieldByte);
+                    Expr part = values[field];
+                    if (fieldByte > 0) part = binary(Op.USHR, part, i64(fieldByte * 8));
+                    if (take < 8) part = binary(Op.AND, part, i64((1L << (take * 8)) - 1));
+                    if (wordByte > 0) part = binary(Op.MUL, part, i64(1L << (wordByte * 8)));
+                    word = binary(Op.XOR, word, part);
+                    wordByte += take;
+                    fieldByte += take;
+                    if (fieldByte == widths[field].bytes) { field++; fieldByte = 0; }
+                }
+                b.store(wordWidth, at(destination, offset), word);
+                offset += wordWidth.bytes;
+            }
         }
         return b.let(destination);
     }

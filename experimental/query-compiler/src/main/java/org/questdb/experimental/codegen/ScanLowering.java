@@ -36,6 +36,7 @@ import static org.questdb.experimental.codegen.Pipeline.*;
 final class ScanLowering {
     enum Mode { FUSED, EAGER, MASKED }
     static final int LANES = 64;
+    private static final int SELECTION_LANES = 8;
     private ScanLowering() { }
 
     @FunctionalInterface
@@ -50,7 +51,7 @@ final class ScanLowering {
 
     @FunctionalInterface
     interface RowPredicate {
-        Expr emit(Builder builder, Expr rowIndex);
+        Expr emit(Builder builder, Expr descriptors, Expr rowIndex);
     }
 
     /** Existing ordered selection-vector contract, with bounded vector reads and a scalar tail. */
@@ -96,7 +97,7 @@ final class ScanLowering {
     private static Program selection(ScanPlan plan, RowPredicate residual, boolean cancellable,
                                      boolean countOnly, int[] sourceIndexes, Expr begin, long limitOffset) {
         // Row IDs are 64-bit: keep each predicate mask at the output-vector width.
-        final int selectionLanes = countOnly ? 64 : 8;
+        final int selectionLanes = countOnly ? 64 : SELECTION_LANES;
         Builder b = new Builder();
         Var count = b.let(i64(0));
         Var limit = limitOffset < 0 ? null : b.let(load(at(COLUMNS, limitOffset)));
@@ -116,7 +117,7 @@ final class ScanLowering {
                 });
             };
             if (residual == null) accept.accept(selected);
-            else selected.when(residual.emit(selected, index), accept);
+            else selected.when(residual.emit(selected, COLUMNS, index), accept);
         }, Mode.MASKED, cancellable, selectionLanes, residual != null ? null : (selected, index, mask) -> {
             if (limit != null) selected.when(binary(Op.LT, binary(Op.SUB, limit, count), new PopulationCount(mask)), tail -> {
                 Var remaining = tail.let(mask);
@@ -166,33 +167,57 @@ final class ScanLowering {
 
     private static void emit(ScanPlan plan, Builder b, RowConsumer consume, Mode mode, boolean cancellable,
                              int lanes, MaskConsumer consumeMask, int[] sourceIndexes, Expr begin, Var visited) {
+        emit(plan, b, consume, mode, cancellable, lanes, consumeMask, sourceIndexes, begin, visited, COLUMNS);
+    }
+
+    /** Resumable scan into a consumer, with relocatable predicate frame descriptors. */
+    static void filteredRange(ScanPlan plan, RowPredicate residual, Builder b, Expr descriptors, Expr begin,
+                              BiConsumer<Builder, Expr> consumer) {
+        b.poll();
+        emit(plan, b, (selected, row, index) -> {
+            if (residual == null) consumer.accept(selected, index);
+            else selected.when(residual.emit(selected, descriptors, index), accepted -> consumer.accept(accepted, index));
+        }, Mode.MASKED, true, SELECTION_LANES, null, null, begin, null, descriptors);
+    }
+
+    private static void emit(ScanPlan plan, Builder b, RowConsumer consume, Mode mode, boolean cancellable,
+                             int lanes, MaskConsumer consumeMask, int[] sourceIndexes, Expr begin, Var visited, Expr descriptors) {
         List<Var> addresses = new ArrayList<>();
         for (Column column : plan.input()) {
             int source = sourceIndexes == null ? column.index() : sourceIndexes[column.index()];
-            addresses.add(b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, source * 8L))));
+            addresses.add(b.let(new Load(MemoryType.ADDRESS, at(descriptors, source * 8L))));
         }
-        Var index = b.let(begin);
+        Var start = b.let(begin);
+        Var index = b.let(start);
         if (!(plan.predicate() instanceof All) && mode == Mode.MASKED) {
             Expr present = bool(true);
             var columns = plan.predicateColumns();
             for (int i = columns.nextSetBit(0); i >= 0; i = columns.nextSetBit(i + 1))
                 present = binary(Op.BOTH, present, ne(addresses.get(i), nil()));
-            b.when(present, fast -> fast.loop(binary(Op.GE, binary(Op.SUB, ROWS, index), i64(lanes)), batch -> {
-                if (visited != null) batch.assign(visited, add(index, i64(lanes)));
-                if (cancellable) batch.when(eq(binary(Op.AND, index, i64(4095)), i64(0)), Builder::poll);
-                Var mask = batch.let(i64(lanes == 64 ? -1L : (1L << lanes) - 1));
-                predicateMask(batch, mask, plan.predicate(), row(plan.input(), addresses, index, false), lanes);
-                if (consumeMask != null) {
-                    batch.when(ne(mask, i64(0)), selected -> consumeMask.accept(selected, index, mask));
-                } else {
-                    batch.loop(ne(mask, i64(0)), selected -> {
-                        Var rowIndex = selected.let(add(index, new TrailingZeros(mask)));
-                        consume(plan, selected, row(plan.input(), addresses, rowIndex, true), rowIndex, consume);
-                        selected.assign(mask, binary(Op.AND, mask, binary(Op.SUB, mask, i64(1))));
-                    });
-                }
-                batch.assign(index, add(index, i64(lanes)));
-            }));
+            b.when(present, fast -> {
+                // Resume on the same predicate windows: sparse AND leaves otherwise touch extra cache lines.
+                fast.assign(index, binary(Op.AND, start, i64(-lanes)));
+                fast.loop(binary(Op.GE, binary(Op.SUB, ROWS, index), i64(lanes)), batch -> {
+                    if (visited != null) batch.assign(visited, add(index, i64(lanes)));
+                    if (cancellable) batch.when(eq(binary(Op.AND, index, i64(4095)), i64(0)), Builder::poll);
+                    Var mask = batch.let(i64(lanes == 64 ? -1L : (1L << lanes) - 1));
+                    predicateMask(batch, mask, plan.predicate(), row(plan.input(), addresses, index, false), lanes);
+                    batch.when(binary(Op.LT, index, start), resumed -> resumed.assign(mask, binary(Op.AND, mask,
+                            binary(Op.XOR, i64(-1), binary(Op.USHR, i64(-1), binary(Op.SUB, i64(64), binary(Op.SUB, start, index)))))));
+                    if (consumeMask != null) {
+                        batch.when(ne(mask, i64(0)), selected -> consumeMask.accept(selected, index, mask));
+                    } else {
+                        batch.loop(ne(mask, i64(0)), selected -> {
+                            Var rowIndex = selected.let(add(index, new TrailingZeros(mask)));
+                            consume(plan, selected, row(plan.input(), addresses, rowIndex, true), rowIndex, consume);
+                            selected.assign(mask, binary(Op.AND, mask, binary(Op.SUB, mask, i64(1))));
+                        });
+                    }
+                    batch.assign(index, add(index, i64(lanes)));
+                });
+                // A short tail may start before the requested row if no vector batch fit.
+                fast.when(binary(Op.LT, index, start), tail -> tail.assign(index, start));
+            });
         }
         // Also handles column tops and zero rows. Never speculatively read a tail.
         b.loop(binary(Op.LT, index, ROWS), loop -> {

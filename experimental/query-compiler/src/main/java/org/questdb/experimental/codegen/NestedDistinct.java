@@ -26,6 +26,7 @@ package org.questdb.experimental.codegen;
 
 import io.questdb.std.Numbers;
 
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import static org.questdb.experimental.codegen.Ir.*;
@@ -91,6 +92,20 @@ final class NestedDistinct {
             Var hash = hash(existing, value.data());
             Var index = existing.let(binary(Op.AND, hash, binary(Op.SUB, capacity, i64(1))));
             existing.prefetch(slot(set, index), false);
+        });
+    }
+
+    /** Visit the non-NULL values of an ordinary state without changing it.
+     * Source state and its allocator must remain alive and immutable during the visit.
+     */
+    static void forEach(Builder b, Expr countAddress, BiConsumer<Builder, Expr> consumer) {
+        Var count = b.let(load(countAddress));
+        b.when(binary(Op.BOTH, binary(Op.LT, count, i64(0)), ne(count, i64(Long.MIN_VALUE))),
+                unfinished -> unfinished.exit(3));
+        b.when(eq(count, i64(1)), singleton -> consumer.accept(singleton, load(at(countAddress, 8))));
+        b.when(binary(Op.GE, count, i64(2)), multiple -> {
+            Var set = multiple.let(new Load(MemoryType.ADDRESS, at(countAddress, 8)));
+            forEachSet(multiple, set, consumer);
         });
     }
 
@@ -162,12 +177,16 @@ final class NestedDistinct {
 
     /** GroupByLongHashSet.merge: slot order and addAt growth rules are preserved. */
     private static void mergeSets(Builder b, Var destination, Expr source) {
+        forEachSet(b, source, (present, value) -> addKey(present, destination, value));
+    }
+
+    private static void forEachSet(Builder b, Expr source, BiConsumer<Builder, Expr> consumer) {
         Var capacity = b.let(intAt(source, 0));
         Var index = b.let(i64(0));
         b.loop(binary(Op.LT, index, capacity), loop -> {
             loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
             Var value = loop.let(load(slot(source, index)));
-            loop.when(ne(value, i64(Long.MIN_VALUE)), present -> addKey(present, destination, value));
+            loop.when(ne(value, i64(Long.MIN_VALUE)), present -> consumer.accept(present, value));
             loop.assign(index, add(index, i64(1)));
         });
     }

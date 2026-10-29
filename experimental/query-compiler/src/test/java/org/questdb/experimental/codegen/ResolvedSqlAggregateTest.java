@@ -122,6 +122,232 @@ public class ResolvedSqlAggregateTest {
     }
 
     @Test
+    public void stagedPartitionMergePreservesGrowthRawStatesAndReopens() throws Exception {
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(64, 2048);
+            engine.execute("create table staged_merge as (select "
+                    + "cast(case when x%73=0 then null else x%1009 end as int) k,x%31 j,"
+                    + "case when x%43=0 then null else x end v,"
+                    + "case when x%37=0 then null else x*3 end w,x*7 z "
+                    + "from long_sequence(200003))", context);
+            String sql = "select k,j,sum(v+w+z),count(v) from staged_merge where v>1000 or v=null group by k,j";
+            long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+            context.setQueryCodeGenerator(null);
+            try (var control = Demo.compileSql(engine, context, sql, true)) {
+                var expected = Demo.readSql(control, context, 4);
+                context.setQueryCodeGenerator(new ResolvedQueryCompiler(backend, temporary.newFolder().toPath()));
+                try (var candidate = Demo.compileSql(engine, context, sql, true)) {
+                    RecordCursorFactory source = candidate;
+                    while (!(source instanceof io.questdb.griffin.engine.table.AsyncGroupByRecordCursorFactory)) {
+                        source = source.getBaseFactory();
+                        assertNotNull(plan(candidate), source);
+                    }
+                    var field = AggregateSlot.class.getDeclaredField("prepared");
+                    field.setAccessible(true);
+                    var prepared = (ResolvedAggregateKernel.Prepared) field.get(
+                            ((io.questdb.griffin.engine.table.AsyncGroupByRecordCursorFactory) source).getAtom().getCompiledUpdater(-1));
+                    assertNotNull(prepared.stagedPartitionMergeCode);
+                    assertNull("Keep the test on raw-state merge", prepared.inputPartitionCode);
+                    // Exercise the emitted path independently of the test host's cache geometry.
+                    prepared.partitionMergeCode = prepared.stagedPartitionMergeCode;
+                    assertEquals(expected, Demo.readSql(candidate, context, 4));
+                    assertEquals(expected, Demo.readSql(candidate, context, 4));
+                    assertTrue(prepared.stagedPartitionMergeCode.compilationNanos() > 0);
+                }
+            }
+            assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        } finally {
+            System.clearProperty("query.codegen.localCapacity");
+        }
+    }
+
+    @Test
+    public void stagedDistinctPrefetchKeepsNullsGrowthAndReopens() throws Exception {
+        mapEntrySize = 64; // Keep this wide state in the admitted Unordered4 layout.
+        engine.execute("create table staged as (select cast(case when x%73=0 then null else x%6001 end as int) k,"
+                + "case when x%43=0 then null else x end v,"
+                + "cast(case when x%37=0 then null else x%105 end as int) w from long_sequence(200003))", context);
+        for (boolean fused : new boolean[]{false, true}) {
+            String sql = "select k,count_distinct(v),count_distinct(cast(w as long)),sum(v) from staged"
+                    + " where v>1000 or v=null group by k";
+            long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+            context.setQueryCodeGenerator(null);
+            try (var control = Demo.compileSql(engine, context, sql, true)) {
+                var expected = Demo.readSql(control, context, 4);
+                context.setQueryCodeGenerator(fused
+                        ? ResolvedQueryCompiler.filterFusionExperiment(backend, temporary.newFolder().toPath())
+                        : new ResolvedQueryCompiler(backend, temporary.newFolder().toPath()));
+                try (var candidate = Demo.compileSql(engine, context, sql, true)) {
+                    RecordCursorFactory source = candidate;
+                    while (!(source instanceof io.questdb.griffin.engine.table.AsyncGroupByRecordCursorFactory)) {
+                        source = source.getBaseFactory();
+                        assertNotNull(plan(candidate), source);
+                    }
+                    var field = AggregateSlot.class.getDeclaredField("prepared");
+                    field.setAccessible(true);
+                    var prepared = (ResolvedAggregateKernel.Prepared) field.get(
+                            ((io.questdb.griffin.engine.table.AsyncGroupByRecordCursorFactory) source).getAtom().getCompiledUpdater(-1));
+                    assertNotNull(prepared.stagedMapCode);
+                    // Exercise the emitted path independently of the test host's cache geometry.
+                    prepared.mapCode = prepared.stagedMapCode;
+                    if (fused) {
+                        assertNotNull(prepared.stagedFilterCode);
+                        prepared.fusedFilterCode = prepared.stagedFilterCode;
+                    }
+                    assertEquals(expected, Demo.readSql(candidate, context, 4));
+                    assertEquals(expected, Demo.readSql(candidate, context, 4));
+                    assertTrue((fused ? prepared.stagedFilterCode : prepared.stagedMapCode).compilationNanos() > 0);
+                }
+            }
+            assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        }
+    }
+
+    @Test
+    public void exactKeyFilterKeepsNullsSelectionsAndReopens() throws Exception {
+        engine.execute("create table dedup as (select cast(case when x%53=0 then null else x%100003 end as int) k,"
+                + "case when x%37=0 then null else (x%150001)*198491317 end v,"
+                + "cast(case when x%7=0 then 'odd' else 'even' end as varchar) tag from long_sequence(250003))", context);
+        for (String predicate : List.of("", " where v>0 and k>50000", " where tag like '%dd'")) {
+            String sql = "select count() from (select k,v from dedup" + predicate + " group by k,v)";
+            long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+            context.setQueryCodeGenerator(null);
+            try (var control = Demo.compileSql(engine, context, sql, true)) {
+                var expected = Demo.readSql(control, context, 1);
+                context.setQueryCodeGenerator(new ResolvedQueryCompiler(backend, temporary.newFolder().toPath()));
+                try (var candidate = Demo.compileSql(engine, context, sql, true)) {
+                    assertEquals(sql, expected, Demo.readSql(candidate, context, 1));
+                    assertEquals(sql, expected, Demo.readSql(candidate, context, 1));
+                    RecordCursorFactory source = candidate;
+                    while (!(source instanceof io.questdb.griffin.engine.table.AsyncGroupByRecordCursorFactory)) {
+                        source = source.getBaseFactory();
+                        assertNotNull(plan(candidate), source);
+                    }
+                    var field = AggregateSlot.class.getDeclaredField("prepared");
+                    field.setAccessible(true);
+                    var prepared = (ResolvedAggregateKernel.Prepared) field.get(((io.questdb.griffin.engine.table.AsyncGroupByRecordCursorFactory) source).getAtom().getCompiledUpdater(-1));
+                    assertNotNull(prepared.keyFilterCode);
+                    assertTrue(sql, prepared.keyFilterCode.compilationNanos() > 0
+                            || (prepared.filteredKeyFilterCode != null && prepared.filteredKeyFilterCode.compilationNanos() > 0));
+                    if (predicate.isEmpty()) {
+                        CompiledKernel original = prepared.keyFilterCode;
+                        var fail = new java.util.concurrent.atomic.AtomicBoolean(true);
+                        try (var injected = CompiledKernel.handwritten((columns, rows, state) -> {
+                            if (fail.getAndSet(false)) throw CairoException.nonCritical().put("key filter failure");
+                            return original.run(columns, rows, state);
+                        })) {
+                            prepared.keyFilterCode = injected;
+                            try {
+                                CairoException failure = assertThrows(CairoException.class,
+                                        () -> Demo.readSql(candidate, context, 1));
+                                assertTrue(failure.getFlyweightMessage().toString().contains("key filter failure"));
+                                assertEquals(0, engine.getBusyReaderCount());
+                                assertEquals(expected, Demo.readSql(candidate, context, 1));
+                            } finally {
+                                prepared.keyFilterCode = original;
+                            }
+                        }
+                    }
+                }
+            }
+            assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        }
+    }
+
+    @Test
+    public void generatedFinalMapFailureClosesWorkersAndReopens() throws Exception {
+        mapEntrySize=64;shardingThreshold=2;
+        String sql="select k,count(v),sum(v) from (select k,v from t group by k,v) group by k";
+        long memory=Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        var calls=new java.util.concurrent.atomic.AtomicInteger();
+        var closed=new java.util.concurrent.atomic.AtomicInteger();
+        var failId=new java.util.concurrent.atomic.AtomicInteger(-1);
+        Backend wrapped=new Backend() {
+            public String name(){return backend.name();}
+            public CompiledKernel compile(Ir.Program program,java.nio.file.Path artifacts) throws java.io.IOException {
+                int id=calls.incrementAndGet();
+                CompiledKernel code=backend.compile(program,artifacts);
+                return new CompiledKernel((columns,rows,state)->{
+                    if(failId.compareAndSet(id,-1))throw CairoException.nonCritical().put("map consumer failure");
+                    return code.run(columns,rows,state);
+                },()->{code.close();closed.incrementAndGet();},code.artifacts(),code.compilationNanos());
+            }
+        };
+        context.setQueryCodeGenerator(null);
+        try(var baseline=Demo.compileSql(engine,context,sql,true)) {
+            var expected=Demo.readSql(baseline,context,3);
+            context.setQueryCodeGenerator(new ResolvedQueryCompiler(wrapped,temporary.newFolder().toPath()));
+            try(var candidate=Demo.compileSql(engine,context,sql,true)) {
+                assertTrue(plan(candidate),plan(candidate).contains("compiledMapInput"));
+                failId.set(calls.get()); // Consumer is the last eager kernel in this direct pair -> count/sum plan.
+                CairoException failure=assertThrows(CairoException.class,()->Demo.readSql(candidate,context,3));
+                assertTrue(failure.getFlyweightMessage().toString().contains("map consumer failure"));
+                assertEquals(-1,failId.get());
+                assertEquals(0,engine.getBusyReaderCount());
+                assertEquals(expected,Demo.readSql(candidate,context,3));
+                queryMemoryLimit=4096;
+                CairoException limit=assertThrows(CairoException.class,()->Demo.readSql(candidate,context,3));
+                assertTrue(limit.isOutOfMemory());
+                queryMemoryLimit=0;
+                assertEquals(expected,Demo.readSql(candidate,context,3));
+            } finally { queryMemoryLimit=0; }
+        }
+        assertEquals(calls.get(),closed.get());
+        assertEquals(0,engine.getBusyReaderCount());
+        assertEquals(memory,Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+    }
+
+    @Test
+    public void generatedFinalMapInputUsesResolvedReadersAndReopens() throws Exception {
+        mapEntrySize=64;shardingThreshold=2;
+        for(String sql:List.of(
+                "select k,count(v),count(),sum(v+1),min(v),max(v) from (select k,v from t group by k,v) group by k",
+                "select k,sum(v) total,count() n from (select k,v from t group by k,v) group by k order by total desc limit 10",
+                "select n,sum(total),count(total),min(total),max(total) from (select cast(k as long)+1 g,count() n,sum(v) total from t group by cast(k as long)+1) group by n",
+                "select g*3 key,n+1 c,sum(total+2),count() from (select cast(k as long)+1 g,count() n,sum(v) total from t group by cast(k as long)+1) group by g*3,n+1",
+                "select v,cast(k as long) g,count(),sum(k) from (select k,v from t group by k,v) group by v,cast(k as long)",
+                "select k,count(v),sum(v) from (select k,v from t where k<0 group by k,v) group by k",
+                "select g,count() from (select cast(k as long)+1 g from t group by cast(k as long)+1) group by g",
+                "select n,sum(g),count() from (select cast(k as long)+1 g,count_distinct(v) n from t group by cast(k as long)+1) group by n")) {
+            long memory=Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+            context.setQueryCodeGenerator(null);
+            try(var control=Demo.compileSql(engine,context,sql,true)) {
+                var expected=Demo.readSql(control,context,control.getMetadata().getColumnCount());
+                context.setQueryCodeGenerator(new ResolvedQueryCompiler(backend,temporary.newFolder().toPath()));
+                try(var candidate=Demo.compileSql(engine,context,sql,true)) {
+                    assertTrue(sql+"\n"+plan(candidate),plan(candidate).contains("compiledMapInput"));
+                    if (sql.endsWith("limit 10")) {
+                        RecordCursorFactory aggregate = candidate;
+                        while (!(aggregate instanceof io.questdb.griffin.engine.groupby.GroupByRecordCursorFactory)) {
+                            aggregate = aggregate.getBaseFactory();
+                            assertNotNull(plan(candidate), aggregate);
+                        }
+                        assertTrue(aggregate.recordCursorSupportsCompiledLongTopK(1));
+                    }
+                    assertEquals(sql,expected,Demo.readSql(candidate,context,candidate.getMetadata().getColumnCount()));
+                    assertEquals(sql,expected,Demo.readSql(candidate,context,candidate.getMetadata().getColumnCount()));
+                }
+            }
+            assertEquals("native code/scratch lifetime",memory,Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        }
+        // Sorting/limits and post-aggregate filtering are not transparent projections.
+        for (String sql : List.of(
+                "select k,count(v) from (select k,v from t group by k,v order by k,v limit 20) group by k",
+                "select n,count(),sum(total) from (select cast(k as long)+1 g,count() n,sum(v) total from t group by cast(k as long)+1) where total>10000 group by n")) {
+            context.setQueryCodeGenerator(null);
+            try (var control = Demo.compileSql(engine, context, sql, true)) {
+                var expected = Demo.readSql(control, context, control.getMetadata().getColumnCount());
+                context.setQueryCodeGenerator(new ResolvedQueryCompiler(backend, temporary.newFolder().toPath()));
+                try (var candidate = Demo.compileSql(engine, context, sql, true)) {
+                    assertFalse(plan(candidate), plan(candidate).contains("compiledMapInput"));
+                    assertEquals(expected, Demo.readSql(candidate, context, candidate.getMetadata().getColumnCount()));
+                }
+            }
+        }
+    }
+
+    @Test
     public void compiledCountReducesFramesAndShardsAndReopens() throws Exception {
         shardingThreshold = 2;
         engine.execute("create table counts as (select x,cast(x%1009 as int) k from long_sequence(70001))", context);
@@ -205,6 +431,7 @@ public class ResolvedSqlAggregateTest {
     public void parallelDistinctUnionPreservesMultipleAggregatesAndReopens() throws Exception {
         shardingThreshold = 2;
         engine.execute("create table unions as (select cast(x%2 as int) k,"
+                + "cast(case when x%2=0 then 0 else x%5+1 end as int) g,"
                 + "case when x%97=0 then null else x end v,"
                 + "case when x%101=0 then null else x%400003 end d,cast(x%311 as short) s "
                 + "from long_sequence(2000000))", context);
@@ -212,6 +439,10 @@ public class ResolvedSqlAggregateTest {
         assertMatches("select k,count_distinct(v),sum(v) from unions where k=0 group by k", true);
         assertTrue("Parallel union was not exercised", compiler.parallelUnionTasks.get() > 0);
         assertTrue("Parallel initialization was not exercised", compiler.parallelZeroTasks.get() > 0);
+        long unionTasks = compiler.parallelUnionTasks.get();
+        // Check a skewed distribution as well as similarly sized states.
+        assertMatches("select g,count_distinct(v) from unions group by g", true);
+        assertTrue("The skewed union was not split", compiler.parallelUnionTasks.get() > unionTasks);
         context.setQueryCodeGenerator(compiler);
         String sql = "select k,count_distinct(v),count_distinct(d),sum(v),avg(s) from unions where k>=0 group by k";
         try (var factory = Demo.compileSql(engine, context, sql, true)) {
@@ -1449,7 +1680,14 @@ public class ResolvedSqlAggregateTest {
         long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
         for (boolean parquet : new boolean[]{false, true}) {
             context.setQueryCodeGenerator(null);
-            if (parquet) engine.execute("alter table ranked convert partition to parquet list '2024-01-01'", context);
+            if (parquet) {
+                // Conversion skips the active partition. Seal the populated day before testing the fallback.
+                engine.execute("insert into ranked values(20004,'zz-seal','2024-01-02')", context);
+                engine.execute("alter table ranked convert partition to parquet list '2024-01-01'", context);
+                try (var reader = engine.getReader("ranked")) {
+                    assertEquals(io.questdb.cairo.sql.PartitionFormat.PARQUET, reader.getPartitionFormatFromMetadata(0));
+                }
+            }
             for (String predicate : List.of("", " where s is not null")) for (String order : List.of("asc", "desc")) {
                 for (int limit : new int[]{10, 5000}) {
                     String sql = "select id,s from ranked" + predicate + " order by s " + order + " limit " + limit;
@@ -1465,7 +1703,7 @@ public class ResolvedSqlAggregateTest {
                         while (base != null && !(base instanceof io.questdb.griffin.engine.table.AsyncTopKRecordCursorFactory)) base = base.getBaseFactory();
                         assertNotNull(base);
                         var build = (ResolvedTopK) ((io.questdb.griffin.engine.table.AsyncTopKRecordCursorFactory) base).getAtom().getCompiledTopK();
-                        long inputRows = predicate.isEmpty() ? 20003 : 20003 - 20003 / 13;
+                        long inputRows = parquet ? 20004 - (predicate.isEmpty() ? 0 : 20003 / 13) : 20003;
                         for (int execution = 0; execution < 2; execution++) try (var cursor = factory.getCursor(context)) {
                             assertEquals(sql, expected, readOrderedStringTopK(cursor));
                             assertEquals(inputRows * (execution + 1), build.getNativeRows());
@@ -1475,6 +1713,43 @@ public class ResolvedSqlAggregateTest {
                             assertEquals("Rewind must not rebuild", inputRows * (execution + 1), build.getNativeRows());
                         }
                     }
+                }
+            }
+        }
+        assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
+    public void generatedVarcharTopKFusesMixedPredicatesAndKeepsColumnTopFallback() throws Exception {
+        engine.execute("create table ranked_filter as (select x id,cast(x%19 as int) k,"
+                + "cast(case when x%7=0 then null else 'long-prefix-ž-'||cast(x%97 as string) end as varchar) s "
+                + "from long_sequence(6007))", context);
+        engine.execute("alter table ranked_filter add column f varchar", context);
+        engine.execute("insert into ranked_filter select x+6007,cast(x%19 as int),"
+                + "cast(case when x%7=0 then null else 'long-prefix-ž-'||cast(x%97 as string) end as varchar),"
+                + "cast(case when x%3=0 then null when x%2=0 then 'needle' else 'miss' end as varchar) "
+                + "from long_sequence(3001)", context);
+        long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        for (String predicate : List.of("k>=7 and f like '%needle%'", "k<0 and f is not null", "length(s)>8")) {
+            String sql = "select id,s from ranked_filter where " + predicate + " order by s desc limit 37";
+            context.setQueryCodeGenerator(null);
+            List<String> expected;
+            try (var stock = Demo.compileSql(engine, context, sql, true); var cursor = stock.getCursor(context)) {
+                expected = readOrderedStringTopK(cursor);
+            }
+            context.setQueryCodeGenerator(compiler.delegate);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                assertTrue(plan(factory), plan(factory).contains("compiledTopK: " + backend.name()));
+                for (int execution = 0; execution < 2; execution++) try (var cursor = factory.getCursor(context)) {
+                    assertEquals(sql, expected, readOrderedStringTopK(cursor));
+                }
+                if (predicate.startsWith("k<0")) {
+                    RecordCursorFactory base = factory;
+                    while (!(base instanceof io.questdb.griffin.engine.table.AsyncTopKRecordCursorFactory)) base = base.getBaseFactory();
+                    // No row passes. A positive native row count proves a fused scan ran after the column top.
+                    assertTrue(((io.questdb.griffin.engine.table.AsyncTopKRecordCursorFactory) base)
+                            .getAtom().getCompiledTopK().getNativeRows() > 0);
                 }
             }
         }
@@ -1494,7 +1769,8 @@ public class ResolvedSqlAggregateTest {
             Backend failing = new Backend() {
                 @Override public String name() { return backend.name(); }
                 @Override public CompiledKernel compile(Ir.Program program, java.nio.file.Path path) throws java.io.IOException {
-                    if (compileFailure && fail.getAndSet(false)) throw new java.io.IOException("Top-K preparation failure");
+                    // Standalone row/count filters compile before the fused Top-K kernel.
+                    if (compileFailure && created.get() == 2 && fail.getAndSet(false)) throw new java.io.IOException("Top-K preparation failure");
                     var code = backend.compile(program, path);
                     created.incrementAndGet();
                     return new CompiledKernel((columns, count, state) -> {
@@ -1504,7 +1780,7 @@ public class ResolvedSqlAggregateTest {
                 }
             };
             context.setQueryCodeGenerator(new ResolvedQueryCompiler(failing, temporary.newFolder().toPath()));
-            String sql = "select id,s from ranked order by s limit 10";
+            String sql = "select id,s from ranked where s is not null order by s limit 10";
             if (compileFailure) assertThrows(CairoException.class, () -> Demo.compileSql(engine, context, sql, true));
             try (var factory = Demo.compileSql(engine, context, sql, true)) {
                 if (!compileFailure) assertThrows(CairoException.class, () -> {
@@ -1848,6 +2124,20 @@ public class ResolvedSqlAggregateTest {
         assertEquals("Runtime binds must not become compile-time constants", before, compiler.filterRows.get());
         assertEquals(compiler.created.get(), compiler.closed.get());
         assertEquals(compiler.slots.get(), compiler.closedSlots.get());
+    }
+
+    @Test
+    public void widenedGroupingKeysStoreTheResultTypeNull() throws Exception {
+        mapEntrySize = 64;
+        engine.execute("create table widened as (select w,k,cast(k as varchar) label from t)", context);
+        for (int shardAt : new int[]{Integer.MAX_VALUE, 2}) {
+            shardingThreshold = shardAt;
+            for (String keys : List.of("cast(w as long)", "k,cast(w as long)", "label,cast(w as long)")) {
+                long before = compiler.mapRows.get();
+                assertMatches("select " + keys + ",count() from widened group by " + keys, true);
+                assertEquals(20000, compiler.mapRows.get() - before);
+            }
+        }
     }
 
     @Test
@@ -2543,12 +2833,12 @@ public class ResolvedSqlAggregateTest {
                         @Override public void finalizeMap(io.questdb.cairo.map.Map map, Runnable checkpoint) { update.finalizeMap(map, checkpoint); }
                         @Override public boolean beginParallelMerge() { return update.beginParallelMerge(); }
                         @Override public void endParallelMerge(boolean hasDeferredStates) { update.endParallelMerge(hasDeferredStates); }
-                        @Override public int getPendingMergeCount() { return update.getPendingMergeCount(); }
-                        @Override public boolean prepareMergeTasks(ObjList<MergeTask> tasks, int parallelism, Runnable checkpoint) { return update.prepareMergeTasks(tasks, parallelism, checkpoint); }
+                        @Override public long getPendingMergeWork() { return update.getPendingMergeWork(); }
+                        @Override public boolean prepareMergeTasks(ObjList<MergeTask> tasks, long targetTaskWork, Runnable checkpoint) { return update.prepareMergeTasks(tasks, targetTaskWork, checkpoint); }
                         @Override public void runMergeTask(MergeTask task, Runnable checkpoint) {
                             if (failUnion && task.phase() == 2) throw new IllegalStateException("injected union failure");
                             update.runMergeTask(task, checkpoint);
-                            if (task.phase() == 2) parallelUnionTasks.incrementAndGet();
+                            if (task.phase() == 2 && task.index() > 0) parallelUnionTasks.incrementAndGet();
                             if (task.phase() == 1) parallelZeroTasks.incrementAndGet();
                         }
                         @Override public void mergePartition(io.questdb.cairo.map.Map destination, Updater source, int partition, Runnable checkpoint) {

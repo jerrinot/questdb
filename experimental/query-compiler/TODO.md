@@ -44,6 +44,12 @@ not a change to execution defaults.
   input rows; peak RSS is now about 27.7 GB, above the older unbounded-map path's
   20.4 GB. Evaluate admission or draining through existing owners and query
   budgets. A small local map alone does not bound query memory.
+  The disposable spill experiment completes 500M unique groups under 4 GiB and
+  2 GiB query limits; the resident pipeline fails under 8 GiB. It relocates the
+  existing packed records and reuses generated merge/subdivision/Top-K. This is
+  feasibility evidence, not an integrated fix: cached spill reads, soft per-slot
+  watermarks and whole-partition reloads leave strict admission and skew open.
+  See the bounded-retention design in FOUNDATIONS_PLAN.md and PROGRESS.md.
 - [x] Measure variable-key bytes before extending cache subdivision to that path.
   The existing HLL now carries deterministic distinct-key width samples. Planning
   counts aligned used entries and the actual power-of-two offset table at the
@@ -138,10 +144,9 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
   final LIMIT selection. Port `vergesort_entries<encoded_var>`, MSD radix and pdqsort
   from existing sources. Preserve prefix/tail ordering, heap rebasing and small/large
   partition behavior; use bounded stacks and tracked, reusable workspace.
-- [ ] Qualify Q22–Q25 on actual data when desktop profiling resumes. Q25's complete
-  generated path matches stock on the small schema fixture; the confirmed full-data
-  count remains 30/43. Measure compilation and complete latency, including long-tail
-  comparison sensitivity, before claiming a performance benefit.
+- [x] Qualify Q22–Q25 on actual data. The current standard HTML records 34/43 fully
+  generated queries. Q25 is fully generated but slightly slower than stock; operator
+  coverage does not imply a speedup. See the 2026-10-28 profiling entry in PROGRESS.md.
 - [ ] Extend to composite ordering for Q26 without losing its existing partially
   timestamp-sorted execution. Do not replace that plan with a full-table Top-K scan.
 
@@ -162,6 +167,24 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
 
 ## Remaining measured performance gaps (2026-10-27)
 
+- [x] Fuse admitted filters into generated VARCHAR Top-K's row consumer (2026-10-29).
+  Q25 hot execution falls from 54.6 to 31.8 ms, versus 51.5 ms stock; controller
+  traffic falls from 2.90 to 1.69 GB/query on eight physical cores. Independent
+  500M-row controls improve 1.09–2.39x; sparse numeric filtering is near parity.
+  Reuse predicate bindings, buffer ownership and scheduling, with no new toggle.
+  Preserve eight-row numeric predicate windows across resumptions: wider or shifted
+  windows regressed sparse conjunctions. Parquet, column tops, casts and unsupported
+  predicates retain the existing path. First-request latency still loses to stock;
+  the standard protocol measured 633 ms versus 127 ms. See PROGRESS.md for scope.
+- [ ] Bind VARCHAR code-point length and AvgInt's existing DOUBLE/LONG state, then
+  generated post-aggregate predicates and DOUBLE ordering. Q27/Q28 currently fall
+  back entirely. Length already has an ASCII metadata fast path; preserve the
+  non-ASCII code-point count. Profile expression work separately from grouping.
+- [ ] Investigate general constant-regex lowering after the shared expression/state
+  prerequisites. Q28 spends 53% of CPU samples in regex but stock already borrows
+  captured bytes; do not build a query-specific URL parser or assume allocation is
+  the cause. Hash/probe and string MIN remain significant even if regex improves.
+
 - Bounded overlapping equality closes much of the measured branch waste: EC2
   eight-core Q33 improves 1147->984ms. The remaining hash loops/tails and serial
   multiply/add chain are the next isolated experiment; keep exact hash semantics
@@ -179,10 +202,75 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
   private LLVM, despite beating ordinary Java. The opt-in compiler path needs a
   small-query/admission and memory-footprint study before default enablement;
   per-slot cache scratch adds128KiB and the shared result uses256 final maps.
-- Adaptive generated inner-set union now closes the indivisible DISTINCT merge tail,
-  using existing workers and parallel initialization. Remaining risk: presizing from
-  summed cardinalities wastes memory for overlapping sets. Preserve the serial
-  fallback and256MiB per-target bound when studying a better capacity policy.
+- Generated inner-set union now distributes ranges by estimated input work rather
+  than pending-state count, using existing workers and parallel initialization.
+  Q8's union phase falls about 115->46 ms and complete hot execution 480->405 ms;
+  the standard protocol also improves Q8/Q9. The unchanged scan is about 277 ms,
+  already above DuckDB's complete 171 ms. Next isolate scan/state traffic and a
+  generated intermediate aggregation consumer before adopting a flat DISTINCT
+  strategy: a SQL rewrite with a Java outer aggregate measured about 470 ms.
+  Remaining risk: presizing from summed cardinalities wastes memory for overlapping
+  sets, and additional ranges can increase traffic. Preserve the serial fallback
+  and 256 MiB per-target bound when studying a better capacity policy. See the
+  2026-10-29 PROGRESS entry and `/tmp/query-q8-20261029` for controls and limits.
+- Scan morsel scheduling is already provided by page frames, the shared reduce
+  queue and owner work stealing. Q8's 1M->100K maximum-frame experiment regresses
+  412->446 ms and increases controller traffic 13.91->15.80 GB despite a smaller
+  final scan tail. Larger-frame controls do not show a repeatable gain. Keep the
+  default; investigate aggregation work before another scheduler. Explicit NUMA
+  placement remains a separate, unvalidated gap on this one-node machine. Evidence:
+  `/tmp/query-morsel-20261029` and the 2026-10-29 PROGRESS entry.
+- The generated finalized-map consumer, fixed-key word packing and exact key-only
+  duplicate filter are integrated. A flat pair-DISTINCT plan now beats nested sets
+  on the independent 500M-row medium (0.96 -> 0.81 s), many-group (3.90 -> 0.84 s)
+  and large-state (5.45 -> 3.22 s) controls, but loses on singleton sets
+  (0.147 -> 0.190 s). Original COUNT DISTINCT SQL still uses nested sets. The next
+  physical-strategy experiment needs observed reuse/state size and a cheap fallback;
+  do not add a query-specific rewrite or silently replace every DISTINCT plan.
+  Preserve all-NULL groups, finalized-state semantics, mixed aggregates, memory
+  budgets and fallback compatibility with ordinary aggregate functions. A mixed
+  COUNT DISTINCT + SUM control rules out blanket flattening: medium-domain nested
+  sets take 1.03 s versus 1.47 s flat, whereas large-state flat wins 5.50 -> 3.26 s.
+  Flat emits 474M partial SUM states on the medium control; its key-only duplicate
+  filter cannot apply. A same-snapshot scratch experiment now separates regular
+  group state from key-only DISTINCT pairs: 500M-row medium execution improves
+  nested/flat/separate 1.16/1.36/0.91 s, large state 5.66/3.20/2.45 s, but singleton
+  sets regress 0.229 -> 0.318 s. Four/sixteen-core controls retain the larger-state
+  gains. This is two generated loops per selected chunk, not integrated routing;
+  see the 2026-10-29 PROGRESS entry and `/tmp/query-fanout-20261029/study.json`.
+  State reconciliation is now proven in isolation: the generated exporter appends
+  ordinary inline/set values into existing pair partitions before exact deduplication,
+  preserving all-NULL groups with a NULL pair. Against membership checks, the 500M-row
+  large-state mixed fallback control improves 5.68 -> 4.09 s, but medium regresses
+  1.48 -> 1.69 s. See `/tmp/query-reconcile-20261029/study.json`. Next integrate real
+  fallback routing and side-state query budgets; scratch whole-frame routing with
+  an always-true predicate is not that integration. Only then test adaptive admission
+  and phase changes. Serial export preparation remains a measured-strategy concern.
+  `CompiledMapAggregate` supplies a finalized-map consumer, not this fan-out or
+  runtime strategy choice. Keep the existing snapshot, slot ownership and budgets;
+  two independently opened SQL factories would not establish snapshot equivalence.
+  The hard compatibility boundary is ordinary-frame fallback: Java's
+  CountDistinctLongGroupByFunction still carries an inline singleton or set pointer,
+  while finalized native readers consume a count. A side table must incorporate fallback sets before
+  counting, not add their cardinalities to already-deduplicated native pairs.
+  Reuse the existing task infrastructure without a second worker pool. Export must
+  finish after scan joins and before pair merge; existing post-merge dependency
+  stages run too late for that preparation step.
+- [x] Emit exact 8/4/2/1-byte chunks for known-size copies. Hardware counters and
+  500M-row controls support retaining this small change; dynamic copies stay unchanged.
+- [x] Reuse staged partition merge for large fixed-key maps. Cache admission avoids
+  the measured medium-state regression; 500M-row wider-key and 4/8/16-core controls
+  retain the gain. Compact-input merging already stages probes and stays unchanged.
+  See the 2026-10-29 PROGRESS entry and `merge-study.json` for scope and counters.
+- [x] Hide dependent loads for large numeric nested DISTINCT state. The existing
+  adaptive-kernel policy chooses ordinary or staged prefetch loops at invocation
+  boundaries, after hardware-derived cache admission. Static cache-size admission
+  alone fails when a large map's working set becomes hot. Independent 500M-row
+  uniform/skew/phase-change controls and the full protocol validate the retained
+  policy; actual Q8 is neutral. Missing cache metadata keeps the ordinary path.
+  No new scheduler or setting. See the 2026-10-29 PROGRESS entry and staged-distinct
+  hardware study. Cross-machine validation is still open.
+
 - An isolated generated raw-partition experiment now bypasses local preaggregation,
   using the existing pages/allocator/merge scheduler. On Q33 it is worse:696.2->848.0ms,
   43.0->51.8GB/query, with exact results and both near61GB/s. Do not adopt it or assume

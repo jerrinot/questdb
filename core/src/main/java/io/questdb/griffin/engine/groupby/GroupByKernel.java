@@ -24,12 +24,16 @@
 
 package io.questdb.griffin.engine.groupby;
 
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.ListColumnFilter;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
+import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.ObjList;
@@ -38,6 +42,13 @@ import org.jetbrains.annotations.Nullable;
 
 /** Query-owned aggregate code. Slots borrow it until the existing frame sequence drains. */
 public interface GroupByKernel extends QuietCloseable {
+    /** Planning-only borrow of source output readers and existing exclusive worker slots. */
+    default CompiledMapAggregate compileMapAggregate(CairoConfiguration configuration,
+            ColumnTypes inputs, ObjList<Function> sourceFunctions, ObjList<Updater> sourceSlots,
+            ObjList<RecordCursorFactory> projections,
+            ColumnTypes keys, ListColumnFilter keyColumns, ObjList<Function> keyFunctions,
+            ColumnTypes values, ObjList<GroupByFunction> functions, Map layout) { return null; }
+
     /** Borrowed output readers for finalized state; the original list retains function ownership. */
     default ObjList<Function> outputFunctions(ObjList<Function> functions) { return functions; }
 
@@ -89,13 +100,13 @@ public interface GroupByKernel extends QuietCloseable {
         /** All scan/sharding work has drained. Opt into a second phase for indivisible inner states. */
         default boolean beginParallelMerge() { return false; }
 
-        /** Number of independently mergeable states after outer-map tasks drain. */
-        default int getPendingMergeCount() { return 0; }
+        /** Estimated input work remaining after outer-map tasks drain, in units shared by all slots. */
+        default long getPendingMergeWork() { return 0; }
 
         /** Append one dependency stage. Return true when another stage follows after this one drains.
-         * parallelism is the available worker budget per independent state, not an extra pool.
+         * targetTaskWork is the total pending work divided by the existing worker slots.
          */
-        default boolean prepareMergeTasks(ObjList<MergeTask> tasks, int parallelism, Runnable checkpoint) { return false; }
+        default boolean prepareMergeTasks(ObjList<MergeTask> tasks, long targetTaskWork, Runnable checkpoint) { return false; }
 
         /** Runs in an acquired existing worker slot, with that slot's allocator and scratch. */
         default void runMergeTask(MergeTask task, Runnable checkpoint) { throw new UnsupportedOperationException(); }

@@ -150,7 +150,7 @@ public class AsyncTopKAtom implements StatefulAtom, PerWorkerLockOwner, Reopenab
                 }
                 this.sortKeyColumnIndexes = SortKeyEncoder.extractSortKeyColumnIndexes(orderByFilter);
                 if (codeGenerator != null) {
-                    this.compiledTopK = codeGenerator.compileTopK(orderByMetadata, orderByFilter);
+                    this.compiledTopK = codeGenerator.compileTopK(orderByMetadata, orderByFilter, ownerFilter);
                 }
                 if (filterUsedColumnIndexes != null) {
                     // Late materialization needs only the sort-key columns the filter

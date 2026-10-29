@@ -24,7 +24,10 @@
 
 package org.questdb.experimental.codegen;
 
+import io.questdb.cairo.map.NativeMapView;
 import io.questdb.griffin.engine.table.GroupByMapFragment;
+
+import java.util.function.BiConsumer;
 
 import static org.questdb.experimental.codegen.Ir.*;
 
@@ -48,8 +51,47 @@ final class QuestPartitions {
     private static final int BLOB_AVAILABLE_OFFSET = Long.BYTES;
     static final int STATE_BYTES = BLOB_OFFSET + 2 * Long.BYTES;
     static final int NEED_FLUSH = 10;
+    static final int EXPORTED_ROWS_OFFSET = NativeMapView.MUTATION_BYTES;
+    private static final int EXPORT_KEY_OFFSET = EXPORTED_ROWS_OFFSET + 16;
 
     private QuestPartitions() { }
+
+    static int distinctExportScratchBytes(QuestMapProbe pairs) { return EXPORT_KEY_OFFSET + pairs.keyBytes(); }
+
+    /** Export an ordinary DISTINCT state into the existing key-only pair partitions.
+     * COLUMNS is the borrowed source view followed by count/key scratch; STATE is the partition descriptor.
+     * Group keys are the pair-key prefix. Source storage remains immutable; allocation uses the owning slot.
+     * Failure aborts the query after possible partial append, never requests ordinary-frame replay.
+     */
+    static Program distinctValues(QuestMapProbe source, long countOffset, QuestMapProbe pairs) {
+        if (source.variable() || source.varchar() || (source.ordered() && !source.orderedNative())
+                || pairs.variable() || !pairs.orderedNative() || pairs.keyBytes() != source.keyBytes() + 8
+                || countOffset < 0) {
+            throw new IllegalArgumentException("Fixed group-key prefix and one LONG DISTINCT argument required");
+        }
+        Builder b = new Builder();
+        Var emitted = b.let(i64(0));
+        QuestMapScan.emit(b, source, COLUMNS, (group, entry) -> {
+            Expr state = at(source.valueAddress(entry), countOffset);
+            BiConsumer<Builder, Expr> append = (next, value) -> {
+                Var key = next.let(at(COLUMNS, EXPORT_KEY_OFFSET));
+                QuestMapMutation.copy(next, entry, key, source.keyBytes());
+                next.store(at(key, source.keyBytes()), value);
+                Var hash = pairs.hash(next, key);
+                Append output = append(next, STATE, hash, pairs.keyBytes());
+                QuestMapMutation.copy(next, key, output.row(), pairs.keyBytes());
+                output.commit(next);
+                next.assign(emitted, add(emitted, i64(1)));
+            };
+            // COUNT(argument) must still produce a zero-count group for entirely NULL input.
+            group.when(binary(Op.EITHER, eq(load(state), i64(0)), eq(load(state), i64(Long.MIN_VALUE))),
+                    empty -> append.accept(empty, i64(Long.MIN_VALUE)));
+            NestedDistinct.forEach(group, state, append);
+        });
+        b.store(at(COLUMNS, EXPORTED_ROWS_OFFSET), emitted);
+        b.exit(0);
+        return new Program(b.block());
+    }
 
     /** Reserve one row without publishing its count until the payload is complete. */
     static Append append(Builder b, Expr partitions, Expr hash, long rowBytes) {
@@ -179,7 +221,7 @@ final class QuestPartitions {
     }
 
     static Program merge(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, int batchRows, AggregateUpdates initialization) {
-        if (probe.variable()) return mergeVariable(probe, updates, valueBytes, batchRows, initialization, false);
+        if (probe.variable()) return mergeStaged(probe, updates, valueBytes, batchRows, initialization, false);
         Builder b = new Builder();
         int keyBytes = probe.varchar() ? 24 : probe.keyBytes();
         Var index = b.let(load(STATE));
@@ -202,7 +244,7 @@ final class QuestPartitions {
     }
 
     static Program mergeInputs(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, int batchRows) {
-        return mergeVariable(probe, updates, valueBytes, batchRows, null, true);
+        return mergeStaged(probe, updates, valueBytes, batchRows, null, true);
     }
 
     static Append reserveVariable(Builder b, Expr bucket, Var rowBytes) {
@@ -261,14 +303,14 @@ final class QuestPartitions {
         return new Program(b.block());
     }
 
-    /** Stage cached hashes and contiguous source records before dependent destination probes. */
-    private static Program mergeVariable(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, int batchRows,
-                                         AggregateUpdates initialization, boolean inputs) {
+    /** Stage source keys and hashes before dependent destination probes. */
+    static Program mergeStaged(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, int batchRows,
+                               AggregateUpdates initialization, boolean inputs) {
         Builder b = new Builder();
         int window = Math.max(1, batchRows);
         Var index = b.let(load(STATE));
         Var batches = b.let(i64(0));
-        Var sourceOffset = b.let(load(at(STATE, 96)));
+        Var sourceOffset = probe.variable() ? b.let(load(at(STATE, 96))) : null;
         b.loop(binary(Op.LT, index, ROWS), batch -> {
             batch.when(eq(binary(Op.AND, batches, i64(Math.max(1, 1024 / window) - 1)), i64(0)), Builder::poll);
             batch.assign(batches, add(batches, i64(1)));
@@ -276,18 +318,21 @@ final class QuestPartitions {
             Var position = batch.let(index);
             Var scratch = batch.let(at(STATE, ResolvedAggregateKernel.prefetchScratch(probe)));
             batch.loop(binary(Op.LT, position, end), stage -> {
-                Var row = stage.let(new Offset(COLUMNS, sourceOffset));
-                Var key = stage.let(at(row, 8));
-                Var hash = stage.let(load(row));
+                Var row = stage.let(new Offset(COLUMNS, probe.variable() ? sourceOffset
+                        : binary(Op.MUL, position, i64(probe.keyBytes() + valueBytes))));
+                Var key = probe.variable() ? stage.let(at(row, 8)) : row;
+                Var hash = probe.variable() ? stage.let(load(row)) : probe.hash(stage, key);
                 stage.prefetch(key, false);
                 probe.prefetchOffset(stage, key, hash);
-                stage.store(scratch, sourceOffset);
+                if (probe.variable()) stage.store(scratch, sourceOffset);
                 stage.store(MemoryType.ADDRESS, at(scratch, 8), key);
                 stage.store(at(scratch, 24), hash);
                 stage.assign(scratch, at(scratch, probe.prefetchRowBytes()));
-                Expr payloadBytes = inputs ? add(QuestVariableKey.bytes(key), i64(QuestPartitionInputs.numericBytes(updates)))
-                        : QuestVariableKey.stride(key, i64(valueBytes));
-                stage.assign(sourceOffset, add(sourceOffset, add(i64(8), payloadBytes)));
+                if (probe.variable()) {
+                    Expr payloadBytes = inputs ? add(QuestVariableKey.bytes(key), i64(QuestPartitionInputs.numericBytes(updates)))
+                            : QuestVariableKey.stride(key, i64(valueBytes));
+                    stage.assign(sourceOffset, add(sourceOffset, add(i64(8), payloadBytes)));
+                }
                 stage.assign(position, add(position, i64(1)));
             });
             batch.assign(position, index);
@@ -304,8 +349,8 @@ final class QuestPartitions {
             batch.loop(binary(Op.LT, index, end), consume -> {
                 Var key = consume.let(new Load(MemoryType.ADDRESS, at(scratch, 8)));
                 Var source = consume.let(probe.valueAddress(key));
-                // Heap growth rebuilds staging from this unconsumed record's byte offset.
-                consume.store(at(STATE, 96), load(scratch));
+                // Variable records resume by byte offset; fixed records resume by index.
+                if (probe.variable()) consume.store(at(STATE, 96), load(scratch));
                 Var inserted = consume.let(bool(false));
                 Var destination = probe.finishOrdered(consume, key, consume.let(new Load(MemoryType.ADDRESS, at(scratch, 16))),
                         consume.let(load(at(scratch, 24))), consume.let(load(at(scratch, 32))), index, (init, value) -> {

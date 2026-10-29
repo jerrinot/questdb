@@ -241,6 +241,13 @@ public class AsyncTopKRecordCursorFactory extends AbstractRecordCursorFactory {
             }
             record.init(frameMemory);
 
+            if (!isParquetFrame && !frameMemory.hasColumnTops() && !frameMemory.hasColumnTypeCasts()
+                    && atom.isEncoded() && atom.getCompiledTopK() != null
+                    && atom.getCompiledTopK().filterAndEncodeFrame(record, frameIndex, frameRowCount,
+                    atom.getTopK(slotId), circuitBreaker)) {
+                return;
+            }
+
             if (compiledFilter == null || frameMemory.hasColumnTops() || frameMemory.hasColumnTypeCasts()) {
                 // Use Java-based filter when there is no compiled filter or in case of a page frame with column tops.
                 AsyncFilterUtils.applyFilter(filter, rows, record, frameRowCount);

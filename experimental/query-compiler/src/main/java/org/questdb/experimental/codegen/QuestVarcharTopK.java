@@ -36,7 +36,9 @@ final class QuestVarcharTopK {
 
     private QuestVarcharTopK() { }
 
-    static Program program(boolean descending) {
+    static Program program(boolean descending) { return program(descending, null); }
+
+    static Program program(boolean descending, ResolvedFilter.Binding filter) {
         Builder b = new Builder();
         Var index = b.let(load(at(COLUMNS, NEXT))), count = b.let(load(at(STATE, COUNT)));
         Var heapPos = b.let(load(at(STATE, HEAP_POS)));
@@ -44,77 +46,88 @@ final class QuestVarcharTopK {
         Var heap = b.let(new Load(MemoryType.ADDRESS, at(STATE, HEAP)));
         Var selection = b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, SELECTION)));
         Var first = b.let(ne(load(at(STATE, FIRST)), i64(0)));
-        b.loop(binary(Op.LT, index, ROWS), row -> {
-            row.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
-            Var r = row.let(new Select(eq(selection, nil()), index,
-                    load(new Offset(selection, binary(Op.MUL, index, i64(8))))));
-            Var rowId = row.let(add(load(at(COLUMNS, ROW_BASE)), r));
-            var value = QuestVarchar.decode(row, COLUMNS, r);
-            Var length = row.let(new Select(value.isNull(), i64(1), add(value.size(), i64(2))));
-            Var prefix = row.let(i64(descending ? 0xff00000000000000L : 0));
-            Var prefix6 = row.let(bool(false));
-            row.when(eq(value.isNull(), bool(false)), present -> {
-                Var aux = present.let(new Offset(new Load(MemoryType.ADDRESS, COLUMNS), binary(Op.MUL, r, i64(16))));
-                present.assign(prefix6, binary(Op.BOTH, eq(load(at(COLUMNS, 32)), i64(0)),
-                        eq(binary(Op.AND, new Load(MemoryType.I32, aux), i64(1)), i64(0))));
-                present.when(prefix6, split -> {
-                    Var word = split.let(binary(Op.AND, load(at(aux, 4)), i64(0x0000ffffffffffffL)));
-                    validateWord(split, word);
-                    Expr normalized = binary(Op.XOR, add(word, i64(0x0000010101010101L)),
-                            i64(descending ? 0x0000ffffffffffffL : 0));
-                    split.assign(prefix, binary(Op.XOR, i64(descending ? 0xfe00000000000000L : 0x0100000000000000L),
-                            binary(Op.USHR, reverseBytes(split, normalized), i64(8))));
-                });
-                present.when(eq(prefix6, bool(false)), inline -> inline.assign(prefix,
-                        leadingWord(inline, value.address(), value.size(), descending)));
+        if (filter == null) {
+            b.loop(binary(Op.LT, index, ROWS), row -> {
+                row.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
+                Var r = row.let(new Select(eq(selection, nil()), index,
+                        load(new Offset(selection, binary(Op.MUL, index, i64(8))))));
+                appendRow(row, r, index, descending, first, count, heapPos, entries, heap);
+                row.assign(index, add(index, i64(1)));
             });
-            Var rejected = row.let(bool(false));
-            row.when(ne(load(at(STATE, HAS_THRESHOLD)), i64(0)), threshold -> {
-                Var mask = threshold.let(new Select(prefix6, i64(-256), i64(-1)));
-                Var cmp = compareUnsigned(threshold, binary(Op.AND, prefix, mask), binary(Op.AND, load(at(STATE, K1)), mask));
-                Var settled = threshold.let(ne(cmp, i64(0)));
-                threshold.when(eq(cmp, i64(0)), tie -> {
-                    Expr prefixBytes = new Select(prefix6, i64(7), i64(8));
-                    tie.when(binary(Op.EITHER, binary(Op.GE, prefixBytes, length), binary(Op.GE, prefixBytes, load(at(STATE, LENGTH)))), shortKey -> {
-                        shortKey.assign(cmp, compareUnsigned(shortKey, length, load(at(STATE, LENGTH))));
-                        shortKey.when(eq(cmp, i64(0)), same -> same.assign(cmp, compareUnsigned(same, rowId, load(at(STATE, ROW_ID)))));
-                        shortKey.assign(settled, bool(true));
-                    });
-                });
-                threshold.assign(rejected, binary(Op.BOTH, settled, beyond(cmp, first)));
-            });
-            row.when(eq(rejected, bool(false)), accepted -> {
-                accepted.when(binary(Op.GE, count, load(at(STATE, STOP))), full -> finish(full, ENTRY_SPACE, index, count, heapPos));
-                // Match encodeVariable's padding reservation, including short-key scratch bytes.
-                Var required = accepted.let(add(heapPos, add(length, new Select(binary(Op.LT, length, i64(16)), i64(16), i64(0)))));
-                accepted.when(binary(Op.LT, load(at(STATE, HEAP_SIZE)), required), full -> {
-                    full.store(at(COLUMNS, NEED), required);
-                    finish(full, HEAP_SPACE, index, count, heapPos);
-                });
-                Var key = accepted.let(new Offset(heap, heapPos));
-                accepted.store(MemoryType.I8, key, new Select(value.isNull(), i64(descending ? 255 : 0), i64(descending ? 254 : 1)));
-                accepted.when(eq(value.isNull(), bool(false)), nonNull -> encodeBytes(nonNull, value.address(), value.size(), at(key, 1), descending));
-                accepted.when(binary(Op.LT, length, i64(16)), pad -> {
-                    pad.store(new Offset(key, length), i64(0));
-                    pad.store(new Offset(key, add(length, i64(8))), i64(0));
-                });
-                Var entry = accepted.let(new Offset(entries, binary(Op.MUL, count, i64(40))));
-                accepted.store(entry, reverseBytes(accepted, load(key)));
-                accepted.store(at(entry, 8), reverseBytes(accepted, load(at(key, 8))));
-                accepted.store(at(entry, 16), length);
-                accepted.store(at(entry, 24), heapPos);
-                accepted.store(at(entry, 32), rowId);
-                Var keep = accepts(accepted, entry, key);
-                accepted.when(keep, commit -> {
-                    commit.assign(count, add(count, i64(1)));
-                    commit.when(binary(Op.LT, i64(16), length), longKey -> longKey.assign(heapPos, add(heapPos, length)));
-                    commit.when(eq(count, load(at(STATE, STOP))), full -> finish(full, BOUNDARY, add(index, i64(1)), count, heapPos));
-                });
-            });
-            row.assign(index, add(index, i64(1)));
-        });
-        finish(b, DONE, index, count, heapPos);
+            finish(b, DONE, index, count, heapPos);
+        } else {
+            ScanLowering.filteredRange(filter.plan(), filter.residual(), b, at(COLUMNS, INPUT_BYTES), index,
+                    (row, r) -> appendRow(row, r, r, descending, first, count, heapPos, entries, heap));
+            finish(b, DONE, ROWS, count, heapPos);
+        }
         return new Program(b.block());
+    }
+
+    private static void appendRow(Builder row, Expr r, Expr next, boolean descending, Var first,
+                                  Var count, Var heapPos, Var entries, Var heap) {
+        Var rowId = row.let(add(load(at(COLUMNS, ROW_BASE)), r));
+        var value = QuestVarchar.decode(row, COLUMNS, r);
+        Var length = row.let(new Select(value.isNull(), i64(1), add(value.size(), i64(2))));
+        Var prefix = row.let(i64(descending ? 0xff00000000000000L : 0));
+        Var prefix6 = row.let(bool(false));
+        row.when(eq(value.isNull(), bool(false)), present -> {
+            Var aux = present.let(new Offset(new Load(MemoryType.ADDRESS, COLUMNS), binary(Op.MUL, r, i64(16))));
+            present.assign(prefix6, binary(Op.BOTH, eq(load(at(COLUMNS, 32)), i64(0)),
+                    eq(binary(Op.AND, new Load(MemoryType.I32, aux), i64(1)), i64(0))));
+            present.when(prefix6, split -> {
+                Var word = split.let(binary(Op.AND, load(at(aux, 4)), i64(0x0000ffffffffffffL)));
+                validateWord(split, word);
+                Expr normalized = binary(Op.XOR, add(word, i64(0x0000010101010101L)),
+                        i64(descending ? 0x0000ffffffffffffL : 0));
+                split.assign(prefix, binary(Op.XOR, i64(descending ? 0xfe00000000000000L : 0x0100000000000000L),
+                        binary(Op.USHR, reverseBytes(split, normalized), i64(8))));
+            });
+            present.when(eq(prefix6, bool(false)), inline -> inline.assign(prefix,
+                    leadingWord(inline, value.address(), value.size(), descending)));
+        });
+        Var rejected = row.let(bool(false));
+        row.when(ne(load(at(STATE, HAS_THRESHOLD)), i64(0)), threshold -> {
+            Var mask = threshold.let(new Select(prefix6, i64(-256), i64(-1)));
+            Var cmp = compareUnsigned(threshold, binary(Op.AND, prefix, mask), binary(Op.AND, load(at(STATE, K1)), mask));
+            Var settled = threshold.let(ne(cmp, i64(0)));
+            threshold.when(eq(cmp, i64(0)), tie -> {
+                Expr prefixBytes = new Select(prefix6, i64(7), i64(8));
+                tie.when(binary(Op.EITHER, binary(Op.GE, prefixBytes, length), binary(Op.GE, prefixBytes, load(at(STATE, LENGTH)))), shortKey -> {
+                    shortKey.assign(cmp, compareUnsigned(shortKey, length, load(at(STATE, LENGTH))));
+                    shortKey.when(eq(cmp, i64(0)), same -> same.assign(cmp, compareUnsigned(same, rowId, load(at(STATE, ROW_ID)))));
+                    shortKey.assign(settled, bool(true));
+                });
+            });
+            threshold.assign(rejected, binary(Op.BOTH, settled, beyond(cmp, first)));
+        });
+        row.when(eq(rejected, bool(false)), accepted -> {
+            accepted.when(binary(Op.GE, count, load(at(STATE, STOP))), full -> finish(full, ENTRY_SPACE, next, count, heapPos));
+            // Match encodeVariable's padding reservation, including short-key scratch bytes.
+            Var required = accepted.let(add(heapPos, add(length, new Select(binary(Op.LT, length, i64(16)), i64(16), i64(0)))));
+            accepted.when(binary(Op.LT, load(at(STATE, HEAP_SIZE)), required), full -> {
+                full.store(at(COLUMNS, NEED), required);
+                finish(full, HEAP_SPACE, next, count, heapPos);
+            });
+            Var key = accepted.let(new Offset(heap, heapPos));
+            accepted.store(MemoryType.I8, key, new Select(value.isNull(), i64(descending ? 255 : 0), i64(descending ? 254 : 1)));
+            accepted.when(eq(value.isNull(), bool(false)), nonNull -> encodeBytes(nonNull, value.address(), value.size(), at(key, 1), descending));
+            accepted.when(binary(Op.LT, length, i64(16)), pad -> {
+                pad.store(new Offset(key, length), i64(0));
+                pad.store(new Offset(key, add(length, i64(8))), i64(0));
+            });
+            Var entry = accepted.let(new Offset(entries, binary(Op.MUL, count, i64(40))));
+            accepted.store(entry, reverseBytes(accepted, load(key)));
+            accepted.store(at(entry, 8), reverseBytes(accepted, load(at(key, 8))));
+            accepted.store(at(entry, 16), length);
+            accepted.store(at(entry, 24), heapPos);
+            accepted.store(at(entry, 32), rowId);
+            Var keep = accepts(accepted, entry, key);
+            accepted.when(keep, commit -> {
+                commit.assign(count, add(count, i64(1)));
+                commit.when(binary(Op.LT, i64(16), length), longKey -> longKey.assign(heapPos, add(heapPos, length)));
+                commit.when(eq(count, load(at(STATE, STOP))), full -> finish(full, BOUNDARY, add(next, i64(1)), count, heapPos));
+            });
+        });
     }
 
     private static void validateWord(Builder b, Expr word) {

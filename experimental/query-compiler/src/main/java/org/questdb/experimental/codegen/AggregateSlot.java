@@ -39,6 +39,7 @@ import io.questdb.griffin.engine.table.GroupByMapFragment;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
 import io.questdb.std.Unsafe;
 import org.questdb.experimental.codegen.ResolvedAggregateKernel.Prepared;
@@ -59,6 +60,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private final KernelMemory memory;
     private final long addresses;
     private final long stateAddress;
+    ResolvedMapAggregate.Slot mapConsumer;
     private boolean closed;
     private long updatedRows;
     private long fusedInputRows;
@@ -70,6 +72,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private long sortedRows;
     private long limitedRows;
     private long unionTasks;
+    private long keyFilterAddress;
     private long rankScratch;
     private long partitionTopK;
     private long partitionSketch;
@@ -179,6 +182,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     @Override
     public void clear() {
         if (prepared.sharedMaps != null) prepared.sharedMaps.clear();
+        keyFilterAddress = 0;
         rankScratch = 0;
         partitionTopK = 0;
         partitionSketch = mergedSketch = splitStates = splitInputs = 0;
@@ -210,6 +214,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
             Unsafe.putLong(partitions + QuestPartitions.SKETCH_OFFSET, partitionSketch);
             if (inputPartitions != 0) Unsafe.putLong(inputPartitions + QuestPartitions.SKETCH_OFFSET, partitionSketch);
         }
+        // The growth callback owns scratch[0..31]; its rehash must not overwrite the source view.
         long descriptor = scratchAddress + 32;
         source.writeNativeMutationView(descriptor);
         long rows = Unsafe.getLong(descriptor + NativeMapView.MASK) + (prepared.probe.varchar() ? 1 : 2);
@@ -452,16 +457,16 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     public void endParallelMerge(boolean hasDeferredStates) { parallelMerge = false; finalizeDeferred = hasDeferredStates; }
 
     @Override
-    public int getPendingMergeCount() {
-        int count = 0;
+    public long getPendingMergeWork() {
+        long work = 0;
         long context = Unsafe.getLong(stateAddress + DeferredDistinct.CONTROL + 8);
-        while (context != 0) { count++; context = Unsafe.getLong(context); }
-        return count;
+        while (context != 0) { work += Unsafe.getLong(context + 16); context = Unsafe.getLong(context); }
+        return work;
     }
 
     @Override
     public boolean prepareMergeTasks(ObjList<GroupByKernel.MergeTask> tasks,
-                              int parallelism, Runnable checkpoint) {
+                              long targetTaskWork, Runnable checkpoint) {
         int stage = mergePreparationStage++;
         if (stage > 2) return false;
         long context = Unsafe.getLong(stateAddress + DeferredDistinct.CONTROL + 8);
@@ -469,7 +474,9 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         while (context != 0) {
             checkpoint.run();
             if (stage == 0) {
-                int parts = Integer.highestOneBit(Math.min(DeferredDistinct.PARTS, parallelism));
+                // Unequal sets need unequal ranges; counting states alone serializes large outliers.
+                long work = Unsafe.getLong(context + 16);
+                int parts = Numbers.ceilPow2((int) Math.min(DeferredDistinct.PARTS, 1 + (work - 1) / targetTaskWork));
                 tasks.add(new GroupByKernel.MergeTask(context, parts, 0));
             } else {
                 boolean serial = Unsafe.getLong(context + 96) != 0;
@@ -502,7 +509,13 @@ public final class AggregateSlot implements GroupByKernel.Updater {
 
     @Override
     public void finalizeMap(Map map, Runnable checkpoint) {
-        if (parallelMerge || (!prepared.finalizeResults && !finalizeDeferred) || prepared.finalizeCode == null || map.size() == 0) return;
+        if (parallelMerge) return;
+        finalizeState(map, checkpoint);
+        if (mapConsumer != null) mapConsumer.consume(map, checkpoint);
+    }
+
+    private void finalizeState(Map map, Runnable checkpoint) {
+        if ((!prepared.finalizeResults && !finalizeDeferred) || prepared.finalizeCode == null || map.size() == 0) return;
         long descriptor = scratchAddress;
         if (prepared.probe.orderedNative()) map.writeNativeMutationView(descriptor);
         else map.writeNativeProbeView(descriptor);
@@ -1022,6 +1035,39 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         return true;
     }
 
+    void consumeMap(CompiledKernel kernel, Map source, Map destination, Runnable checkpoint) {
+        if (source.size() == 0) return;
+        // The growth callback owns scratch[0..31]; its rehash must not overwrite the source view.
+        long descriptor = scratchAddress + 32;
+        source.writeNativeMutationView(descriptor);
+        writeViews(destination, null);
+        memory.enterCheckpoint(checkpoint);
+        try { runMutable(kernel, descriptor, source.size(), destination, null, false); }
+        finally { try { publishViews(destination, null); } finally { memory.close(); } }
+    }
+
+    private void runKeyFilter(CompiledKernel kernel, long begin, long rows, boolean filtered) {
+        if (begin == rows) return;
+        if (keyFilterAddress == 0) {
+            long bytes = prepared.localCapacity * QuestKeyFilter.stride(prepared.probe);
+            keyFilterAddress = KernelMemory.allocator().malloc(bytes);
+            io.questdb.std.Vect.memset(keyFilterAddress, bytes, 0);
+        }
+        long scratch = ResolvedAggregateKernel.prefetchScratch(prepared.probe);
+        Unsafe.putLong(stateAddress, begin);
+        Unsafe.putLong(stateAddress + scratch, keyFilterAddress);
+        Unsafe.putLong(stateAddress + scratch + 8, partitions);
+        long status = kernel.run(addresses, rows, stateAddress);
+        if (PROFILE) mapCalls++;
+        memory.throwIfFailed();
+        if (status != 0) throw new IllegalStateException("Key filter failed: " + status);
+        partitionRows += Unsafe.getLong(stateAddress + scratch + 16);
+        long accepted = filtered ? Unsafe.getLong(stateAddress + ResolvedAggregateKernel.FILTERED_ROWS) : rows - begin;
+        updatedRows += accepted;
+        mapRows += accepted;
+        if (filtered) fusedSelectedRows += accepted;
+    }
+
     private void writeViews(Map map, ObjList<Map> shards) {
         long state = stateAddress;
         Unsafe.putLong(state + DeferredDistinct.CONTROL, parallelMerge && shards == null ? 1 : 0);
@@ -1054,13 +1100,56 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     /** Return whether the remainder of this frame should use compact input records. */
     private boolean runMutable(CompiledKernel kernel, long input, long rows, Map map, ObjList<Map> shards,
                                boolean update, long begin, boolean frameHasRows) {
+        // Preserve the scalar merge while its used heap and offset table fit in L2.
+        if (!update && kernel == prepared.partitionMergeCode && prepared.stagedPartitionMergeCode != null
+                && CacheSizing.L2_DATA_BYTES > 0) {
+            long descriptor = view(0);
+            long bytes = Unsafe.getLong(descriptor + NativeMapView.Ordered.APPEND)
+                    - Unsafe.getLong(descriptor + NativeMapView.ENTRIES)
+                    + (Unsafe.getLong(descriptor + NativeMapView.MASK) + 1) * Long.BYTES;
+            if (bytes >= CacheSizing.L2_DATA_BYTES) {
+                return runMutableLoop(kernel, prepared.stagedPartitionMergeCode,
+                        input, rows, map, shards, update, begin, frameHasRows);
+            }
+        }
+        // A large allocated state makes latency hiding plausible, but does not prove it:
+        // skew and phase changes can leave a tiny hot working set in a large map.
+        if (update && prepared.mapChoice != null && CacheSizing.L2_DATA_BYTES > 0
+                && memory.peakBytes() >= CacheSizing.L2_DATA_BYTES
+                && (kernel == prepared.mapCode || kernel == prepared.fusedFilterCode)) {
+            long footprint = 0;
+            for (int i = 0, n = shards == null ? 1 : shards.size(); i < n; i++) {
+                long descriptor = view(i);
+                footprint += (Unsafe.getLong(descriptor + NativeMapView.MASK) + 1)
+                        * Unsafe.getLong(descriptor + NativeMapView.STRIDE);
+            }
+            if (footprint >= CacheSizing.L2_DATA_BYTES) {
+                AdaptiveKernel choice = kernel == prepared.mapCode ? prepared.mapChoice : prepared.filterChoice;
+                // Allocated DISTINCT states never use bounded partition collection. Time the
+                // complete invocation, including growth, rather than train on partial retries.
+                choice.runBatch(rows - begin, selected ->
+                        runMutableLoop(kernel, selected, input, rows, map, shards, update, begin, frameHasRows));
+                return false;
+            }
+        }
+        return runMutableLoop(kernel, kernel, input, rows, map, shards, update, begin, frameHasRows);
+    }
+
+    private boolean runMutableLoop(CompiledKernel kernel, Kernel execution, long input, long rows, Map map, ObjList<Map> shards,
+                               boolean update, long begin, boolean frameHasRows) {
+        CompiledKernel keyFilter = !update ? null : kernel == prepared.mapCode ? prepared.keyFilterCode
+                : kernel == prepared.fusedFilterCode ? prepared.filteredKeyFilterCode : null;
+        if (keyFilterAddress != 0 && keyFilter != null) {
+            runKeyFilter(keyFilter, begin, rows, kernel == prepared.fusedFilterCode);
+            return false;
+        }
         long state = stateAddress;
         long position = begin;
         if (prepared.probe.varchar()) Unsafe.putLong(state + 80, -1);
         if (prepared.probe.variable()) Unsafe.putLong(state + 96, 0);
         while (position < rows) {
             Unsafe.putLong(state, position);
-            long status = kernel.run(input, rows, state);
+            long status = execution.run(input, rows, state);
             if (PROFILE && update) mapCalls++;
             memory.throwIfFailed();
             if (status != 0 && status != QuestMapProbe.NEED_KEY && status != NEED_CAPACITY && status != QuestVarchar.NEED_COPY && status != QuestVariableKey.NEED_STAGING && status != QuestPartitions.NEED_FLUSH) {
@@ -1093,6 +1182,12 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 if (compact) {
                     partitionInputs(position, rows, map);
                     return true;
+                }
+                if (keyFilter != null) {
+                    // A complete window proved that the key set exceeds the local map.
+                    // Remember emitted keys instead of probing and flushing that map again.
+                    runKeyFilter(keyFilter, position, rows, kernel == prepared.fusedFilterCode);
+                    return false;
                 }
                 continue;
             }

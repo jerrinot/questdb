@@ -24,6 +24,7 @@
 
 package org.questdb.experimental.codegen;
 
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.map.Map;
@@ -35,6 +36,7 @@ import io.questdb.griffin.engine.CompiledProjection;
 import io.questdb.griffin.engine.CompiledScalarAggregate;
 import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.groupby.CompiledMapAggregate;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByKernel.Updater;
 import io.questdb.griffin.engine.groupby.GroupByKernel;
@@ -128,9 +130,9 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     }
 
     @Override
-    public io.questdb.griffin.engine.orderby.CompiledTopK compileTopK(ColumnTypes inputs, io.questdb.cairo.ListColumnFilter order) {
+    public io.questdb.griffin.engine.orderby.CompiledTopK compileTopK(ColumnTypes inputs, io.questdb.cairo.ListColumnFilter order, Function filter) {
         if (handwritten) return null;
-        try { return ResolvedTopK.compile(inputs, order, backend, artifacts); }
+        try { return ResolvedTopK.compile(inputs, order, filter, backend, artifacts); }
         catch (IOException failure) { throw CairoException.nonCritical().put("Top-K build compilation failed: ").put(failure.getMessage()); }
     }
 
@@ -215,6 +217,18 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     }
 
     private record CompiledUpdates(ResolvedAggregateKernel.Prepared prepared, String name, boolean fuseFilter) implements GroupByKernel {
+        @Override
+        public CompiledMapAggregate compileMapAggregate(
+                CairoConfiguration configuration, ColumnTypes inputs,
+                ObjList<Function> sourceFunctions, ObjList<Updater> sourceSlots,
+                ObjList<RecordCursorFactory> projections, ColumnTypes keys,
+                io.questdb.cairo.ListColumnFilter keyColumns, ObjList<Function> keyFunctions,
+                ColumnTypes values, ObjList<GroupByFunction> functions, Map layout) {
+            try { return ResolvedMapAggregate.compile(configuration, prepared, inputs, sourceFunctions,
+                    sourceSlots, projections, keys, keyColumns, keyFunctions, values, functions, layout); }
+            catch (IOException failure) { throw CairoException.nonCritical().put("Map aggregate compilation failed: ").put(failure.getMessage()); }
+        }
+
         @Override
         public void prepareFilter(ColumnTypes inputs, Function function) {
             try { prepared.prepareFilter(inputs, function, fuseFilter); }

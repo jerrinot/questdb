@@ -24,8 +24,14 @@
 
 package org.questdb.experimental.codegen;
 
+import io.questdb.cairo.ArrayColumnTypes;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.DefaultCairoConfiguration;
+import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.map.MapFactory;
+import io.questdb.griffin.engine.functions.columns.LongColumn;
+import io.questdb.griffin.engine.functions.groupby.CountDistinctLongGroupByFunction;
 import io.questdb.griffin.engine.groupby.FastGroupByAllocator;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
@@ -36,6 +42,8 @@ import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
 import java.lang.foreign.Arena;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
 
@@ -63,6 +71,119 @@ public class NestedDistinctTest {
     @Test
     public void mixedControlMatchesEveryAggregateAndSetAfterEveryRow() throws Exception {
         assertLayoutAfterEveryRow(true);
+    }
+
+    @Test
+    public void exportsJavaStatesIntoExistingPairPartitions() throws Exception {
+        var configuration = new DefaultCairoConfiguration(temporary.getRoot().toString()) {
+            @Override public int getSqlUnorderedMapMaxEntrySize() { return 64; }
+        };
+        var keys = new ArrayColumnTypes().add(ColumnType.LONG);
+        var values = new ArrayColumnTypes().add(ColumnType.LONG); // unrelated aggregate before DISTINCT
+        var pairKeys = new ArrayColumnTypes().add(ColumnType.LONG).add(ColumnType.LONG);
+        var function = new CountDistinctLongGroupByFunction(LongColumn.newInstance(0), 3, .6);
+        function.initValueTypes(values);
+        long[] input = new long[1];
+        var record = new io.questdb.cairo.sql.Record() {
+            @Override public long getLong(int column) { return input[0]; }
+        };
+        for (boolean ordered : new boolean[]{false, true}) {
+            try (var left = ordered ? MapFactory.createOrderedMap(configuration, keys, values)
+                    : MapFactory.createUnorderedMap(configuration, keys, values);
+                 var right = ordered ? MapFactory.createOrderedMap(configuration, keys, values)
+                         : MapFactory.createUnorderedMap(configuration, keys, values);
+                 var pairs = MapFactory.createOrderedMap(configuration, pairKeys);
+                 var allocator = new FastGroupByAllocator(64, 1 << 20);
+                 var outputAllocator = new FastGroupByAllocator(64, 1 << 20);
+                 var arena = Arena.ofConfined()) {
+                assertEquals(ordered, left instanceof io.questdb.cairo.map.OrderedMap);
+                function.setAllocator(allocator);
+                var expected = new HashMap<Long, HashSet<Long>>();
+                for (var map : List.of(left, right)) {
+                    for (long group : new long[]{Long.MIN_VALUE, 0, 1, 2}) {
+                        var set = expected.computeIfAbsent(group, unused -> new HashSet<>());
+                        for (int i = 0; i < 257; i++) {
+                            input[0] = group == Long.MIN_VALUE ? Long.MIN_VALUE : group == 0 ? Long.MAX_VALUE
+                                    : i % 13 == 0 ? Long.MIN_VALUE
+                                    : group == 1 ? i + (map == right ? 128 : 0) : Long.MIN_VALUE + i + 1;
+                            var key = map.withKey(); key.putLong(group);
+                            var value = key.createValue();
+                            if (value.isNew()) {
+                                value.putLong(0, 42);
+                                function.computeFirst(value, record, i);
+                            } else function.computeNext(value, record, i);
+                            if (input[0] != Long.MIN_VALUE) set.add(input[0]);
+                        }
+                    }
+                }
+                var nullKey = left.withKey(); nullKey.putLong(3);
+                var nullValue = nullKey.createValue(); nullValue.putLong(0, 42);
+                function.setNull(nullValue);
+                expected.put(3L, new HashSet<>());
+                var columns = new ListColumnFilter(); columns.add(1);
+                var source = QuestMapProbe.fixed(QuestFixedKey.bind(keys, keys, columns, null, left), ColumnType.LONG, ordered);
+                columns.add(2);
+                var target = QuestMapProbe.fixed(QuestFixedKey.bind(pairKeys, pairKeys, columns, null, pairs), -1, true);
+                long view = arena.allocate(QuestPartitions.distinctExportScratchBytes(target), 8).address();
+                long partitions = arena.allocate(QuestPartitions.STATE_BYTES, 8).address();
+                try (var code = backend.compile(QuestPartitions.distinctValues(source, 8, target), temporary.newFolder().toPath());
+                     var memory = KernelMemory.bind(outputAllocator, () -> { })) {
+                    long exported = 0;
+                    for (var map : List.of(left, right)) {
+                        var before = new HashMap<Long, List<Long>>();
+                        try (var cursor = map.getCursor()) {
+                            var stored = cursor.getRecord();
+                            while (cursor.hasNext()) before.put(stored.getLong(3), List.of(stored.getLong(0), stored.getLong(1), stored.getLong(2)));
+                        }
+                        if (ordered) map.writeNativeMutationView(view); else map.writeNativeProbeView(view);
+                        long sourceBytes = allocator.allocated();
+                        assertEquals(0, code.run(view, map.size(), partitions));
+                        memory.throwIfFailed();
+                        exported += get(view + QuestPartitions.EXPORTED_ROWS_OFFSET);
+                        assertEquals(sourceBytes, allocator.allocated());
+                        try (var cursor = map.getCursor()) {
+                            var stored = cursor.getRecord();
+                            while (cursor.hasNext()) assertEquals(before.get(stored.getLong(3)),
+                                    List.of(stored.getLong(0), stored.getLong(1), stored.getLong(2)));
+                        }
+                    }
+                    var actual = new HashMap<Long, HashSet<Long>>();
+                    long rows = 0;
+                    for (int shard = 0; shard < io.questdb.griffin.engine.table.GroupByMapFragment.NUM_SHARDS; shard++) {
+                        long bucket = partitions + shard * (long) QuestPartitions.BUCKET_BYTES;
+                        long page = get(bucket), tail = get(bucket + QuestPartitions.BUCKET_TAIL_OFFSET);
+                        if (tail == 0) continue;
+                        while (true) {
+                            long count = get(page + QuestPartitions.PAGE_COUNT_OFFSET);
+                            for (int i = 0; i < count; i++) {
+                                long row = page + QuestPartitions.PAGE_HEADER_BYTES + i * 16L;
+                                long group = get(row), value = get(row + 8);
+                                var set = actual.computeIfAbsent(group, unused -> new HashSet<>());
+                                if (value != Long.MIN_VALUE) set.add(value);
+                                var key = pairs.withKey(); key.putLong(group); key.putLong(value);
+                                assertEquals(shard, key.hash() >>> io.questdb.griffin.engine.table.GroupByMapFragment.NUM_SHARDS_SHR);
+                                rows++;
+                            }
+                            if (page == tail) break;
+                            page = get(page); assertNotEquals(0, page);
+                        }
+                    }
+                    assertEquals(exported, rows);
+                    assertEquals("All-NULL groups and overlapping partials", expected, actual);
+                    assertTrue(rows > expected.values().stream().mapToLong(HashSet::size).sum() + expected.size());
+                    if (ordered) left.writeNativeMutationView(view); else left.writeNativeProbeView(view);
+                    try (var cancelled = KernelMemory.bind(outputAllocator, () -> { throw new IllegalStateException("cancelled"); })) {
+                        assertEquals(4, code.run(view, left.size(), partitions));
+                        assertThrows(IllegalStateException.class, cancelled::throwIfFailed);
+                    }
+                    var key = left.withKey(); key.putLong(1);
+                    key.findValue().putLong(1, DeferredDistinct.PENDING);
+                    assertEquals("A pending union must not be exported", 3, code.run(view, left.size(), partitions));
+                }
+                function.clear();
+            }
+        }
+        function.close();
     }
 
     private void assertLayoutAfterEveryRow(boolean mixed) throws Exception {

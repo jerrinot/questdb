@@ -49,7 +49,7 @@ public interface QueryCodeGenerator {
 
     /** Optional encoded Top-K; ordinary cursors and buffers retain scheduling and memory ownership. */
     default @Nullable io.questdb.griffin.engine.orderby.CompiledTopK compileTopK(
-            ColumnTypes inputs, io.questdb.cairo.ListColumnFilter order) { return null; }
+            ColumnTypes inputs, io.questdb.cairo.ListColumnFilter order, @Nullable Function filter) { return null; }
 
     /** Resolved selection/count kernels using the existing filter ABI and cursor ownership. */
     default @Nullable CompiledFilters compileFilters(ColumnTypes inputs, Function predicate) { return null; }

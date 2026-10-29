@@ -107,7 +107,10 @@ final class QuestMapMutation {
 
     static void copy(Builder b, Expr source, Expr destination, long bytes) {
         long offset = 0;
-        for (; offset + 8 <= bytes; offset += 8) b.store(at(destination, offset), load(at(source, offset)));
-        for (; offset < bytes; offset++) b.store(MemoryType.I8, at(destination, offset), new Load(MemoryType.I8, at(source, offset)));
+        for (var width : new MemoryType[]{MemoryType.I64, MemoryType.I32, MemoryType.I16, MemoryType.I8}) {
+            for (; offset + width.bytes <= bytes; offset += width.bytes) {
+                b.store(width, at(destination, offset), new Load(width, at(source, offset)));
+            }
+        }
     }
 }

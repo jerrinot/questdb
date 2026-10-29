@@ -28,6 +28,7 @@ import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.vm.api.MemoryCARW;
@@ -46,6 +47,8 @@ import java.util.concurrent.atomic.LongAdder;
 final class ResolvedTopK implements CompiledTopK {
     private static final long BYTES = QuestEncodedTopK.INPUT_BYTES + VIEW_BYTES;
     private final CompiledKernel code;
+    private final CompiledKernel filterCode;
+    private final ResolvedFilter.Binding filter;
     private final CompiledKernel compactCode;
     private final CompiledKernel mergeCode;
     private final CompiledKernel sortCode;
@@ -56,37 +59,63 @@ final class ResolvedTopK implements CompiledTopK {
     private final LongAdder compactions = new LongAdder();
     private final LongAdder sortedRows = new LongAdder();
 
-    private ResolvedTopK(CompiledKernel code, int column, Backend backend, Path artifacts) {
-        this.code = code; this.column = column; this.name = backend.name();
+    private ResolvedTopK(CompiledKernel code, CompiledKernel filterCode, ResolvedFilter.Binding filter, int column, Backend backend, Path artifacts) {
+        this.code = code; this.filterCode = filterCode; this.filter = filter; this.column = column; this.name = backend.name();
         compactCode = CompiledKernel.defer(backend, QuestEncodedTopK::compact, artifacts);
         mergeCode = CompiledKernel.defer(backend, QuestEncodedTopK::merge, artifacts);
         sortCode = CompiledKernel.defer(backend, QuestEncodedSort::program, artifacts);
     }
 
     static CompiledTopK compile(ColumnTypes inputs, ListColumnFilter order, Backend backend, Path artifacts) throws IOException {
+        return compile(inputs, order, null, backend, artifacts);
+    }
+
+    static CompiledTopK compile(ColumnTypes inputs, ListColumnFilter order, Function predicate, Backend backend, Path artifacts) throws IOException {
         if (order.size() != 1) return null;
         int key = order.getQuick(0), column = Math.abs(key) - 1;
         if (column < 0 || column >= inputs.getColumnCount() || inputs.getColumnType(column) != ColumnType.VARCHAR) return null;
-        var code = backend.compile(QuestVarcharTopK.program(key < 0), artifacts);
-        try { return new ResolvedTopK(code, column, backend, artifacts); }
-        catch (Throwable failure) { code.close(); throw failure; }
+        var filter = predicate == null ? null : ResolvedFilter.bind(inputs, predicate);
+        var code = filter == null ? backend.compile(QuestVarcharTopK.program(key < 0), artifacts)
+                : CompiledKernel.defer(backend, () -> QuestVarcharTopK.program(key < 0), artifacts);
+        CompiledKernel filtered = null;
+        try {
+            if (filter != null) filtered = backend.compile(QuestVarcharTopK.program(key < 0, filter), artifacts);
+            return new ResolvedTopK(code, filtered, filter, column, backend, artifacts);
+        } catch (Throwable failure) {
+            try { code.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            if (filtered != null) try { filtered.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
+    }
+
+    @Override public boolean filterAndEncodeFrame(PageFrameMemoryRecord record, int frameIndex, long frameRows,
+                                                   EncodedTopKBuffer buffer, SqlExecutionCircuitBreaker breaker) {
+        return filter != null && encode(record, frameIndex, null, frameRows, buffer, breaker, true);
     }
 
     @Override public boolean encodeFrame(PageFrameMemoryRecord record, int frameIndex, DirectLongList rows, long frameRows,
                                           EncodedTopKBuffer buffer, SqlExecutionCircuitBreaker breaker) {
+        return encode(record, frameIndex, rows, frameRows, buffer, breaker, false);
+    }
+
+    private boolean encode(PageFrameMemoryRecord record, int frameIndex, DirectLongList rows, long frameRows,
+                           EncodedTopKBuffer buffer, SqlExecutionCircuitBreaker breaker, boolean filtering) {
         long count = rows == null ? frameRows : rows.size();
         if (count == 0) return true;
-        long scratch = Unsafe.malloc(BYTES, MemoryTag.NATIVE_JIT);
-        long view = scratch + QuestEncodedTopK.INPUT_BYTES;
+        long bytes = BYTES + (filtering ? filter.bytes() : 0);
+        long scratch = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
+        long view = scratch + bytes - VIEW_BYTES;
         try (var memory = KernelMemory.bind(null, breaker::statefulThrowExceptionIfTrippedTimeThrottled)) {
-            if (!record.writeNativeVarcharView(column, scratch) || !buffer.writeCompiledView(view)) return false;
+            if (!record.writeNativeVarcharView(column, scratch)
+                    || (filtering && !filter.prepare(record, scratch + QuestEncodedTopK.INPUT_BYTES))
+                    || !buffer.writeCompiledView(view)) return false;
             Unsafe.putLong(scratch + QuestVarcharTopK.SELECTION, rows == null ? 0 : rows.getAddress());
             Unsafe.putLong(scratch + QuestVarcharTopK.ROW_BASE, Rows.toRowID(frameIndex, 0));
             Unsafe.putLong(scratch + QuestEncodedTopK.NEXT, 0);
-            append(code, scratch, count, view, buffer, memory);
+            append(filtering ? filterCode : code, scratch, count, view, buffer, memory);
             nativeRows.add(count);
             return true;
-        } finally { Unsafe.free(scratch, BYTES, MemoryTag.NATIVE_JIT); }
+        } finally { Unsafe.free(scratch, bytes, MemoryTag.NATIVE_JIT); }
     }
 
     @Override public void merge(EncodedTopKBuffer source, EncodedTopKBuffer target, SqlExecutionCircuitBreaker breaker) {
@@ -182,7 +211,7 @@ final class ResolvedTopK implements CompiledTopK {
     @Override public CharSequence getName() { return name; }
     @Override public long getNativeRows() { return nativeRows.sum(); }
     @Override public void close() {
-        try { code.close(); }
+        try { try { code.close(); } finally { if (filterCode != null) filterCode.close(); } }
         finally { try { mergeCode.close(); } finally { try { compactCode.close(); } finally { sortCode.close(); } } }
     }
 }

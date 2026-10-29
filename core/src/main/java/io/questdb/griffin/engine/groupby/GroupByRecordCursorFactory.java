@@ -48,6 +48,9 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.AbstractVirtualFunctionRecordCursor;
 import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.table.AsyncGroupByRecordCursorFactory;
+import io.questdb.griffin.engine.table.SelectedRecordCursorFactory;
+import io.questdb.griffin.engine.table.VirtualRecordCursorFactory;
 import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.MemoryTracker;
@@ -58,6 +61,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
+    private CompiledMapAggregate compiledInput;
     private RecordCursorFactory base;
     private GroupByRecordCursor cursor;
     private ObjList<GroupByFunction> groupByFunctions;
@@ -92,6 +96,17 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             this.mapSink = RecordSinkFactory.getInstance(configuration, asm, base.getMetadata(), listColumnFilter, keyFunctions, null);
             final GroupByFunctionsUpdater updater = GroupByFunctionsUpdaterFactory.getInstance(asm, groupByFunctions);
             this.cursor = new GroupByRecordCursor(configuration, recordFunctions, groupByFunctions, updater, keyTypes, valueTypes);
+            RecordCursorFactory sourceFactory = base;
+            ObjList<RecordCursorFactory> projections = new ObjList<>();
+            while (sourceFactory.getClass() == VirtualRecordCursorFactory.class
+                    || sourceFactory.getClass() == SelectedRecordCursorFactory.class) {
+                projections.add(sourceFactory);
+                sourceFactory = sourceFactory.getBaseFactory();
+            }
+            if (sourceFactory instanceof AsyncGroupByRecordCursorFactory source) {
+                compiledInput = source.compileMapAggregate(projections, keyTypes, listColumnFilter, keyFunctions,
+                        valueTypes, groupByFunctions, cursor.dataMap);
+            }
         } catch (Throwable e) {
             Misc.free(this, e);
             throw e;
@@ -204,6 +219,21 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public void prepareLongTopK(int columnIndex) {
+        if (compiledInput != null) compiledInput.prepareLongTopK(recordFunctions.getQuick(columnIndex));
+    }
+
+    @Override
+    public void prepareLongTopK(int columnIndex, boolean ascending, int limit) {
+        if (compiledInput != null) compiledInput.prepareLongTopK(recordFunctions.getQuick(columnIndex), ascending, limit);
+    }
+
+    @Override
+    public boolean recordCursorSupportsCompiledLongTopK(int columnIndex) {
+        return compiledInput != null && compiledInput.supportsLongTopK(recordFunctions.getQuick(columnIndex));
+    }
+
+    @Override
     public boolean recordCursorSupportsLongTopK(int columnIndex) {
         final int columnType = getMetadata().getColumnType(columnIndex);
         return columnType == ColumnType.LONG || ColumnType.isTimestamp(columnType);
@@ -222,6 +252,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("GroupBy");
+        if (compiledInput != null) sink.meta("compiledMapInput").val(compiledInput.getName());
         sink.meta("vectorized").val(false);
         sink.optAttr("keys", getKeys(recordFunctions, getMetadata()));
         sink.optAttr("values", groupByFunctions, true);
@@ -257,8 +288,10 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         Throwable cleanupFailure = Misc.freeObjListBestEffort(null, recordFunctions);
         cleanupFailure = Misc.freeObjListBestEffort(cleanupFailure, keyFunctions);
         cleanupFailure = freeSharedRecordFunctionsBestEffort(cleanupFailure, sharedRecordFunctions);
-        cleanupFailure = Misc.freeBestEffort(cleanupFailure, base);
         cleanupFailure = Misc.freeBestEffort(cleanupFailure, cursor);
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, compiledInput);
+        compiledInput = null;
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, base);
         // Shared cursors hold no native memory; primary state freed above covers it.
         Misc.clear(sharedCursors);
         CairoException.rethrowCleanupFailure(cleanupFailure);
@@ -289,7 +322,10 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         @Override
         public void longTopK(DirectLongLongSortedList list, int columnIndex) {
             buildMapConditionally();
-            ((MapRecordCursor) baseCursor).longTopK(list, getFunctions().getQuick(columnIndex));
+            Function function = getFunctions().getQuick(columnIndex);
+            if (!primaryCursor.compiledLongTopK(dataMap, list, function)) {
+                ((MapRecordCursor) baseCursor).longTopK(list, function);
+            }
         }
 
         @Override
@@ -364,7 +400,11 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 Misc.free(dataMap);
                 Misc.free(allocator);
                 Misc.clearObjList(groupByFunctions);
-                super.close();
+                try {
+                    super.close();
+                } finally {
+                    if (compiledInput != null) compiledInput.clear();
+                }
             }
         }
 
@@ -377,7 +417,10 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         @Override
         public void longTopK(DirectLongLongSortedList list, int columnIndex) {
             buildMapConditionally();
-            ((MapRecordCursor) baseCursor).longTopK(list, recordFunctions.getQuick(columnIndex));
+            Function function = recordFunctions.getQuick(columnIndex);
+            if (!compiledLongTopK(dataMap, list, function)) {
+                ((MapRecordCursor) baseCursor).longTopK(list, function);
+            }
         }
 
         public void of(RecordCursor managedCursor, SqlExecutionContext executionContext) throws SqlException {
@@ -391,6 +434,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 allocator.reopen();
             }
             this.circuitBreaker = executionContext.getCircuitBreaker();
+            if (compiledInput != null) compiledInput.reopen(executionContext.getMemoryTracker());
             Function.init(keyFunctions, managedCursor, executionContext, null);
             isDataMapBuilt = false;
             rowId = 0;
@@ -411,15 +455,21 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             final Record baseRecord = managedCursor.getRecord();
             // Consult the breaker before the build loop, so an empty base scan still observes cancellation.
             circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottledOrYield();
-            while (managedCursor.hasNext()) {
-                circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
-                final MapKey key = dataMap.withKey();
-                mapSink.copy(baseRecord, key);
-                MapValue value = key.createValue();
-                if (value.isNew()) {
-                    groupByFunctionsUpdater.updateNew(value, baseRecord, rowId++);
-                } else {
-                    groupByFunctionsUpdater.updateExisting(value, baseRecord, rowId++);
+            if (compiledInput != null) {
+                // The producer joins all scan/merge tasks before hasNext returns.
+                managedCursor.hasNext();
+                compiledInput.finish(dataMap, allocator, circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
+            } else {
+                while (managedCursor.hasNext()) {
+                    circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+                    final MapKey key = dataMap.withKey();
+                    mapSink.copy(baseRecord, key);
+                    MapValue value = key.createValue();
+                    if (value.isNew()) {
+                        groupByFunctionsUpdater.updateNew(value, baseRecord, rowId++);
+                    } else {
+                        groupByFunctionsUpdater.updateExisting(value, baseRecord, rowId++);
+                    }
                 }
             }
             super.of(dataMap.getCursor());
@@ -430,6 +480,11 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             if (!isDataMapBuilt) {
                 buildDataMap();
             }
+        }
+
+        private boolean compiledLongTopK(Map map, DirectLongLongSortedList list, Function function) {
+            return compiledInput != null && compiledInput.longTopK(map, list, function,
+                    circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
         }
     }
 }

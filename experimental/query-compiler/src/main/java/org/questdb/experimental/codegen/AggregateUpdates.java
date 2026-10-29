@@ -214,6 +214,14 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         }, destination);
     }
 
+    void prefetchHeaders(Builder b, Expr destination) {
+        for (var update : updates) if (update instanceof DistinctUpdate distinct) {
+            Expr countAddress = at(destination, distinct.offset());
+            b.when(binary(Op.GE, load(countAddress), i64(2)), existing ->
+                    existing.prefetch(new Load(MemoryType.ADDRESS, at(countAddress, 8)), false));
+        }
+    }
+
     static Function outputFunction(Function function) {
         return function.getClass() == AvgShortGroupByFunction.class
                 ? DoubleColumn.newInstance(((GroupByFunction) function).getValueIndex()) : function;
