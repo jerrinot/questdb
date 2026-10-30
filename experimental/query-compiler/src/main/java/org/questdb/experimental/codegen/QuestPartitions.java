@@ -329,7 +329,7 @@ final class QuestPartitions {
                 stage.store(at(scratch, 24), hash);
                 stage.assign(scratch, at(scratch, probe.prefetchRowBytes()));
                 if (probe.variable()) {
-                    Expr payloadBytes = inputs ? add(QuestVariableKey.bytes(key), i64(QuestPartitionInputs.numericBytes(updates)))
+                    Expr payloadBytes = inputs ? add(QuestVariableKey.bytes(key), i64(QuestPartitionInputs.valueBytes(updates)))
                             : QuestVariableKey.stride(key, i64(valueBytes));
                     stage.assign(sourceOffset, add(sourceOffset, add(i64(8), payloadBytes)));
                 }
@@ -359,7 +359,8 @@ final class QuestPartitions {
                             else initialization.initialize(init, value);
                             init.assign(inserted, bool(true));
                         });
-                if (inputs) updates.emit(consume, QuestPartitionInputs.loadValues(consume, updates, source), destination, nil());
+                if (inputs) updates.emit(consume, QuestPartitionInputs.loadFrame(consume, updates, source,
+                        QuestPartitionInputs.numericBytes(updates)), destination, nil());
                 else if (initialization != null) updates.merge(consume, source, destination);
                 else consume.when(eq(inserted, bool(false)), existing -> updates.merge(existing, source, destination));
                 consume.assign(scratch, at(scratch, probe.prefetchRowBytes()));

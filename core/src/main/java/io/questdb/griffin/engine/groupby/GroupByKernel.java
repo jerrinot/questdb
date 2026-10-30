@@ -44,6 +44,12 @@ import org.jetbrains.annotations.Nullable;
 
 /** Query-owned aggregate code. Slots borrow it until the existing frame sequence drains. */
 public interface GroupByKernel extends QuietCloseable {
+    /** Owner-only initialization after resolved functions init, before task dispatch. */
+    default void prepareExecution(io.questdb.std.MemoryTracker tracker) { }
+
+    /** Releases execution state only after workers drain; cached code remains reusable. */
+    default void clearExecution() { }
+
     /** Planning-only borrow of source output readers and existing exclusive worker slots. */
     default CompiledMapAggregate compileMapAggregate(CairoConfiguration configuration,
             ColumnTypes inputs, ObjList<Function> sourceFunctions, ObjList<Updater> sourceSlots,

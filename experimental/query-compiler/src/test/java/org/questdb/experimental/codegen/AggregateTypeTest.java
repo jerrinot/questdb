@@ -92,7 +92,7 @@ public class AggregateTypeTest {
                 + "cast(case when x%7=0 then null else cast(x%17 as string) end as symbol) s,"
                 + "timestamp_sequence('2024-01-01',1000000) ts from long_sequence(1003)) timestamp(ts) partition by day bypass wal", context);
         for (String sql : List.of("select k,count(s),count() from counts group by k",
-                "select s,count(s) from counts group by s", "select count(s) from counts",
+                "select s,count(s) from counts group by s", "select count(s) from counts", "select count(s),count() from counts",
                 "select k,count(s) from counts where s in ('1','2',null) group by k")) {
             try (var candidate = compile(sql)) {
                 check(sql, candidate);
@@ -239,6 +239,8 @@ public class AggregateTypeTest {
                 "select g,sum(d/2.0),avg(d+0.25),count(d) from expressions where d!=null group by g",
                 "select g,count() from expressions where d=i*0.25 group by g",
                 "select g,count() from expressions where d!=i*0.25 group by g",
+                "select sum(d*2.0+0.25),count() from expressions",
+                "select avg(i+1),sum(d*2.0),count() from expressions",
                 "select sum(d*2.0),avg(d) from expressions where d>=0.0 or d=null")) {
             try (var candidate = compile(sql)) {
                 check(sql, candidate);
@@ -335,6 +337,43 @@ public class AggregateTypeTest {
             }
         }
         return 0;
+    }
+
+    @Test public void varcharCountPreservesNullsEmptyStringsColumnTopsAndParquet() throws Exception {
+        engine.execute("create table strings as (select cast(x%7 as int) k,x v,"
+                + "timestamp_sequence('2024-01-01',1000000) ts from long_sequence(33)) timestamp(ts) partition by day bypass wal", context);
+        engine.execute("alter table strings add column s varchar", context);
+        engine.execute("insert into strings select cast(x%7 as int),x,timestamp_sequence('2024-01-02',1000000),"
+                + "cast(case when x%11=0 then null when x%13=0 then '' when x%3=0 then '中' "
+                + "else 'long-shared-prefix-'||cast(x%29 as string) end as varchar) from long_sequence(1003)", context);
+        for (String sql : List.of("select k,count(s),count() from strings group by k",
+                "select s,count(s),count() from strings group by s",
+                "select k,s,count(s),sum(v) from strings group by k,s",
+                "select count(s) from strings",
+                "select count(s),count() from strings",
+                "select sum(v),count() from strings",
+                "select k,count(case when v<500 then s when v<750 then '' else null::varchar end) from strings group by k",
+                "select count(case when k<3 then s else null::varchar end) from strings where v>100",
+                "select k,count(s),min(s),max(s) from strings group by k")) {
+            try (var candidate = compile(sql)) {
+                check(sql, candidate); check(sql, candidate);
+                // Fully batched aggregates keep their existing execution.
+                if (sql.equals("select sum(v),count() from strings")) assertEquals(0, nativeRows(candidate));
+                else assertTrue(sql, nativeRows(candidate) > 0);
+            }
+        }
+        String sql = "select k,count(s),count() from strings group by k";
+        for (String partition : List.of("2024-01-01", "2024-01-02")) {
+            engine.execute("alter table strings convert partition to parquet list '" + partition + "'", context);
+            try (var candidate = compile(sql)) { check(sql, candidate); assertTrue(nativeRows(candidate) > 0); }
+            try (var candidate = compile("select count(s) from strings")) { check("select count(s) from strings", candidate); }
+        }
+        // A joined row has no VARCHAR descriptor ABI yet; retain ordinary execution.
+        engine.execute("create table dim as (select cast(x as int) k from long_sequence(7))", context);
+        String join = "select count(s) from strings join dim on strings.k=dim.k";
+        try (var candidate = compile(join)) { check(join, candidate); }
+        engine.execute("truncate table strings", context);
+        try (var candidate = compile("select count(s) from strings")) { check("select count(s) from strings", candidate); }
     }
 
     private RecordCursorFactory compile(String sql) throws Exception {

@@ -38,6 +38,10 @@ import io.questdb.griffin.engine.functions.eq.EqVarcharFunctionFactory;
 import io.questdb.griffin.engine.functions.regex.AbstractLikeVarcharFunctionFactory;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.MemoryTracker;
+import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.griffin.engine.functions.BinaryFunction;
+import io.questdb.griffin.engine.functions.regex.SymbolKeySetProvider;
 import io.questdb.std.Unsafe;
 
 import java.io.IOException;
@@ -74,6 +78,8 @@ final class ResolvedFilter implements AutoCloseable {
         if (!conjuncts(function, leaves, 0)) return null;
         var strings = new java.util.ArrayList<Integer>();
         var tests = new java.util.ArrayList<StringPredicate>();
+        var symbols = new java.util.ArrayList<SymbolMembership>();
+        var symbolTests = new java.util.ArrayList<SymbolPredicate>();
         Pipeline.Predicate numeric = new Pipeline.All();
         for (Function leaf : leaves) {
             Function original = leaf;
@@ -83,7 +89,20 @@ final class ResolvedFilter implements AutoCloseable {
                 leaf = ((NotFunctionFactory.Func) leaf).getArg();
             }
             final boolean negate = (negations & 1) != 0;
-            if (leaf != null && leaf.getClass() == EqVarcharFunctionFactory.NullCheckFunc.class) {
+            if (leaf instanceof SymbolKeySetProvider source) {
+                Function argument = leaf instanceof UnaryFunction unary ? unary.getArg()
+                        : leaf instanceof BinaryFunction binary ? binary.getLeft() : null;
+                if (argument == null) return null;
+                var column = inputs.column(argument, ColumnType.SYMBOL);
+                if (column == null) return null;
+                symbols.add(new SymbolMembership(source));
+                symbolTests.add((builder, pointers, descriptor, row) -> {
+                    Expr base = new Load(MemoryType.ADDRESS, at(pointers, column.index() * 8L));
+                    Var key = builder.let(new Load(MemoryType.I32, new Offset(base, binary(Op.MUL, row, i64(4)))));
+                    Expr found = SymbolMembership.contains(builder, descriptor, key);
+                    return negate ? eq(found, bool(false)) : found;
+                });
+            } else if (leaf != null && leaf.getClass() == EqVarcharFunctionFactory.NullCheckFunc.class) {
                 var check = (EqVarcharFunctionFactory.NullCheckFunc) leaf;
                 int column = varcharColumn(types, check.getArg());
                 if (column < 0) return null;
@@ -115,12 +134,18 @@ final class ResolvedFilter implements AutoCloseable {
         }
         // Admitted leaves are total and side-effect free. Reject numeric rows before decoding strings.
         long stringOffset = (inputs.columns().size() + parameters.size()) * 8L;
-        ScanLowering.RowPredicate residual = strings.isEmpty() ? null : (builder, descriptors, row) -> {
+        long symbolOffset = stringOffset + strings.size() * 48L;
+        ScanLowering.RowPredicate residual = strings.isEmpty() && symbols.isEmpty() ? null : (builder, descriptors, row) -> {
             Var accepted = builder.let(bool(true));
             for (int i = 0; i < strings.size(); i++) {
                 long offset = stringOffset + i * 48L;
                 StringPredicate test = tests.get(i);
                 builder.when(accepted, check -> check.assign(accepted, test.emit(check, at(descriptors, offset), row)));
+            }
+            for (int i = 0; i < symbols.size(); i++) {
+                long offset = symbolOffset + i * SymbolMembership.BYTES;
+                SymbolPredicate test = symbolTests.get(i);
+                builder.when(accepted, check -> check.assign(accepted, test.emit(check, descriptors, at(descriptors, offset), row)));
             }
             return accepted;
         };
@@ -129,7 +154,7 @@ final class ResolvedFilter implements AutoCloseable {
         var plan = new ScanPlan(inputs.columns(), numeric, inputs.columns(),
                 new java.util.ArrayList<Pipeline.Scalar>(inputs.columns()), parameterTypes);
         return new Binding(plan, inputs.indexes(), strings.stream().mapToInt(Integer::intValue).toArray(), residual,
-                List.copyOf(parameters));
+                List.copyOf(parameters), List.copyOf(symbols));
     }
 
     private static int varcharColumn(ColumnTypes types, Function function) {
@@ -143,15 +168,30 @@ final class ResolvedFilter implements AutoCloseable {
         Expr emit(Builder builder, Expr descriptor, Expr row);
     }
 
+    @FunctionalInterface
+    private interface SymbolPredicate {
+        Expr emit(Builder builder, Expr pointers, Expr descriptor, Expr row);
+    }
+
     record Binding(ScanPlan plan, int[] sourceIndexes, int[] varcharColumns, ScanLowering.RowPredicate residual,
-                   List<IntSupplier> parameters) {
+                   List<IntSupplier> parameters, List<SymbolMembership> symbols) implements AutoCloseable {
         long stringOffset() { return (sourceIndexes.length + parameters.size()) * 8L; }
-        long bytes() { return stringOffset() + varcharColumns.length * 48L; }
+        long symbolOffset() { return stringOffset() + varcharColumns.length * 48L; }
+        long bytes() { return symbolOffset() + symbols.size() * SymbolMembership.BYTES; }
+
+        void prepareExecution(MemoryTracker tracker) {
+            try { for (var symbol : symbols) symbol.prepare(tracker); }
+            catch (Throwable failure) { close(); throw failure; }
+        }
+
+        @Override public void close() { for (var symbol : symbols) symbol.close(); }
 
         private void prepareParameters(long addresses) {
             // Borrow resolved keys after Function.init; they are immutable while tasks run.
             for (int i = 0; i < parameters.size(); i++)
                 Unsafe.putInt(addresses + (sourceIndexes.length + i) * 8L, parameters.get(i).getAsInt());
+            for (int i = 0; i < symbols.size(); i++)
+                symbols.get(i).write(addresses + symbolOffset() + i * SymbolMembership.BYTES);
         }
 
         boolean prepare(PageFrameMemoryRecord record, long addresses) {
@@ -196,8 +236,11 @@ final class ResolvedFilter implements AutoCloseable {
 
     ScanPlan fusedPlan() {
         // The map-fused ABI currently carries column pointers only.
-        return binding.varcharColumns().length == 0 && binding.parameters().isEmpty() ? binding.plan() : null;
+        return binding.residual() == null && binding.parameters().isEmpty() ? binding.plan() : null;
     }
+
+    void prepareExecution(MemoryTracker tracker) { binding.prepareExecution(tracker); }
+    void clearExecution() { binding.close(); }
 
     long compilationNanos() { return code.compilationNanos(); }
 
@@ -208,7 +251,7 @@ final class ResolvedFilter implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!closed) { closed = true; code.close(); }
+        if (!closed) { closed = true; try { code.close(); } finally { binding.close(); } }
     }
 
     final class Slot implements AutoCloseable {

@@ -92,7 +92,7 @@ public class ResolvedAggregateKernelTest {
              var nativeValue = new SimpleMapValue(types.getColumnCount());
              var expected = new SimpleMapValue(types.getColumnCount());
              var merged = new SimpleMapValue(types.getColumnCount());
-             var code = ResolvedScalarAggregate.compile(inputs, types, functions, nativeValue, backend, temporary.newFolder().toPath());
+             var code = ResolvedScalarAggregate.compile(inputs, types, functions, nativeValue, null, backend, temporary.newFolder().toPath());
              var slot = code.newUpdater(); var arena = Arena.ofConfined()) {
             var noop = io.questdb.cairo.sql.SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER;
             for (int i = 0; i < functions.size(); i++) {

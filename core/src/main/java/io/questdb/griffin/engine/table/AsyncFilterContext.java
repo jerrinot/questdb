@@ -157,6 +157,7 @@ public class AsyncFilterContext implements Closeable {
     }
 
     public void clear() {
+        if (compiledFilter != null) compiledFilter.clearExecution();
         Misc.free(ownerMemoryPool);
         Misc.freeObjListAndKeepObjects(perWorkerMemoryPools);
         ownerSelectivityStats.clear();
@@ -300,6 +301,7 @@ public class AsyncFilterContext implements Closeable {
             pool.setMemoryTracker(memoryTracker);
             pool.of(pageFrameAddressCache, ParquetDecodeHint.MONOTONIC);
         }
+        if (compiledFilter != null) compiledFilter.prepareExecution(memoryTracker);
     }
 
     public boolean shouldUseLateMaterialization(int slotId, boolean isParquetFrame) {

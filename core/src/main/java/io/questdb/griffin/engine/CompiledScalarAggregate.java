@@ -31,6 +31,11 @@ import io.questdb.std.QuietCloseable;
 
 /** Query-owned unkeyed reduction code; existing acquired slots own state and scratch. */
 public interface CompiledScalarAggregate extends QuietCloseable {
+    /** Owner-only initialization after functions init, before dispatch. */
+    default void prepareExecution(io.questdb.std.MemoryTracker tracker) { }
+    /** Called after all workers drain. */
+    default void clearExecution() { }
+
     CharSequence getName();
 
     Updater newUpdater();
@@ -41,6 +46,10 @@ public interface CompiledScalarAggregate extends QuietCloseable {
     interface Updater extends QuietCloseable {
         /** Read after the frame sequence drains. */
         long getNativeRows();
+
+        /** Returns accepted rows, or -1 to decline before mutation. Empty results preserve isNew. */
+        default long filterAndUpdate(PageFrameMemoryRecord record, long rowCount,
+                                     MapValue value, SqlExecutionCircuitBreaker circuitBreaker) { return -1; }
 
         /**
          * Zero rowIdsAddress means contiguous rows. Otherwise IDs use original frame coordinates.

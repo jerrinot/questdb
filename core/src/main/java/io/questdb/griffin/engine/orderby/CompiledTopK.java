@@ -32,6 +32,12 @@ import io.questdb.std.QuietCloseable;
 
 /** Query-owned encoding, admission and buffer operations; the acquired slot owns the borrowed memory. */
 public interface CompiledTopK extends QuietCloseable {
+    /** Owner-only initialization after resolved functions init, before task dispatch. */
+    default void prepareExecution(io.questdb.std.MemoryTracker tracker) { }
+
+    /** Releases execution state only after workers drain; cached code remains reusable. */
+    default void clearExecution() { }
+
     // EncodedTopKBuffer view. Addresses expire on growth/compaction; only COUNT and HEAP_POS are writable.
     int ENTRIES = 0, COUNT = 8, STOP = 16, HEAP = 24, HEAP_POS = 32, HEAP_SIZE = 40;
     int HAS_THRESHOLD = 48, FIRST = 56, K1 = 64, K2 = 72, LENGTH = 80, ROW_ID = 88, TAIL = 96;

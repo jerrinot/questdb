@@ -43,6 +43,7 @@ import io.questdb.griffin.engine.functions.groupby.CountIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongConstGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountSymbolGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.CountVarcharGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxDoubleGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxLongGroupByFunction;
@@ -131,7 +132,8 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             } else if (implementation == SumShortGroupByFunction.class || implementation == AvgShortGroupByFunction.class) {
                 argumentType = ColumnType.SHORT;
                 sum = true;
-            } else if (mutableMap && (implementation == MinVarcharGroupByFunction.class || implementation == MaxVarcharGroupByFunction.class)) {
+            } else if (implementation == CountVarcharGroupByFunction.class
+                    || mutableMap && (implementation == MinVarcharGroupByFunction.class || implementation == MaxVarcharGroupByFunction.class)) {
                 argumentType = ColumnType.VARCHAR;
                 sum = false;
             } else {
@@ -148,7 +150,9 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             if (argumentType == ColumnType.VARCHAR) {
                 var expression = strings.bind(((UnaryFunction) function).getArg());
                 if (expression == null) return null;
-                updates.add(new VarcharExtremum(expression, offsets.applyAsLong(valueIndex), implementation == MinVarcharGroupByFunction.class));
+                updates.add(implementation == CountVarcharGroupByFunction.class
+                        ? new VarcharCount(expression, offsets.applyAsLong(valueIndex))
+                        : new VarcharExtremum(expression, offsets.applyAsLong(valueIndex), implementation == MinVarcharGroupByFunction.class));
                 continue;
             }
             if ((distinct || average) && (valueIndex + 1 >= valueTypes.getColumnCount()
@@ -265,7 +269,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         return isAverage(function.getClass())
                 ? DoubleColumn.newInstance(((GroupByFunction) function).getValueIndex()) : function;
     }
-    sealed interface Update permits ScalarUpdate, IntegerExtremum, DoubleSum, DoubleExtremum, DistinctUpdate, AverageUpdate, VarcharExtremum, VectorSumUpdate, VectorLongAverageUpdate, VectorDoubleCount, VectorDoubleExtremum {
+    sealed interface Update permits ScalarUpdate, IntegerExtremum, DoubleSum, DoubleExtremum, DistinctUpdate, AverageUpdate, VarcharCount, VarcharExtremum, VectorSumUpdate, VectorLongAverageUpdate, VectorDoubleCount, VectorDoubleExtremum {
         long offset();
         void initialize(Builder b, Expr destination);
         void merge(Builder b, Expr source, Expr destination);
@@ -275,6 +279,17 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         default boolean deferredMerge() { return false; }
         default void finish(Builder b, Expr destination, boolean deferred) { }
         default void prefetch(Builder b, java.util.function.Function<Pipeline.Scalar, Pipeline.Value> input, Expr destination) { }
+    }
+
+    record VarcharCount(ResolvedVarchar.Expression argument, long offset) implements Update {
+        @Override public void initialize(Builder b, Expr destination) { b.store(at(destination, offset), i64(0)); }
+        @Override public void merge(Builder b, Expr source, Expr destination) {
+            b.store(at(destination, offset), add(load(at(destination, offset)), load(at(source, offset))));
+        }
+        @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            Expr present = new Select(frame.isNull(b, argument), i64(0), i64(1));
+            b.store(at(destination, offset), add(load(at(destination, offset)), present));
+        }
     }
 
     /** SUM(DOUBLE) ignores NaN inputs and replaces a NaN accumulator on the next value. */

@@ -15,25 +15,30 @@ function/state contracts and exact results before measuring 500M-row controls.
 - [x] DOUBLE binary arithmetic, integer widening and SQL comparisons/NULL predicates.
 - [x] DOUBLE raw-bit grouping keys, including computed/composite keys and column tops.
   Generated DOUBLE projection and ranking remain separate encoding gaps.
-- [ ] Correct ordinary Rosti `keyedIntSumIntMerge`: `vec_int_key_agg.cpp` reads
-  the source LONG sum through `jint*`, truncating large INT sums before merge.
-  The 2026-10-29 extreme-value SYMBOL test reproduces partition-dependent AVG(INT)
-  answers. Generated arrays retain full LONG sums; compare that case against
-  ordinary scalar SQL. Fix and validate the native stock path separately.
-- [ ] Correct ordinary Rosti integer AVG missing-key wrap-up: `kIntAvgLongWrapUp<T>`
-  writes the unkeyed average through `jdouble*` into the raw integer sum before
-  the final division. Integer-only generated arrays retain their working NULL-key
-  path. Newly admitted floating plans reuse ordinary missing-key handling; mixed
-  floating/integer AVG plans inherit the stock boundary until fixed separately.
-- [ ] Revisit scalar filter selection-vector traffic: generated AVG cuts instructions
-  by more than half but improves only about 5% at eight cores; controller traffic
-  stays about 16 GB/query. Test fused selection/reduction before changing policy.
-- [ ] Extend VARCHAR aggregate/expression coverage after those fixed-width types.
-- [ ] Select the next moonshot from measured residual cost, study primary research,
-  and test a general reduction in state, data movement or dependent accesses.
-  Keep hardware budgets discovered, snapshots/query ownership intact, and complete
-  compilation/build/merge/output costs visible. Do not turn this host's winner into
-  a universal policy.
+- [x] VARCHAR COUNT, including searched CASE, scalar consumers and compact input partitions.
+- [x] Mixed batch/scalar aggregates now try the existing generated reduction
+  before ordinary batch/scalar phases. Fully batched plans retain their current path.
+- [x] Correct ordinary Rosti `keyedIntSumIntMerge`: retain the LONG accumulator
+  instead of narrowing the source to INT before merge. Native regression reproduces
+  the wrong answer; rebuilt native library and generated-array comparisons pass.
+- [x] Correct ordinary Rosti integer AVG missing-key wrap-up: combine floating
+  partial sums with the actual 64/128-bit state, then publish the final DOUBLE.
+  Refresh map views after NULL-key insertion can grow the map. Native tests cover
+  existing/new NULL groups, 128-bit sums and growth; mixed generated floating/
+  integer plans reuse this corrected ordinary missing-key boundary.
+- [x] Fuse supported scalar filters into the existing register reduction, retaining
+  SIMD predicates and Parquet late materialization. On 500M rows, integer AVG
+  drops 260–271 to 146–147 ms and controller traffic 16.2 to 8.2 GB. The 6.3%
+  selectivity control pays about 3–4% more; no selectivity-specific policy added.
+- [ ] Extend remaining VARCHAR expression coverage and grouped VARCHAR DISTINCT.
+- [x] Dictionary-domain SYMBOL predicates: reuse resolved LIKE/ILIKE/regex match sets,
+  compile exact range/bitmap/sparse membership, and share immutable query-owned state.
+  Official 1BRC filtered COUNT falls about 3.1 s to 78 ms; 16-core execution reaches
+  the measured input-bandwidth floor. Sparse/skewed domains, 4/8/16 cores and
+  lifecycle failures are covered; other CPU families and general OR remain open.
+- [ ] Continue the moonshot by removing measured materialization or dependent-access
+  costs. Keep discovered hardware budgets, snapshot/query ownership and complete
+  compilation/build/merge/output accounting; do not assume this host's optimum is universal.
 
 Recorded 2026-10-26. Continue compiler coverage first; this is a later experiment,
 not a change to execution defaults.

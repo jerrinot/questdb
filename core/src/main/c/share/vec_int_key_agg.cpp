@@ -929,30 +929,36 @@ static jboolean kIntAvgLongWrapUp(jlong pRosti, jint valueOffset, jdouble valueA
     auto map = reinterpret_cast<rosti_t *>(pRosti);
     const auto value_offset = map->value_offsets_[valueOffset];
     const auto count_offset = map->value_offsets_[valueOffset + count_idx];
-    const auto capacity = map->capacity_;
-    const auto ctrl = map->ctrl_;
-    const auto shift = map->slot_size_shift_;
-    const auto slots = map->slots_;
+    jdouble *null_value = nullptr;
+    jdouble null_average = 0;
 
     // populate null value
     if (valueAtNullCount > 0) {
         auto nullKey = reinterpret_cast<int32_t *>(map->slot_initial_values_)[0];
         auto res = find(map, nullKey);
-        // maps must have identical structure to use "shift" from map B on map A
+        if (PREDICT_FALSE(res.first == UL_MAX)) {
+            return JNI_FALSE;
+        }
         auto dest = map->slots_ + res.first;
         if (PREDICT_FALSE(res.second)) {
-            if (PREDICT_FALSE(res.first == UL_MAX)) {
-                return JNI_FALSE;
-            }
             *reinterpret_cast<int32_t *>(dest) = nullKey;
-            *reinterpret_cast<jdouble *>(dest + value_offset) = valueAtNull;
+            *reinterpret_cast<T *>(dest + value_offset) = 0;
             *reinterpret_cast<jlong *>(dest + count_offset) = valueAtNullCount;
         } else {
-            *reinterpret_cast<jdouble *>(dest + value_offset) += valueAtNull;
+            valueAtNull += static_cast<jdouble>(*reinterpret_cast<T *>(dest + value_offset));
             *reinterpret_cast<jlong *>(dest + count_offset) += valueAtNullCount;
         }
+        // Missing key pages supply a floating-point sum. Keep it out of the
+        // integer accumulator until all raw states have been finalized.
+        null_value = reinterpret_cast<jdouble *>(dest + value_offset);
+        null_average = valueAtNull / *reinterpret_cast<jlong *>(dest + count_offset);
     }
 
+    // find() may have grown the map while adding the missing NULL key.
+    const auto capacity = map->capacity_;
+    const auto ctrl = map->ctrl_;
+    const auto shift = map->slot_size_shift_;
+    const auto slots = map->slots_;
     for (size_t i = 0; i < capacity; i++) {
         ctrl_t c = ctrl[i];
         if (c > -1) {
@@ -963,6 +969,9 @@ static jboolean kIntAvgLongWrapUp(jlong pRosti, jint valueOffset, jdouble valueA
             auto res = static_cast<jdouble>(sum) / count;
             *reinterpret_cast<jdouble *>(pValue) = res;
         }
+    }
+    if (null_value != nullptr) {
+        *null_value = null_average;
     }
     return JNI_TRUE;
 }
@@ -1706,7 +1715,7 @@ Java_io_questdb_std_Rosti_keyedIntSumIntMerge(JNIEnv *env, jclass cl, jlong pRos
         if (c > -1) {
             auto src = slots + (i << shift);
             auto key = *reinterpret_cast<int32_t *>(src);
-            auto val = *reinterpret_cast<jint *>(src + value_offset);
+            auto val = *reinterpret_cast<jlong *>(src + value_offset);
             auto count = *reinterpret_cast<jlong *>(src + count_offset);
 
             auto res = find(map_a, key);

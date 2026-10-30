@@ -192,11 +192,30 @@ public class ResolvedSymbolAggregateTest {
         sql = "select k,avg(v),sum(v) from t group by k";
         try (var candidate = engine.select(sql, context)) {
             assertNotNull(vector(candidate).getCompiledAggregate());
-            // Rosti's keyedIntSumIntMerge currently narrows the source LONG sum
-            // to INT. The ordinary scalar functions retain these exact sums.
             assertMatches(sql, candidate);
             assertEquals(10001, vector(candidate).getCompiledAggregate().getNativeRows());
+            context.setQueryCodeGenerator(null);
+            try (var ordinary = engine.select(sql, context)) {
+                assertEquals(Demo.readSql(ordinary, context, 1), Demo.readSql(candidate, context, 1));
+            } finally { context.setQueryCodeGenerator(compiler); }
         }
+    }
+
+    @Test public void mixedFloatingAndIntegerAveragesMergeMissingSymbolPages() throws Exception {
+        engine.execute("create table mixed as (select cast(2147483647 as int) i,x*11 l,x*0.25 d,"
+                + "timestamp_sequence('2024-01-01',1000000L) ts from long_sequence(103)) timestamp(ts) partition by day bypass wal", context);
+        engine.execute("alter table mixed add column k symbol", context);
+        engine.execute("insert into mixed select cast(x as int),x*11,x*0.25,timestamp_sequence('2024-01-02',1000000L),"
+                + "cast(case when x%7=0 then null else cast(x%17 as string) end as symbol) from long_sequence(1003)", context);
+        String sql = "select k,avg(i),avg(l),sum(d),count() from mixed group by k";
+        context.setQueryCodeGenerator(compiler);
+        try (var candidate = engine.select(sql, context)) {
+            assertMatches(sql, candidate);
+            assertEquals(1003, vector(candidate).getCompiledAggregate().getNativeRows());
+            assertMatches(sql, candidate);
+        }
+        engine.execute("alter table mixed convert partition to parquet list '2024-01-01'", context);
+        try (var candidate = engine.select(sql, context)) { assertMatches(sql, candidate); }
     }
 
     @Test public void snapshotGrowthDeclinesLargeDictionaryAndReopens() throws Exception {

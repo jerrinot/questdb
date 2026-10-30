@@ -1096,6 +1096,7 @@ public class ResolvedSqlAggregateTest {
         long rows = compiler.scalarRows.get();
         assertScalarMatches("select min(v),max(v),sum(v),count(v) from scalar_frames where k>=0", true);
         assertTrue("Parquet slices reach native reduction", compiler.scalarRows.get() > rows);
+        assertScalarMatches("select avg(v),sum(v),count() from scalar_frames where k<1", true);
         engine.execute("alter table scalar_frames alter column k type long", context);
         assertScalarMatches("select min(k),max(k),sum(v) from scalar_frames where v>0", true);
 
@@ -2337,6 +2338,45 @@ public class ResolvedSqlAggregateTest {
     }
 
     @Test
+    public void partitionedVarcharCountsRetainOnlyNullStatusAndReopen() throws Exception {
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(64, 2048);
+            mapEntrySize = 64;
+            engine.execute("create table vc as (select cast(x%1009 as int) k,cast(x%31 as varchar) tag,"
+                    + "cast(case when x%17=0 then null when x%13=0 then '' else '中-long-prefix-'||cast(x as string) end as varchar) s,"
+                    + "x v,timestamp_sequence('2024-01-01',60000000L) ts from long_sequence(10003)) timestamp(ts) partition by day bypass wal", context);
+            for (boolean parquet : new boolean[]{false, true}) {
+                if (parquet) engine.execute("alter table vc convert partition to parquet list '2024-01-01'", context);
+                for (String key : List.of("k", "k,tag")) {
+                    for (String argument : List.of("s", "case when k<300 then s else null::varchar end")) {
+                        long before = compiler.inputPartitionRows.get();
+                        assertMatches("select " + key + ",count(" + argument + "),count(),sum(v),count(v),min(v),max(v) "
+                                + "from vc where v>0 group by " + key + " order by sum(v) desc limit 19", true);
+                        assertTrue("Compact null flags must be consumed", compiler.inputPartitionRows.get() > before);
+                    }
+                }
+            }
+            engine.execute("alter table vc add column top varchar", context);
+            assertMatches("select k,tag,count(top),count(),sum(v),count(v) from vc group by k,tag", true);
+            String sql = "select k,tag,count(s),count(),sum(v),count(v),min(v),max(v) from vc group by k,tag";
+            context.setQueryCodeGenerator(compiler);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                compiler.failInputPartition = true;
+                try { assertThrows(CairoException.class, () -> Demo.readSql(factory, context, 8)); }
+                finally { compiler.failInputPartition = false; }
+                var actual = Demo.readSql(factory, context, 8);
+                context.setQueryCodeGenerator(null);
+                try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                    assertEquals(Demo.readSql(baseline, context, 8), actual);
+                }
+            }
+        } finally {
+            System.clearProperty("query.codegen.localCapacity");
+        }
+    }
+
+    @Test
     public void partitionedStringArgumentsRetainPayloadsAndReopen() throws Exception {
         String previous = System.getProperty("query.codegen.localCapacity");
         System.setProperty("query.codegen.localCapacity", "64");
@@ -2349,7 +2389,7 @@ public class ResolvedSqlAggregateTest {
                 for (int entrySize : new int[]{16, 64}) {
                     mapEntrySize = entrySize;
                     for (String value : List.of("s", "case when d<5000 then s else 'literal-ž-that-outlives-the-frame' end")) {
-                        String sql = "select k,min(" + value + "),max(" + value + "),count() n,sum(d) score,count(d),sum(w) "
+                        String sql = "select k,min(" + value + "),max(" + value + "),count(" + value + "),count() n,sum(d) score,count(d),sum(w) "
                                 + "from vp where k>=0 group by k order by score desc limit 25";
                         long before = compiler.inputPartitionRows.get();
                         assertMatches(sql, true);
@@ -2713,11 +2753,13 @@ public class ResolvedSqlAggregateTest {
 
         @Override
         public CompiledScalarAggregate compileScalarAggregate(ColumnTypes inputs, ColumnTypes values,
-                ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue layout) {
-            var code = delegate.compileScalarAggregate(inputs, values, functions, layout);
+                ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue layout, Function filter) {
+            var code = delegate.compileScalarAggregate(inputs, values, functions, layout, filter);
             if (code == null) return null;
             created.incrementAndGet();
             return new CompiledScalarAggregate() {
+                @Override public void prepareExecution(io.questdb.std.MemoryTracker tracker) { code.prepareExecution(tracker); }
+                @Override public void clearExecution() { code.clearExecution(); }
                 @Override public CharSequence getName() { return code.getName(); }
                 @Override public void merge(io.questdb.cairo.map.MapValue source, io.questdb.cairo.map.MapValue destination) {
                     code.merge(source, destination);
@@ -2728,6 +2770,16 @@ public class ResolvedSqlAggregateTest {
                     var update = code.newUpdater();
                     slots.incrementAndGet();
                     return new Updater() {
+                        @Override public long filterAndUpdate(PageFrameMemoryRecord record, long count,
+                                io.questdb.cairo.map.MapValue value, SqlExecutionCircuitBreaker breaker) {
+                            long selected = update.filterAndUpdate(record, count, value, breaker);
+                            if (selected > 0) {
+                                scalarRows.addAndGet(selected);
+                                calls.incrementAndGet();
+                                if (failUpdate) throw CairoException.nonCritical().put("injected after update");
+                            }
+                            return selected;
+                        }
                         @Override public long getNativeRows() { return update.getNativeRows(); }
                         @Override public void close() { closedSlots.incrementAndGet(); update.close(); }
                         @Override public boolean update(PageFrameMemoryRecord record, long count, long rowIds,

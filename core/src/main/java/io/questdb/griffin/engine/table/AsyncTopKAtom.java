@@ -214,6 +214,7 @@ public class AsyncTopKAtom implements StatefulAtom, PerWorkerLockOwner, Reopenab
 
     @Override
     public void clear() {
+        if (compiledTopK != null) compiledTopK.clearExecution();
         Misc.freeObjListAndKeepObjects(rankMaps);
         Misc.free(ownerChain);
         Misc.free(ownerTopK);
@@ -345,6 +346,7 @@ public class AsyncTopKAtom implements StatefulAtom, PerWorkerLockOwner, Reopenab
         memoryTracker = executionContext.getMemoryTracker();
         try {
             filterCtx.initFilters(symbolTableSource, executionContext);
+            if (compiledTopK != null) compiledTopK.prepareExecution(memoryTracker);
             if (isEncoded) {
                 keyType = ownerEncoder.init(symbolTableSource);
                 assert keyType != SortKeyType.UNSUPPORTED;

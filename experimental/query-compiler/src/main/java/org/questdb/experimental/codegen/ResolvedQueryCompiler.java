@@ -127,9 +127,9 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
 
     @Override
     public CompiledScalarAggregate compileScalarAggregate(ColumnTypes inputs, ColumnTypes values,
-            ObjList<GroupByFunction> functions, MapValue layout) {
+            ObjList<GroupByFunction> functions, MapValue layout, Function filter) {
         if (handwritten) return null;
-        try { return ResolvedScalarAggregate.compile(inputs, values, functions, layout, backend, artifacts); }
+        try { return ResolvedScalarAggregate.compile(inputs, values, functions, layout, filter, backend, artifacts); }
         catch (IOException failure) { throw CairoException.nonCritical().put("Scalar aggregate compilation failed: ").put(failure.getMessage()); }
     }
 
@@ -244,6 +244,16 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
         public void prepareFilter(ColumnTypes inputs, Function function) {
             try { prepared.prepareFilter(inputs, function, fuseFilter); }
             catch (IOException failure) { throw CairoException.nonCritical().put("Filter compilation failed: ").put(failure.getMessage()); }
+        }
+
+        @Override
+        public void prepareExecution(io.questdb.std.MemoryTracker tracker) {
+            if (prepared.filter != null) prepared.filter.prepareExecution(tracker);
+        }
+
+        @Override
+        public void clearExecution() {
+            if (prepared.filter != null) prepared.filter.clearExecution();
         }
 
         @Override

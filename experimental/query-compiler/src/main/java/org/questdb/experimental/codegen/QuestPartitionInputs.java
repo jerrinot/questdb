@@ -34,18 +34,28 @@ import static org.questdb.experimental.codegen.Ir.*;
 final class QuestPartitionInputs {
     private QuestPartitionInputs() { }
 
-    private static List<ResolvedVarchar.Expression> stringArguments(AggregateUpdates updates) {
-        var result = new ArrayList<ResolvedVarchar.Expression>();
-        for (var update : updates.updates()) if (update instanceof VarcharExtremum extrema
-                && !result.contains(extrema.argument())) result.add(extrema.argument());
-        return result;
+    private record StringArgument(ResolvedVarchar.Expression expression, boolean payload) {
+        long bytes() { return payload ? 16 : 8; }
+    }
+
+    private static List<StringArgument> stringArguments(AggregateUpdates updates) {
+        var result = new LinkedHashMap<ResolvedVarchar.Expression, Boolean>();
+        for (var update : updates.updates()) {
+            if (update instanceof VarcharExtremum extrema) result.put(extrema.argument(), true);
+            else if (update instanceof AggregateUpdates.VarcharCount count) result.putIfAbsent(count.argument(), false);
+        }
+        return result.entrySet().stream().map(entry -> new StringArgument(entry.getKey(), entry.getValue())).toList();
+    }
+
+    static long valueBytes(AggregateUpdates updates) {
+        return numericBytes(updates) + stringArguments(updates).stream().mapToLong(StringArgument::bytes).sum();
     }
 
     static long rowBytes(QuestMapProbe probe, AggregateUpdates updates) {
         // Variable records return a lower bound; actual size includes each encoded key's payload.
-        if (probe.variable()) return 8L + probe.variableKey().minimumBytes() + numericBytes(updates);
+        if (probe.variable()) return 8L + probe.variableKey().minimumBytes() + valueBytes(updates);
         long bytes = probe.keyBytes() + numericBytes(updates);
-        return ((bytes + 7) & ~7L) + stringArguments(updates).size() * 16L;
+        return ((bytes + 7) & ~7L) + valueBytes(updates) - numericBytes(updates);
     }
 
     static long numericBytes(AggregateUpdates updates) {
@@ -75,7 +85,7 @@ final class QuestPartitionInputs {
             Var hash = probe.hash(entry, key);
             QuestPartitionSketch.add(entry, sketch, hash, keyBytes);
             var append = probe.variable() ? QuestPartitions.appendVariable(entry, partitions, hash,
-                    entry.let(add(keyBytes, i64(8 + numericBytes(updates)))))
+                    entry.let(add(keyBytes, i64(8 + valueBytes(updates)))))
                     : QuestPartitions.append(entry, partitions, hash, rowBytes(probe, updates));
             Var row = append.row();
             if (probe.variable()) {
@@ -92,16 +102,20 @@ final class QuestPartitionInputs {
                 entry.store(width, at(valueAddress, offset), values.values().get(i).data());
                 offset += width.bytes;
             }
-            offset = (probe.keyBytes() + offset + 7) & ~7L;
+            offset = stringOffset(probe, updates);
             var frame = updates.inputs().frame(values, inputRow, at(COLUMNS, 8));
             for (var argument : stringArguments(updates)) {
-                var value = argument.emit(entry, frame);
-                Var pointer = QuestPartitions.retain(entry, partitions, value);
-                entry.store(at(append.row(), offset), binary(Op.XOR, value.size(),
-                        binary(Op.XOR, new Select(value.isNull(), i64(1L << 32), i64(0)),
-                                new Select(value.isAscii(), i64(1L << 33), i64(0)))));
-                entry.store(MemoryType.ADDRESS, at(append.row(), offset + 8), pointer);
-                offset += 16;
+                if (argument.payload) {
+                    var value = frame.value(entry, argument.expression);
+                    Var pointer = QuestPartitions.retain(entry, partitions, value);
+                    entry.store(at(valueAddress, offset), binary(Op.XOR, value.size(),
+                            binary(Op.XOR, new Select(value.isNull(), i64(1L << 32), i64(0)),
+                                    new Select(value.isAscii(), i64(1L << 33), i64(0)))));
+                    entry.store(MemoryType.ADDRESS, at(valueAddress, offset + 8), pointer);
+                } else {
+                    entry.store(at(valueAddress, offset), new Select(frame.isNull(entry, argument.expression), i64(1L << 32), i64(0)));
+                }
+                offset += argument.bytes();
             }
             append.commit(entry);
             entry.assign(index, add(index, i64(1)));
@@ -147,12 +161,14 @@ final class QuestPartitionInputs {
                 Var row = stage.let(new Offset(COLUMNS, binary(Op.MUL, position, i64(rowBytes(probe, layout)))));
                 var strings = stringArguments(layout);
                 var activeStrings = stringArguments(updates);
-                long stringOffset = rowBytes(probe, layout) - strings.size() * 16L;
-                for (int i = 0; i < strings.size(); i++) {
-                    if (!activeStrings.contains(strings.get(i))) continue;
-                    Expr view = at(row, stringOffset + i * 16L);
-                    stage.when(ne(binary(Op.AND, load(view), i64(0xffff_ffffL)), i64(0)), present ->
-                            present.prefetch(new Load(MemoryType.ADDRESS, at(view, 8)), false));
+                long stringOffset = probe.keyBytes() + stringOffset(probe, layout);
+                for (var argument : strings) {
+                    if (argument.payload && activeStrings.contains(argument)) {
+                        Expr view = at(row, stringOffset);
+                        stage.when(ne(binary(Op.AND, load(view), i64(0xffff_ffffL)), i64(0)), present ->
+                                present.prefetch(new Load(MemoryType.ADDRESS, at(view, 8)), false));
+                    }
+                    stringOffset += argument.bytes();
                 }
                 Var key = probe.orderedNative() ? row : stage.let(new Load(probe.keyBytes() == 4 ? MemoryType.I32 : MemoryType.I64, row));
                 stage.store(probe.stagedKeyType(), at(scratch, 8), key);
@@ -205,20 +221,27 @@ final class QuestPartitionInputs {
         return new Pipeline.Row(layout.columns(), values);
     }
 
-    private static void emitValues(Builder b, AggregateUpdates layout, AggregateUpdates updates, QuestMapProbe probe, Var row, Var destination) {
-        var values = loadValues(b, layout, at(row, probe.keyBytes()));
-        long offset = (probe.keyBytes() + numericBytes(layout) + 7) & ~7L;
+    private static long stringOffset(QuestMapProbe probe, AggregateUpdates layout) {
+        long numeric = numericBytes(layout);
+        return probe.variable() ? numeric : ((probe.keyBytes() + numeric + 7) & ~7L) - probe.keyBytes();
+    }
+
+    static ResolvedVarchar.Frame loadFrame(Builder b, AggregateUpdates layout, Expr address, long offset) {
+        var values = loadValues(b, layout, address);
         var strings = new LinkedHashMap<ResolvedVarchar.Expression, Pipeline.Utf8Value>();
         for (var argument : stringArguments(layout)) {
-            Var header = b.let(load(at(row, offset)));
-            strings.put(argument, new Pipeline.Utf8Value(new Load(MemoryType.ADDRESS, at(row, offset + 8)),
+            Var header = b.let(load(at(address, offset)));
+            strings.put(argument.expression, new Pipeline.Utf8Value(argument.payload ? new Load(MemoryType.ADDRESS, at(address, offset + 8)) : nil(),
                     binary(Op.AND, header, i64(0xffff_ffffL)),
                     ne(binary(Op.AND, header, i64(1L << 32)), i64(0)),
                     ne(binary(Op.AND, header, i64(1L << 33)), i64(0)), bool(true)));
-            offset += 16;
+            offset += argument.bytes();
         }
-        var frame = new ResolvedVarchar.Frame(values, i64(0), nil(), nil(), strings);
-        updates.emit(b, frame, destination, nil());
+        return new ResolvedVarchar.Frame(values, i64(0), nil(), nil(), strings);
+    }
+
+    private static void emitValues(Builder b, AggregateUpdates layout, AggregateUpdates updates, QuestMapProbe probe, Var row, Var destination) {
+        updates.emit(b, loadFrame(b, layout, at(row, probe.keyBytes()), stringOffset(probe, layout)), destination, nil());
     }
 
     private static Program mergeScalar(QuestMapProbe probe, AggregateUpdates layout, AggregateUpdates updates) {

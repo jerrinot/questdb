@@ -180,7 +180,7 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
             );
             this.cursor = new AsyncGroupByNotKeyedRecordCursor(groupByFunctions);
             this.workerCount = workerCount;
-            if (compiler != null && !vectorized) {
+            if (compiler != null && (!vectorized || atom.hasNonBatchFunctions())) {
                 atom.compileAggregate(compiler, baseMetadata, valueTypes);
             }
         } catch (Throwable e) {
@@ -413,6 +413,15 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
         // aggregate() for why a leaked slot is permanent.
         try {
             final PageFrameMemory frameMemory = frameMemoryPool.navigateTo(frameIndex);
+            // A mixed batch/scalar plan may compile as one reduction. Try it
+            // before either ordinary phase mutates the shared aggregate state.
+            final CompiledScalarAggregate.Updater compiled = atom.getCompiledUpdater(slotId);
+            if (compiled != null) {
+                record.init(frameMemory);
+                if (compiled.update(record, frameRowCount, 0, value, circuitBreaker)) {
+                    return;
+                }
+            }
             if (frameMemory.hasColumnTops() || frameMemory.hasColumnTypeCasts()) {
                 // Fall back to row-by-row for the entire frame.
                 record.init(frameMemory);
@@ -545,6 +554,14 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
                 frameMemory = frameMemoryPool.navigateTo(frameIndex);
             }
             record.init(frameMemory);
+            final CompiledScalarAggregate.Updater compiled = atom.getCompiledUpdater(slotId);
+            if (!useLateMaterialization && compiled != null) {
+                long selected = compiled.filterAndUpdate(record, frameRowCount, value, circuitBreaker);
+                if (selected >= 0) {
+                    if (isParquetFrame) filterCtx.getSelectivityStats(slotId).update(selected, frameRowCount);
+                    return;
+                }
+            }
 
             if (compiledFilter == null || frameMemory.hasColumnTops() || frameMemory.hasColumnTypeCasts()) {
                 // Use Java-based filter when there is no compiled filter or in case of a page frame with column tops.
@@ -573,7 +590,6 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
                 record = filteredMemoryRecord;
             }
             long baseRowId = Rows.toRowID(frameIndex, 0);
-            final CompiledScalarAggregate.Updater compiled = atom.getCompiledUpdater(slotId);
             if (compiled != null && compiled.update(record, rows.size(), rows.getAddress(), value, circuitBreaker)) {
                 return;
             }

@@ -46,9 +46,9 @@ public interface QueryCodeGenerator {
             ObjList<io.questdb.griffin.engine.groupby.vect.VectorAggregateFunction> functions,
             long rosti, int workerCount) { return null; }
 
-    /** Borrows resolved functions and the actual unkeyed state layout during compilation only. */
+    /** Borrows resolved operators and the actual unkeyed state layout; the factory retains function ownership. */
     default @Nullable CompiledScalarAggregate compileScalarAggregate(ColumnTypes inputs, ColumnTypes values,
-            ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue layout) { return null; }
+            ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue layout, @Nullable Function filter) { return null; }
 
     /** Only bind inputs whose calculateSize supplies bulk counts, without enumerating rows. */
     default @Nullable CompiledCounter compileCounter(@Transient RecordCursorFactory input) { return null; }

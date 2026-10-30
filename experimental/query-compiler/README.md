@@ -110,6 +110,8 @@ The binders and focused tests are authoritative. Current families include:
   boolean predicates and constant membership;
   static SYMBOL equality/inequality against literals and small IN/NOT IN sets
   (up to 16 values, including runtime constants), with AND/OR/NOT composition;
+  static SYMBOL LIKE/ILIKE/regex through the existing dictionary match sets,
+  with generated range/bitmap/sparse-set membership under AND/NOT;
   direct VARCHAR null and literal substring predicates, including their negation;
   searched CASE string values.
 - Direct and computed fixed-width keys, SYMBOL IDs, VARCHAR keys and composite keys
@@ -117,12 +119,14 @@ The binders and focused tests are authoritative. Current families include:
   signed zero and NaN payloads. NULL and empty strings remain distinct.
 - DOUBLE arithmetic (+, -, *, /), integer-to-DOUBLE widening, tolerance-aware
   comparisons and NULL predicates in scan/filter/aggregate expressions
-- Resolved COUNT (including static SYMBOL and DOUBLE), integer/DOUBLE SUM/MIN/MAX/AVG,
+- Resolved COUNT (including static SYMBOL, DOUBLE and VARCHAR), integer/DOUBLE SUM/MIN/MAX/AVG,
   INT/LONG/static-SYMBOL DISTINCT and VARCHAR MIN/MAX
   implementations. Supported overloads depend on the selected map/update path.
 - Unkeyed COUNT and integer/DOUBLE SUM/MIN/MAX/AVG reductions over filtered frames and
   unfiltered expressions whose plan uses row-by-row updates. Existing vector and
   metadata specializations retain priority. Worker-state copying/merging is generated.
+  Supported filters feed SIMD masks directly into reduction; Parquet late
+  materialization and unsupported inputs retain their selected-row fallback.
 - Numeric projection, final COUNT reduction, LONG full sort and Top-K, and positive
   LIMIT/OFFSET selection over supported generated results.
 - Ordered frame-prefix admission for forward filtered scans with finite nonnegative

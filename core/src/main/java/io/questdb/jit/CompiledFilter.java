@@ -50,6 +50,12 @@ import java.io.Closeable;
  * @see CompiledFilterIRSerializer
  */
 public class CompiledFilter implements Closeable {
+    /** Owner-only initialization after resolved functions init, before task dispatch. */
+    public void prepareExecution(io.questdb.std.MemoryTracker tracker) { }
+
+    /** Releases execution state only after workers drain; cached code remains reusable. */
+    public void clearExecution() { }
+
     private static final CarrierLocal<FiltersCompiler.JitError> tlJitError = new CarrierLocal<>(FiltersCompiler.JitError::new);
     private long fnAddress;
 

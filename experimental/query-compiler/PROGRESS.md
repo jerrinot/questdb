@@ -5541,3 +5541,169 @@ Hash Aggregation](https://hannes.muehleisen.org/publications/icde2024-out-of-cor
 but uses QuestDB's existing maps, compact partitions and scheduler. Evidence and
 validated studies: `/tmp/query-type-coverage-20261029/double-keys` and `cache-policy`;
 full temporary responses remain with the isolated typed fixture.
+
+
+## 2026-10-30: VARCHAR COUNT without payload work
+
+COUNT(VARCHAR) now shares its ordinary LONG counter state with generated keyed
+and scalar consumers. Direct columns read only the auxiliary header's null bit;
+searched CASE evaluates the chosen branch's null status. Empty strings count,
+NULL does not. Compact input partitions store one eight-byte null flag per unique
+COUNT-only argument, including variable keys, subdivision and replay. A shared
+MIN/MAX argument upgrades that entry to the existing retained payload descriptor.
+Joined VARCHAR arguments still decline until joined rows carry string descriptors.
+
+Fifteen focused backend cases cover empty/NULL/UTF-8/long strings, CASE, mixed
+COUNT/MIN/MAX, column tops, Parquet, fixed/variable compact records, Top-K, failure
+and reopen. Native allocation checks pass. All 210 full responses from six balanced
+500M-row processes match independent integer-derived expectations:
+
+| General shape | Stock ms | Generated ms |
+| --- | ---: | ---: |
+| SHORT groups, COUNT(VARCHAR) + COUNT(*) | 614–632 | 273–274 |
+| VARCHAR groups, both counts | 2987–3039 | 1204–1205 |
+| SHORT groups, COUNT(CASE ...) + COUNT(*) | 985–1006 | 259–262 |
+| 1,048,574 LONG groups, both counts | 4707 | 916–945 |
+
+For the primary grouped case, balanced instructions fall ~277–283 to108/input,
+cycles ~52 to23. Separate retiring captures fall 258 to93 operations/input.
+Controller reads change only9.54 to9.25 GB/query, writes0.164 to0.054 GB: the major
+mechanism is less core work, not skipped data. Nine GB of useful input has an
+optimistic154ms streaming floor; the273ms result still has execution headroom.
+The million-group case still pays substantial partition allocation/minor-fault
+costs, included in complete execution time.
+
+A separate single-COUNT scalar control verifies28 full responses and3.5B generated
+rows/process: instructions48 ->14/input, but139–141 ->136ms. Streaming8GB alone
+costs~137ms at this host's measured read roof, so the small wall-time gain fits
+the bandwidth limit. Another28-response control exposed a separate boundary:
+COUNT(VARCHAR)+COUNT(*) selects the mixed batch reducer because COUNT(*) supports
+batching, disabling generated scalar aggregation. VARCHAR itself remains row
+based there. Fresh mixed-control medians148–152ms before and154–157ms after are
+~3–4% apart despite retaining that same execution path; attribution is unresolved,
+and no scalar-wide speedup is claimed. This admission gap is recorded in TODO.
+Evidence: `/tmp/query-type-coverage-20261029/varchar-count`, validated study,
+complete responses, execution audits and PMU/resource captures. Stock settings
+and its saved binary remain unchanged.
+
+
+## 2026-10-30: repair ordinary integer aggregate state boundaries
+
+Two native regressions reproduce the previously recorded wrong answers:
+INT-sum merge returned5 instead of4,294,967,301; missing-key AVG returned
+1.54e18 instead of22/3. Rosti now reads the source INT sum as its actual LONG
+accumulator. Integer AVG combines the unkeyed floating sum with the64/128-bit
+state before publishing the final DOUBLE, and refreshes map views after a new
+NULL key can trigger growth. The per-group finalization loop gains no branch.
+
+Rebuilt with `cmake --build core/cmake-build-release --target questdb -j 8`;
+test output confirms loading the rebuilt DEV CXX library. Three Rosti cases and
+eight generated/ordinary integration cases pass, including existing/new NULL
+groups, growth, a three-LONG_MAX128-bit sum, column tops, Parquet and mixed DOUBLE/
+integer aggregates. This is a correctness fix, with no performance claim. The
+saved clean-stock benchmark binary remains unchanged. Evidence:
+`/tmp/query-type-coverage-20261029/rosti-correctness`.
+
+
+## 2026-10-30: admit mixed batch/scalar reductions
+
+The scalar factory now admits generated reduction when its batch reducer also
+contains row-wise functions. It tries the complete generated update before either
+ordinary phase mutates state. Fully batched plans keep their existing path; failed
+binding/frame preparation retains ordinary execution. This closes the preceding
+VARCHAR+COUNT(*) gap and generalizes to computed numeric aggregates and SYMBOL.
+
+500M rows, eight physical cores: arithmetic DOUBLE SUM+COUNT falls244–245 ->109ms
+(clean stock247–281ms). Instructions122 ->9.5/input, cycles20.4 ->9.5, retired
+operations104 ->9.8; reads4.23 ->4.18GB/query. Four-core execution484 ->207ms.
+The four-GB read floor is68ms, so the remaining109ms cannot be explained as simply
+reaching that roof. Strict floating reduction dependencies merit separate study.
+First-query SQL compilation rises~1.9 ->18.6ms, execution309 ->147ms in the paired
+processes; hot results exclude compilation.
+
+Mixed VARCHAR COUNT+COUNT improves150–152 ->137ms at eight cores and283 ->136ms
+at four, reaching the previously measured header-streaming floor. Fully batched
+SUM(INT)+COUNT remains34–35ms and MAX(LONG)+COUNT~70ms. All350 full measured
+responses match independent expectations; nine focused backend cases pass,
+including SYMBOL, computed aggregates, column tops, Parquet and the fully batched
+admission control. Evidence: `/tmp/query-type-coverage-20261029/scalar-batches`.
+
+## 2026-10-30 — Dictionary-domain SYMBOL predicates reach the scan floor
+
+- Reuse `SymbolKeySetProvider`'s exact initialized LIKE/ILIKE/regex match sets.
+  Generated membership uses a range for contiguous IDs, a bitmap when no larger
+  than sorted IDs, and bounded binary search otherwise. No per-row string decoding,
+  new regex implementation, per-worker dictionary copy or configuration switch.
+  Query-tracked state is rebuilt on reopen and freed after drain; standalone,
+  aggregate and VARCHAR Top-K filters share the binding. Arbitrary OR remains a gap.
+  The mechanism follows dictionary-predicate pushdown in
+  [Larson et al., VLDB 2015, section 6.3](https://www.vldb.org/pvldb/vol8/p1740-Larson.pdf).
+- Eight physical cores, two warmups plus five measured executions, balanced
+  stock/before/after process order. On 500M rows, 257-ID pattern COUNT falls
+  **467–512 to 42–50 ms**; filtered grouped COUNT/SUM **589–633 to 204–205 ms**.
+  Wider 8,191-ID membership falls **651–1,120 to 42 ms**. Skewed inputs improve
+  **104–117 to 37–39 ms**, sparse two-ID matches **116–119 to 63–64 ms**.
+  Existing compiled all-matching range controls remain **35–37 ms**.
+- Official 1BRC data: station-pattern COUNT **3.05–3.18 s to 78 ms**, and filtered
+  station MIN/AVG/MAX **3.18–3.30 s to 627 ms**. The random station order makes the
+  old search particularly costly: **238 to 24 instructions**, **118 to 3.6 cycles**,
+  and **2.48 to 0.003 branch misses per row**. Dispatched operations that do not
+  retire fall from about **50% to 1.2%**; this supports reduced speculation waste
+  as well as reduced work. The separate flush-recovery event returned zero in
+  both runs and is uninformative; no precise misprediction penalty is claimed.
+- The billion-row COUNT scales **156/78/61 ms on 4/8/16 physical cores**. Four GB
+  of input in 61 ms is **66 GB/s**, near the independently measured sixteen-core
+  read ceiling of 67 GB/s. Eight-core controller reads are 4.14 GB/query. Longer
+  baseline UMC windows include background traffic, so their larger totals are
+  not all credited to eliminated query reads. No measured disk reads, major faults,
+  quota throttling or memory pressure in the hot windows. First-execution
+  compilation for this count rises from about **8 to 20 ms**, still included in
+  the separate cold-plan accounting; dictionary/bitmap preparation stays in execution.
+- **27 focused tests pass** on LLVM, AsmJit and C: Unicode, NULL/empty patterns,
+  negation, changed bindings, dictionary growth/truncate, column tops/Parquet,
+  dense/sparse/int-limit domains, early close/rewind, allocation failure and reuse.
+  **1,071 complete responses match**: synthetic data uses independent 500M-row C
+  oracles; official data uses stock SQL results. Final lifecycle placement was
+  rechecked on both fixtures. This is an operator and real-data breakthrough,
+  not a new full ClickBench score or evidence for another CPU family.
+  Scratch evidence: `/tmp/query-type-coverage-20261029/symbol-bitmap/`.
+
+## 2026-10-30 — Fuse scalar filtering and reduction
+
+The scalar aggregate now consumes the existing SIMD predicate masks directly,
+using the existing aggregate updates promoted into registers. Query-owned filter
+bindings follow the atom's initialization/drain lifecycle. The selected-row
+kernel remains a deferred fallback; Parquet late materialization retains its
+selection/decode contract. No new aggregate state, scheduler or switch.
+
+500M rows, eight physical cores, balanced stock/before/after processes: filtered
+INT/LONG AVG falls **260–271 to 146–147 ms** (stock312–321 ms); arithmetic DOUBLE
+SUM+COUNT **229–230 to115 ms** (stock345–369 ms). A DOUBLE predicate with integer
+AVG improves115–122 to90–92 ms, and a dictionary SYMBOL predicate136 to105 ms.
+Unfiltered and all-rejected controls remain unchanged. The6.3%-selectivity AVG
+case costs about3–4% more (45–47 to47–48 ms); it retires4.49 versus4.10
+instructions/input. Keep this small measured tradeoff explicit rather than
+adding an unproven selectivity policy.
+
+The primary query's controller traffic falls **16.18 to8.21 GB/query**, including
+**2.73 to0.04 GB writes**. Instructions stay42–43/input; cycles fall22.7 to12.6,
+oldest-load waits49% to22%. Native-symbol profiles replace the selection kernel
+(33% of baseline samples) and reduction (62%) with one fused kernel (~96%).
+This confirms avoided materialization, not simply fewer instructions. The8 GB
+source-stream floor is137 ms at the measured58.4 GB/s eight-core read ceiling.
+Fused4/8/16-core times are244/146/128 ms versus282/261/251 ms before: four cores
+remain limited by reduction work; sixteen reach~64 GB/s controller reads, near
+the67 GB/s calibration. This is evidence on one CPU family, not a universal ratio.
+
+**469 complete responses match an independent500M-row oracle**; all335 measured
+windows have zero process disk reads and major faults. Focused LLVM/AsmJit/C tests
+cover scalar state/merge/cancellation, empty/all-NULL inputs, overflow, DOUBLE and
+VARCHAR inputs, selective Parquet, tops/casts, changed SYMBOL bindings and reopen.
+First-plan compilation stays~91–104 ms before and~93–94 ms after; first execution
+falls398–417 to277–281 ms in the paired runs.
+
+The design applies [Neumann's materialization-boundary argument](https://www.vldb.org/pvldb/vol4/p539-neumann.pdf)
+while retaining SIMD selection, consistent with the workload-dependent tradeoffs
+in [Kersten et al.'s compilation/vectorization comparison](https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf).
+Evidence: `/tmp/query-type-coverage-20261029/scalar-fusion/`, including a validated
+hardware study, before/after native symbols, PMU data and the independent oracle.

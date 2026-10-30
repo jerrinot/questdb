@@ -46,7 +46,7 @@ final class ResolvedStandaloneFilter {
                                                         Backend backend, Path artifacts) throws IOException {
         var binding = ResolvedFilter.bind(types, function);
         if (binding == null) return null;
-        boolean descriptors = binding.varcharColumns().length != 0 || !binding.parameters().isEmpty();
+        boolean descriptors = binding.residual() != null || !binding.parameters().isEmpty();
         CompiledKernel rows = backend.compile(descriptors
                 ? ScanLowering.selection(binding.plan(), binding.residual(), false)
                 : ScanLowering.selection(binding.plan(), binding.sourceIndexes(), false), artifacts);
@@ -95,6 +95,11 @@ final class ResolvedStandaloneFilter {
         private Rows(CompiledKernel code, Backend backend, Path artifacts, ResolvedFilter.Binding binding) {
             this.code = code; this.backend = backend; this.artifacts = artifacts; this.binding = binding;
         }
+
+        @Override public void prepareExecution(io.questdb.std.MemoryTracker tracker) {
+            if (binding != null) binding.prepareExecution(tracker);
+        }
+        @Override public void clearExecution() { if (binding != null) binding.close(); }
 
         @Override public boolean prepareLimit(long limit) {
             frameLimit = Long.MAX_VALUE;
@@ -166,7 +171,7 @@ final class ResolvedStandaloneFilter {
         @Override public CharSequence getBackendName() { return backend.name(); }
         @Override public long getNativeInputRows() { return inputRows.sum(); }
         @Override public void close() {
-            try (code; var limit = limitCode; var bounded = boundedCode) {
+            try (binding; code; var limit = limitCode; var bounded = boundedCode) {
                 if (limitState != 0) limitState = Unsafe.free(limitState, Long.BYTES, MemoryTag.NATIVE_JIT);
             }
         }

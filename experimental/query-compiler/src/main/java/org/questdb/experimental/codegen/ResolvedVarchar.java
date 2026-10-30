@@ -126,16 +126,23 @@ final class ResolvedVarchar {
             if (value == null) throw new IllegalArgumentException("Unmaterialized string argument");
             return value;
         }
+        Expr isNull(Builder b, Expression argument) {
+            return materialized == null ? argument.isNull(b, this) : value(b, argument).isNull();
+        }
     }
 
     sealed interface Expression permits Column, Literal, Conditional {
         Pipeline.Utf8Value emit(Builder builder, Frame frame);
+        Expr isNull(Builder builder, Frame frame);
     }
 
     private record Column(int index) implements Expression {
         @Override
         public Pipeline.Utf8Value emit(Builder b, Frame frame) {
             return QuestVarchar.decode(b, at(frame.columns, index * 48L), frame.row);
+        }
+        @Override public Expr isNull(Builder b, Frame frame) {
+            return ne(binary(Op.AND, QuestVarchar.header(b, at(frame.columns, index * 48L), frame.row), i64(4)), i64(0));
         }
     }
 
@@ -145,11 +152,24 @@ final class ResolvedVarchar {
             // A literal descriptor is slot-owned; it must never escape as a stable source pointer.
             return new Pipeline.Utf8Value(at(frame.literals, offset), i64(size), bool(isNull), bool(isAscii), bool(false));
         }
+        @Override public Expr isNull(Builder b, Frame frame) { return bool(isNull); }
     }
 
     private record Branch(Pipeline.Predicate condition, Expression value) { }
 
     private record Conditional(List<Branch> branches, Expression otherwise) implements Expression {
+        @Override public Expr isNull(Builder b, Frame frame) {
+            Var isNull = b.let(bool(true)), matched = b.let(bool(false));
+            for (Branch branch : branches) {
+                b.when(eq(matched, bool(false)), next -> next.when(branch.condition.emit(frame.numeric), selected -> {
+                    selected.assign(isNull, branch.value.isNull(selected, frame));
+                    selected.assign(matched, bool(true));
+                }));
+            }
+            b.when(eq(matched, bool(false)), selected -> selected.assign(isNull, otherwise.isNull(selected, frame)));
+            return isNull;
+        }
+
         @Override
         public Pipeline.Utf8Value emit(Builder b, Frame frame) {
             Var address = b.let(frame.literals), size = b.let(i64(0)), isNull = b.let(bool(true));

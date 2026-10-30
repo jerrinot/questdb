@@ -251,7 +251,10 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
     @Override
     public void clear() {
         shardingCtx.clear();
-        if (compiledAggregates != null) compiledAggregates.clearGroupLimit();
+        if (compiledAggregates != null) {
+            compiledAggregates.clearGroupLimit();
+            compiledAggregates.clearExecution();
+        }
         Misc.clearObjList(ownerGroupByFunctions);
         if (perWorkerGroupByFunctions != null) {
             for (int i = 0, n = perWorkerGroupByFunctions.size(); i < n; i++) {
@@ -601,6 +604,7 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
                 allocator.reopen();
             }
         }
+        if (compiledAggregates != null) compiledAggregates.prepareExecution(memoryTracker);
     }
 
     public void resetLocalStats(int slotId) {

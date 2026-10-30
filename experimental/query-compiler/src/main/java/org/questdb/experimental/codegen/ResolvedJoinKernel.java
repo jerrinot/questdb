@@ -85,6 +85,8 @@ final class ResolvedJoinKernel {
         var updates = AggregateUpdates.bind(valueTypes, functions,
                 index -> groupLayout != null ? packed.getOffset(index) : layout.getAddress(index) - base, false, inputs);
         if (updates == null) return null;
+        // Joined rows currently carry numeric cells, not VARCHAR frame descriptors.
+        for (var update : updates.updates()) if (update instanceof AggregateUpdates.VarcharCount) return null;
         var target = new Target(mapProbe, groupKey);
         Builder b = new Builder();
         b.when(ne(load(at(COLUMNS, UNIQUE)), i64(0)), unique -> emitScan(unique, updates, predicate, target, probeColumnCount, true));

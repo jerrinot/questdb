@@ -435,7 +435,7 @@ public final class ResolvedAggregateKernel {
                                 activeProbe, updates, valueBytes, prefetchRows, null, false));
                     }
                     if (prepared.inputPartitionRowBytes > 0 && (activeProbe.variable()
-                            ? QuestPartitionInputs.numericBytes(updates) < valueBytes
+                            ? QuestPartitionInputs.valueBytes(updates) < valueBytes
                             : prepared.inputPartitionRowBytes < prepared.partitionRowBytes)) {
                         prepared.inputPartitionCode = prepared.defer(() -> QuestPartitionInputs.rows(activeProbe, updates));
                         prepared.inputPartitionMergeCode = prepared.defer(() -> QuestPartitionInputs.merge(activeProbe, updates, valueBytes, prefetchRows));
@@ -689,7 +689,7 @@ public final class ResolvedAggregateKernel {
                     if (probe.variable()) {
                         splitStateCode = defer(() -> QuestRepartition.variableRows(binding.valueBytes, false));
                         if (inputPartitionCode != null) splitInputCode = defer(() -> QuestRepartition.variableRows(
-                                QuestPartitionInputs.numericBytes(binding.updates), true));
+                                QuestPartitionInputs.valueBytes(binding.updates), true));
                     } else {
                         splitStateCode = defer(() -> QuestRepartition.rows(probe, partitionRowBytes));
                         if (inputPartitionCode != null) splitInputCode = defer(() -> QuestRepartition.rows(probe, inputPartitionRowBytes));

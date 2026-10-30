@@ -27,6 +27,7 @@ package org.questdb.experimental.codegen;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.PageFrameFilteredMemoryRecord;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.engine.CompiledScalarAggregate;
@@ -48,18 +49,23 @@ import static org.questdb.experimental.codegen.Ir.*;
 final class ResolvedScalarAggregate implements CompiledScalarAggregate {
     private final CompiledKernel code;
     private final CompiledKernel mergeCode;
+    private final CompiledKernel filteredCode;
+    private final ResolvedFilter.Binding filter;
     private final ResolvedVarchar.Binding inputs;
     private final String name;
 
-    private ResolvedScalarAggregate(CompiledKernel code, CompiledKernel mergeCode, ResolvedVarchar.Binding inputs, String name) {
+    private ResolvedScalarAggregate(CompiledKernel code, CompiledKernel mergeCode, CompiledKernel filteredCode,
+                                    ResolvedFilter.Binding filter, ResolvedVarchar.Binding inputs, String name) {
         this.code = code;
         this.mergeCode = mergeCode;
+        this.filteredCode = filteredCode;
+        this.filter = filter;
         this.inputs = inputs;
         this.name = name;
     }
 
     static ResolvedScalarAggregate compile(ColumnTypes inputs, ColumnTypes values, ObjList<GroupByFunction> functions,
-            MapValue layout, Backend backend, Path artifacts) throws IOException {
+            MapValue layout, Function predicate, Backend backend, Path artifacts) throws IOException {
         long base = layout.getAddress(0);
         var updates = AggregateUpdates.bind(inputs, values, functions, index -> layout.getAddress(index) - base, false);
         if (updates == null) return null;
@@ -67,13 +73,20 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
         for (var update : updates.updates()) {
             if (!(update instanceof AggregateUpdates.ScalarUpdate || update instanceof AggregateUpdates.IntegerExtremum
                     || update instanceof AggregateUpdates.AverageUpdate || update instanceof AggregateUpdates.DoubleSum
-                    || update instanceof AggregateUpdates.DoubleExtremum)) return null;
+                    || update instanceof AggregateUpdates.DoubleExtremum || update instanceof AggregateUpdates.VarcharCount)) return null;
         }
-        CompiledKernel code = backend.compile(scan(updates), artifacts);
+        var filter = predicate == null ? null : ResolvedFilter.bind(inputs, predicate);
+        CompiledKernel code = filter == null ? backend.compile(scan(updates), artifacts)
+                : CompiledKernel.defer(backend, () -> scan(updates), artifacts);
+        CompiledKernel merged = null, filtered = null;
         try {
-            return new ResolvedScalarAggregate(code, backend.compile(merge(updates), artifacts), updates.inputs(), backend.name());
+            merged = backend.compile(merge(updates), artifacts);
+            if (filter != null) filtered = backend.compile(filteredScan(updates, filter), artifacts);
+            return new ResolvedScalarAggregate(code, merged, filtered, filter, updates.inputs(), backend.name());
         } catch (Throwable failure) {
             try { code.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            if (merged != null) try { merged.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            if (filtered != null) try { filtered.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
         }
     }
@@ -115,13 +128,44 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
             Var end = chunk.let(new Select(binary(Op.LT, ROWS, add(index, i64(1024))), ROWS, add(index, i64(1024))));
             chunk.loop(binary(Op.LT, index, end), loop -> {
                 Var row = rowIds == null ? index : loop.let(load(new Offset(rowIds, binary(Op.MUL, index, i64(8)))));
-                var values = updates.loadFrameRow(loop, row, addresses);
-                Builder emitted = loop.fork();
-                updates.emit(emitted, values, STATE, nil());
-                loop.append(promote(emitted.block(), registers));
+                updateRow(loop, updates, addresses, registers, row);
                 loop.assign(index, add(index, i64(1)));
             });
         });
+    }
+
+    private static void updateRow(Builder loop, AggregateUpdates updates, List<Var> addresses,
+                                  Map<Load, Var> registers, Var row) {
+        var values = updates.loadFrameRow(loop, row, addresses);
+        var frame = updates.inputs().frame(values, row, at(COLUMNS, 8));
+        var strings = new LinkedHashMap<ResolvedVarchar.Expression, Pipeline.Utf8Value>();
+        for (var update : updates.updates()) if (update instanceof AggregateUpdates.VarcharCount count
+                && !strings.containsKey(count.argument())) {
+            // Frame reads stay outside state promotion. COUNT needs no payload or length.
+            Var isNull = loop.let(frame.isNull(loop, count.argument()));
+            strings.put(count.argument(), new Pipeline.Utf8Value(nil(), i64(0), isNull, bool(false), bool(true)));
+        }
+        Builder emitted = loop.fork();
+        updates.emit(emitted, new ResolvedVarchar.Frame(values, row, nil(), nil(), strings), STATE, nil());
+        loop.append(promote(emitted.block(), registers));
+    }
+
+    private static Program filteredScan(AggregateUpdates updates, ResolvedFilter.Binding filter) {
+        Builder b = new Builder();
+        var registers = new LinkedHashMap<Load, Var>();
+        for (var load : stateLoads(updates, STATE)) registers.put(load, b.let(load));
+        var addresses = new ArrayList<Var>();
+        for (int i = 0; i < updates.columns().size(); i++)
+            addresses.add(b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, (i + 1L) * 8))));
+        Var count = b.let(i64(0));
+        ScanLowering.filteredRange(filter.plan(), filter.residual(), b, at(COLUMNS, 8 + updates.inputs().bytes()), i64(0),
+                (selected, row) -> {
+                    updateRow(selected, updates, addresses, registers, selected.let(row));
+                    selected.assign(count, add(count, i64(1)));
+                });
+        for (var entry : registers.entrySet()) b.store(entry.getKey().width(), entry.getKey().address(), entry.getValue());
+        b.exit(count);
+        return new Program(b.block());
     }
 
     // Reuse the existing update definitions. Only their known state loads/stores become registers;
@@ -175,15 +219,41 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
         long status = mergeCode.run(source.getAddress(0), destination.isNew() ? 0 : 1, destination.getAddress(0));
         if (status != 0) throw new IllegalStateException("Scalar merge failed: " + status);
     }
-    @Override public void close() { try (code; mergeCode) { } }
+    @Override public void prepareExecution(io.questdb.std.MemoryTracker tracker) {
+        if (filter != null) filter.prepareExecution(tracker);
+    }
+    @Override public void clearExecution() { if (filter != null) filter.close(); }
+    @Override public void close() { try (filter; code; mergeCode; filteredCode) { } }
 
     private final class Slot implements Updater {
-        private final long bytes = 8 + inputs.bytes();
+        private final long filterOffset = 8 + inputs.bytes();
+        private final long bytes = filterOffset + (filter == null ? 0 : filter.bytes());
         private final KernelMemory memory = KernelMemory.reusable((Runnable) null);
         private long addresses = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
         private long nativeRows;
 
         @Override public long getNativeRows() { return nativeRows; }
+        @Override public long filterAndUpdate(PageFrameMemoryRecord record, long rows,
+                                              MapValue value, SqlExecutionCircuitBreaker circuitBreaker) {
+            if (filteredCode == null) return -1;
+            if (addresses == 0) throw new IllegalStateException("Scalar aggregate slot is closed");
+            circuitBreaker.statefulThrowExceptionIfTripped();
+            if (rows == 0) return 0;
+            if (record instanceof PageFrameFilteredMemoryRecord || !inputs.prepare(record, addresses + 8)
+                    || !filter.prepare(record, addresses + filterOffset)) return -1;
+            memory.enter(circuitBreaker);
+            try {
+                long selected = filteredCode.run(addresses, rows, value.getAddress(0));
+                memory.throwIfFailed();
+                if (selected < 0 || selected > rows) throw new IllegalStateException("Invalid filtered reduction count: " + selected);
+                if (selected > 0) value.setNew(false);
+                nativeRows += selected;
+                return selected;
+            } finally {
+                memory.close();
+            }
+        }
+
         @Override public boolean update(PageFrameMemoryRecord record, long rows, long rowIdsAddress,
                                         MapValue value, SqlExecutionCircuitBreaker circuitBreaker) {
             if (addresses == 0) throw new IllegalStateException("Scalar aggregate slot is closed");

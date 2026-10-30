@@ -210,8 +210,11 @@ final class ResolvedTopK implements CompiledTopK {
     long sortedRows() { return sortedRows.sum(); }
     @Override public CharSequence getName() { return name; }
     @Override public long getNativeRows() { return nativeRows.sum(); }
+    @Override public void prepareExecution(io.questdb.std.MemoryTracker tracker) {
+        if (filter != null) filter.prepareExecution(tracker);
+    }
+    @Override public void clearExecution() { if (filter != null) filter.close(); }
     @Override public void close() {
-        try { try { code.close(); } finally { if (filterCode != null) filterCode.close(); } }
-        finally { try { mergeCode.close(); } finally { try { compactCode.close(); } finally { sortCode.close(); } } }
+        try (filter; code; filterCode; mergeCode; compactCode; sortCode) { }
     }
 }

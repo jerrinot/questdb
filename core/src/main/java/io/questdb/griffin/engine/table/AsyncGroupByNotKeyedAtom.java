@@ -175,6 +175,7 @@ public class AsyncGroupByNotKeyedAtom implements StatefulAtom, PerWorkerLockOwne
 
     @Override
     public void clear() {
+        if (compiledAggregate != null) compiledAggregate.clearExecution();
         ownerFunctionUpdater.updateEmpty(ownerMapValue);
         ownerMapValue.setNew(true);
         for (int i = 0, n = perWorkerMapValues.size(); i < n; i++) {
@@ -244,7 +245,7 @@ public class AsyncGroupByNotKeyedAtom implements StatefulAtom, PerWorkerLockOwne
 
     // The factory/sequence owns this atom before compilation, including partial adoption.
     void compileAggregate(QueryCodeGenerator compiler, ColumnTypes inputs, ColumnTypes values) {
-        compiledAggregate = compiler.compileScalarAggregate(inputs, values, ownerGroupByFunctions, ownerMapValue);
+        compiledAggregate = compiler.compileScalarAggregate(inputs, values, ownerGroupByFunctions, ownerMapValue, filterCtx.getFilter(-1));
         if (compiledAggregate != null) {
             compiledUpdaters = new ObjList<>(perWorkerMapValues.size() + 1);
             for (int i = -1; i < perWorkerMapValues.size(); i++) {
@@ -393,6 +394,7 @@ public class AsyncGroupByNotKeyedAtom implements StatefulAtom, PerWorkerLockOwne
                 allocator.reopen();
             }
         }
+        if (compiledAggregate != null) compiledAggregate.prepareExecution(memoryTracker);
     }
 
     @Override
