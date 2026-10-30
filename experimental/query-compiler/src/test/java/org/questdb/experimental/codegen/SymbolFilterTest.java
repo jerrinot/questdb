@@ -246,7 +246,7 @@ public class SymbolFilterTest {
     @Test
     public void dictionaryPatternsComposeWithStringsAndReachTopKAndBoundedSelection() throws Exception {
         for (String predicate : List.of("s like '%a%'", "s not like '%a%'", "s ilike '%X%'", "s ~ '^(ž|a)'",
-                "s like '%' and k>2 and v is not null", "s like 'absent%'")) {
+                "s like '%' and k>2 and v is not null", "s like '%a%' and v like 'value-%'", "s like 'absent%'")) {
             String sql = "select count() from symbols where " + predicate;
             try (var factory = candidate(sql)) {
                 check(factory, sql);
@@ -311,7 +311,7 @@ public class SymbolFilterTest {
 
     @Test
     public void dictionaryFilterBudgetFailureAndEarlyCloseReleaseExecutionState() throws Exception {
-        String sql = "select id from symbols where s ~ '^(ž|a)'";
+        String sql = "select id from symbols where s ~ '^(ž|a)' or s ~ '(alpha|žluť)'";
         try (var factory = candidate(sql);
              var tracker = new io.questdb.std.MemoryTracker() {
                  @Override public long getQueryId() { return -1; }
@@ -321,7 +321,7 @@ public class SymbolFilterTest {
             var physical = find(factory, AsyncJitFilteredRecordCursorFactory.class);
             context.setMemoryTracker(tracker);
             try {
-                Unsafe.putLong(tracker.nativeAddress() + Unsafe.MEMORY_TRACKER_LIMIT_OFFSET, 1);
+                Unsafe.putLong(tracker.nativeAddress() + Unsafe.MEMORY_TRACKER_LIMIT_OFFSET, 8);
                 assertThrows(io.questdb.cairo.CairoException.class, () -> {
                     try (var cursor = physical.getCursor(context)) { cursor.hasNext(); }
                 });
@@ -338,6 +338,78 @@ public class SymbolFilterTest {
             check(factory, sql);
         }
         assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
+    public void residualBooleanTreesPreserveNullsAndShortCircuitComposition() throws Exception {
+        for (String predicate : List.of(
+                "s like '%a%' or s ilike '%X%'",
+                "s like '%a%' or k>2",
+                "s like '%a%' or id*1.25>700.5",
+                "s like '%a%' or s='X'",
+                "v like 'value-1%' or v like '%3'",
+                "s like '%a%' or v like 'value-1%'",
+                "not (s like '%a%' or (v like 'value-1%' and k>2))",
+                "(s like '%a%' or s ~ '^(ž|X)') and k>2",
+                "(s is null or s like '%a%') and (v='value-1' or k=2)",
+                "s like 'absent%' or v is null")) {
+            String sql = "select count() from symbols where " + predicate;
+            try (var factory = candidate(sql)) {
+                check(factory, sql);
+                var filtered = find(factory, AsyncJitFilteredRecordCursorFactory.class);
+                assertNotNull(predicate, filtered.getCompiledCountOnlyFilter());
+                assertEquals(predicate, backend.name(), filtered.getCompiledFilter().getBackendName());
+                assertEquals(predicate, 1003, filtered.getCompiledCountOnlyFilter().getNativeInputRows());
+            }
+        }
+        String unsupported = "select count() from symbols where s like '%a%' or length(v)>3";
+        try (var factory = candidate(unsupported)) {
+            check(factory, unsupported);
+            for (var input = factory; input != null; input = input.getBaseFactory()) {
+                if (input.getCompiledFilter() != null)
+                    assertNull("An unsupported branch must retain ordinary filtering", input.getCompiledFilter().getBackendName());
+            }
+        }
+        for (String sql : List.of(
+                "select k,count(),sum(id) from symbols where s like '%a%' or v like 'value-1%' group by k",
+                "select sum(id),count() from symbols where s like '%a%' or k>2",
+                "select id,v from symbols where s like '%a%' or k>2 order by v limit 7",
+                "select id from symbols where s like '%a%' or v like 'value-1%' order by ts limit 7")) {
+            try (var factory = candidate(sql)) { check(factory, sql); check(factory, sql); }
+        }
+    }
+
+    @Test
+    public void residualBooleanTreesRebindAndRetainColumnTopAndParquetFallback() throws Exception {
+        context.getBindVariableService().setStr(0, "%a%");
+        String sql = "select count() from symbols where s like $1 or s='X'";
+        try (var factory = candidate(sql)) {
+            int compiled = compilations.get();
+            check(factory, sql);
+            assertEquals(backend.name(), find(factory, AsyncJitFilteredRecordCursorFactory.class).getCompiledFilter().getBackendName());
+            context.getBindVariableService().setStr(0, (CharSequence) null);
+            check(factory, sql);
+            context.getBindVariableService().setStr(0, "%new%");
+            engine.execute("insert into symbols values (1004,1,'new-value','tail','2024-01-01T01:00:00')", context);
+            check(factory, sql);
+            engine.execute("truncate table symbols", context);
+            engine.execute("insert into symbols values (1,1,'new-value','one','2024-01-01'),"
+                    + "(2,2,'X','two','2024-01-01T00:00:01'),(3,3,null,'three','2024-01-01T00:00:02')", context);
+            check(factory, sql);
+            assertEquals(compiled, compilations.get());
+        }
+        engine.execute("alter table symbols add column late symbol", context);
+        engine.execute("insert into symbols values (4,4,'alpha','tail','2024-01-01T01:00:00','new')", context);
+        for (boolean parquet : new boolean[]{false,true}) {
+            if (parquet) engine.execute("alter table symbols convert partition to parquet list '2024-01-01'", context);
+            for (String predicate : List.of("late like '%e%' or k=2", "not (late like '%e%' or s like '%a%')")) {
+                String query = "select count() from symbols where " + predicate;
+                try (var factory = candidate(query)) {
+                    check(factory, query);
+                    assertEquals(backend.name(), find(factory, AsyncJitFilteredRecordCursorFactory.class).getCompiledFilter().getBackendName());
+                }
+            }
+        }
     }
 
     private RecordCursorFactory candidate(String sql) throws Exception {

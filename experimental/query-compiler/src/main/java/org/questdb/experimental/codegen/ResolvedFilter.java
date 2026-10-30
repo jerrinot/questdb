@@ -36,6 +36,7 @@ import io.questdb.griffin.engine.functions.columns.VarcharColumn;
 import io.questdb.griffin.engine.functions.bool.NotFunctionFactory;
 import io.questdb.griffin.engine.functions.eq.EqVarcharFunctionFactory;
 import io.questdb.griffin.engine.functions.regex.AbstractLikeVarcharFunctionFactory;
+import io.questdb.griffin.engine.functions.str.StartsWithVarcharFunctionFactory;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.MemoryTracker;
@@ -76,85 +77,188 @@ final class ResolvedFilter implements AutoCloseable {
         var inputs = new ResolvedInputs(types, parameters);
         var leaves = new java.util.ArrayList<Function>();
         if (!conjuncts(function, leaves, 0)) return null;
-        var strings = new java.util.ArrayList<Integer>();
-        var tests = new java.util.ArrayList<StringPredicate>();
-        var symbols = new java.util.ArrayList<SymbolMembership>();
-        var symbolTests = new java.util.ArrayList<SymbolPredicate>();
+        var residuals = new ResidualBinder(types, inputs, parameters);
+        var tests = new java.util.ArrayList<ScanLowering.RowPredicate>();
         Pipeline.Predicate numeric = new Pipeline.All();
         for (Function leaf : leaves) {
-            Function original = leaf;
-            int negations = 0;
-            while (leaf != null && leaf.getClass() == NotFunctionFactory.Func.class) {
-                if (++negations > 64) return null;
-                leaf = ((NotFunctionFactory.Func) leaf).getArg();
-            }
-            final boolean negate = (negations & 1) != 0;
-            if (leaf instanceof SymbolKeySetProvider source) {
-                Function argument = leaf instanceof UnaryFunction unary ? unary.getArg()
-                        : leaf instanceof BinaryFunction binary ? binary.getLeft() : null;
-                if (argument == null) return null;
-                var column = inputs.column(argument, ColumnType.SYMBOL);
-                if (column == null) return null;
-                symbols.add(new SymbolMembership(source));
-                symbolTests.add((builder, pointers, descriptor, row) -> {
-                    Expr base = new Load(MemoryType.ADDRESS, at(pointers, column.index() * 8L));
-                    Var key = builder.let(new Load(MemoryType.I32, new Offset(base, binary(Op.MUL, row, i64(4)))));
-                    Expr found = SymbolMembership.contains(builder, descriptor, key);
-                    return negate ? eq(found, bool(false)) : found;
-                });
-            } else if (leaf != null && leaf.getClass() == EqVarcharFunctionFactory.NullCheckFunc.class) {
-                var check = (EqVarcharFunctionFactory.NullCheckFunc) leaf;
-                int column = varcharColumn(types, check.getArg());
-                if (column < 0) return null;
-                strings.add(column);
-                boolean wantNull = !check.isNegated() ^ negate;
-                tests.add((builder, descriptor, row) -> eq(ne(binary(Op.AND,
-                        QuestVarchar.header(builder, descriptor, row), i64(4)), i64(0)), bool(wantNull)));
-            } else if (leaf != null && leaf.getClass() == AbstractLikeVarcharFunctionFactory.ConstContainsSwarVarcharFunction.class) {
-                var contains = (AbstractLikeVarcharFunctionFactory.ConstContainsSwarVarcharFunction) leaf;
-                int column = varcharColumn(types, contains.getArg());
-                if (column < 0) return null;
-                strings.add(column);
-                var literal = contains.getPattern();
-                byte[] pattern = new byte[literal.size()];
-                for (int i = 0; i < pattern.length; i++) pattern[i] = literal.byteAt(i);
-                tests.add((builder, descriptor, row) -> {
-                    var value = QuestVarchar.decode(builder, descriptor, row);
-                    Var found = builder.let(bool(false));
-                    builder.when(eq(value.isNull(), bool(false)), present ->
-                            present.assign(found, ByteSequences.contains(present, value.address(), value.size(), pattern)));
-                    // NOT negates the resolved Boolean, including false for a NULL input.
-                    return negate ? eq(found, bool(false)) : found;
-                });
-            } else {
-                var predicate = inputs.predicate(original);
-                if (predicate == null) return null;
+            var predicate = inputs.predicate(leaf);
+            if (predicate != null) {
                 numeric = numeric instanceof Pipeline.All ? predicate : new Pipeline.And(numeric, predicate);
+            } else {
+                var test = residuals.bind(leaf, 0);
+                if (test == null) return null;
+                tests.add(test);
             }
         }
-        // Admitted leaves are total and side-effect free. Reject numeric rows before decoding strings.
-        long stringOffset = (inputs.columns().size() + parameters.size()) * 8L;
-        long symbolOffset = stringOffset + strings.size() * 48L;
-        ScanLowering.RowPredicate residual = strings.isEmpty() && symbols.isEmpty() ? null : (builder, descriptors, row) -> {
-            Var accepted = builder.let(bool(true));
-            for (int i = 0; i < strings.size(); i++) {
-                long offset = stringOffset + i * 48L;
-                StringPredicate test = tests.get(i);
-                builder.when(accepted, check -> check.assign(accepted, test.emit(check, at(descriptors, offset), row)));
-            }
-            for (int i = 0; i < symbols.size(); i++) {
-                long offset = symbolOffset + i * SymbolMembership.BYTES;
-                SymbolPredicate test = symbolTests.get(i);
-                builder.when(accepted, check -> check.assign(accepted, test.emit(check, descriptors, at(descriptors, offset), row)));
-            }
-            return accepted;
-        };
+        // Only top-level numeric conjuncts may reject a row before the residual tree.
+        // Numeric leaves inside OR must stay in that branch.
+        ScanLowering.RowPredicate residual = tests.isEmpty() ? null : combine(tests, false);
         var parameterTypes = java.util.stream.IntStream.range(0, parameters.size())
                 .mapToObj(i -> new Pipeline.Parameter(i, ColumnType.SYMBOL)).toList();
         var plan = new ScanPlan(inputs.columns(), numeric, inputs.columns(),
                 new java.util.ArrayList<Pipeline.Scalar>(inputs.columns()), parameterTypes);
-        return new Binding(plan, inputs.indexes(), strings.stream().mapToInt(Integer::intValue).toArray(), residual,
-                List.copyOf(parameters), List.copyOf(symbols));
+        return new Binding(plan, inputs.indexes(), residuals.strings.stream().mapToInt(Integer::intValue).toArray(), residual,
+                List.copyOf(parameters), List.copyOf(residuals.symbols), residuals.literals.toByteArray(), new DirectLongList(0, MemoryTag.NATIVE_JIT, true));
+    }
+
+    private static ScanLowering.RowPredicate combine(List<ScanLowering.RowPredicate> tests, boolean disjunction) {
+        return (builder, descriptors, row) -> {
+            Var accepted = builder.let(bool(!disjunction));
+            for (var test : tests) builder.when(eq(accepted, bool(!disjunction)), check ->
+                    check.assign(accepted, test.emit(check, descriptors, row)));
+            return accepted;
+        };
+    }
+
+    /** Compiler-time descriptor indexes; offsets are final when the bound tree emits IR. */
+    private static final class ResidualBinder {
+        private final ColumnTypes types;
+        private final ResolvedInputs inputs;
+        private final List<IntSupplier> parameters;
+        private final java.util.ArrayList<Integer> strings = new java.util.ArrayList<>();
+        private final java.util.ArrayList<SymbolMembership> symbols = new java.util.ArrayList<>();
+        private final java.io.ByteArrayOutputStream literals = new java.io.ByteArrayOutputStream();
+
+        private ResidualBinder(ColumnTypes types, ResolvedInputs inputs, List<IntSupplier> parameters) {
+            this.types = types;
+            this.inputs = inputs;
+            this.parameters = parameters;
+        }
+
+        private long stringOffset() { return (inputs.columns().size() + parameters.size()) * 8L; }
+        private long symbolOffset() { return stringOffset() + strings.size() * 48L; }
+        private long literalOffset() { return symbolOffset() + symbols.size() * SymbolMembership.BYTES; }
+
+        private ScanLowering.RowPredicate bind(Function function, int depth) {
+            if (depth > 64) return null;
+            var numeric = inputs.predicate(function);
+            if (numeric != null) return (builder, descriptors, row) -> {
+                var columns = inputs.columns();
+                var addresses = new java.util.ArrayList<Expr>();
+                for (int i = 0; i < columns.size(); i++) addresses.add(new Load(MemoryType.ADDRESS, at(descriptors, i * 8L)));
+                var values = new java.util.ArrayList<Expr>();
+                for (int i = 0; i < parameters.size(); i++) values.add(new Load(MemoryType.I32, at(descriptors, (columns.size() + i) * 8L)));
+                return numeric.emit(ScanLowering.row(columns, addresses, row, true, values));
+            };
+            if (function.getClass() == NotFunctionFactory.Func.class) {
+                var child = bind(((NotFunctionFactory.Func) function).getArg(), depth + 1);
+                return child == null ? null : (builder, descriptors, row) -> eq(child.emit(builder, descriptors, row), bool(false));
+            }
+            var arguments = ResolvedInputs.andArguments(function);
+            boolean disjunction = function.getClass() == io.questdb.griffin.engine.functions.bool.OrFunctionFactory.MyBooleanFunction.class;
+            if (disjunction) {
+                var binary = (BinaryFunction) function;
+                arguments = new Function[]{binary.getLeft(), binary.getRight()};
+            }
+            if (arguments != null) {
+                var tests = new java.util.ArrayList<ScanLowering.RowPredicate>();
+                for (Function argument : arguments) {
+                    var child = bind(argument, depth + 1);
+                    if (child == null) return null;
+                    tests.add(child);
+                }
+                return combine(List.copyOf(tests), disjunction);
+            }
+            if (function instanceof SymbolKeySetProvider source) {
+                Function argument = function instanceof UnaryFunction unary ? unary.getArg()
+                        : function instanceof BinaryFunction binary ? binary.getLeft() : null;
+                if (argument == null) return null;
+                var column = inputs.column(argument, ColumnType.SYMBOL);
+                if (column == null) return null;
+                int index = symbols.size();
+                symbols.add(new SymbolMembership(source));
+                return (builder, descriptors, row) -> {
+                    Expr base = new Load(MemoryType.ADDRESS, at(descriptors, column.index() * 8L));
+                    Var key = builder.let(new Load(MemoryType.I32, new Offset(base, binary(Op.MUL, row, i64(4)))));
+                    return SymbolMembership.contains(builder, at(descriptors, symbolOffset() + index * SymbolMembership.BYTES), key);
+                };
+            }
+            StringPredicate test;
+            int column;
+            if (function.getClass() == EqVarcharFunctionFactory.NullCheckFunc.class) {
+                var check = (EqVarcharFunctionFactory.NullCheckFunc) function;
+                column = varcharColumn(types, check.getArg());
+                test = (builder, descriptor, row, literalBase) -> eq(ne(binary(Op.AND,
+                        QuestVarchar.header(builder, descriptor, row), i64(4)), i64(0)), bool(!check.isNegated()));
+            } else if (function.getClass() == AbstractLikeVarcharFunctionFactory.ConstContainsSwarVarcharFunction.class) {
+                var contains = (AbstractLikeVarcharFunctionFactory.ConstContainsSwarVarcharFunction) function;
+                column = varcharColumn(types, contains.getArg());
+                var patternValue = contains.getPattern();
+                byte[] pattern = new byte[patternValue.size()];
+                for (int i = 0; i < pattern.length; i++) pattern[i] = patternValue.byteAt(i);
+                test = (builder, descriptor, row, literalBase) -> {
+                    var value = QuestVarchar.decode(builder, descriptor, row);
+                    Var found = builder.let(bool(false));
+                    builder.when(eq(value.isNull(), bool(false)), present ->
+                            present.assign(found, ByteSequences.contains(present, value.address(), value.size(), pattern)));
+                    return found;
+                };
+            } else {
+                LiteralMatch literal = literalMatch(function, literals);
+                if (literal == null) return null;
+                column = varcharColumn(types, ((UnaryFunction) function).getArg());
+                test = literal::emit;
+            }
+            if (column < 0) return null;
+            int index = strings.size();
+            strings.add(column);
+            return (builder, descriptors, row) -> test.emit(builder, at(descriptors, stringOffset() + index * 48L), row,
+                    new Load(MemoryType.ADDRESS, at(descriptors, literalOffset())));
+        }
+    }
+
+    private enum LiteralKind { EQUAL, PREFIX, SUFFIX }
+
+    private static LiteralMatch literalMatch(Function function, java.io.ByteArrayOutputStream bytes) {
+        if (function == null) return null;
+        io.questdb.std.str.Utf8Sequence literal;
+        LiteralKind kind;
+        boolean negate = false;
+        if (function.getClass() == EqVarcharFunctionFactory.ConstCheckFunc.class) {
+            var equal = (EqVarcharFunctionFactory.ConstCheckFunc) function;
+            literal = equal.getConstant();
+            negate = equal.isNegated();
+            kind = LiteralKind.EQUAL;
+        } else if (function.getClass() == StartsWithVarcharFunctionFactory.ConstFunc.class
+                || function.getClass() == AbstractLikeVarcharFunctionFactory.ConstStartsWithVarcharFunction.class) {
+            literal = ((StartsWithVarcharFunctionFactory.ConstFunc) function).getPrefix();
+            kind = LiteralKind.PREFIX;
+        } else if (function.getClass() == AbstractLikeVarcharFunctionFactory.ConstEndsWithVarcharFunction.class) {
+            literal = ((AbstractLikeVarcharFunctionFactory.ConstEndsWithVarcharFunction) function).getPattern();
+            kind = LiteralKind.SUFFIX;
+        } else return null;
+        int offset = bytes.size(), size = literal == null ? -1 : literal.size();
+        long prefix = 0;
+        for (int i = 0; i < size; i++) {
+            byte value = literal.byteAt(i);
+            bytes.write(value);
+            if (i < 6) prefix |= (value & 255L) << (i * 8);
+        }
+        return new LiteralMatch(kind, offset, size, prefix, negate);
+    }
+
+    private record LiteralMatch(LiteralKind kind, int offset, int size, long prefix, boolean negate) {
+        Expr emit(Builder b, Expr descriptor, Expr row, Expr literals) {
+            Var found = b.let(bool(false));
+            if (size >= 0) {
+                var value = QuestVarchar.decode(b, descriptor, row);
+                Expr length = kind == LiteralKind.EQUAL ? eq(value.size(), i64(size)) : binary(Op.GE, value.size(), i64(size));
+                b.when(binary(Op.BOTH, eq(value.isNull(), bool(false)), length), valid -> {
+                    if (size == 0) valid.assign(found, bool(true));
+                    else if (kind == LiteralKind.SUFFIX) {
+                        Expr start = new Offset(value.address(), binary(Op.SUB, value.size(), i64(size)));
+                        valid.assign(found, ByteSequences.equal(valid, start, valid.let(at(literals, offset)), i64(size)));
+                    } else {
+                        long mask = (1L << (Math.min(6, size) * 8)) - 1;
+                        Var actual = QuestVarchar.sixPrefix(valid, descriptor, row, value);
+                        valid.assign(found, eq(binary(Op.AND, actual, i64(mask)), i64(prefix)));
+                        if (size > 6) valid.when(found, tail -> tail.assign(found,
+                                ByteSequences.equal(tail, at(value.address(), 6), tail.let(at(literals, offset + 6)), i64(size - 6))));
+                    }
+                });
+            }
+            return negate ? eq(found, bool(false)) : found;
+        }
     }
 
     private static int varcharColumn(ColumnTypes types, Function function) {
@@ -165,28 +269,39 @@ final class ResolvedFilter implements AutoCloseable {
 
     @FunctionalInterface
     private interface StringPredicate {
-        Expr emit(Builder builder, Expr descriptor, Expr row);
-    }
-
-    @FunctionalInterface
-    private interface SymbolPredicate {
-        Expr emit(Builder builder, Expr pointers, Expr descriptor, Expr row);
+        Expr emit(Builder builder, Expr descriptor, Expr row, Expr literalBase);
     }
 
     record Binding(ScanPlan plan, int[] sourceIndexes, int[] varcharColumns, ScanLowering.RowPredicate residual,
-                   List<IntSupplier> parameters, List<SymbolMembership> symbols) implements AutoCloseable {
+                   List<IntSupplier> parameters, List<SymbolMembership> symbols, byte[] literals, DirectLongList literalMemory) implements AutoCloseable {
         long stringOffset() { return (sourceIndexes.length + parameters.size()) * 8L; }
         long symbolOffset() { return stringOffset() + varcharColumns.length * 48L; }
-        long bytes() { return symbolOffset() + symbols.size() * SymbolMembership.BYTES; }
+        long literalOffset() { return symbolOffset() + symbols.size() * SymbolMembership.BYTES; }
+        long bytes() { return literalOffset() + (literals.length == 0 ? 0 : Long.BYTES); }
 
         void prepareExecution(MemoryTracker tracker) {
-            try { for (var symbol : symbols) symbol.prepare(tracker); }
-            catch (Throwable failure) { close(); throw failure; }
+            try {
+                for (var symbol : symbols) symbol.prepare(tracker);
+                literalMemory.close();
+                literalMemory.setMemoryTracker(tracker);
+                if (literals.length != 0) {
+                    literalMemory.ensureCapacity((literals.length + 7L) / 8);
+                    Unsafe.copyMemory(literals, Unsafe.BYTE_OFFSET, null, literalMemory.getAddress(), literals.length);
+                }
+            } catch (Throwable failure) { close(); throw failure; }
         }
 
-        @Override public void close() { for (var symbol : symbols) symbol.close(); }
+        @Override public void close() {
+            for (var symbol : symbols) symbol.close();
+            literalMemory.close();
+            literalMemory.setMemoryTracker(null);
+        }
 
         private void prepareParameters(long addresses) {
+            if (literals.length != 0) {
+                if (literalMemory.getAddress() == 0) throw new IllegalStateException("Filter literals are not prepared");
+                Unsafe.putLong(addresses + literalOffset(), literalMemory.getAddress());
+            }
             // Borrow resolved keys after Function.init; they are immutable while tasks run.
             for (int i = 0; i < parameters.size(); i++)
                 Unsafe.putInt(addresses + (sourceIndexes.length + i) * 8L, parameters.get(i).getAsInt());

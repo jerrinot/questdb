@@ -83,6 +83,18 @@ final class QuestVarchar {
                 ne(load(at(descriptor, 40)), i64(0)));
     }
 
+    /** Zero-padded six-byte prefix of a decoded non-NULL value, including Parquet slices. */
+    static Var sixPrefix(Builder b, Expr descriptor, Expr row, Pipeline.Utf8Value value) {
+        Var aux = b.let(new Offset(new Load(MemoryType.ADDRESS, descriptor), binary(Op.MUL, row, i64(16))));
+        Var split = b.let(binary(Op.BOTH, eq(load(at(descriptor, 32)), i64(0)),
+                eq(binary(Op.AND, new Load(MemoryType.I32, aux), i64(1)), i64(0))));
+        Var prefix = b.let(i64(0));
+        b.when(split, nativeFrame -> nativeFrame.assign(prefix,
+                binary(Op.AND, load(at(aux, 4)), i64(0x0000ffffffffffffL))));
+        b.when(eq(split, bool(false)), slice -> slice.assign(prefix, ByteSequences.sixPrefix(value.address(), value.size())));
+        return prefix;
+    }
+
     // Staged key: packed hash/size/flags, pointer with lifetime bit, full hash for sharding.
     static Var stage(Builder b, Expr row, Expr scratch) {
         var value = decode(b, new Load(MemoryType.ADDRESS, at(STATE, 16)), row);

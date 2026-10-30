@@ -89,6 +89,10 @@ public class StartsWithVarcharFunctionFactory implements FunctionFactory {
             return value;
         }
 
+        public Utf8Sequence getPrefix() {
+            return startsWith;
+        }
+
         @Override
         public boolean getBool(Record rec) {
             if (startsWith == null) {

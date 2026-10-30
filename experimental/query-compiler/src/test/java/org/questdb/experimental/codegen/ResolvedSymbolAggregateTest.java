@@ -275,8 +275,7 @@ public class ResolvedSymbolAggregateTest {
 
     private void assertMatches(String sql, RecordCursorFactory candidate) throws Exception {
         context.setQueryCodeGenerator(null);
-        // Scalar SQL is an independent oracle: vector MAX(SHORT) mishandles an
-        // existing group whose initial LONG_NULL narrows to SHORT zero.
+        // Scalar SQL remains independent of the generated array and native Rosti updates.
         try (var stock = Demo.compileSql(engine, context, sql, false)) {
             assertEquals(Demo.readSql(stock, context, 1), Demo.readSql(candidate, context, 1));
         } finally { context.setQueryCodeGenerator(compiler); }

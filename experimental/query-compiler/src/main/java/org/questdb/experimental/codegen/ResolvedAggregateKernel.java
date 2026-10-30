@@ -434,9 +434,9 @@ public final class ResolvedAggregateKernel {
                         prepared.stagedPartitionMergeCode = prepared.defer(() -> QuestPartitions.mergeStaged(
                                 activeProbe, updates, valueBytes, prefetchRows, null, false));
                     }
-                    if (prepared.inputPartitionRowBytes > 0 && (activeProbe.variable()
+                    if (!updates.updates().isEmpty() && prepared.inputPartitionRowBytes > 0 && (activeProbe.variable()
                             ? QuestPartitionInputs.valueBytes(updates) < valueBytes
-                            : prepared.inputPartitionRowBytes < prepared.partitionRowBytes)) {
+                            : prepared.inputPartitionRowBytes <= prepared.partitionRowBytes)) {
                         prepared.inputPartitionCode = prepared.defer(() -> QuestPartitionInputs.rows(activeProbe, updates));
                         prepared.inputPartitionMergeCode = prepared.defer(() -> QuestPartitionInputs.merge(activeProbe, updates, valueBytes, prefetchRows));
                     }

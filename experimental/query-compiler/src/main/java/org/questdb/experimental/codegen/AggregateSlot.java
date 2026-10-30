@@ -90,6 +90,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private long newGroups;
     private long partitionRows;
     private long inputPartitionRows;
+    private long inputPartitionRemaining;
+    private long inputPartitionWindow;
     private long localRows;
     private long topKRows;
     private long topKMergeRows;
@@ -191,6 +193,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         rankScratchCapacity = 0;
         partitioned = false;
         localRows = 0;
+        inputPartitionRemaining = 0;
+        inputPartitionWindow = 4L * prepared.localCapacity;
         parallelMerge = false;
         mergePreparationStage = 0;
         finalizeDeferred = false;
@@ -857,8 +861,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         prepareMap(map, shards, batchSize);
         long groupsBefore = PROFILE ? groupCount(map, shards) + partitionRows : 0;
         long accepted = 0;
-        // Compact mode lasts for the frame, not just one selection chunk.
-        boolean compact = false;
+        inputPartitionRemaining = 0;
+        inputPartitionWindow = 4L * prepared.localCapacity;
         memory.enter(circuitBreaker);
         try {
             for (long begin = 0; begin < rowCount;) {
@@ -866,8 +870,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 long selected = filter.filterRange(begin, end, rows, circuitBreaker);
                 if (selected > 0) {
                     Unsafe.putLong(state + 8, rows.getAddress());
-                    if (compact) partitionInputs(0, selected, map);
-                    else compact = runMutable(prepared.mapCode, addresses, selected, map, shards, true, 0, accepted > 0);
+                    runMutable(prepared.mapCode, addresses, selected, map, shards, true, 0, accepted > 0);
                     accepted += selected;
                 }
                 begin = end;
@@ -933,6 +936,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private void runMap(long rowCount, Map map, ObjList<Map> shards,
                         int batchSize, SqlExecutionCircuitBreaker circuitBreaker, CompiledKernel kernel) {
         prepareMap(map, shards, batchSize);
+        inputPartitionRemaining = 0;
+        inputPartitionWindow = 4L * prepared.localCapacity;
         long groupsBefore = PROFILE ? groupCount(map, shards) + partitionRows : 0;
         memory.enter(circuitBreaker);
         try {
@@ -1113,8 +1118,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         runMutable(kernel, input, rows, map, shards, update, begin, false);
     }
 
-    /** Return whether the remainder of this frame should use compact input records. */
-    private boolean runMutable(CompiledKernel kernel, long input, long rows, Map map, ObjList<Map> shards,
+    private void runMutable(CompiledKernel kernel, long input, long rows, Map map, ObjList<Map> shards,
                                boolean update, long begin, boolean frameHasRows) {
         // Preserve the scalar merge while its used heap and offset table fit in L2.
         if (!update && kernel == prepared.partitionMergeCode && prepared.stagedPartitionMergeCode != null
@@ -1124,8 +1128,9 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                     - Unsafe.getLong(descriptor + NativeMapView.ENTRIES)
                     + (Unsafe.getLong(descriptor + NativeMapView.MASK) + 1) * Long.BYTES;
             if (bytes >= CacheSizing.L2_DATA_BYTES) {
-                return runMutableLoop(kernel, prepared.stagedPartitionMergeCode,
+                runMutableLoop(kernel, prepared.stagedPartitionMergeCode,
                         input, rows, map, shards, update, begin, frameHasRows);
+                return;
             }
         }
         // A large allocated state makes latency hiding plausible, but does not prove it:
@@ -1145,25 +1150,32 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 // complete invocation, including growth, rather than train on partial retries.
                 choice.runBatch(rows - begin, selected ->
                         runMutableLoop(kernel, selected, input, rows, map, shards, update, begin, frameHasRows));
-                return false;
+                return;
             }
         }
-        return runMutableLoop(kernel, kernel, input, rows, map, shards, update, begin, frameHasRows);
+        runMutableLoop(kernel, kernel, input, rows, map, shards, update, begin, frameHasRows);
     }
 
-    private boolean runMutableLoop(CompiledKernel kernel, Kernel execution, long input, long rows, Map map, ObjList<Map> shards,
+    private void runMutableLoop(CompiledKernel kernel, Kernel execution, long input, long rows, Map map, ObjList<Map> shards,
                                boolean update, long begin, boolean frameHasRows) {
         CompiledKernel keyFilter = !update ? null : kernel == prepared.mapCode ? prepared.keyFilterCode
                 : kernel == prepared.fusedFilterCode ? prepared.filteredKeyFilterCode : null;
         if (keyFilterAddress != 0 && keyFilter != null) {
             runKeyFilter(keyFilter, begin, rows, kernel == prepared.fusedFilterCode);
-            return false;
+            return;
         }
         long state = stateAddress;
         long position = begin;
         if (prepared.probe.varchar()) Unsafe.putLong(state + 80, -1);
         if (prepared.probe.variable()) Unsafe.putLong(state + 96, 0);
         while (position < rows) {
+            if (inputPartitionRemaining > 0 && update && kernel == prepared.mapCode) {
+                long end = position + Math.min(rows - position, inputPartitionRemaining);
+                partitionInputs(position, end, map);
+                inputPartitionRemaining -= end - position;
+                position = end;
+                if (position == rows) return;
+            }
             Unsafe.putLong(state, position);
             long status = execution.run(input, rows, state);
             if (PROFILE && update) mapCalls++;
@@ -1181,29 +1193,36 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 if (kernel == prepared.mapCode) localRows += accepted;
             }
             position = end;
-            if (status == 0) return false;
+            if (status == 0) return;
             if (status == QuestPartitions.NEED_FLUSH) {
                 map.publishNativeMutationView(view(0));
-                // The full-map window supplies actual combining effectiveness. A
-                // misleading frame prefix cannot suppress later reassessment.
-                // Return to local aggregation on the next frame to detect reuse.
+                // A full map supplies actual combining effectiveness. Revisit local
+                // aggregation within this frame: a distinct prefix can precede hot keys.
                 boolean compact = inputPartitions != 0 && kernel == prepared.mapCode && update
                         && (position > begin || frameHasRows) && localRows >= map.size()
                         // With variable keys, zero combining proves that smaller input payloads
                         // save bytes without estimating a skewed distribution of key lengths.
                         && (prepared.probe.variable() ? localRows == map.size()
-                        : map.size() * prepared.partitionRowBytes > localRows * prepared.inputPartitionRowBytes);
+                        : map.size() * prepared.partitionRowBytes > localRows * prepared.inputPartitionRowBytes
+                        // Equal-width input avoids a second aggregation pass at at most
+                        // five percent extra partition bytes in the observed window.
+                        || prepared.inputPartitionRowBytes == prepared.partitionRowBytes
+                        && localRows - map.size() <= map.size() / 20);
                 flush(map);
                 writeViews(map, null);
                 if (compact) {
-                    partitionInputs(position, rows, map);
-                    return true;
+                    // Start cautiously after each frame/reuse change. Repeated complete
+                    // windows with poor combining amortize lookup checks by backing off.
+                    inputPartitionRemaining = inputPartitionWindow;
+                    inputPartitionWindow *= 2;
+                    continue;
                 }
+                inputPartitionWindow = 4L * prepared.localCapacity;
                 if (keyFilter != null) {
                     // A complete window proved that the key set exceeds the local map.
                     // Remember emitted keys instead of probing and flushing that map again.
                     runKeyFilter(keyFilter, position, rows, kernel == prepared.fusedFilterCode);
-                    return false;
+                    return;
                 }
                 continue;
             }
@@ -1233,7 +1252,6 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 target.writeNativeMutationView(view(shard));
             }
         }
-        return false;
     }
 
     @Override

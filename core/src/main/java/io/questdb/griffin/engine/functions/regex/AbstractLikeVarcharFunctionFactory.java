@@ -274,7 +274,7 @@ public abstract class AbstractLikeVarcharFunctionFactory implements FunctionFact
         }
     }
 
-    private static class ConstEndsWithVarcharFunction extends BooleanFunction implements UnaryFunction {
+    public static class ConstEndsWithVarcharFunction extends BooleanFunction implements UnaryFunction {
         private final Utf8String pattern;
         private final Function value;
 
@@ -286,6 +286,10 @@ public abstract class AbstractLikeVarcharFunctionFactory implements FunctionFact
         @Override
         public Function getArg() {
             return value;
+        }
+
+        public Utf8Sequence getPattern() {
+            return pattern;
         }
 
         @Override
@@ -391,7 +395,7 @@ public abstract class AbstractLikeVarcharFunctionFactory implements FunctionFact
         }
     }
 
-    private static class ConstStartsWithVarcharFunction extends StartsWithVarcharFunctionFactory.ConstFunc {
+    public static class ConstStartsWithVarcharFunction extends StartsWithVarcharFunctionFactory.ConstFunc {
         ConstStartsWithVarcharFunction(Function value, CharSequence startsWith) {
             super(value, startsWith);
         }

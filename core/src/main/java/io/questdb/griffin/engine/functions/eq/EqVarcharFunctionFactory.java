@@ -86,7 +86,7 @@ public class EqVarcharFunctionFactory implements FunctionFactory {
         return new ConstCheckFunc(varFunc, constValue);
     }
 
-    static class ConstCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
+    public static class ConstCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
         private final Function arg;
         private final Utf8Sequence constant;
         private final long constantSixPrefix;
@@ -100,6 +100,10 @@ public class EqVarcharFunctionFactory implements FunctionFactory {
         @Override
         public Function getArg() {
             return arg;
+        }
+
+        public Utf8Sequence getConstant() {
+            return constant;
         }
 
         @Override

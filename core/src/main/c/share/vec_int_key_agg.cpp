@@ -347,7 +347,8 @@ static jboolean kIntMaxShort(to_int_fn to_int, jlong pRosti, jlong pKeys, jlong 
             *reinterpret_cast<jlong *>(pVal) = val;
         } else {
             const jlong old = *reinterpret_cast<jlong *>(pVal);
-            *reinterpret_cast<jlong *>(pVal) = MAX(val, (jshort) old);
+            // A key created by another aggregate still has the LONG_NULL initial state.
+            *reinterpret_cast<jlong *>(pVal) = MAX((jlong) val, old);
         }
     }
     return JNI_TRUE;

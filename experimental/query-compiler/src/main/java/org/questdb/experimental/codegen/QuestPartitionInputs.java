@@ -55,6 +55,9 @@ final class QuestPartitionInputs {
         // Variable records return a lower bound; actual size includes each encoded key's payload.
         if (probe.variable()) return 8L + probe.variableKey().minimumBytes() + valueBytes(updates);
         long bytes = probe.keyBytes() + numericBytes(updates);
+        // Numeric loads already support packed records, as do the partial-state pages.
+        // Padding an INT key plus DOUBLE input from 12 to 16 bytes prevents equal-width bypass.
+        if (stringArguments(updates).isEmpty()) return bytes;
         return ((bytes + 7) & ~7L) + valueBytes(updates) - numericBytes(updates);
     }
 

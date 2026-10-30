@@ -320,10 +320,10 @@ final class ScanLowering {
         return row(columns, addresses, index, guardTops, List.of());
     }
 
-    private static Row row(List<Column> columns, List<Var> addresses, Expr index, boolean guardTops, List<Expr> parameters) {
+    static Row row(List<Column> columns, List<? extends Expr> addresses, Expr index, boolean guardTops, List<Expr> parameters) {
         List<Value> values = new ArrayList<>();
         for (Column column : columns) {
-            Var base = addresses.get(column.index());
+            Expr base = addresses.get(column.index());
             Expr address = new Offset(base, binary(Op.MUL, index, i64(column.width().bytes)));
             Expr data = new Load(column.width(), address);
             if (guardTops) data = new Select(eq(base, nil()), column.nullLiteral(), data);

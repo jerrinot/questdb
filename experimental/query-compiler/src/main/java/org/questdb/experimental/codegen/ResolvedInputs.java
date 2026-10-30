@@ -175,7 +175,17 @@ final class ResolvedInputs {
     }
 
     Pipeline.Predicate predicate(Function function) {
-        return predicate(function, 0);
+        int columnCount = columns.size();
+        int parameterCount = parameters == null ? 0 : parameters.size();
+        var result = predicate(function, 0);
+        if (result == null) {
+            // A residual tree may retry supported children of a rejected numeric tree.
+            // Keep only bindings that belong to a successfully resolved predicate.
+            columns.subList(columnCount, columns.size()).clear();
+            indexes.subList(columnCount, indexes.size()).clear();
+            if (parameters != null) parameters.subList(parameterCount, parameters.size()).clear();
+        }
+        return result;
     }
 
     // Only total, side-effect-free leaves are admitted, so SIMD evaluation of both

@@ -1337,6 +1337,51 @@ public class ResolvedSqlAggregateTest {
     }
 
     @Test
+    public void equalWidthInputPartitionsReconsiderHotKeysAndReopen() throws Exception {
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(32771, 32771);
+            mapEntrySize = 64;
+            engine.execute("create table equal_inputs as (select "
+                    + "case when (x-1)%8192<256 then x%3001 else x%17 end k,"
+                    + "cast(case when x%89=0 then null else x%3001 end as int) i,"
+                    + "case when x%97=0 then null else (x%8191-4095)*0.25 end d "
+                    + "from long_sequence(65539))", context);
+            String sql = "select k,min(d) from equal_inputs group by k";
+            long before = compiler.inputPartitionRows.get();
+            assertMatches(sql, true);
+            long inputs = compiler.inputPartitionRows.get() - before;
+            assertTrue("Low-reuse windows should bypass local updates", inputs > 0);
+            assertTrue("A distinct prefix must not bypass the hot frame remainder: " + inputs,
+                    inputs < 2 * 65539 / 4);
+            for (String key : List.of("k+1", "k,k+1", "d")) {
+                assertMatches("select " + key + ",min(d) from equal_inputs where k>=0 group by " + key, true);
+            }
+            before = compiler.inputPartitionRows.get();
+            assertMatches("select i,min(d) from equal_inputs where k>=0 group by i", true);
+            assertTrue("Packed INT/DOUBLE input records should bypass local updates",
+                    compiler.inputPartitionRows.get() > before);
+            assertMatches("select k,min(d) from equal_inputs where k<0 group by k", true);
+            assertMatches("select k,min(d) from equal_inputs where k<17 group by k", true);
+
+            context.setQueryCodeGenerator(compiler);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                compiler.failInputPartition = true;
+                try { assertThrows(CairoException.class, () -> Demo.readSql(factory, context, 2)); }
+                finally { compiler.failInputPartition = false; }
+                var actual = Demo.readSql(factory, context, 2);
+                context.setQueryCodeGenerator(null);
+                try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                    assertEquals(Demo.readSql(baseline, context, 2), actual);
+                }
+            }
+            assertEquals(0, engine.getBusyReaderCount());
+        } finally {
+            System.clearProperty("query.codegen.localCapacity");
+        }
+    }
+
+    @Test
     public void variableInputPartitionsAdaptAndResumeAfterStagingGrowth() throws Exception {
         System.setProperty("query.codegen.localCapacity", "64");
         try {

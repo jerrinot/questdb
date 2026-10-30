@@ -5773,3 +5773,326 @@ control caused page reclaim and read I/O; its timings are excluded. Subsequent
 controls were repeated in isolated processes, with zero measured read I/O or major
 faults. The primary A/B windows are clean. No other CPU family has been measured.
 Evidence: `/tmp/query-type-coverage-20261029/map-scan/`.
+
+## 2026-10-30 — Resolved VARCHAR equality, prefix and suffix predicates
+
+Bind the exact ordinary literal-equality, VARCHAR starts_with/LIKE-prefix and
+LIKE-suffix implementations, including negation. The compiler borrows their
+resolved constants, preserves NULL/empty/Unicode semantics and reuses bounded
+byte comparison plus the stored six-byte prefix. Literal tails occupy one shared,
+query-tracked DirectLongList prepared once per execution and freed after drain.
+Long literals produce a bounded comparison loop, not one instruction sequence per
+byte. Runtime patterns, general regex/ILIKE and the STRING starts_with overload
+retain ordinary execution. No new switch, matching algorithm or per-row helper.
+
+Balanced stock/before/after processes,500M rows,eight physical cores:
+
+- Prefix COUNT **302–308 to242 ms** (stock298–308). Instructions/input fall
+  **154 to39**, cycles25.5 to21.0; reads stay**14.24 to14.26 GB**. Controller
+  throughput rises47 to58 GB/s, near the independently measured read ceiling.
+  Four-core execution improves574 to239 ms; sixteen-core execution stays210–211 ms.
+  This is the expected shift from substantial retiring work to a bandwidth floor.
+- Literal equality **303–307 to136–138 ms**; short Unicode prefix
+  **373–379 to135–137 ms**; a prefix longer than every input385–387 to135–137 ms.
+  Ordinary equality/short-prefix paths already avoid most payload reads: measured
+  traffic remains8.2–8.3 GB. Gains come from removing generic getter/comparison
+  work: equality129 to27 instructions/input, short-prefix160 to37.
+- Filtered integer AVG with a DOUBLE conjunct **487–488 to213 ms**. Existing
+  numeric-first filtering and fused reduction now apply: instructions226 to34,
+  cycles40.4 to18.4, reads**21.29 to12.24 GB**, writes1.01 to0.04 GB.
+- Prefix-filtered grouped COUNT/SUM538–539 to446–449 ms (stock878–887); suffix
+  COUNT275–279 to267 ms. Existing compiled substring COUNT stays239–241 ms.
+  The untyped STRING starts_with control has substantial C2 warmup variation;
+  it remains fallback, so none of its apparent change is attributed to this work.
+
+**679 complete responses match an independent500M-row oracle**, with zero
+measured process disk reads or major faults. Twelve focused LLVM/AsmJit/C cases
+pass:6/7-byte tails,empty/NULL/Unicode,negative predicates,~96KiB constants,
+column tops,Parquet,mixed SYMBOL/VARCHAR bindings,scalar/grouped/Top-K/limited
+consumers,memory-limit failure,cancellation,early close and reopen. The primary
+count's first-plan compilation rises41–42 to74–76 ms; first execution falls
+477–506 to344–348 ms. Native symbols attribute98% of final samples to the fused
+predicate/count kernel. Evidence: `/tmp/query-type-coverage-20261029/varchar-predicates/`.
+
+
+## 2026-10-30 — Avoid ineffective local aggregation
+
+Reuse existing input partitions for equal-width numeric state when a completed
+local map saves less than 5% of partition bytes. Numeric-only records retain their
+packed widths (INT + DOUBLE is 12 bytes). Start with short bypass windows, double
+only after another map confirms low reuse, and reset at frame/reuse boundaries.
+No new map, scheduler, allocator or configuration switch.
+
+On 500M rows and eight physical cores, balanced before/after runs show:
+
+| Case | Previous LLVM | Updated LLVM | Unchanged stock |
+|---|---:|---:|---:|
+| LONG key, DOUBLE MIN | 1,055–1,057 ms | 728–749 ms | 3,115–3,147 ms |
+| INT key, DOUBLE MIN | 977–1,006 ms | 576–601 ms | 3,224–3,251 ms |
+| Selective INT key | 512–513 ms | 335–338 ms | 1,708–1,727 ms |
+| Composite numeric key | 1,269 ms | 1,112–1,115 ms | 7,175–7,200 ms |
+| Alternating cardinality | 588–595 ms | 435–437 ms | 2,112–2,183 ms |
+
+For the first case, instructions/input fall **214 to 113**, cycles **84 to 54**,
+branch misses **0.93 to 0.22**, and discarded dispatched operations **39% to 21%**.
+Traffic rises **34.5 to 35.2 GB/query**: removing repeated map work explains the
+speedup. Native samples shift from 73% local insertion/flush to 54% raw partition
+writing and 30% input merge. First SQL compilation remains about 128–140 ms;
+first execution, including lazy kernels, improves 1.42 to 1.07–1.11 seconds.
+
+Four-core primary execution improves **1.93 to 1.13 seconds**; sixteen cores
+**647–650 to 599–602 ms**. Important limits: existing AVG loses roughly 3–4% on
+eight cores, and the hostile-prefix control loses 9–11% on sixteen cores as its
+traffic grows 8.8 to 9.6 GB. Skew/small-group controls and 5–50% duplicate controls
+stay close to baseline. This is not a universal gain at the bandwidth ceiling.
+
+Rejected: bypassing a whole frame made the hostile-prefix case 163 -> 392 ms;
+fixed short windows made AVG 754 -> 925 ms. Growing windows retain the uniform
+benefit and bring the eight-core hostile-prefix case back to 166–168 ms.
+**1,302 complete ordered responses match an independent oracle**. Five trial/A-B
+windows had small read/fault activity (largest 610KB in the rejected experiment);
+primary and final hardware-counter windows are clean. Thirty focused backend/lifecycle
+checks pass, covering exact-capacity reuse, NULL/zero keys, packed records, phase changes,
+staging growth, cancellation and reopen. Evidence:
+`/tmp/query-type-coverage-20261029/preaggregation/`.
+
+## 2026-10-30 — DOUBLE and static SYMBOL map consumers
+
+Extend the existing finalized-map consumer with typed DOUBLE loads and exact static
+MapSymbolColumn readers. Its map index differs from its dictionary cursor index;
+ordinary functions retain dictionary ownership. AVG source states are finalized
+before consumption. Raw DOUBLE grouping bits remain intact. No new worker, map,
+allocator or switch; outer AVG and variable source keys still decline this binding.
+
+On 500M rows and 8.4M inner groups, the SYMBOL/DOUBLE two-stage aggregation improves
+**1.41 to 1.20–1.25 seconds** on eight physical cores (unchanged stock **10.40s**).
+DOUBLE-key projection/count improves **1.04–1.08 to 0.86–0.91s**; SYMBOL count
+**0.97 to 0.85–0.86s**; finalized AVG feeding MIN **1.37 to 1.23s**. The existing
+integer consumer has warmup variation and no demonstrated gain; unsupported outer
+AVG stays about 1.33s. Four-core primary execution improves **2.22 to 2.06s**,
+sixteen-core **1.08 to 0.92s**. This closes a type boundary, not a new benchmark-wide claim.
+
+The baseline ends with approximately **236ms on one network worker**, with query
+workers idle. JFR attributes the outer loop to numeric getters, NULL checks and
+map probing. Instructions/input fall only **168 to 160**, cycles **96 to 93**,
+and controller traffic stays **46GB/query**. Parallelizing that boundary explains
+the larger elapsed gain. The predicted total tail below 50ms was too optimistic:
+64–83ms remains. Native samples attribute 77% of that remainder to generated input
+merge and about 1% to the new consumer; it is a different completion tail.
+First SQL compilation grows **60 to 96–102ms**, first execution falls **1.59 to 1.37–1.47s**.
+
+**574 complete ordered responses match an independent 500M-row oracle; 21 focused
+backend/lifecycle cases pass.** Initial DOUBLE baseline windows had substantial
+read I/O and are excluded; clean repeated baselines establish the smaller gain
+above. Final A/B, PMU and scaling windows have zero process reads/major faults;
+one monitored candidate window has 814us cgroup I/O pressure without query I/O.
+Tests cover dictionary growth/truncate, Parquet, NULL/nonfinite/raw-bit keys,
+finalized averages, projections, map growth, cancellation, failures and reopen.
+Evidence: `/tmp/query-type-coverage-20261029/map-types/`.
+
+## 2026-10-30 — Correct vector MAX(SHORT) initialization
+
+The type checks exposed a stock Rosti bug: a group created by another aggregate
+has LONG_NULL in its untouched MAX(SHORT) state. Narrowing that state to SHORT
+turns it into zero, producing a wrong maximum for negative input. Compare in LONG
+width instead. A focused native regression fails before the fix (-32768 expected,
+zero returned) and passes after rebuilding; all four Rosti tests pass. No performance
+claim and no change to the saved stock benchmark binary.
+
+## 2026-10-30 — Partition-write diagnostics: defer extra machinery
+
+After the preaggregation change, a fresh 500M-row primary profile has 2.11 L1 DTLB
+misses and 0.13 page walks/input. That does not establish a translation bottleneck.
+A matched C diagnostic reproduces the 256 streams, 64KiB linked pages, hash sketch
+and 16-byte numeric records. Four-row software buffers make the eight-core stage
+**401 to 594ms**; specializing the copy length does not rescue it. Compact page-count
+metadata halves L1 DTLB misses (**2.01 to 1.02/input**) but leaves eight-core execution
+at **399–403ms**. Traffic stays **24.4GB**, or about **61GB/s**, close to the measured
+mixed-traffic ceiling. Four cores gain only **479 to 444ms**. All 500M output records
+match byte-for-byte. These are isolated diagnostics, not full-engine wins; neither
+change enters production. A lower count is useful only if it moves the resource limit.
+
+Weighted IBS initially appeared to blame long L2 hits in merge. Disassembly shows
+those samples are on nonblocking PREFETCHW instructions: they are not demand-load
+stall measurements. Keep prefetch samples separate when interpreting latency.
+The next bandwidth experiment must remove traffic (for example, full-line streaming
+writes) and pay for alignment, partial lines and publication ordering explicitly.
+The [radix-partitioning study](https://www.vldb.org/pvldb/vol8/p934-schuhknecht.pdf)
+motivates those controls; its reported gains do not establish a gain here.
+Evidence: `/tmp/query-type-coverage-20261029/partition-writes/`.
+
+
+## 2026-10-30 — Mixed Boolean predicates retain generated execution
+
+OR containing SYMBOL pattern membership or VARCHAR predicates previously rejected
+an otherwise supported filter. Bind residual AND/OR/NOT recursively, preserving
+short-circuit control flow and existing dictionary/literal ownership. Top-level
+numeric conjuncts retain SIMD hoisting; numeric leaves inside OR stay in their
+branch. Unsupported children still decline the whole binding. No new runtime
+state or switch. Failed numeric-binding attempts discard their partial descriptors.
+
+On500M rows, eight-core SYMBOL pattern OR improves **667–669 to71–72ms**, mixed
+SYMBOL/numeric **541–548 to78–80ms**, VARCHAR prefix-or-suffix **605–609 to244–246ms**,
+mixed SYMBOL/VARCHAR **788–800 to171–173ms**, nested NOT **848–899 to203–205ms**,
+and filtered grouped SUM **1.06–1.07s to146–148ms**. Existing numeric OR and AND
+controls stay unchanged. Primary four-core execution improves **1.317s to132ms**,
+sixteen-core **385 to39ms**. JFR's1360 `IntList.scanSearch` leaf samples identify
+repeated dictionary searches; instructions/input fall **354 to33.5**, cycles
+**56.7 to5.9**. Retiring remains high (59% to55%); the gain removes work rather
+than establishing a new bandwidth limit. Controller traffic falls2.83 to2.07GB.
+Compilation grows44–48 to69–71ms; resident-data first execution, including compile,
+falls774 to158ms. The first broad baseline had cold input and is not that comparison.
+
+**497 complete responses match an independent500M-row oracle.** The oracle follows
+the resolved NULL-sensitive comparison after SQL pushes NOT through the tree;
+ordinary Boolean negation of `i>0` would incorrectly count NULL integers.42 focused
+backend cases pass; an additional three-case allocation-failure check verifies
+cleanup after the second membership allocation fails. Tests cover Unicode,
+DOUBLE/numeric branches, binds, dictionary growth/truncate, Parquet, column tops,
+scalar/grouped consumers, Top-K, bounded selection and unsupported-branch fallback.
+One baseline mixed query read28KB; all other measured windows have zero process
+reads/major faults. Sparse pressure deltas are below1ms and are retained in evidence.
+Evidence: `/tmp/query-type-coverage-20261029/filter-boolean/`.
+
+## 2026-10-30 — Streaming-write diagnostic reaches the predicted traffic reduction
+
+Full aligned cache-line streaming writes improve the isolated500M-row partition
+stage **401 to297ms** on eight cores while controller reads fall **16.29 to8.25GB**
+and writes stay **8.10GB**. Instructions rise33.73 to36.23/input; fewer instructions
+are not the mechanism. The identically aligned ordinary-buffered control takes528ms.
+Four cores improve480 to383ms, sixteen387 to256ms; all output rows match byte-for-byte.
+Production integration is deferred until alignment, partial-window ownership and
+store completion are explicit. The full-query gain is unmeasured; the stage saving
+suggests an initial ceiling around14% against the current730ms query. TODO records
+the existing code contracts and falsification requirements. Evidence:
+`/tmp/query-type-coverage-20261029/partition-writes/streaming-summary.json`.
+
+## 2026-10-30 — Fresh complete ClickBench attribution check
+
+The standard one-cache-drop/three-execution protocol, stock/LLVM then LLVM/stock,
+produces hot-query sums **22.47/8.97s** and **8.91/22.29s**.25 of43 queries are at
+least1.5x faster in both process orders. Plans/native counters show34 fully generated
+queries and2 partial. All774 responses across six suites pass validation, including
+independent selected-group checks for permitted ordering ties. This is99,997,497
+rows on eight physical9950X cores, with identical configuration and unchanged stock.
+
+Most of that suite gain predates this session: a fresh saved-LLVM/current-LLVM pair
+is **9.04 versus8.98s**. Type-focused gains do not imply a new ClickBench-wide gain;
+Q16/Q35 improve, while most existing shapes stay similar. The standalone standard
+renderer marks generated queries and embeds timings, plans and validation:
+`target/clickbench-types.html`. This snapshot is candidate `aa2ed3ef4c`, before the
+Boolean-composition extension. Evidence: `/tmp/query-clickbench-20261030/`.
+
+
+## 2026-10-30 — Reject standalone DOUBLE projection batching
+
+The existing projection boundary can represent DOUBLE inputs and outputs with raw
+IEEE bits while retaining ordinary SYMBOL/VARCHAR ownership. A focused experiment
+passed 21 backend/scheduler cases and all 357 complete responses from independent
+500M-row controls, including NULL, signed zero, infinities, rewind and A/B random
+access. Correctness alone was insufficient to retain it.
+
+The first version increased the serial tail's retired operations by 36% and query
+time by about 3%. Materializing numeric pass-through columns in the same batch and
+moving DOUBLE decoding into the projection removed most of that cost. However,
+LONG-key/DOUBLE-min ordering still changed 1.605 to 1.658s at four cores, 1.102 to
+1.098s at eight, and 876 to 889ms at sixteen. The SYMBOL pass-through control lost
+1–3%; the existing integer control improved 1–5%. Compilation stayed comparable.
+One baseline window read 28KB; other measured windows had no process reads or major
+faults.
+
+The corrected version still retired 25.7 versus 21.9 billion operations across
+five sampled serial tails. Those windows include completion work, so they are not
+exclusive projection counters. They nevertheless falsify the proposed dispatch-work
+reduction at this boundary: Java batch filling and record handling outweigh the few
+compiled arithmetic operations. No default admission, setting or extra runtime
+interface is retained. The scratch patch and counter evidence are in
+`/tmp/query-type-coverage-20261029/double-projection/`.
+
+Next experiment: evaluate typed expressions inside a generated map/order consumer,
+using existing map ownership and sort encodings, before introducing another
+materialization boundary. Standalone DOUBLE projection remains a coverage gap.
+
+
+## 2026-10-30 — Final retained build and complete protocol validation
+
+Candidate `9db3a19517` (later commits change documentation only) passes 102 focused
+aggregate, floating-IR, map-consumer, SYMBOL and VARCHAR cases in one final run.
+The restored integer projection adds six passing cursor-contract cases. The
+rejected DOUBLE projection extension is absent from the retained code.
+
+Final standard ClickBench pairs total **22.38s stock / 8.95s LLVM** and, in reverse
+order, **22.43s stock / 8.90s LLVM**. These are sums of each query's best hot run,
+not geometric-mean scores. **27/43 queries exceed 1.5x in both final orders;
+25/43 do so across all four stock/LLVM pairs tonight.** Plans and execution counters
+still establish 34 fully generated and two partial queries. All **1,290 responses**
+across ten suites pass complete-result validation, including independent checks
+for permitted ties. Stock binary, source data, configuration and CPU affinity are
+unchanged. Hot runs have no major faults or memory pressure; small aggregate reads
+of 0.6–1.0MB per final suite are retained in the evidence.
+
+The pre-session LLVM snapshot totals 9.04s. The whole ClickBench increment is small;
+most of the stock/LLVM gap predates this session. The large new gains concern the
+expanded type/operator workloads documented above. The refreshed standard renderer
+is `target/clickbench-types.html`, with generated-query badges and downloadable
+raw results. Evidence: `/tmp/query-clickbench-20261030/`.
+
+## 2026-10-30 — Fresh profile of the largest ordinary VARCHAR gap
+
+Q28 remains ordinary execution, around 2.05s on eight cores. Fixed-work counters
+show **3,071 instructions and 845 cycles per input row**, about five branch misses
+per row, and **23.6GB controller reads + 4.2GB writes per query**. The 20ms bandwidth
+samples have median 12.6, p95 19.7 and maximum 46.1GB/s, below the measured 63.4GB/s
+mixed-streaming ceiling. This case has execution/dependent-load work to remove;
+it is not currently limited by DRAM bandwidth. Oldest-load wait is 32%, which does
+not identify a cache level. Retiring is 37.5% in the repeated run; the initial
+retiring-counter run was 9% slower and is retained as an outlier, not pooled into
+an exact instruction decomposition.
+
+Of 3,179 measured query-thread JFR samples, 44% include the regex matcher; matcher
+or regex-wrapper stacks together account for 53%. Map stacks account for 29%,
+VARCHAR MIN for 11%, and code-point length for 4%; these inclusive categories can
+overlap. The source already returns borrowed captured byte ranges, so replacing
+an imagined substring allocation cannot explain the opportunity. Removing all
+regex work would suggest roughly a 2x ceiling if the rest stayed fixed; that is
+an Amdahl estimate from samples, not a measured counterfactual. All 56 profile
+responses match stock exactly; measured windows have zero process disk reads or
+major faults.
+Next work and primary-source references are in TODO. Evidence:
+`/tmp/query-type-coverage-20261029/final-varchar-profile/`.
+
+
+## 2026-10-30 — Low-core counterexample to unconditional streaming stores
+
+The same 500M-row partition diagnostic is **7% slower on one core**: ordinary
+stores take 1.375s, buffered streaming stores 1.472s. Instructions rise **33.73 to
+36.23 per input** (+7.4%) and cycles 15.54 to 16.43. Controller traffic still falls
+**25.05 to 17.80GB** in the separate UMC run. Lower traffic does not make this
+execution faster when the additional core work dominates. Two cores improve only
+776 to 745ms, compared with 401 to 297ms at eight cores. All rows match byte-for-byte;
+measured runs have zero process reads and minor/major faults.
+
+This falsifies unconditional streaming-store admission. The observed crossover at
+two cores is not a portable policy. Integration must retain ordinary stores and
+measure the complete competing paths, including buffer drains and fences, using
+existing adaptive machinery where its state contract permits. The IR alignment/
+completion and packed-record requirements in TODO still apply. Evidence:
+`/tmp/query-type-coverage-20261029/partition-writes/streaming-summary.json`.
+
+
+## 2026-10-30 — Backend-width counterfactual for streaming copies
+
+Within the same Clang build, expressing an aligned 64-byte non-temporal vector
+copy lets LLVM emit one ZMM store here. One-core streaming execution improves
+**1.484 to 1.426s**, with instructions **32.17 to 30.67/input**. At eight cores,
+**298 to 296ms** and **16.30 to 16.26GB** are effectively unchanged: copy width
+removes core work but not the bandwidth demand. Every 500M-row output matches.
+The strongest ordinary-store control remains GCC at **1.375s** on one core;
+Clang's ordinary loop is slower (1.705s), so it must not replace that control to
+claim a win. Native instruction counts alone would also mislead here.
+
+The isolated copy IR legalizes to SSE stores on baseline x86-64 and paired STNP
+stores on generic ARM64. This is compile-only portability evidence, not execution
+or performance validation on another CPU. Production still needs the explicit
+alignment/completion contract and a measured choice of ordinary versus streaming
+stores. No new runtime code or setting is retained from this diagnostic.

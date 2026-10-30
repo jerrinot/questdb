@@ -70,8 +70,12 @@ ordinary maps feed a generated final merge and numeric Top-K; the ordinary resul
 cursor retains ownership. Filters and limits between the two aggregations remain
 boundaries. This does not rewrite COUNT DISTINCT into a two-stage plan.
 
-Bounded aggregation retains partial states and can switch to compact input records
-when local combining does not reduce work. Existing workers merge partitions.
+Bounded aggregation retains partial states and can switch to packed input records
+when local combining does not reduce work. Equal-width records permit at most 5%
+extra bytes in the observed map window. Short initial bypass windows grow only
+when repeated map windows confirm low reuse; each frame and reuse change resets
+the policy. This limits misleading-prefix costs but cannot eliminate every phase
+regression. Existing workers, maps and allocators still merge the partitions.
 An eligible unordered positive LIMIT/OFFSET finalizes only enough complete
 partitions to satisfy demand, after scanning all input. It merges the first
 partition on the owner and uses its group count to size subsequent parallel
@@ -96,7 +100,9 @@ not promises that every aggregation uses the same strategy.
 Static SYMBOL predicates borrow IDs already resolved by the ordinary functions
 at cursor initialization. Typed parameters load once per frame; dictionary lookup
 stays outside generated row loops. Reopening refreshes values without compiling
-new code. Standalone selection/count, aggregate selection and VARCHAR Top-K share
+new code. Literal VARCHAR tails likewise share query-owned, memory-tracked bytes;
+long literals retain bounded generated comparison loops. Standalone selection/count,
+aggregate selection and VARCHAR Top-K share
 this binding. Large sets, dynamic symbol sources and equality against runtime
 expressions retain ordinary filtering. Parameterized aggregate filters currently
 produce selection vectors; the experimental map-fused ABI still accepts only
@@ -111,8 +117,11 @@ The binders and focused tests are authoritative. Current families include:
   static SYMBOL equality/inequality against literals and small IN/NOT IN sets
   (up to 16 values, including runtime constants), with AND/OR/NOT composition;
   static SYMBOL LIKE/ILIKE/regex through the existing dictionary match sets,
-  with generated range/bitmap/sparse-set membership under AND/NOT;
-  direct VARCHAR null and literal substring predicates, including their negation;
+  with generated range/bitmap/sparse-set membership;
+  direct VARCHAR null, literal equality, prefix/suffix and short literal substring
+  predicates. Supported numeric, SYMBOL and VARCHAR predicates compose under
+  AND/OR/NOT with generated short-circuit control flow. Prefix matching binds the VARCHAR
+  starts_with overload or resolved LIKE prefix; STRING overloads remain ordinary;
   searched CASE string values.
 - Direct and computed fixed-width keys, SYMBOL IDs, VARCHAR keys and composite keys
   using existing map encodings. DOUBLE grouping preserves raw IEEE bits, including
@@ -127,8 +136,16 @@ The binders and focused tests are authoritative. Current families include:
   metadata specializations retain priority. Worker-state copying/merging is generated.
   Supported filters feed SIMD masks directly into reduction; Parquet late
   materialization and unsupported inputs retain their selected-row fallback.
-- Numeric projection, final COUNT reduction, SHORT/INT/LONG/DOUBLE full sort and Top-K, and positive
-  LIMIT/OFFSET selection over supported generated results.
+- INT/LONG projection, final COUNT reduction, SHORT/INT/LONG/DOUBLE full sort and
+  Top-K, and positive LIMIT/OFFSET selection over supported generated results.
+  Standalone DOUBLE projection stays ordinary: the tested batch bridge adds
+  marshalling work and does not improve the complete query. DOUBLE expressions
+  inside admitted aggregate/filter/map-consumer kernels are generated.
+- Finalized fixed-key maps feed generated outer aggregation through exact numeric
+  readers and static SYMBOL IDs, including finalized DOUBLE AVG and typed projections.
+  Existing worker slots execute the consumer; ordinary functions retain symbol
+  dictionary ownership. Variable source keys, intervening filters/limits and outer
+  aggregates requiring finalization retain ordinary execution.
 - Ordered frame-prefix admission for forward filtered scans with finite nonnegative
   LIMIT advice. Native VARCHAR selection stops each frame after K matches; the
   existing ordered collector applies the remaining global budget.

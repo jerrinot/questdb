@@ -60,6 +60,10 @@ public class MapSymbolColumn extends SymbolFunction {
         return rec.getInt(mapColumnIndex);
     }
 
+    public int getMapColumnIndex() {
+        return mapColumnIndex;
+    }
+
     @Override
     public @Nullable StaticSymbolTable getStaticSymbolTable() {
         if (symbolTable instanceof StaticSymbolTable) {

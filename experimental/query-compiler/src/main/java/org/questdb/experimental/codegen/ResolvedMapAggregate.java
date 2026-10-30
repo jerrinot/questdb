@@ -37,6 +37,7 @@ import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.columns.ByteColumn;
 import io.questdb.griffin.engine.functions.columns.ColumnFunction;
+import io.questdb.griffin.engine.functions.columns.DoubleColumn;
 import io.questdb.griffin.engine.functions.columns.IntColumn;
 import io.questdb.griffin.engine.functions.columns.LongColumn;
 import io.questdb.griffin.engine.functions.columns.ShortColumn;
@@ -45,6 +46,7 @@ import io.questdb.griffin.engine.groupby.CompiledMapAggregate;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByAllocatorFactory;
 import io.questdb.griffin.engine.groupby.GroupByKernel;
+import io.questdb.griffin.engine.groupby.MapSymbolColumn;
 import io.questdb.griffin.engine.table.SelectedRecordCursorFactory;
 import io.questdb.griffin.engine.table.VirtualRecordCursorFactory;
 import io.questdb.std.DirectLongLongSortedList;
@@ -80,9 +82,6 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
         if (source.probe == null || !source.probe.mutable() || source.probe.variable() || source.probe.varchar()) return null;
         for (int i = 0; i < sourceSlots.size(); i++) {
             if (!(sourceSlots.getQuick(i) instanceof AggregateSlot slot) || slot.mapConsumer != null) return null;
-        }
-        for (int i = 0; i < keys.getColumnCount(); i++) {
-            if (keys.getColumnType(i) == ColumnType.SYMBOL) return null;
         }
         ColumnTypes inputs = projections.size() == 0 ? sourceInputs : projections.getQuick(0).getMetadata();
         QuestFixedKey key = QuestFixedKey.bind(inputs, keys, keyColumns, keyFunctions, layout);
@@ -254,24 +253,32 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
         MemoryType width = switch (type) {
             case ColumnType.BYTE -> MemoryType.I8;
             case ColumnType.SHORT -> MemoryType.I16;
-            case ColumnType.INT -> MemoryType.I32;
+            case ColumnType.INT, ColumnType.SYMBOL -> MemoryType.I32;
             case ColumnType.LONG -> MemoryType.I64;
+            case ColumnType.DOUBLE -> MemoryType.F64;
             default -> null;
         };
         if (width == null) return null;
         if (function instanceof GroupByFunction) {
             long offset = source.numericResultOffset(function);
-            return offset < 0 || (type != ColumnType.INT && type != ColumnType.LONG)
+            return offset < 0 || (type != ColumnType.INT && type != ColumnType.LONG && type != ColumnType.DOUBLE)
                     ? null : new Stored(width, source.probe.keyBytes() + offset, type);
         }
         Class<?> implementation = function.getClass();
-        if (implementation != ByteColumn.class && implementation != ShortColumn.class
-                && implementation != IntColumn.class && implementation != LongColumn.class) return null;
-        int key = ((ColumnFunction) function).getColumnIndex() - source.binding.valueColumnCount;
+        int column;
+        if (implementation == MapSymbolColumn.class && ((MapSymbolColumn) function).isSymbolTableStatic()) {
+            // The ordinary function retains its dictionary cursor index and ownership.
+            column = ((MapSymbolColumn) function).getMapColumnIndex();
+        } else if (implementation == ByteColumn.class || implementation == ShortColumn.class
+                || implementation == IntColumn.class || implementation == LongColumn.class || implementation == DoubleColumn.class) {
+            column = ((ColumnFunction) function).getColumnIndex();
+        } else return null;
+        int key = column - source.binding.valueColumnCount;
         if (key < 0) return null;
         QuestFixedKey fixed = source.probe.fixedKey();
         if (fixed == null) return key == 0 && width.bytes == source.probe.keyBytes() ? new Stored(width, 0, type) : null;
-        if (key >= fixed.widths().length || width != fixed.widths()[key]) return null;
+        MemoryType storedWidth = type == ColumnType.DOUBLE ? MemoryType.I64 : width;
+        if (key >= fixed.widths().length || storedWidth != fixed.widths()[key]) return null;
         long offset = 0;
         for (int i = 0; i < key; i++) offset += fixed.widths()[i].bytes;
         return new Stored(width, offset, type);

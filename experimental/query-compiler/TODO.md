@@ -1,8 +1,12 @@
 # Deferred aggregation performance work
 
-Active 2026-10-29: autonomous type expansion through 2026-10-30 05:57 UTC.
-Controlled profiling is authorized. Work one gap at a time, preserving ordinary
-function/state contracts and exact results before measuring 500M-row controls.
+Type expansion checkpoint, 2026-10-30: retained changes and final protocol results
+are committed; see README for current coverage and PROGRESS for measured gains,
+regressions and rejected experiments. Next coverage gap: shared VARCHAR-to-numeric
+expression binding, followed by capture-aware regex evaluation. Streaming partition
+writes remain an experiment pending ownership/completion and adaptive-selection work.
+Continue one gap at a time, preserving ordinary function/state contracts and exact
+results before measuring 500M-row controls.
 
 - [x] Static SYMBOL literal equality and bounded IN, including initialized runtime values.
 - [x] Static SYMBOL COUNT in keyed and unkeyed generated aggregates.
@@ -14,7 +18,13 @@ function/state contracts and exact results before measuring 500M-row controls.
 - [x] DOUBLE vector/SYMBOL-array COUNT/SUM/AVG/MIN/MAX contracts.
 - [x] DOUBLE binary arithmetic, integer widening and SQL comparisons/NULL predicates.
 - [x] DOUBLE raw-bit grouping keys, including computed/composite keys and column tops.
-  Generated DOUBLE projection remains a separate encoding gap.
+  Standalone DOUBLE projection remains a gap. Raw-bit batch encoding was correct
+  but added marshalling work and regressed 4/16-core ordering by 1–3%; the experiment
+  was rejected. Fuse typed expressions into existing map/order consumers next.
+- [x] Finalized-map consumers read DOUBLE values/keys and static SYMBOL IDs using
+  existing worker slots and dictionary owners. On 500M rows/8.4M inner groups,
+  the SYMBOL/DOUBLE two-stage case improves 1.41 to 1.20–1.25s at eight cores.
+  Outer AVG and variable source keys remain separate contracts.
 - [x] VARCHAR COUNT, including searched CASE, scalar consumers and compact input partitions.
 - [x] Mixed batch/scalar aggregates now try the existing generated reduction
   before ordinary batch/scalar phases. Fully batched plans retain their current path.
@@ -33,12 +43,19 @@ function/state contracts and exact results before measuring 500M-row controls.
 - [x] Numeric result ranking: INT/SHORT/DOUBLE full sort and Top-K, including
   finalized AVG, signed zero/NaN ordering and ordinary fallback. On 500M rows,
   selected K=64 cases gain 4–5%; aggregation still dominates.
-- [ ] Extend remaining VARCHAR expression coverage and grouped VARCHAR DISTINCT.
+- [x] Resolved VARCHAR literal equality, prefix and suffix predicates with shared
+  query-tracked constants and bounded comparison loops. Equality/short prefixes
+  reach the8.2GB header-scan floor on500M rows; mixed filtered AVG saves9GB reads.
+- [ ] Extend remaining VARCHAR expressions, runtime literal predicates, long
+  substring and grouped VARCHAR DISTINCT.
 - [x] Dictionary-domain SYMBOL predicates: reuse resolved LIKE/ILIKE/regex match sets,
   compile exact range/bitmap/sparse membership, and share immutable query-owned state.
   Official 1BRC filtered COUNT falls about 3.1 s to 78 ms; 16-core execution reaches
   the measured input-bandwidth floor. Sparse/skewed domains, 4/8/16 cores and
-  lifecycle failures are covered; other CPU families and general OR remain open.
+  lifecycle failures are covered; other CPU families remain unmeasured.
+- [x] Mixed SYMBOL/VARCHAR/numeric AND/OR/NOT reuse the existing residual/filter
+  lifecycle. The 500M-row SYMBOL OR control improves 669 to72ms at eight cores;
+  numeric OR and conjunction controls remain unchanged.
 - [x] Remove per-bucket occupancy branches from generated inline-map scans.
   Existing cursor order and zero-key placement are preserved;500M-row MIN/MAX
   aggregation improves14–18% at eight cores with branch misses1.57 to0.93/input.
@@ -222,10 +239,11 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
   windows regressed sparse conjunctions. Parquet, column tops, casts and unsupported
   predicates retain the existing path. First-request latency still loses to stock;
   the standard protocol measured 633 ms versus 127 ms. See PROGRESS.md for scope.
-- [ ] Bind VARCHAR code-point length and AvgInt's existing DOUBLE/LONG state, then
-  generated post-aggregate predicates and DOUBLE ordering. Q27/Q28 currently fall
-  back entirely. Length already has an ASCII metadata fast path; preserve the
-  non-ASCII code-point count. Profile expression work separately from grouping.
+- [ ] Bind VARCHAR code-point length and generated post-aggregate predicates.
+  Integer AVG state and DOUBLE ordering are now supported; Q27/Q28 still fall
+  back because their expression/consumer chain is incomplete. Length already has
+  an ASCII metadata fast path; preserve the non-ASCII code-point count. Profile
+  expression work separately from grouping.
 - [ ] Investigate general constant-regex lowering after the shared expression/state
   prerequisites. Q28 spends 53% of CPU samples in regex but stock already borrows
   captured bytes; do not build a query-specific URL parser or assume allocation is
@@ -367,14 +385,15 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
 
 ## 2026-10-29: vector MAX(SHORT) with all-negative groups
 
-- [ ] Fix `kIntMaxShort` in `core/src/main/c/share/vec_int_key_agg.cpp`:
+- [x] Fix `kIntMaxShort` in `core/src/main/c/share/vec_int_key_agg.cpp`:
   when another aggregate already created the group, the initial LONG_NULL
   accumulator is narrowed to SHORT zero before MAX. An all-negative group
   can therefore return zero. `kIntMinShort` already checks the sentinel.
   Reproduced with SYMBOL grouping and MIN/AVG/MAX over negative SHORT values;
-  scalar SQL and the generated array agree on the negative maximum. Keep this
-  separate from the symbol-array performance experiment and add a focused
-  native/vector regression when fixing it.
+  scalar SQL and the generated array agree on the negative maximum. The native
+  comparison now widens the input instead of narrowing the LONG accumulator.
+  A direct regression covers pre-existing/new groups, growth, NULL keys and
+  both SHORT extremes; all four Rosti tests pass with the rebuilt native library.
 
 ## 2026-10-29: unordered group admission
 
@@ -433,3 +452,64 @@ The predicate extension improves coverage. The measured gain for 16-value sets
 comes from avoiding the default Java fallback; enabling the existing stock JIT
 for those sets closes the timing gap. See PROGRESS for that diagnostic and the
 near-parity small-set cases.
+
+
+## 2026-10-30: streaming partition writes
+
+- [ ] Integrate full-line streaming writes only after defining their IR memory
+  contract and completing a full-query experiment. A matched 500M-row C stage
+  gains **401 to297ms** at eight cores: controller reads **16.29 to8.25GB**, writes
+  **8.09 to8.10GB**. Ordinary buffered stores take528ms. Four cores gain480 to383ms,
+  sixteen387 to256ms; every output byte matches. These are stage results.
+  Against the current730ms full query, the104ms stage saving suggests an upper
+  first estimate around14%, not26% for the whole pipeline.
+- One-core falsification: streaming stores regress 1.375 to 1.472s despite traffic
+  falling 25.05 to 17.80GB. Instructions rise 7.4%; two cores gain only 4%.
+  Retain ordinary stores and compare complete paths through existing adaptive
+  machinery, with safe buffer/fence transitions. Do not encode this host's core
+  crossover as an admission rule. Lower traffic alone is not acceptance evidence.
+- Let the backend lower aligned full-line copies to its supported vector width.
+  A same-Clang counterfactual removes 1.5 instructions/input and gains 4% on one
+  core; eight-core time/traffic stay unchanged. The best ordinary one-core loop
+  still wins. SSE and ARM64 copy-IR legalization is verified only by compilation;
+  neither store completion nor cross-architecture performance is established.
+- Reuse `QuestPartitions` and slot/query allocation ownership. Current pages have
+  a16-byte header and no64-byte alignment guarantee. Do not add a second allocator.
+  Make payload alignment, partial tails and store completion explicit; fence
+  before publication and before failures can return to query-memory cleanup.
+- Keep partial line buffers across adaptive `partitionInputs` windows. Draining
+  each short window destroys next-call alignment and adds tail traffic. Flush
+  before slot completion/merge; cover rewind, cancellation and budget failures.
+  Preserve packed12/24-byte rows; padding merely to qualify wastes bandwidth.
+- Require full-query counters/results, small/skewed-state controls, short frames,
+  partition splits,4/8/16-core scaling and another CPU family when available.
+  Detailed code-grounded design and diagnostics:
+  `/tmp/query-type-coverage-20261029/partition-writes/integration-design.md`.
+
+
+## 2026-10-30: next VARCHAR expression experiment
+
+- Q28's refreshed profile attributes 53% of sampled stacks to regex matching or
+  its wrapper, 29% to maps, and 11% to VARCHAR MIN (inclusive, overlapping groups).
+  Traffic is 27.8GB/query at about 13.5GB/s, with 20ms bursts below 47GB/s against
+  a 63.4GB/s ceiling. Prioritize fewer executed operations and dependent accesses.
+- Read `RegexpReplaceVarcharFunctionFactory.SingleGroupAsciiFunc`: its existing
+  result borrows source bytes and preserves unmatched input. Keep that ownership,
+  NULL, newline, capture-priority and UTF-8 behavior. No URL-specific parser.
+- Share frame-aware numeric/string expression binding before adding code-point
+  length. `AggregateUpdates` already receives `ResolvedVarchar.Frame`; reuse its
+  descriptors and ordinary AVG state instead of creating a length-only aggregator.
+  ASCII length can use metadata; non-ASCII length must count code points.
+- Compare a bounded, capture-aware regex compiler with a native JIT helper on the
+  same strings and full pipeline. Establish Java semantic compatibility before
+  admission; unsupported patterns retain the ordinary function. Measure compile
+  cost, helper-call cost, instructions, branch behavior and all grouped output.
+  Add 500M-row controls for failing/long prefixes, Unicode, empty captures,
+  repeated alternatives, NULL and skew before defaulting any new path.
+- [Hyperscan's paper](https://www.usenix.org/conference/nsdi19/presentation/wang-xiang)
+  motivates decomposing literals and automata and using SIMD, but its matching
+  interface does not supply the capture semantics required here. It is not a
+  drop-in replacement. [Cox's VM treatment](https://swtch.com/~rsc/regexp/regexp2.html)
+  explains ordered submatch tracking. [PCRE2 JIT](https://pcre.org/current/doc/html/pcre2jit.html)
+  supplies a native compiled control, including ARM64 and x86; Java compatibility
+  and per-worker scratch ownership remain obligations, not assumed equivalence.

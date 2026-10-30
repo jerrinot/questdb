@@ -39,6 +39,50 @@ import org.junit.Test;
 public class RostiTest extends AbstractCairoTest {
 
     @Test
+    public void testShortMaxForPreviouslyCreatedGroups() throws Exception {
+        assertMemoryLeak(() -> {
+            long input = Unsafe.malloc(384, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (boolean existing : new boolean[]{true, false}) {
+                    long map = Rosti.alloc(new ArrayColumnTypes().add(ColumnType.INT).add(ColumnType.LONG), 16);
+                    long initialBytes = Rosti.getAllocMemory(map);
+                    try {
+                        Unsafe.putInt(Rosti.getInitialValueSlot(map, 0), Numbers.INT_NULL);
+                        Unsafe.putLong(Rosti.getInitialValueSlot(map, 1), Numbers.LONG_NULL);
+                        for (int i = 0; i < 64; i++) {
+                            Unsafe.putInt(input + 4L * i, i == 0 ? Numbers.INT_NULL : i);
+                            Unsafe.putShort(input + 256 + 2L * i, (short) (Short.MIN_VALUE + i));
+                        }
+                        // Another aggregate, or a frame with a column top, can create the key first.
+                        if (existing) Assert.assertTrue(Rosti.keyedIntDistinct(map, input, 64));
+                        Assert.assertTrue(Rosti.keyedIntMaxShort(map, input, input + 256, 64, 1));
+                        for (int i = 0; i < 64; i++) {
+                            Assert.assertEquals(Short.MIN_VALUE + i,
+                                    Unsafe.getLong(valueAddress(map, i == 0 ? Numbers.INT_NULL : i)));
+                            Unsafe.putShort(input + 256 + 2L * i, (short) (-i - 1));
+                        }
+                        Assert.assertTrue(Rosti.keyedIntMaxShort(map, input, input + 256, 64, 1));
+                        for (int i = 0; i < 64; i++) {
+                            Assert.assertEquals(-i - 1, Unsafe.getLong(valueAddress(map, i == 0 ? Numbers.INT_NULL : i)));
+                        }
+                        Unsafe.putShort(input + 256, (short) 0);
+                        Unsafe.putShort(input + 258, Short.MAX_VALUE);
+                        Assert.assertTrue(Rosti.keyedIntMaxShort(map, input, input + 256, 2, 1));
+                        Assert.assertEquals(0, Unsafe.getLong(valueAddress(map, Numbers.INT_NULL)));
+                        Assert.assertEquals(Short.MAX_VALUE, Unsafe.getLong(valueAddress(map, 1)));
+                        Assert.assertTrue(Rosti.getCapacity(map) > 16);
+                    } finally {
+                        Rosti.updateMemoryUsage(map, initialBytes);
+                        Rosti.free(map);
+                    }
+                }
+            } finally {
+                Unsafe.free(input, 384, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testIntSumMergeKeepsLongAccumulator() throws Exception {
         assertMemoryLeak(() -> {
             long a = integerState(false, 16);
