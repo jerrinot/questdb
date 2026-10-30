@@ -5707,3 +5707,69 @@ while retaining SIMD selection, consistent with the workload-dependent tradeoffs
 in [Kersten et al.'s compilation/vectorization comparison](https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf).
 Evidence: `/tmp/query-type-coverage-20261029/scalar-fusion/`, including a validated
 hardware study, before/after native symbols, PMU data and the independent oracle.
+
+## 2026-10-30 — Numeric result ranking closes INT/DOUBLE coverage
+
+Existing generated full sort and Top-K now load SHORT/INT/LONG/DOUBLE state at
+the actual width. DOUBLE keys use the ordinary encoder's IEEE ordering; INT NULL
+widening matches the ordinary getter. AVG ranks its finalized DOUBLE slot, never
+partial sums. Existing small/large-K algorithms, partition selection, buffers and
+ownership remain in place. A borrowed numeric getter preserves the same order
+when ordinary map collection handles a declined native call. No new toggle.
+
+500M rows, eight physical cores, balanced stock/before/after processes: DOUBLE
+MIN with K=64 falls **1.302–1.305 to 1.234–1.236 s**; INT MAX with K=64
+**1.176–1.179 to 1.127–1.128 s**. AVG, full sort, ascending K=65 and offset
+controls are essentially unchanged; the existing LONG control costs about
+2–3% more (170–172 versus173–175 ms). Most of the advantage over stock predates
+this change: stock DOUBLE MIN takes3.16 s. This is useful coverage, not a new
+aggregation breakthrough.
+
+The primary query's cycles/input fall102.7 to98.9, branch misses1.665 to1.570;
+instructions increase224 to227 and controller traffic stays34.7 GB/query. Native
+symbols attribute95% of baseline samples to scan/local-map flush/partition merge,
+consistent with the small incremental gain. At26.7 GB/s, it is well below the
+measured63.4 GB/s mixed-traffic ceiling; discarded dispatched operations (~54%)
+and branch misses justify investigating control flow rather than assuming
+bandwidth saturation. The eight-core baseline scales2.45/1.30/0.75 s on4/8/16
+physical cores. First-plan compilation rises about93 to115 ms.
+
+**385 complete ordered responses match an independent500M-row oracle**. All275
+measured windows have zero process disk reads and major faults. Fifteen focused
+LLVM/AsmJit/C cases pass: unequal-count AVG groups, NaN payloads, signed zeros,
+infinities/subnormals, INT NULLs, K64/65, offsets/full sort, column tops, Parquet,
+truncate/reopen, ordinary fallback and cancellation. Evidence:
+`/tmp/query-type-coverage-20261029/numeric-rank/`.
+
+## 2026-10-30 — Remove unpredictable occupancy branches from map scans
+
+Generated Unordered4Map/Unordered8Map/UnorderedVarcharMap consumers now build an
+eight-slot occupancy mask and visit its set bits in existing bucket order. Actual
+map stride, zero-key placement, source immutability and cancellation remain intact.
+All three maps guarantee power-of-two capacities of at least16. OrderedMap retains
+its dense walk. This reuses existing IR operations; no new metadata, allocator or
+ISA-specific instruction requirement.
+
+On500M rows and eight physical cores, high-cardinality DOUBLE MIN aggregation plus
+Top-K improves **1.24–1.27 to1.07 s**; INT MAX over the same LONG keys
+**1.13–1.14 to0.93–0.94 s**. Primary4/8/16-core times improve
+**2.36/1.24/0.74 to1.95/1.07/0.66 s**. Skewed COUNT/SUM, AVG's existing compact-input
+path, small maps, wider state and VARCHAR-key controls are approximately unchanged.
+The narrowing-cast control still declines generated map execution and is unchanged.
+This removes a general scan cost; it does not solve repeated high-cardinality hashing.
+
+The primary query's **branch misses/input fall1.57 to0.93**, cycles98.9 to83.5 and
+instructions227 to214. Dispatched operations not retired fall52% to39%; controller
+traffic remains34.5–34.7 GB/query. Branch-miss samples attribute59% of the baseline
+misses to local-map flushing (ordinary sampling has skid). Generated assembly shows
+branchless scalar occupancy comparisons followed by set-bit iteration. Flush code
+grows from554 to1204 bytes because zero-key handling is emitted outside the loop;
+first-plan compilation rises about115 to125 ms. The counter movement supports
+reduced speculation waste, not a bandwidth-saving claim.
+
+**392 complete responses match independent primary-query oracles or unchanged
+control results;26 focused backend/lifecycle cases pass.** One wide variable-key
+control caused page reclaim and read I/O; its timings are excluded. Subsequent
+controls were repeated in isolated processes, with zero measured read I/O or major
+faults. The primary A/B windows are clean. No other CPU family has been measured.
+Evidence: `/tmp/query-type-coverage-20261029/map-scan/`.

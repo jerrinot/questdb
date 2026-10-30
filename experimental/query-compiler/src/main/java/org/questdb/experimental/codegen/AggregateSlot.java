@@ -631,7 +631,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     @Override
     public boolean sortLong(Map owner, ObjList<Map> shards, DirectLongList entries, DirectLongList scratch,
                      Function function, boolean ascending, long maxEntries, Runnable checkpoint) {
-        if (prepared.longSortCode == null) return false;
+        if (prepared.longSortCode == null || prepared.longSortType != function.getType()) return false;
         if (closed || prepared.closed) throw new IllegalStateException("Aggregate slot is closed");
         long offset = prepared.resultOffset(function);
         if (offset < 0) return false;
@@ -680,7 +680,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     @Override
     public boolean longTopK(Map map, DirectLongLongSortedList list, Function function, Runnable checkpoint) {
         if (closed || prepared.closed) throw new IllegalStateException("Aggregate slot is closed");
-        if (!canRunTopK(list)) return false;
+        if (!canRunTopK(list) || prepared.topKType != function.getType()) return false;
         long offset = prepared.resultOffset(function);
         if (offset < 0) return false;
         if (map.size() == 0) return true;
@@ -695,7 +695,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     @Override
     public boolean longTopK(ObjList<Map> maps, DirectLongLongSortedList list, Function function, Runnable checkpoint) {
         if (maps.size() > GroupByMapFragment.NUM_SHARDS || list.getCapacity() <= 64) return false;
-        if (!canRunTopK(list)) return false;
+        if (!canRunTopK(list) || prepared.topKType != function.getType()) return false;
         long offset = prepared.resultOffset(function);
         if (offset < 0) return false;
         long descriptors = stateAddress + prepared.probe.controlBytes();

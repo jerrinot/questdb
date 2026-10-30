@@ -246,7 +246,8 @@ public class AsyncGroupByRecordCursorFactory extends AbstractRecordCursorFactory
     @Override
     public boolean recordCursorSupportsLongTopK(int columnIndex) {
         final int columnType = getMetadata().getColumnType(columnIndex);
-        return columnType == ColumnType.LONG || ColumnType.isTimestamp(columnType);
+        return columnType == ColumnType.LONG || ColumnType.isTimestamp(columnType)
+                || recordCursorSupportsCompiledLongTopK(columnIndex);
     }
 
     @Override

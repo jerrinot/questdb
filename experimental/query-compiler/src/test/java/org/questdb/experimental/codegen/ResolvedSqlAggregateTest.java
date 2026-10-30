@@ -842,6 +842,55 @@ public class ResolvedSqlAggregateTest {
     }
 
     @Test
+    public void doubleTopKPreservesOrdinaryFallbackCancellationAndReopen() throws Exception {
+        String previous = System.getProperty("query.codegen.bounded");
+        System.setProperty("query.codegen.bounded", "false");
+        try { assertDoubleTopKFallback(); }
+        finally {
+            if (previous == null) System.clearProperty("query.codegen.bounded");
+            else System.setProperty("query.codegen.bounded", previous);
+        }
+    }
+
+    private void assertDoubleTopKFallback() throws Exception {
+        shardingThreshold = 2;
+        topKThreshold = 0;
+        engine.execute("create table double_ranked as (select cast(x%257 as long) k,"
+                + "case when x%257=0 then null else (x%257-128)*0.25 end v from long_sequence(10280))", context);
+        String sql = "select avg(v) value from double_ranked group by k order by value desc limit 64";
+        context.setQueryCodeGenerator(null);
+        List<Long> expected;
+        try (var factory = Demo.compileSql(engine, context, sql, true)) { expected = readOrderedDouble(factory); }
+        context.setQueryCodeGenerator(compiler);
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            long merged = compiler.topKMerges.get();
+            assertEquals(expected, readOrderedDouble(factory));
+            assertTrue("Finalized averages use worker-list merge", compiler.topKMerges.get() > merged);
+            compiler.declineTopK = true;
+            long fallback = compiler.topKFallbacks.get();
+            try { assertEquals(expected, readOrderedDouble(factory)); }
+            finally { compiler.declineTopK = false; }
+            assertTrue(compiler.topKFallbacks.get() > fallback);
+            compiler.failTopK = true;
+            try { assertThrows(CairoException.class, () -> readOrderedDouble(factory)); }
+            finally { compiler.failTopK = false; }
+            assertEquals(expected, readOrderedDouble(factory));
+        }
+        assertEquals(compiler.created.get(), compiler.closed.get());
+        assertEquals(compiler.slots.get(), compiler.closedSlots.get());
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    private List<Long> readOrderedDouble(RecordCursorFactory factory) throws Exception {
+        var result = new java.util.ArrayList<Long>();
+        try (var cursor = factory.getCursor(context)) {
+            var record = cursor.getRecord();
+            while (cursor.hasNext()) result.add(Double.doubleToLongBits(record.getDouble(0)));
+        }
+        return result;
+    }
+
+    @Test
     public void numericTopKUsesNativeCollectionAndWorkerMerge() throws Exception {
         // This test forces ordinary shard collection and worker-list merge. Bounded
         // aggregation deliberately bypasses the sharding threshold for small maps.

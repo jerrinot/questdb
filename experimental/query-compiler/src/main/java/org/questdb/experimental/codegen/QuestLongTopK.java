@@ -54,6 +54,10 @@ final class QuestLongTopK {
     static Program program(QuestMapProbe probe, int sortOrder) { return program(probe, sortOrder, -1); }
 
     static Program program(QuestMapProbe probe, int sortOrder, int capacityClass) {
+        return program(probe, sortOrder, capacityClass, io.questdb.cairo.ColumnType.LONG);
+    }
+
+    static Program program(QuestMapProbe probe, int sortOrder, int capacityClass, int type) {
         if (capacityClass < -1 || capacityClass > 1) throw new IllegalArgumentException("Invalid Top-K capacity class");
         if (sortOrder < -1 || sortOrder > 1) throw new IllegalArgumentException("Invalid Top-K order");
         Builder b = new Builder();
@@ -66,10 +70,10 @@ final class QuestLongTopK {
         }
         if (capacityClass != 0 && Boolean.parseBoolean(System.getProperty("query.codegen.largeTopK", "true"))) {
             if (capacityClass == 1) {
-                QuestLargeTopK.emit(b, probe, destination, size, capacity, sortOrder);
+                QuestLargeTopK.emit(b, probe, destination, size, capacity, sortOrder, type);
                 return new Program(b.block());
             }
-            b.when(binary(Op.LT, i64(64), capacity), large -> QuestLargeTopK.emit(large, probe, destination, size, capacity, sortOrder));
+            b.when(binary(Op.LT, i64(64), capacity), large -> QuestLargeTopK.emit(large, probe, destination, size, capacity, sortOrder, type));
         }
         for (int order = 0; order < 2; order++) {
             if (sortOrder != -1 && sortOrder != order) continue;
@@ -80,7 +84,7 @@ final class QuestLongTopK {
                     QuestMapScan.emit(map, probe, COLUMNS, (entryBuilder, entry) -> {
                         Expr value = probe.variable() ? new Offset(QuestVariableKey.value(entry), valueOffset)
                                 : new Offset(entry, valueOffset);
-                        insert(entryBuilder, destination, size, capacity, entry, entryBuilder.let(load(value)), ascending);
+                        insert(entryBuilder, destination, size, capacity, entry, QuestSortValue.load(entryBuilder, value, type), ascending);
                     });
                     map.exit(0);
                 });

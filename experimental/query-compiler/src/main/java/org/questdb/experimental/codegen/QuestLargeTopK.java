@@ -31,7 +31,7 @@ import static org.questdb.experimental.codegen.QuestLongTopK.*;
 final class QuestLargeTopK {
     private QuestLargeTopK() { }
 
-    static void emit(Builder b, QuestMapProbe probe, Var destination, Var size, Var capacity, int sortOrder) {
+    static void emit(Builder b, QuestMapProbe probe, Var destination, Var size, Var capacity, int sortOrder, int type) {
         // Scratch persists between maps and clears with the owning slot allocator.
         Var bufferCapacity = b.let(new Select(binary(Op.LT, capacity, i64(2048)), i64(4096), binary(Op.MUL, capacity, i64(2))));
         Var memory = b.let(new Load(MemoryType.ADDRESS, at(STATE, SCRATCH_OFFSET)));
@@ -77,7 +77,7 @@ final class QuestLargeTopK {
                         Expr view = new Offset(COLUMNS, binary(Op.MUL, mapIndex, i64(64)));
                         QuestMapScan.emit(map, probe, view, (entryBuilder, entry) -> {
                             Expr value = probe.variable() ? new Offset(QuestVariableKey.value(entry), valueOffset) : new Offset(entry, valueOffset);
-                            append.accept(entryBuilder, new Expr[]{entry, entryBuilder.let(load(value))});
+                            append.accept(entryBuilder, new Expr[]{entry, QuestSortValue.load(entryBuilder, value, type)});
                         });
                         map.assign(mapIndex, add(mapIndex, i64(1)));
                     });
@@ -86,7 +86,7 @@ final class QuestLargeTopK {
                     Var valueOffset = map.let(load(at(STATE, VALUE_OFFSET)));
                     QuestMapScan.emit(map, probe, COLUMNS, (entryBuilder, entry) -> {
                         Expr value = probe.variable() ? new Offset(QuestVariableKey.value(entry), valueOffset) : new Offset(entry, valueOffset);
-                        append.accept(entryBuilder, new Expr[]{entry, entryBuilder.let(load(value))});
+                        append.accept(entryBuilder, new Expr[]{entry, QuestSortValue.load(entryBuilder, value, type)});
                     });
                 });
                 sorted.when(eq(load(at(STATE, SOURCE_KIND_OFFSET)), i64(SOURCE_PAIRS)), list -> {

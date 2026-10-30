@@ -14,7 +14,7 @@ function/state contracts and exact results before measuring 500M-row controls.
 - [x] DOUBLE vector/SYMBOL-array COUNT/SUM/AVG/MIN/MAX contracts.
 - [x] DOUBLE binary arithmetic, integer widening and SQL comparisons/NULL predicates.
 - [x] DOUBLE raw-bit grouping keys, including computed/composite keys and column tops.
-  Generated DOUBLE projection and ranking remain separate encoding gaps.
+  Generated DOUBLE projection remains a separate encoding gap.
 - [x] VARCHAR COUNT, including searched CASE, scalar consumers and compact input partitions.
 - [x] Mixed batch/scalar aggregates now try the existing generated reduction
   before ordinary batch/scalar phases. Fully batched plans retain their current path.
@@ -30,12 +30,18 @@ function/state contracts and exact results before measuring 500M-row controls.
   SIMD predicates and Parquet late materialization. On 500M rows, integer AVG
   drops 260–271 to 146–147 ms and controller traffic 16.2 to 8.2 GB. The 6.3%
   selectivity control pays about 3–4% more; no selectivity-specific policy added.
+- [x] Numeric result ranking: INT/SHORT/DOUBLE full sort and Top-K, including
+  finalized AVG, signed zero/NaN ordering and ordinary fallback. On 500M rows,
+  selected K=64 cases gain 4–5%; aggregation still dominates.
 - [ ] Extend remaining VARCHAR expression coverage and grouped VARCHAR DISTINCT.
 - [x] Dictionary-domain SYMBOL predicates: reuse resolved LIKE/ILIKE/regex match sets,
   compile exact range/bitmap/sparse membership, and share immutable query-owned state.
   Official 1BRC filtered COUNT falls about 3.1 s to 78 ms; 16-core execution reaches
   the measured input-bandwidth floor. Sparse/skewed domains, 4/8/16 cores and
   lifecycle failures are covered; other CPU families and general OR remain open.
+- [x] Remove per-bucket occupancy branches from generated inline-map scans.
+  Existing cursor order and zero-key placement are preserved;500M-row MIN/MAX
+  aggregation improves14–18% at eight cores with branch misses1.57 to0.93/input.
 - [ ] Continue the moonshot by removing measured materialization or dependent-access
   costs. Keep discovered hardware budgets, snapshot/query ownership and complete
   compilation/build/merge/output accounting; do not assume this host's optimum is universal.

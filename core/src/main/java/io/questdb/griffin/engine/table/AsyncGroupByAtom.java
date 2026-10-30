@@ -58,6 +58,7 @@ import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdaterFactory;
 import io.questdb.griffin.engine.groupby.GroupByKernel;
 import io.questdb.griffin.engine.groupby.GroupByUtils;
 import io.questdb.jit.CompiledFilter;
+import io.questdb.griffin.engine.orderby.SortKeyEncoder;
 import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.DirectLongLongSortedList;
@@ -461,7 +462,7 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
     public void longTopK(int slotId, Map map, DirectLongLongSortedList list, Function function, Runnable checkpoint) {
         final GroupByKernel.Updater updater = getCompiledUpdater(slotId);
         if (updater == null || !updater.longTopK(map, list, function, checkpoint)) {
-            map.getCursor().longTopK(list, function);
+            map.getCursor().longTopK(list, SortKeyEncoder.longTopKFunction(function));
         }
     }
 

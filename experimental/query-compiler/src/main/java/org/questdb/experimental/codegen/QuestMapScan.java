@@ -55,20 +55,37 @@ final class QuestMapScan {
             });
         } else {
             Var zero = b.let(new Load(MemoryType.ADDRESS, at(view, NativeMapView.ZERO_ENTRY)));
-            Var end = b.let(add(load(at(view, NativeMapView.MASK)), i64(2)));
-            Var index = b.let(i64(probe.varchar() || zeroLast ? 1 : 0));
+            if (!probe.varchar() && !zeroLast) emitZero(b, view, zero, consumer);
+            Var end = b.let(add(load(at(view, NativeMapView.MASK)), i64(1)));
+            Var index = b.let(i64(0));
             MemoryType width = probe.keyType() == ColumnType.INT ? MemoryType.I32 : MemoryType.I64;
+            // Unordered4/8/VarcharMap capacities are powers of two, at least 16.
+            // Keep their runtime stride and cursor order; no extra occupancy metadata.
             b.loop(binary(Op.LT, index, end), loop -> {
                 loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
-                Var entry = loop.let(zero);
-                loop.when(ne(index, i64(0)), physical -> physical.assign(entry,
-                        new Offset(base, binary(Op.MUL, binary(Op.SUB, index, i64(1)), stride))));
-                Var occupied = loop.let(ne(new Load(width, entry), i64(0)));
-                loop.when(eq(index, i64(0)), z -> z.assign(occupied, ne(load(at(view, NativeMapView.HAS_ZERO)), i64(0))));
-                loop.when(occupied, present -> consumer.accept(present, entry));
-                loop.assign(index, add(index, i64(1)));
+                Var chunk = loop.let(new Offset(base, binary(Op.MUL, index, stride)));
+                Expr bits = i64(0);
+                for (int lane = 0; lane < 8; lane++) {
+                    Expr entry = new Offset(chunk, binary(Op.MUL, i64(lane), stride));
+                    bits = binary(Op.ADD, bits, new Select(ne(new Load(width, entry), i64(0)), i64(1L << lane), i64(0)));
+                }
+                Var mask = loop.let(bits);
+                loop.loop(ne(mask, i64(0)), present -> {
+                    Var lane = present.let(new TrailingZeros(mask));
+                    Var entry = present.let(new Offset(chunk, binary(Op.MUL, lane, stride)));
+                    consumer.accept(present, entry);
+                    present.assign(mask, binary(Op.AND, mask, binary(Op.SUB, mask, i64(1))));
+                });
+                loop.assign(index, add(index, i64(8)));
             });
-            if (zeroLast && !probe.varchar()) b.when(ne(load(at(view, NativeMapView.HAS_ZERO)), i64(0)), present -> consumer.accept(present, zero));
+            if (!probe.varchar() && zeroLast) emitZero(b, view, zero, consumer);
         }
+    }
+
+    private static void emitZero(Builder b, Expr view, Expr zero, BiConsumer<Builder, Expr> consumer) {
+        b.when(ne(load(at(view, NativeMapView.HAS_ZERO)), i64(0)), present -> {
+            present.poll();
+            consumer.accept(present, zero);
+        });
     }
 }

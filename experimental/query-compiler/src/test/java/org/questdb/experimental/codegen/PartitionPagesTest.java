@@ -57,6 +57,63 @@ public class PartitionPagesTest {
     }
 
     @Test
+    public void inlineMapScanPreservesCursorOrderAndSourceAcrossOccupancies() throws Exception {
+        var values = new io.questdb.cairo.ArrayColumnTypes().add(ColumnType.LONG);
+        for (int type : new int[]{ColumnType.INT, ColumnType.LONG, ColumnType.VARCHAR}) {
+            var probe = QuestMapProbe.direct(0, type, false);
+            for (boolean zeroLast : new boolean[]{false, true}) {
+                Builder b = new Builder();
+                Var count = b.let(i64(0));
+                QuestMapScan.emit(b, probe, COLUMNS, zeroLast, (next, entry) -> {
+                    next.store(new Offset(STATE, binary(Op.MUL, count, i64(8))), load(probe.valueAddress(entry)));
+                    next.assign(count, add(count, i64(1)));
+                });
+                b.exit(count);
+                try (var code = backend.compile(new Program(b.block()), temporary.newFolder().toPath());
+                     io.questdb.cairo.map.Map map = type == ColumnType.INT
+                             ? new io.questdb.cairo.map.Unordered4Map(type, values, 1, 0.9, 30)
+                             : type == ColumnType.LONG ? new io.questdb.cairo.map.Unordered8Map(type, values, 1, 0.9, 30)
+                             : new io.questdb.cairo.map.UnorderedVarcharMap(values, 1, 0.9, 30, 4096, 1 << 20);
+                     var arena = Arena.ofConfined();
+                     var memory = KernelMemory.bind(null, () -> { })) {
+                    long view = arena.allocate(io.questdb.cairo.map.NativeMapView.MUTATION_BYTES, 8).address();
+                    long output = arena.allocate(8192 * 8L, 8).address();
+                    // Empty/minimum, densely occupied, grown and sparse-after-clear maps.
+                    for (int rows : new int[]{0, 1, 14, 15, 900, 4097, 0, 3}) {
+                        map.clear();
+                        for (int i = 0; i < rows; i++) {
+                            var key = map.withKey();
+                            if (type == ColumnType.INT) key.putInt(i == 1 ? Integer.MIN_VALUE : i);
+                            else if (type == ColumnType.LONG) key.putLong(i == 1 ? Long.MIN_VALUE : i);
+                            else key.putVarchar(i == 0 ? null : new io.questdb.std.str.Utf8String(i == 1 ? "" : "ž-" + i));
+                            key.createValue().putLong(0, i * 17L + 5);
+                        }
+                        var expected = new java.util.ArrayList<Long>();
+                        try (var cursor = map.getCursor()) {
+                            while (cursor.hasNext()) expected.add(cursor.getRecord().getLong(0));
+                        }
+                        if (!zeroLast && type != ColumnType.VARCHAR && rows > 0) {
+                            expected.add(0, expected.remove(expected.size() - 1));
+                        }
+                        map.writeNativeMutationView(view);
+                        long address = Unsafe.getLong(view), stride = Unsafe.getLong(view + io.questdb.cairo.map.NativeMapView.STRIDE);
+                        long bytes = (Unsafe.getLong(view + io.questdb.cairo.map.NativeMapView.MASK) + 1
+                                + (type == ColumnType.VARCHAR ? 0 : 1)) * stride;
+                        byte[] before = new byte[(int) bytes];
+                        for (int i = 0; i < bytes; i++) before[i] = Unsafe.getByte(address + i);
+                        for (int repeat = 0; repeat < 2; repeat++) {
+                            assertEquals(rows, code.run(view, rows, output));
+                            memory.throwIfFailed();
+                            for (int i = 0; i < rows; i++) assertEquals(expected.get(i).longValue(), Unsafe.getLong(output + i * 8L));
+                            for (int i = 0; i < bytes; i++) assertEquals(before[i], Unsafe.getByte(address + i));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     public void sampledRegistersMatchQuestHllWithoutBiasOnDenseKeys() throws Exception {
         Builder b = new Builder();
         Var index = b.let(i64(0));

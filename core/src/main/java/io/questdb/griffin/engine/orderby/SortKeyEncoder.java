@@ -29,6 +29,7 @@ import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.VarcharTypeDriver;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.PartitionFormat;
@@ -42,6 +43,7 @@ import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.engine.LimitOverflowException;
 import io.questdb.griffin.engine.RecordComparator;
 import io.questdb.griffin.engine.functions.SymbolFunction;
+import io.questdb.griffin.engine.functions.LongFunction;
 import io.questdb.std.Chars;
 import io.questdb.std.Decimal128;
 import io.questdb.std.Decimal256;
@@ -615,6 +617,20 @@ public class SortKeyEncoder implements QuietCloseable {
                 appendUuidRow(topK, colAddr, rowIdBase, rowIdOffset, rows.get(p), desc);
             }
         }
+    }
+
+    /** Borrowed getter for signed-LONG Top-K lists; output values remain in the original record. */
+    public static Function longTopKFunction(Function function) {
+        if (function.getType() != ColumnType.DOUBLE) {
+            return function;
+        }
+        return new LongFunction() {
+            @Override
+            public long getLong(Record record) {
+                long bits = Double.doubleToLongBits(function.getDouble(record));
+                return bits >= 0 ? bits : bits ^ Long.MAX_VALUE;
+            }
+        };
     }
 
     private static long doubleKey(double value, boolean desc) {

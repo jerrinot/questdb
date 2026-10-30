@@ -408,7 +408,6 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
         return null;
     }
 
-    /** Optional generated full sort of one resolved LONG output. */
     /** Optional bounded selection over finalized native state; preserves ordinary cursor order. */
     default boolean prepareRowLimit() { return false; }
 
@@ -418,6 +417,7 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
     /** Prepare selection from borrowed sorted (value, row ID) pairs. */
     default boolean prepareSortedRowLimit() { return false; }
 
+    /** Optional generated full sort using signed LONG ordering keys. */
     default boolean prepareLongSort(int columnIndex) { return false; }
 
     /** Generated collection/merge can supply the bounded sort for a static OFFSET window. */
@@ -437,7 +437,7 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
 
     /**
      * Returns true when factory's record cursor supports optimized top K (ORDER BY + LIMIT N) loop
-     * for the given LONG or TIMESTAMP column.
+     * using signed LONG keys. Compiled producers may normalize other numeric types.
      *
      * @param columnIndex index of the column to check
      * @return true if the factory supports the fast path for the column

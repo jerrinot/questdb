@@ -91,7 +91,7 @@ public final class ResolvedAggregateKernel {
         for (int i = 0; i < functions.size(); i++) {
             var function = functions.getQuick(i);
             // Capture the exact output slot and type while resolved functions are borrowed.
-            readers.add(new ResultRead(function.getClass(), function.getValueIndex(), layout.getOffset(function.getValueIndex()), function.getType()));
+            readers.add(new ResultRead(function.getClass(), AggregateUpdates.outputFunction(function).getClass(), function.getValueIndex(), layout.getOffset(function.getValueIndex()), function.getType()));
         }
         return new Binding(new Program(b.block()), allocates, probe, prefetchRows, countSumReference, resolved, layout.getSizeInBytes(), valueTypes.getColumnCount(), List.copyOf(readers));
     }
@@ -335,7 +335,7 @@ public final class ResolvedAggregateKernel {
         });
     }
 
-    private record ResultRead(Class<?> implementation, int index, long offset, int type) { }
+    private record ResultRead(Class<?> implementation, Class<?> outputImplementation, int index, long offset, int type) { }
 
     public static final class Binding {
         private final Program program;
@@ -497,6 +497,8 @@ public final class ResolvedAggregateKernel {
         CompiledKernel splitStateCode, splitInputCode;
         int partitionTopKLimit;
         long partitionTopKOffset;
+        int topKType = ColumnType.UNDEFINED;
+        int longSortType = ColumnType.UNDEFINED;
         int topKOrder = -1;
         int topKCapacityClass = -1;
         CompiledKernel finalizeCode;
@@ -641,8 +643,11 @@ public final class ResolvedAggregateKernel {
         boolean prepareLongSort(Function function) throws IOException {
             if (closed) throw new IllegalStateException("Aggregate code is closed");
             if (backend == null || probe == null || !probe.mutable() || resultOffset(function) < 0) return false;
-            if (longSortCode == null) longSortCode = compile(QuestLongSort.program(probe));
-            return true;
+            if (longSortCode == null) {
+                longSortCode = compile(QuestLongSort.program(probe, function.getType()));
+                longSortType = function.getType();
+            }
+            return longSortType == function.getType();
         }
 
         boolean supportsLongTopK(Function function) {
@@ -664,14 +669,15 @@ public final class ResolvedAggregateKernel {
             long offset = resultOffset(function);
             if (topKCode == null && backend != null && probe != null && probe.mutable() && offset >= 0) {
                 int capacityClass = QuestLongTopK.capacityClass(limit);
-                topKCode = compile(QuestLongTopK.program(probe, order, capacityClass));
+                topKCode = compile(QuestLongTopK.program(probe, order, capacityClass, function.getType()));
+                topKType = function.getType();
                 topKOrder = order;
                 topKCapacityClass = capacityClass;
                 if (localCapacity > 0 && !probe.varchar()
                         && limit > 0 && capacityClass == 0 && order >= 0
                         && binding.updates.updates().stream().noneMatch(update -> update.offset() == offset
                         && (update.finalizesResult() || update.deferredMerge()))) {
-                    // This direct Top-K consumer ranks exact LONG state. Independent string
+                    // This direct Top-K consumer ranks completed numeric state. Independent string
                     // extrema can be filled from retained partition records after selection.
                     var delayed = binding.updates.updates().stream().filter(update -> update instanceof VarcharExtremum).toList();
                     if (!delayed.isEmpty()) {
@@ -704,17 +710,21 @@ public final class ResolvedAggregateKernel {
         CompiledKernel compileConsumer(Program program) throws IOException { return backend.compile(program, artifacts); }
 
         long numericResultOffset(Function function) {
-            if (function instanceof GroupByFunction aggregate) {
-                for (var reader : binding.readers) {
-                    if (reader.type() == function.getType() && reader.implementation() == function.getClass()
-                            && reader.index() == aggregate.getValueIndex()) return reader.offset();
-                }
+            int index = function instanceof GroupByFunction aggregate ? aggregate.getValueIndex()
+                    : function instanceof io.questdb.griffin.engine.functions.columns.ColumnFunction column ? column.getColumnIndex() : -1;
+            for (var reader : binding.readers) {
+                if (reader.type() == function.getType() && reader.index() == index
+                        && (reader.implementation() == function.getClass()
+                        || finalizeCode != null && reader.outputImplementation() == function.getClass())) return reader.offset();
             }
             return -1;
         }
 
         long resultOffset(Function function) {
-            return function.getType() == ColumnType.LONG ? numericResultOffset(function) : -1;
+            return switch (function.getType()) {
+                case ColumnType.SHORT, ColumnType.INT, ColumnType.LONG, ColumnType.DOUBLE -> numericResultOffset(function);
+                default -> -1;
+            };
         }
 
         public long compilationNanos() {

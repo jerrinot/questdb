@@ -376,6 +376,95 @@ public class AggregateTypeTest {
         try (var candidate = compile("select count(s) from strings")) { check("select count(s) from strings", candidate); }
     }
 
+    @Test public void numericRankingUsesFinalValuesAndIeeeOrdering() throws Exception {
+        String previous = System.getProperty("query.codegen.localCapacity");
+        System.setProperty("query.codegen.localCapacity", "64");
+        try { assertNumericRanking(); }
+        finally {
+            if (previous == null) System.clearProperty("query.codegen.localCapacity");
+            else System.setProperty("query.codegen.localCapacity", previous);
+        }
+    }
+
+    private void assertNumericRanking() throws Exception {
+        engine.execute("create table ranking (k long,d double,i int,h short,ts timestamp) timestamp(ts) partition by day bypass wal", context);
+        double[] edges = {Double.NaN, Double.longBitsToDouble(0xfff8000000001234L),
+                Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, -0.0, 0.0,
+                Double.MIN_VALUE, -Double.MIN_VALUE, 1.0, 1.00000000005, -17.25};
+        try (var writer = engine.getWriter(engine.verifyTableName("ranking"), "test")) {
+            for (int n = 0; n < 1642; n++) {
+                // Unequal counts make ordering partial sums observably wrong for AVG.
+                int key = n < 1542 ? n % 514 : 300;
+                var row = writer.newRow(1704067200000000L + n);
+                row.putLong(0, key);
+                row.putDouble(1, key < edges.length ? edges[key] : (key - 257) * 0.25);
+                row.putInt(2, key % 17 == 0 ? Integer.MIN_VALUE : key - 257);
+                row.putShort(3, (short) (key - 257)); row.append();
+            }
+            writer.commit();
+        }
+        for (String aggregate : List.of("min(d)", "max(d)", "avg(d)", "avg(i)", "min(i)", "max(h)")) {
+            for (String suffix : List.of("desc limit 64", "asc limit 65")) {
+                String sql = "select " + aggregate + " v from ranking group by k order by v " + suffix;
+                try (var candidate = compile(sql)) {
+                    checkRanked(sql, candidate); checkRanked(sql, candidate);
+                    assertTrue(sql, nativeRankedRows(candidate, false) > 0);
+                }
+            }
+        }
+        for (String suffix : List.of("desc", "asc limit 31,95")) {
+            String sql = "select avg(d) v from ranking group by k order by v " + suffix;
+            try (var candidate = compile(sql)) {
+                checkRanked(sql, candidate);
+                assertTrue(sql, nativeRankedRows(candidate, suffix.equals("desc")) > 0);
+            }
+        }
+        engine.execute("alter table ranking add column late double", context);
+        String sql = "select min(late) v from ranking group by k order by v desc limit 65";
+        try (var candidate = compile(sql)) {
+            checkRanked(sql, candidate);
+            engine.execute("insert into ranking values (515,1.0,1,1,'2024-01-02',-0.0),(516,2.0,2,2,'2024-01-02',0.0)", context);
+            checkRanked(sql, candidate);
+        }
+        engine.execute("alter table ranking convert partition to parquet list '2024-01-01'", context);
+        try (var candidate = compile(sql)) { checkRanked(sql, candidate); }
+        engine.execute("truncate table ranking", context);
+        try (var candidate = compile(sql)) { checkRanked(sql, candidate); }
+    }
+
+    private void checkRanked(String sql, RecordCursorFactory candidate) throws Exception {
+        var actual = rankedValues(candidate);
+        context.setQueryCodeGenerator(null);
+        try (var ordinary = Demo.compileSql(engine, context, sql, true)) { assertEquals(sql, rankedValues(ordinary), actual); }
+        finally { context.setQueryCodeGenerator(compiler); }
+    }
+
+    private List<Long> rankedValues(RecordCursorFactory factory) throws Exception {
+        var result = new java.util.ArrayList<Long>();
+        boolean floating = factory.getMetadata().getColumnType(0) == io.questdb.cairo.ColumnType.DOUBLE;
+        try (var cursor = factory.getCursor(context)) {
+            var record = cursor.getRecord();
+            while (cursor.hasNext()) result.add(floating ? Double.doubleToLongBits(record.getDouble(0)) : record.getLong(0));
+            cursor.toTop();
+            int i = 0;
+            while (cursor.hasNext()) assertEquals(result.get(i++).longValue(), floating ? Double.doubleToLongBits(record.getDouble(0)) : record.getLong(0));
+            assertEquals(result.size(), i);
+        }
+        return result;
+    }
+
+    private long nativeRankedRows(RecordCursorFactory factory, boolean fullSort) {
+        for (; factory != null; factory = factory.getBaseFactory()) {
+            if (factory instanceof AsyncGroupByRecordCursorFactory group) {
+                long rows = 0;
+                for (int i = -1; i < 2; i++) if (group.getAtom().getCompiledUpdater(i) instanceof AggregateSlot slot)
+                    rows += fullSort ? slot.sortedRows() : slot.topKCounters()[0];
+                return rows;
+            }
+        }
+        return 0;
+    }
+
     private RecordCursorFactory compile(String sql) throws Exception {
         context.setQueryCodeGenerator(compiler);
         return Demo.compileSql(engine, context, sql, true);

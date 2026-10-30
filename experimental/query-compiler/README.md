@@ -66,7 +66,7 @@ unwind through native code.
 Eligible numeric aggregate subqueries can feed a second keyed COUNT/SUM/MIN/MAX
 without a Java row loop. `ResolvedMapAggregate` evaluates supported projections
 and consumes each finalized input map in its existing merge task. Slot-owned
-ordinary maps feed a generated final merge and LONG Top-K; the ordinary result
+ordinary maps feed a generated final merge and numeric Top-K; the ordinary result
 cursor retains ownership. Filters and limits between the two aggregations remain
 boundaries. This does not rewrite COUNT DISTINCT into a two-stage plan.
 
@@ -88,7 +88,7 @@ adaptive-kernel policy selects the measured winner after cache-based admission.
 Large fixed-key partition maps reuse the staged variable-key merge loop. Both
 paths use discovered cache geometry and retain their original generated loops
 when it is absent.
-Eligible LONG Top-K can subdivide large partitions and defer independent VARCHAR
+Eligible numeric Top-K can subdivide large partitions and defer independent VARCHAR
 extrema until after ranking. Retained transient strings are copied into query-owned
 storage; stable frame payloads remain borrowed. These are eligibility-gated paths,
 not promises that every aggregation uses the same strategy.
@@ -127,7 +127,7 @@ The binders and focused tests are authoritative. Current families include:
   metadata specializations retain priority. Worker-state copying/merging is generated.
   Supported filters feed SIMD masks directly into reduction; Parquet late
   materialization and unsupported inputs retain their selected-row fallback.
-- Numeric projection, final COUNT reduction, LONG full sort and Top-K, and positive
+- Numeric projection, final COUNT reduction, SHORT/INT/LONG/DOUBLE full sort and Top-K, and positive
   LIMIT/OFFSET selection over supported generated results.
 - Ordered frame-prefix admission for forward filtered scans with finite nonnegative
   LIMIT advice. Native VARCHAR selection stops each frame after K matches; the
@@ -142,7 +142,9 @@ The binders and focused tests are authoritative. Current families include:
   remain outside this binding.
 
 Integer MIN/MAX accepts LONG, INT and SHORT inputs and preserves the ordinary
-8-byte LONG or 4-byte INT state. Generated ordering still requires a LONG result.
+8-byte LONG or 4-byte INT state. Generated ordering normalizes SHORT/INT/LONG/DOUBLE results into signed 64-bit
+keys, preserving ordinary NULL, NaN and signed-zero order. AVG ranks finalized
+values; partial sums are never used as a ranking shortcut.
 Unkeyed kernels bind the actual 32-byte-spaced SimpleMapValue slots, promote
 supported aggregate updates to SSA accumulators, and publish state once per frame.
 Column tops, lazy conversions and mixed-coordinate late materialization can fall

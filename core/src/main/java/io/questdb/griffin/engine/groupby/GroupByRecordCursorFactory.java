@@ -51,6 +51,7 @@ import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.table.AsyncGroupByRecordCursorFactory;
 import io.questdb.griffin.engine.table.SelectedRecordCursorFactory;
 import io.questdb.griffin.engine.table.VirtualRecordCursorFactory;
+import io.questdb.griffin.engine.orderby.SortKeyEncoder;
 import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.MemoryTracker;
@@ -236,7 +237,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
     @Override
     public boolean recordCursorSupportsLongTopK(int columnIndex) {
         final int columnType = getMetadata().getColumnType(columnIndex);
-        return columnType == ColumnType.LONG || ColumnType.isTimestamp(columnType);
+        return columnType == ColumnType.LONG || ColumnType.isTimestamp(columnType)
+                || recordCursorSupportsCompiledLongTopK(columnIndex);
     }
 
     @Override
@@ -324,7 +326,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             buildMapConditionally();
             Function function = getFunctions().getQuick(columnIndex);
             if (!primaryCursor.compiledLongTopK(dataMap, list, function)) {
-                ((MapRecordCursor) baseCursor).longTopK(list, function);
+                ((MapRecordCursor) baseCursor).longTopK(list, SortKeyEncoder.longTopKFunction(function));
             }
         }
 
@@ -419,7 +421,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             buildMapConditionally();
             Function function = recordFunctions.getQuick(columnIndex);
             if (!compiledLongTopK(dataMap, list, function)) {
-                ((MapRecordCursor) baseCursor).longTopK(list, function);
+                ((MapRecordCursor) baseCursor).longTopK(list, SortKeyEncoder.longTopKFunction(function));
             }
         }
 

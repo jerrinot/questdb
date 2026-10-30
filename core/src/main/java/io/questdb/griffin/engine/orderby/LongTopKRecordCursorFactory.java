@@ -35,7 +35,8 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.Misc;
 
 /**
- * Handles ORDER BY + LIMIT N on a single LONG or TIMESTAMP column.
+ * Handles ORDER BY + LIMIT N using signed LONG ordering keys. Compiled producers
+ * can also normalize supported numeric results into that key domain.
  */
 public class LongTopKRecordCursorFactory extends AbstractRecordCursorFactory {
     private final boolean ascending;

@@ -26,7 +26,7 @@ package org.questdb.experimental.codegen;
 
 import static org.questdb.experimental.codegen.Ir.*;
 
-/** Full LONG sort: direct map collection plus the same stable radix primitive as bounded Top-K. */
+/** Full numeric sort over signed LONG keys: direct map collection plus the same stable radix primitive as bounded Top-K. */
 final class QuestLongSort {
     static final int COUNT_OFFSET = 8;
     static final int MODE_OFFSET = 16;
@@ -39,7 +39,9 @@ final class QuestLongSort {
 
     private QuestLongSort() { }
     // STATE starts with the pair buffer address, followed by the fields above.
-    static Program program(QuestMapProbe probe) {
+    static Program program(QuestMapProbe probe) { return program(probe, io.questdb.cairo.ColumnType.LONG); }
+
+    static Program program(QuestMapProbe probe, int type) {
         Builder b = new Builder();
         Var pairs = b.let(new Load(MemoryType.ADDRESS, STATE));
         Var count = b.let(load(at(STATE, COUNT_OFFSET)));
@@ -48,7 +50,7 @@ final class QuestLongSort {
             QuestMapScan.emit(collect, probe, COLUMNS, (entryBuilder, entry) -> {
                 Expr value = probe.variable() ? new Offset(QuestVariableKey.value(entry), offset) : new Offset(entry, offset);
                 Var pair = entryBuilder.let(QuestRadixSort.pair(pairs, count));
-                entryBuilder.store(pair, load(value));
+                entryBuilder.store(pair, QuestSortValue.load(entryBuilder, value, type));
                 entryBuilder.store(MemoryType.ADDRESS, at(pair, 8), entry);
                 entryBuilder.assign(count, add(count, i64(1)));
             });

@@ -24,7 +24,6 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
@@ -125,11 +124,8 @@ public class VirtualFunctionRecordCursor implements RecordCursor {
             return -1;
         }
         final int virtualColumnIndex = columnFunction.getColumnIndex();
-        final int columnType = priorityMetadata.getColumnType(virtualColumnIndex);
-        if (columnType == ColumnType.LONG || ColumnType.isTimestamp(columnType)) {
-            return priorityMetadata.getBaseColumnIndex(virtualColumnIndex);
-        }
-        return -1;
+        // Forward a direct column; the base factory decides which ordering types it supports.
+        return priorityMetadata.getBaseColumnIndex(virtualColumnIndex);
     }
 
     @Override

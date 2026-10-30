@@ -54,6 +54,7 @@ import io.questdb.mp.MCSequence;
 import io.questdb.mp.MPSequence;
 import io.questdb.mp.RingQueue;
 import io.questdb.mp.SOUnboundedCountDownLatch;
+import io.questdb.griffin.engine.orderby.SortKeyEncoder;
 import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
@@ -462,7 +463,7 @@ class AsyncGroupByRecordCursor implements RecordCursor {
     private void collectLongTopK(DirectLongLongSortedList list, Function function, MapRecordCursor cursor) {
         final AsyncGroupByAtom atom = frameSequence.getAtom();
         if (atom.getCompiledUpdater(-1) == null) {
-            cursor.longTopK(list, function);
+            cursor.longTopK(list, SortKeyEncoder.longTopKFunction(function));
         } else if (atom.isSharded()) {
             if (atom.longTopK(atom.getDestShards(), list, function, circuitBreaker::statefulThrowExceptionIfTrippedTimeThrottled)) return;
             for (int i = 0; i < NUM_SHARDS; i++) {
