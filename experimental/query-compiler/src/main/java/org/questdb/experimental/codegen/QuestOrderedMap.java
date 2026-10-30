@@ -30,6 +30,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import static org.questdb.experimental.codegen.Ir.*;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** OrderedMap's offset table and heap algorithms. Allocation stays with the map. */
 final class QuestOrderedMap {
@@ -47,7 +48,7 @@ final class QuestOrderedMap {
 
     static Var findPrepared(QuestMapProbe probe, Builder b, Var key, Var hash, Var slot, Var position,
                             BiConsumer<Builder, Expr> initialize) {
-        return findFrom(probe, b, key, position, load(at(STATE, 56)), null, initialize, hash, slot);
+        return findFrom(probe, b, key, position, load(at(STATE, SHARD_MASK)), null, initialize, hash, slot);
     }
 
     private static Var findFrom(QuestMapProbe probe, Builder b, Var key, Var position, Expr shardMask,
@@ -58,7 +59,7 @@ final class QuestOrderedMap {
         Var offsets = b.let(new Load(MemoryType.ADDRESS, at(view, NativeMapView.OFFSETS)));
         Var destination = b.let(nil());
         b.loop(eq(destination, nil()), loop -> {
-            QuestMapProbe.count(loop, 40);
+            QuestMapProbe.count(loop, PROBE_COUNT);
             Var slotAddress = loop.let(new Offset(offsets, binary(Op.MUL, slot, i64(8))));
             Var packed = loop.let(load(slotAddress));
             Var raw = loop.let(binary(Op.AND, packed, i64(0xffff_ffffL)));
@@ -67,7 +68,7 @@ final class QuestOrderedMap {
                 Var bytes = missing.let(probe.variable() ? QuestVariableKey.stride(key, load(at(view, NativeMapView.STRIDE))) : load(at(view, NativeMapView.STRIDE)));
                 missing.when(binary(Op.EITHER, binary(Op.LT, load(at(view, NativeMapView.FREE)), i64(2)),
                         binary(Op.LT, load(at(view, NativeMapView.Ordered.LIMIT)), add(load(at(view, NativeMapView.Ordered.APPEND)), bytes))), full -> {
-                    if (probe.variable()) full.store(at(STATE, 88), bytes);
+                    if (probe.variable()) full.store(at(STATE, VariableKey.REQUIRED_BYTES), bytes);
                     QuestMapProbe.miss(full, position, lookup.shard(), beforeMiss);
                 });
                 if (probe.variable()) QuestMapMutation.copy(missing, key, entry, QuestVariableKey.bytes(key));
@@ -82,7 +83,7 @@ final class QuestOrderedMap {
                 missing.assign(destination, probe.valueAddress(entry));
             });
             loop.when(binary(Op.BOTH, ne(raw, i64(0)), eq(binary(Op.USHR, packed, i64(32)), binary(Op.AND, lookup.hash(), i64(0xffff_ffffL)))), occupied -> {
-                QuestMapProbe.count(occupied, 48);
+                QuestMapProbe.count(occupied, KEY_COMPARISONS);
                 Var entry = occupied.let(new Offset(lookup.base(), binary(Op.MUL, binary(Op.SUB, raw, i64(1)), i64(8))));
                 occupied.when(probe.keysEqual(occupied, entry, key), hit -> hit.assign(destination, probe.valueAddress(entry)));
             });
@@ -126,7 +127,7 @@ final class QuestOrderedMap {
         Var stride = b.let(load(at(COLUMNS, 24)));
         Var merge = b.let(ne(load(at(COLUMNS, 40)), i64(0)));
         Var index = b.let(load(STATE));
-        Var sourceOffset = probe.variable() ? b.let(load(at(STATE, 96))) : null;
+        Var sourceOffset = probe.variable() ? b.let(load(at(STATE, VariableKey.SOURCE_OFFSET))) : null;
         b.loop(binary(Op.LT, index, ROWS), loop -> {
             loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
             Var source = loop.let(new Offset(base, probe.variable() ? sourceOffset : binary(Op.MUL, index, stride)));
@@ -142,8 +143,8 @@ final class QuestOrderedMap {
             loop.when(occupied, row -> {
                 row.when(eq(merge, bool(false)), shard -> shard.assign(hash, probe.hash(shard, source)));
                 Var inserted = row.let(bool(false));
-                Var destination = find(probe, row, source, index, load(at(STATE, 56)),
-                        probe.variable() ? miss -> miss.store(at(STATE, 96), sourceOffset) : null, (init, value) -> {
+                Var destination = find(probe, row, source, index, load(at(STATE, SHARD_MASK)),
+                        probe.variable() ? miss -> miss.store(at(STATE, VariableKey.SOURCE_OFFSET), sourceOffset) : null, (init, value) -> {
                     QuestMapMutation.copy(init, probe.valueAddress(source), value, valueBytes);
                     init.assign(inserted, bool(true));
                 }, hash);
@@ -165,7 +166,7 @@ final class QuestOrderedMap {
         Var stride = b.let(load(at(COLUMNS, 24)));
         Var merge = b.let(ne(load(at(COLUMNS, 40)), i64(0)));
         Var index = b.let(load(STATE));
-        Var sourceOffset = probe.variable() ? b.let(load(at(STATE, 96))) : null;
+        Var sourceOffset = probe.variable() ? b.let(load(at(STATE, VariableKey.SOURCE_OFFSET))) : null;
         b.loop(binary(Op.LT, index, ROWS), batch -> {
             Var count = batch.let(i64(0)), position = batch.let(index);
             Var scratch = batch.let(at(STATE, ResolvedAggregateKernel.prefetchScratch(probe)));
@@ -209,7 +210,7 @@ final class QuestOrderedMap {
                 Var source = consume.let(new Load(MemoryType.ADDRESS, at(scratch, 8)));
                 Var inserted = consume.let(bool(false));
                 if (probe.variable()) consume.when(eq(merge, bool(false)), save ->
-                        save.store(at(STATE, 96), binary(Op.SUB, load(at(scratch, 8)), load(COLUMNS))));
+                        save.store(at(STATE, VariableKey.SOURCE_OFFSET), binary(Op.SUB, load(at(scratch, 8)), load(COLUMNS))));
                 Var destination = probe.finishOrdered(consume, source,
                         consume.let(new Load(MemoryType.ADDRESS, at(scratch, 16))), consume.let(load(at(scratch, 24))),
                         consume.let(load(at(scratch, 32))), consume.let(load(scratch)), (init, value) -> {

@@ -148,7 +148,7 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
                 Vect.memset(slots[i] + argsOffset, (indexes.length + 3L) * 8, 0);
             }
             // Prepare deferred code on the owner before publication to workers.
-            code.run(slots[0] + argsOffset, 0, slots[0]);
+            code.prepare();
             return true;
         } catch (Throwable failure) {
             clear();
@@ -237,27 +237,7 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
         return rows;
     }
 
-    private Program mergeProgram() {
-        Builder b = new Builder();
-        Var source = b.let(new Load(MemoryType.ADDRESS, COLUMNS));
-        Var sourceSeen = b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, 8)));
-        Var destinationSeen = b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, 16)));
-        Var id = b.let(i64(0));
-        b.loop(binary(Op.LT, id, ROWS), loop -> {
-            loop.when(ne(new Load(MemoryType.I8, new Offset(sourceSeen, id)), i64(0)), present -> {
-                Var destination = present.let(new Offset(STATE, binary(Op.MUL, id, i64(stride))));
-                Expr visited = new Offset(destinationSeen, id);
-                present.when(eq(new Load(MemoryType.I8, visited), i64(0)), first -> {
-                    updates.initialize(first, destination);
-                    first.store(MemoryType.I8, visited, i64(1));
-                });
-                updates.merge(present, new Offset(source, binary(Op.MUL, id, i64(stride))), destination);
-            });
-            loop.assign(id, add(id, i64(1)));
-        });
-        b.exit(0);
-        return new Program(b.block());
-    }
+    private Program mergeProgram() { return DenseAggregate.merge(updates, stride); }
 
     private Program program() {
         Builder b = new Builder();
@@ -274,12 +254,7 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
             Var id = loop.let(new Select(eq(key, i64(SymbolTable.VALUE_IS_NULL)), count, key));
             loop.when(binary(Op.BOTH, ne(key, i64(SymbolTable.VALUE_IS_NULL)),
                     binary(Op.EITHER, binary(Op.LT, key, i64(0)), binary(Op.GE, key, count))), invalid -> invalid.exit(1));
-            Var destination = loop.let(new Offset(STATE, binary(Op.MUL, id, i64(stride))));
-            Expr visited = new Offset(seen, id);
-            loop.when(eq(new Load(MemoryType.I8, visited), i64(0)), first -> {
-                updates.initialize(first, destination);
-                first.store(MemoryType.I8, visited, i64(1));
-            });
+            Var destination = DenseAggregate.entry(loop, updates, STATE, seen, id, stride);
             var values = new ArrayList<Pipeline.Value>();
             for (int i = 0; i < indexes.length; i++) {
                 var column = updates.columns().get(i);

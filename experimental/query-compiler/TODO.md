@@ -2,8 +2,10 @@
 
 Type expansion checkpoint, 2026-10-30: retained changes and final protocol results
 are committed; see README for current coverage and PROGRESS for measured gains,
-regressions and rejected experiments. Next coverage gap: shared VARCHAR-to-numeric
-expression binding, followed by capture-aware regex evaluation. Streaming partition
+regressions and rejected experiments. Shared VARCHAR-to-numeric binding now supports
+code-point length across aggregates, keys and predicates. Next coverage gap:
+capture-aware regex evaluation; compare helpers and generated code before admission.
+Streaming partition
 writes remain an experiment pending ownership/completion and adaptive-selection work.
 Continue one gap at a time, preserving ordinary function/state contracts and exact
 results before measuring 500M-row controls.
@@ -496,16 +498,28 @@ near-parity small-set cases.
 - Read `RegexpReplaceVarcharFunctionFactory.SingleGroupAsciiFunc`: its existing
   result borrows source bytes and preserves unmatched input. Keep that ownership,
   NULL, newline, capture-priority and UTF-8 behavior. No URL-specific parser.
-- Share frame-aware numeric/string expression binding before adding code-point
+- [x] Share frame-aware numeric/string expression binding before adding code-point
   length. `AggregateUpdates` already receives `ResolvedVarchar.Frame`; reuse its
   descriptors and ordinary AVG state instead of creating a length-only aggregator.
   ASCII length can use metadata; non-ASCII length must count code points.
-- Compare a bounded, capture-aware regex compiler with a native JIT helper on the
+  **Implemented:** ordinary UTF-8 length semantics, CASE/numeric composition,
+  scalar/grouped aggregates, fixed/composite keys, residual predicates and compact
+  partition input records. Focused 500M-row gain is 3x; actual Q27 is about 1.1x
+  because its remaining traffic/load waits dominate. Q27's post-aggregate filter
+  and final sort remain ordinary, so this does not add a fully generated query.
+- [x] Compare a bounded, capture-aware regex compiler with a native JIT helper on the
   same strings and full pipeline. Establish Java semantic compatibility before
   admission; unsupported patterns retain the ordinary function. Measure compile
   cost, helper-call cost, instructions, branch behavior and all grouped output.
   Add 500M-row controls for failing/long prefixes, Unicode, empty captures,
   repeated alternatives, NULL and skew before defaulting any new path.
+- [ ] Integrate a capture helper only after native-call/lifetime admission is
+  explicit. The function-level experiment favors PCRE2 on Q28 but finds a 5–7%
+  regression on immediate rejection; a bounded generated matcher wins those
+  controls. Compose general mandatory-literal rejection with the helper inside
+  the generated loop, then repeat full-query counterfactuals. Preserve ordinary
+  matching for unsupported syntax and test budget/cancellation behavior. See the
+  capture experiment in PROGRESS; no regex replacement is enabled yet.
 - [Hyperscan's paper](https://www.usenix.org/conference/nsdi19/presentation/wang-xiang)
   motivates decomposing literals and automata and using SIMD, but its matching
   interface does not supply the capture semantics required here. It is not a

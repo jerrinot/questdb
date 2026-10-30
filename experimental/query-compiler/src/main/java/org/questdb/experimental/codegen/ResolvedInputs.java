@@ -72,6 +72,7 @@ import java.util.function.IntSupplier;
 
 /** Compiler-time bindings shared by resolved predicates and aggregate arguments. */
 final class ResolvedInputs {
+    private ResolvedVarchar strings;
     private final List<IntSupplier> parameters;
     private final ColumnTypes types;
     private final int columnOffset;
@@ -175,9 +176,13 @@ final class ResolvedInputs {
     }
 
     Pipeline.Predicate predicate(Function function) {
+        return predicate(function, 0);
+    }
+
+    Pipeline.Predicate predicate(Function function, int depth) {
         int columnCount = columns.size();
         int parameterCount = parameters == null ? 0 : parameters.size();
-        var result = predicate(function, 0);
+        var result = predicateNode(function, depth);
         if (result == null) {
             // A residual tree may retry supported children of a rejected numeric tree.
             // Keep only bindings that belong to a successfully resolved predicate.
@@ -190,7 +195,7 @@ final class ResolvedInputs {
 
     // Only total, side-effect-free leaves are admitted, so SIMD evaluation of both
     // Boolean operands preserves the resolved functions' short-circuit semantics.
-    private Pipeline.Predicate predicate(Function function, int depth) {
+    private Pipeline.Predicate predicateNode(Function function, int depth) {
         if (depth > 64) return null;
         if (function == null) return new Pipeline.All();
         Class<?> implementation = function.getClass();
@@ -201,13 +206,13 @@ final class ResolvedInputs {
         if (conjunction != null) return conjunction(depth, conjunction);
         if (implementation == OrFunctionFactory.MyBooleanFunction.class) {
             var binary = (BinaryFunction) function;
-            var left = predicate(binary.getLeft(), depth + 1);
-            var right = predicate(binary.getRight(), depth + 1);
+            var left = predicateNode(binary.getLeft(), depth + 1);
+            var right = predicateNode(binary.getRight(), depth + 1);
             if (left == null || right == null) return null;
             return new Pipeline.Or(left, right);
         }
         if (implementation == NotFunctionFactory.Func.class) {
-            var value = predicate(((NotFunctionFactory.Func) function).getArg(), depth + 1);
+            var value = predicateNode(((NotFunctionFactory.Func) function).getArg(), depth + 1);
             return value == null ? null : new Pipeline.Not(value);
         }
         if (parameters != null) {
@@ -252,7 +257,7 @@ final class ResolvedInputs {
         if (implementation == InLongFunctionFactory.InLongSingleConstFunction.class
                 || implementation == InLongFunctionFactory.InLongTwoConstFunction.class
                 || implementation == InLongFunctionFactory.InLongConstFunction.class) {
-            var value = scalar(((UnaryFunction) function).getArg(), ColumnType.LONG);
+            var value = scalar(((UnaryFunction) function).getArg(), ColumnType.LONG, depth + 1);
             if (value == null) return null;
             var constants = new io.questdb.std.LongList();
             if (function instanceof InLongFunctionFactory.InLongSingleConstFunction single) constants.add(single.getValue());
@@ -275,7 +280,7 @@ final class ResolvedInputs {
         }
         if (implementation == EqIntStrCFunctionFactory.Func.class) {
             var comparison = (EqIntStrCFunctionFactory.Func) function;
-            var value = scalar(comparison.getArg(), ColumnType.INT);
+            var value = scalar(comparison.getArg(), ColumnType.INT, depth + 1);
             if (value == null) return null;
             long constant = comparison.getConstant();
             if (constant == Integer.MIN_VALUE) constant = Long.MIN_VALUE;
@@ -285,13 +290,13 @@ final class ResolvedInputs {
                 || implementation == EqDoubleFunctionFactory.FuncIntIsNaN.class
                 || implementation == EqSymLongFunctionFactory.EqLongNullFunction.class) {
             type = implementation == EqDoubleFunctionFactory.FuncIntIsNaN.class ? ColumnType.INT : ColumnType.LONG;
-            var value = scalar(((UnaryFunction) function).getArg(), type);
+            var value = scalar(((UnaryFunction) function).getArg(), type, depth + 1);
             if (value == null) return null;
             return new Pipeline.SqlCompare(((NegatableBooleanFunction) function).isNegated() ? Ir.Op.NE : Ir.Op.EQ,
                     value, new Pipeline.Constant(Long.MIN_VALUE));
         }
         if (implementation == EqDoubleFunctionFactory.FuncDoubleIsNaN.class) {
-            var value = scalar(((UnaryFunction) function).getArg(), ColumnType.DOUBLE);
+            var value = scalar(((UnaryFunction) function).getArg(), ColumnType.DOUBLE, depth + 1);
             if (value == null) return null;
             var present = new Pipeline.IsNotNull(value);
             return ((NegatableBooleanFunction) function).isNegated() ? present : new Pipeline.Not(present);
@@ -304,8 +309,8 @@ final class ResolvedInputs {
         else if (implementation == EqDoubleFunctionFactory.Func.class) { type = ColumnType.DOUBLE; equality = true; }
         else return null;
         var binary = (BinaryFunction) function;
-        var left = scalar(binary.getLeft(), type);
-        var right = scalar(binary.getRight(), type);
+        var left = scalar(binary.getLeft(), type, depth + 1);
+        var right = scalar(binary.getRight(), type, depth + 1);
         if (left == null || right == null) return null;
         boolean negated = ((NegatableBooleanFunction) function).isNegated();
         Ir.Op op = equality ? (negated ? Ir.Op.NE : Ir.Op.EQ) : (negated ? Ir.Op.GE : Ir.Op.LT);
@@ -323,7 +328,7 @@ final class ResolvedInputs {
     private Pipeline.Predicate conjunction(int depth, Function... functions) {
         Pipeline.Predicate result = null;
         for (Function function : functions) {
-            var next = predicate(function, depth + 1);
+            var next = predicateNode(function, depth + 1);
             if (next == null) return null;
             result = result == null ? next : new Pipeline.And(result, next);
         }
@@ -344,6 +349,10 @@ final class ResolvedInputs {
         }
         int type = function.getType();
         if (readType == ColumnType.DOUBLE) return floating(function, depth);
+        if (strings != null && implementation == io.questdb.griffin.engine.functions.str.LengthVarcharFunctionFactory.Func.class
+                && (readType == ColumnType.INT || readType == ColumnType.LONG)) {
+            return strings.length(((UnaryFunction) function).getArg(), depth + 1);
+        }
         if (type == ColumnType.DOUBLE) return null;
         if (type == ColumnType.SYMBOL && readType == ColumnType.SYMBOL) {
             // Only direct static dictionaries have stable IDs shared by frame and merge paths.
@@ -411,6 +420,11 @@ final class ResolvedInputs {
             }
         }
         return column(function, readType);
+    }
+
+    void bindStrings(ResolvedVarchar strings) {
+        if (this.strings != null) throw new IllegalStateException("String inputs already bound");
+        this.strings = strings;
     }
 
     private Pipeline.Scalar floating(Function function, int depth) {

@@ -52,7 +52,7 @@ public class LengthStrFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0));
     }
 
-    private static class Func extends IntFunction implements UnaryFunction {
+    public static class Func extends IntFunction implements UnaryFunction {
         private final Function arg;
 
         public Func(Function arg) {

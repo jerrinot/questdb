@@ -45,7 +45,7 @@ public class LengthSymbolFunctionFactory implements FunctionFactory {
         return new LengthSymbolVFunc(args.getQuick(0));
     }
 
-    private static class LengthSymbolVFunc extends IntFunction implements UnaryFunction {
+    public static class LengthSymbolVFunc extends IntFunction implements UnaryFunction {
         private final Function arg;
 
         public LengthSymbolVFunc(Function arg) {

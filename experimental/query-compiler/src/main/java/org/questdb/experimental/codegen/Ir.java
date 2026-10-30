@@ -60,7 +60,7 @@ public final class Ir {
 
     public enum Op { ADD, SUB, MUL, AND, XOR, USHR, EQ, NE, LT, GE, BOTH, EITHER, FADD, FSUB, FMUL, FDIV, SDIV, FEQ, FNE, FLT, FGE }
 
-    public sealed interface Expr permits Var, Literal, Binary, Load, Offset, Select, Allocate, Reallocate, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, BitCast, AtomicLoad, CompareExchange, AtomicAdd {
+    public sealed interface Expr permits Var, Literal, Binary, Load, Offset, Select, Allocate, Reallocate, NativeCall, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, BitCast, AtomicLoad, CompareExchange, AtomicAdd {
         Type type();
     }
 
@@ -220,6 +220,25 @@ public final class Ir {
         public Type type() {
             return yes.type();
         }
+    }
+
+    /**
+     * Opaque C ABI call: up to eight 64-bit integer/address arguments, signed
+     * 64-bit result. Evaluates target and arguments once, left to right. May
+     * read/write memory; the owner must keep code and context alive until return.
+     * Helpers report errors through their result, never by unwinding across C.
+     */
+    public record NativeCall(Expr function, List<Expr> arguments) implements Expr {
+        public NativeCall {
+            require(function, Type.ADDRESS);
+            arguments = List.copyOf(arguments);
+            if (arguments.size() > 8) throw new IllegalArgumentException("Native call accepts at most eight arguments");
+            for (Expr argument : arguments) {
+                if (argument.type() != Type.I64 && argument.type() != Type.ADDRESS)
+                    throw new IllegalArgumentException("Native call requires integer/address arguments");
+            }
+        }
+        @Override public Type type() { return Type.I64; }
     }
 
     /** Runtime allocation; emit into a local and check for nil before accessing it. */
@@ -412,6 +431,7 @@ public final class Ir {
             case AtomicLoad l -> collectReads(l.address(), reads);
             case AtomicAdd a -> { collectReads(a.address(), reads); collectReads(a.value(), reads); }
             case CompareExchange c -> { collectReads(c.address(), reads); collectReads(c.expected(), reads); collectReads(c.value(), reads); }
+            case NativeCall c -> { collectReads(c.function(), reads); c.arguments().forEach(a -> collectReads(a, reads)); }
             case Allocate a -> collectReads(a.bytes(), reads);
             case Reallocate r -> { collectReads(r.address(), reads); collectReads(r.oldBytes(), reads); collectReads(r.newBytes(), reads); }
             case ToDouble c -> collectReads(c.value(), reads);
@@ -486,6 +506,7 @@ public final class Ir {
             case AtomicLoad l -> verify(l.address(), scope);
             case AtomicAdd a -> { verify(a.address(), scope); verify(a.value(), scope); }
             case CompareExchange c -> { verify(c.address(), scope); verify(c.expected(), scope); verify(c.value(), scope); }
+            case NativeCall c -> { verify(c.function(), scope); c.arguments().forEach(a -> verify(a, scope)); }
             case Allocate a -> verify(a.bytes(), scope);
             case Reallocate r -> { verify(r.address(), scope); verify(r.oldBytes(), scope); verify(r.newBytes(), scope); }
             case ToDouble c -> verify(c.value(), scope);

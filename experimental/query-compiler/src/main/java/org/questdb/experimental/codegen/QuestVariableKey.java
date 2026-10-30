@@ -36,10 +36,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.questdb.experimental.codegen.Ir.*;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** OrderedMap.VarSizeKey encoding: total byte length, then RecordSink-ordered fields. */
 record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
-    static final int NEED_STAGING = 8;
     record Part(MemoryType width, Pipeline.Scalar scalar, ResolvedVarchar.Expression varchar) { }
 
     static QuestVariableKey bind(ColumnTypes input, ColumnTypes types, ListColumnFilter columns,
@@ -100,7 +100,7 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
     }
 
     Var stage(Builder b, Expr row) {
-        Var descriptors = b.let(new Load(MemoryType.ADDRESS, at(STATE, 16)));
+        Var descriptors = b.let(new Load(MemoryType.ADDRESS, at(STATE, KEY_COLUMNS)));
         var source = ResolvedInputs.loadFrameRow(b, inputs.numericInputs(), descriptors, row);
         var frame = inputs.frame(source, row, descriptors);
         var strings = new ArrayList<Pipeline.Utf8Value>();
@@ -112,19 +112,19 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
         }
         Var size = b.let(bytes);
         b.when(binary(Op.GE, size, i64(Integer.MAX_VALUE)), bad -> bad.exit(-8));
-        Var used = b.let(load(at(STATE, 80)));
-        b.when(binary(Op.LT, load(at(STATE, 72)), add(used, size)), full -> {
-            full.store(at(STATE, 88), add(used, size));
-            full.exit(NEED_STAGING); // The producer saved the first unconsumed position at STATE+32.
+        Var used = b.let(load(at(STATE, VariableKey.STAGING_USED)));
+        b.when(binary(Op.LT, load(at(STATE, VariableKey.STAGING_CAPACITY)), add(used, size)), full -> {
+            full.store(at(STATE, VariableKey.REQUIRED_BYTES), add(used, size));
+            full.exit(NEED_STAGING); // The producer saved RESUME_ROW before staging this batch.
         });
-        Var key = b.let(new Offset(new Load(MemoryType.ADDRESS, at(STATE, 64)), used));
+        Var key = b.let(new Offset(new Load(MemoryType.ADDRESS, at(STATE, VariableKey.STAGING_ADDRESS)), used));
         b.store(MemoryType.I32, key, binary(Op.SUB, size, i64(4)));
         Var offset = b.let(i64(4));
         for (int i = 0; i < parts.size(); i++) {
             Part part = parts.get(i);
             Expr field = new Offset(key, offset);
             if (part.width != null) {
-                var value = part.scalar.emit(source);
+                var value = part.scalar.emit(frame.numeric(b));
                 long nullValue = part.width == MemoryType.I64 ? Long.MIN_VALUE
                         : part.scalar instanceof Pipeline.Column column ? column.nullValue() : Integer.MIN_VALUE;
                 Expr data = part.width == MemoryType.I32 || part.width == MemoryType.I64
@@ -139,7 +139,7 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
                 b.assign(offset, add(offset, add(i64(4), value.size())));
             }
         }
-        b.store(at(STATE, 80), add(used, size));
+        b.store(at(STATE, VariableKey.STAGING_USED), add(used, size));
         return key;
     }
 

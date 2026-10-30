@@ -713,7 +713,7 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
     }
 
     /** Scan state is now immutable; no worker can observe this transition. */
-    void finishScan() {
+    void finishScan(Runnable checkpoint) {
         if (shared) {
             sharded = true;
             return;

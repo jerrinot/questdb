@@ -25,7 +25,12 @@
 package org.questdb.experimental.codegen;
 
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.map.Map;
+import io.questdb.griffin.engine.QueryCodeGenerator;
+import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.groupby.GroupByKernel;
+import io.questdb.std.ObjList;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -34,8 +39,32 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /** Fixed-shape measurement reference. Its loop is handwritten C, independent of our typed IR. */
-final class HandwrittenCountSum {
-    private HandwrittenCountSum() { }
+final class HandwrittenCountSum implements QueryCodeGenerator {
+    private final Path artifacts;
+
+    HandwrittenCountSum(Path artifacts) { this.artifacts = artifacts; }
+
+    @Override
+    public GroupByKernel compile(ColumnTypes inputs, ColumnTypes values, ObjList<GroupByFunction> functions) {
+        return null;
+    }
+
+    @Override
+    public GroupByKernel compile(ColumnTypes inputs, ColumnTypes values, ObjList<GroupByFunction> functions,
+                                 int keyColumn, int keyType, Map layout) {
+        var binding = ResolvedAggregateKernel.bind(inputs, values, functions, QuestMapProbe.bind(keyColumn, keyType, layout));
+        if (binding == null) return null;
+        try {
+            var prepared = binding.compileHandwritten(artifacts);
+            try { return new ResolvedQueryCompiler.CompiledUpdates(prepared, "handwritten-c", false); }
+            catch (Throwable failure) {
+                try { prepared.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
+        } catch (IOException failure) {
+            throw io.questdb.cairo.CairoException.nonCritical().put("Handwritten aggregate compilation failed: ").put(failure.getMessage());
+        }
+    }
 
     static CompiledKernel compile(QuestMapProbe probe, boolean sharded, Path artifacts) throws IOException {
         long started = System.nanoTime();

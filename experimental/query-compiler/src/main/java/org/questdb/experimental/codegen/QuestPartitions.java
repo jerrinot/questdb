@@ -30,6 +30,7 @@ import io.questdb.griffin.engine.table.GroupByMapFragment;
 import java.util.function.BiConsumer;
 
 import static org.questdb.experimental.codegen.Ir.*;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** Dense partial-state pages. Allocation and final maps retain their existing query owners. */
 final class QuestPartitions {
@@ -50,7 +51,6 @@ final class QuestPartitions {
     // The blob descriptor starts with the next writable byte pointer.
     private static final int BLOB_AVAILABLE_OFFSET = Long.BYTES;
     static final int STATE_BYTES = BLOB_OFFSET + 2 * Long.BYTES;
-    static final int NEED_FLUSH = 10;
     static final int EXPORTED_ROWS_OFFSET = NativeMapView.MUTATION_BYTES;
     private static final int EXPORT_KEY_OFFSET = EXPORTED_ROWS_OFFSET + 16;
 
@@ -310,7 +310,7 @@ final class QuestPartitions {
         int window = Math.max(1, batchRows);
         Var index = b.let(load(STATE));
         Var batches = b.let(i64(0));
-        Var sourceOffset = probe.variable() ? b.let(load(at(STATE, 96))) : null;
+        Var sourceOffset = probe.variable() ? b.let(load(at(STATE, VariableKey.SOURCE_OFFSET))) : null;
         b.loop(binary(Op.LT, index, ROWS), batch -> {
             batch.when(eq(binary(Op.AND, batches, i64(Math.max(1, 1024 / window) - 1)), i64(0)), Builder::poll);
             batch.assign(batches, add(batches, i64(1)));
@@ -350,7 +350,7 @@ final class QuestPartitions {
                 Var key = consume.let(new Load(MemoryType.ADDRESS, at(scratch, 8)));
                 Var source = consume.let(probe.valueAddress(key));
                 // Variable records resume by byte offset; fixed records resume by index.
-                if (probe.variable()) consume.store(at(STATE, 96), load(scratch));
+                if (probe.variable()) consume.store(at(STATE, VariableKey.SOURCE_OFFSET), load(scratch));
                 Var inserted = consume.let(bool(false));
                 Var destination = probe.finishOrdered(consume, key, consume.let(new Load(MemoryType.ADDRESS, at(scratch, 16))),
                         consume.let(load(at(scratch, 24))), consume.let(load(at(scratch, 32))), index, (init, value) -> {

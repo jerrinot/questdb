@@ -35,3 +35,10 @@ separate_arguments(LLVM_DEFINITION_FLAGS NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 target_compile_options(query_codegen_llvm PRIVATE ${LLVM_DEFINITION_FLAGS})
 target_link_libraries(query_codegen_llvm PRIVATE LLVM)
 target_compile_options(query_codegen_llvm PRIVATE -Wall -Wextra -Werror)
+
+# Only the experimental module links PCRE2; ordinary QuestDB retains its matcher.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
+add_library(query_codegen_regex SHARED regex_helper.c)
+target_link_libraries(query_codegen_regex PRIVATE PkgConfig::PCRE2)
+target_compile_options(query_codegen_regex PRIVATE -Wall -Wextra -Werror)

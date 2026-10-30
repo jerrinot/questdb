@@ -30,6 +30,31 @@ import static org.questdb.experimental.codegen.Ir.*;
 final class ByteSequences {
     private ByteSequences() { }
 
+    /** Utf8s.length: ASCII metadata or full-word continuation-bit counts and a bounded tail. */
+    static Var length(Builder b, Pipeline.Utf8Value value) {
+        Var length = b.let(i64(-1));
+        b.when(eq(value.isNull(), bool(false)), present -> {
+            present.assign(length, value.size());
+            present.when(eq(value.isAscii(), bool(false)), unicode -> {
+                Var index = unicode.let(i64(0));
+                unicode.loop(binary(Op.LT, index, binary(Op.SUB, value.size(), i64(7))), word -> {
+                    Var bits = word.let(load(new Offset(value.address(), index)));
+                    Expr continuations = binary(Op.AND, binary(Op.AND, bits, i64(0x8080808080808080L)),
+                            binary(Op.MUL, binary(Op.XOR, bits, i64(-1)), i64(2)));
+                    word.assign(length, binary(Op.SUB, length, new PopulationCount(continuations)));
+                    word.assign(index, add(index, i64(8)));
+                });
+                unicode.loop(binary(Op.LT, index, value.size()), tail -> {
+                    Var bits = tail.let(new Load(MemoryType.I8, new Offset(value.address(), index)));
+                    Expr continuation = eq(binary(Op.AND, bits, i64(0xc0)), i64(0x80));
+                    tail.assign(length, binary(Op.SUB, length, new Select(continuation, i64(1), i64(0))));
+                    tail.assign(index, add(index, i64(1)));
+                });
+            });
+        });
+        return length;
+    }
+
     /** Lazy, zero-padded prefix with no reads beyond the borrowed slice. */
     static Expr sixPrefix(Expr address, Expr size) {
         Expr result = i64(0);

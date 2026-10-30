@@ -232,13 +232,14 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         emit(b, frame, destination, cardinalityAddress);
     }
 
-    void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+    void emit(Builder b, ResolvedVarchar.Frame source, Expr destination, Expr cardinalityAddress) {
+        var frame = new ResolvedVarchar.Frame(source.numeric(b), source.row(), source.columns(), source.literals(), source.helpers(), source.materialized());
         for (var update : updates) update.emit(b, frame, destination, cardinalityAddress);
     }
 
     void emitFrame(Builder b, Var row, List<Var> addresses, Expr destination, Expr cardinalityAddress) {
         var frame = inputs.frame(loadFrameRow(b, row, addresses), row, at(COLUMNS, 8));
-        for (var update : updates) update.emit(b, frame, destination, cardinalityAddress);
+        emit(b, frame, destination, cardinalityAddress);
     }
 
     void finish(Builder b, Expr destination, boolean deferred) {
@@ -248,7 +249,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     void prefetch(Builder b, Var row, List<Var> addresses, Expr destination) {
         for (var update : updates) update.prefetch(b, argument -> {
             var required = ScanPlan.of(columns(), new Pipeline.IsNotNull(argument)).predicateColumns();
-            return argument.emit(loadFrameRow(b, row, addresses, required));
+            return argument.emit(inputs.frame(loadFrameRow(b, row, addresses, required), row, at(COLUMNS, 8)).numeric(b));
         }, destination);
     }
 
@@ -296,7 +297,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     record DoubleSum(Pipeline.Scalar argument, long offset) implements Update {
         @Override public void initialize(Builder b, Expr destination) { b.store(MemoryType.F64, at(destination, offset), f64(Double.NaN)); }
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
-            combine(b, destination, argument.emit(frame.numeric()).data());
+            combine(b, destination, argument.emit(frame.numeric(b)).data());
         }
         @Override public void merge(Builder b, Expr source, Expr destination) {
             combine(b, destination, new Load(MemoryType.F64, at(source, offset)));
@@ -316,7 +317,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     record DoubleExtremum(Pipeline.Scalar argument, long offset, boolean minimum) implements Update {
         @Override public void initialize(Builder b, Expr destination) { b.store(MemoryType.F64, at(destination, offset), f64(Double.NaN)); }
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
-            combine(b, destination, argument.emit(frame.numeric()).data());
+            combine(b, destination, argument.emit(frame.numeric(b)).data());
         }
         @Override public void merge(Builder b, Expr source, Expr destination) {
             combine(b, destination, new Load(MemoryType.F64, at(source, offset)));
@@ -337,7 +338,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             b.store(at(destination, offset + 8), i64(0));
         }
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
-            var value = argument.emit(frame.numeric());
+            var value = argument.emit(frame.numeric(b));
             if (sumType == MemoryType.F64) {
                 Expr present = binary(Op.FEQ, value.data(), value.data());
                 b.store(MemoryType.F64, at(destination, offset), binary(Op.FADD,
@@ -361,7 +362,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     record VectorDoubleCount(Pipeline.Scalar argument, long offset) implements Update {
         @Override public void initialize(Builder b, Expr destination) { b.store(at(destination, offset), i64(0)); }
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
-            Expr value = argument.emit(frame.numeric()).data();
+            Expr value = argument.emit(frame.numeric(b)).data();
             b.store(at(destination, offset), add(load(at(destination, offset)), new Select(binary(Op.FEQ, value, value), i64(1), i64(0))));
         }
         @Override public void merge(Builder b, Expr source, Expr destination) {
@@ -374,7 +375,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         private Expr empty() { return f64(minimum ? Double.POSITIVE_INFINITY : Double.NEGATIVE_INFINITY); }
         @Override public void initialize(Builder b, Expr destination) { b.store(MemoryType.F64, at(destination, offset), empty()); }
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
-            combine(b, destination, argument.emit(frame.numeric()).data());
+            combine(b, destination, argument.emit(frame.numeric(b)).data());
         }
         @Override public void merge(Builder b, Expr source, Expr destination) {
             combine(b, destination, new Load(MemoryType.F64, at(source, offset)));
@@ -394,7 +395,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             for (int i = 0; i < 3; i++) b.store(at(destination, offset + i * 8), i64(0));
         }
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
-            var value = argument.emit(frame.numeric());
+            var value = argument.emit(frame.numeric(b));
             b.when(eq(value.isNull(), bool(false)), valid -> {
                 addSum(valid, destination, value.data(), new Select(binary(Op.LT, value.data(), i64(0)), i64(-1), i64(0)));
                 valid.store(at(destination, offset + 16), add(load(at(destination, offset + 16)), i64(1)));
@@ -423,7 +424,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         }
         @Override
         public void emit(Builder builder, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
-            operation.emit(builder, frame.numeric(), at(destination, offset));
+            operation.emit(builder, frame.numeric(builder), at(destination, offset));
         }
     }
 
@@ -436,7 +437,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         }
 
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
-            var value = argument.emit(frame.numeric());
+            var value = argument.emit(frame.numeric(b));
             combine(b, destination, new Select(value.isNull(), i64(nullValue()), value.data()));
         }
 
@@ -467,7 +468,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
             Expr sumAddress = at(destination, offset), countAddress = at(destination, countOffset);
             Var count = b.let(load(countAddress));
-            var input = argument.emit(frame.numeric());
+            var input = argument.emit(frame.numeric(b));
             Expr missing = input.data().type() == Type.F64 ? binary(Op.FNE, input.data(), input.data()) : input.isNull();
             if (sumType == MemoryType.F64) {
                 // Ordinary computeFirst(NULL) stores (0,0). A later Java computeNext
@@ -532,7 +533,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         public void emit(Builder builder, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
             Expr countAddress = at(destination, offset);
             Var before = builder.let(load(countAddress));
-            layout.emitWithCapacity(builder, argument.emit(frame.numeric()), countAddress, initialCapacity, loadFactor);
+            layout.emitWithCapacity(builder, argument.emit(frame.numeric(builder)), countAddress, initialCapacity, loadFactor);
             builder.when(ne(before, load(countAddress)), changed ->
                     changed.store(cardinalityAddress, add(load(cardinalityAddress), i64(1))));
         }

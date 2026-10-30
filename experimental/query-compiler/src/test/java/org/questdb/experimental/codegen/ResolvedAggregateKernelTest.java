@@ -976,8 +976,8 @@ public class ResolvedAggregateKernelTest {
     }
     private static QuestFixedKey fixedKey(int type) {
         var column = new Pipeline.Column(0, "key", type);
-        return new QuestFixedKey(new int[]{0}, List.of(column), List.of(column),
-                new Ir.MemoryType[]{column.width()}, ColumnType.sizeOf(type));
+        return new QuestFixedKey(new ResolvedVarchar.Binding(new int[]{0}, List.of(column), new int[0], new byte[0]), List.of(column),
+                new Ir.MemoryType[]{column.width()}, ColumnType.sizeOf(type), List.of());
     }
 
 }

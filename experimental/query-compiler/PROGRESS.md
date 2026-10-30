@@ -6096,3 +6096,417 @@ stores on generic ARM64. This is compile-only portability evidence, not executio
 or performance validation on another CPU. Production still needs the explicit
 alignment/completion contract and a measured choice of ordinary versus streaming
 stores. No new runtime code or setting is retained from this diagnostic.
+
+## 2026-10-30 — Evaluate computed SYMBOL keys in the dictionary domain
+
+The first retained slice evaluates resolved `length` and literal `strpos` INT
+grouping expressions over static SYMBOLs once per dictionary entry. Optional
+STRING casts and `lower`/`upper` use the existing functions, preserving their
+NULL/Unicode behavior. Typed IR loads the resulting INT by symbol ID inside the
+existing generated scan/map loop. No new map, scheduler or configuration switch.
+STRING-valued grouping keys such as `lower(station)` are still outside this slice.
+
+Complete warm HTTP queries, two warm-ups then median of three executions, eight
+physical 9950X cores, identical stock/candidate configuration and current core
+classes; preparation and output are included, compilation is already warm:
+
+| Input rows / dictionary entries | Group key | Stock | LLVM | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| 1B / 413 | `strpos(lower(station),'a')` | 4.042s | 0.580s | 7.0x |
+| 500M / 8,191 | `strpos(wide_key,'7')` | 0.995s | 0.183s | 5.4x |
+| 500M / 1,048,576, scrambled IDs | `strpos(s,'7')` | 1.070–1.134s | 0.410–0.412s | 2.6–2.8x |
+
+All three also compute COUNT and SHORT SUM. Reversed process order retains the
+gains; final rebuilt candidate medians are 0.563/0.184/0.410s. Complete results
+match ordinary SQL. Measured windows have zero process reads or major faults.
+The small-dictionary gains persist with 1 and 16 allowed cores (about 7x and
+5.5x); one allowed core still uses the default minimum two query workers.
+
+For the 1B case, 76% of baseline query-thread JFR leaf samples are `strpos`, with
+another 10% in lowercasing. Instructions fall from 653 to 68 per row, cycles from
+172 to 24. For the 8,191-entry case they fall from 393 to 68 instructions and 83
+to 15 cycles. This is work removal: O(dictionary entries) expression evaluation
+replaces O(rows), followed by one indexed INT load per row. The prior LLVM path
+took 3.90/0.94s because key expressions remained ordinary. Thus the gain combines
+dictionary evaluation with admission to the generated key/map loop; there is no
+matched fully generated per-row string-expression control yet.
+
+The 4MiB lookup retains about 68 instructions/row but costs 34 cycles/row. L2
+demand-read misses rise from 0.005 to 0.767/row versus the 32KiB lookup, and
+load-not-complete cycles from 4.12 to 11.04/row. Controller reads remain near
+3.2–3.4GB for 3GB useful input. This supports cache/dependent-load cost, with
+LLC service inferred rather than directly measured. Controller counters are
+system-wide and background I/O was observed outside the benchmark cgroup; their
+per-query byte differences cannot be assigned entirely to query work.
+
+Admission requires known unfiltered N and D+1 < N/(worker slots + owner), so
+near-unique or filtered inputs decline before allocation/map mutation. Lookup
+memory follows the snapshot and query tracker, refreshes on reopen, checks the
+breaker, and is released after workers drain. 139 focused tests pass, including
+NULL/Unicode, composite keys, insert/truncate/ID reuse, mixed column-top/native
+frames, Parquet, runtime/dynamic inputs, memory limits and cancellation.
+
+Handwritten C and generated direct-array diagnostics use the same rows, expression
+lookup and COUNT/SUM. On 1B rows they take 168/142ms including preparation versus
+about 580ms integrated. On the million-symbol case they take 163/137ms, including
+25/19ms preparation. These use a different aggregation algorithm and harness;
+they establish headroom, not an end-to-end engine comparison. Next experiment:
+reuse existing bounded-array aggregation for proven computed-key domains.
+No query names, literal values or CPU model constants drive admission. Performance
+has only been measured on this CPU family. Raw controls, counters, SQL results,
+floor harness and validated bottleneck study: `/tmp/query-symbol-domain-20261030/`.
+
+## 2026-10-30 — Dictionary-derived keys reach direct array aggregation
+
+The dictionary evaluation pass now proves the INT result range without another
+row scan. A single key with numeric, non-allocating aggregate state uses private
+arrays when both the existing per-worker cache budget and N/(workers+owner) work
+budget admit the range plus NULL. Sparse/unaffordable ranges retain hashing.
+Arrays use the ordinary packed aggregate states and share initialization/merge
+generation with the direct-SYMBOL vector path. After all scans drain, generated
+code merges arrays directly, then publishes each observed group once into the
+existing output map. Ordinary fallback frames merge through the existing maps.
+No Rosti probing or map probing occurs per input row or between private arrays.
+
+Complete warm HTTP executions on eight physical 9950X cores, two warm-ups then
+median of three measured runs, with dictionary preparation, merge and output
+included. All modes use the same current core classes, configuration and data:
+
+| Rows / dictionary entries | Stock | Previous LLVM map | LLVM array |
+| --- | ---: | ---: | ---: |
+| 1B / 413 | 3.889s | 0.565s | 0.159s |
+| 500M / 8,191 | 0.999s | 0.183s | 0.094s |
+| 500M / 1,048,576, scrambled IDs | 1.119s | 0.415s | 0.143s |
+
+These are the same `strpos` + COUNT/SHORT SUM controls as the preceding entry.
+Reversed-order repeats retain the gains. The 1B improvement over the prior LLVM
+map is 3.6x on eight cores, 3.7x on one allowed core and 3.1x on sixteen. The
+8,191-entry control improves about 2x at each core budget. One allowed core still
+uses the default minimum two query workers. Direct-SYMBOL DOUBLE/SHORT controls
+remain within 1% (0.217/0.216s and 0.162/0.163s before/after).
+
+On 1B rows, instructions fall 68.0 to 35.3/row, cycles 23.8 to 6.6/row and
+load-not-complete cycles 6.85 to 2.28/row. The symbolized emitted object removes
+hashing, shard selection and the staged prefetch/probe pass; 97% of final native
+cycle samples land in the array scan. This supports reduced execution and
+dependent-load work, not an exclusive execution-port diagnosis. Controller read
+throughput rises from about 12 to 39GB/s. Useful input is still 6GB, so the measured
+58GB/s streaming ceiling implies about 103ms for input reads alone; 159ms is close
+to the earlier 142ms generated-array diagnostic but does not prove optimality.
+The controller is system-wide and includes background traffic. Measured query
+windows have zero process reads and major faults.
+
+All computed-key benchmark results match exactly. Existing direct-SYMBOL DOUBLE
+averages vary by at most 3.7e-13 across runs; keys/extrema and the SHORT control
+match exactly. Native array-row counters cover every input row in the three new
+paths. 136 focused cases pass across LLVM, AsmJit, C and both worker modes,
+including all-NULL/empty domains, sparse ranges, composite-key fallback,
+dictionary refresh, mixed fallback/native frames, integer/DOUBLE finalization,
+ordering and existing map/partition lifecycles. STRING-valued keys and composite
+dictionary domains are still outside the array path. No additional toggle or
+CPU-specific admission constant. Evidence: `/tmp/query-symbol-array-20261030/`.
+
+## 2026-10-30 — Simplify preparation and array ownership
+
+Explicit `CompiledKernel.prepare()` replaces zero-row calls used solely to trigger
+compilation. Dictionary-array candidates defer the batch/map/rehash/merge fallback
+kernels; other plans retain their existing compilation policy. A counting-backend
+check reproduced four eager fallback compilations before opening the cursor on
+LLVM, AsmJit and C. It now sees zero before admission, then only the array scan and,
+when multiple slots receive rows, its merge. Reopen reuses compiled code.
+
+`DictionaryAggregate` owns its slot state and immutable kernel references.
+Completion runs through the query owner after scan tasks drain, removing the
+concrete updater casts and wrapper-unwrapping loop. Allocation and merge retain
+QuestDB's existing slot allocators and scratch. The handwritten COUNT/SUM control
+now implements the existing compiler interface itself; the ordinary compiler no
+longer carries its mode flag or operator-specific branches. No new toggle or
+framework, and no change to generated scan/merge algorithms.
+
+Focused checks: 153 passed, four expected non-LLVM handwritten-control skips.
+Coverage includes explicit preparation and retry, compilation/resource accounting,
+dictionary refresh and sparse admission, column tops/Parquet, mixed fallback
+frames, numeric finalization, wrapped updaters, failure/reopen and both worker modes.
+This is a maintainability and compilation-work result; no latency benchmark or
+hardware-bottleneck claim was made.
+
+## 2026-10-30 — Shared VARCHAR numeric expressions
+
+Checkpoint `016600dca5` retains dictionary-derived arrays and the ownership/prepare
+cleanup. Three reversed-order pairs preserve identical integer output on 1B/500M
+rows. Median first complete request falls **310 to 268ms / 146 to 115ms**; warm
+runs show no consistent regression. Deferred compilation moves accounting between
+HTTP compiler/execution fields, so these comparisons use complete wall time.
+
+VARCHAR `length` now binds through the shared numeric expression path into ordinary
+SUM/AVG/COUNT/MIN/MAX/DISTINCT updates, grouping keys and residual predicates. CASE
+and arithmetic compose. ASCII metadata avoids payload reads; the non-ASCII loop
+copies `Utf8s.length`'s word/tail algorithm and its unusual NULL result, **-1**.
+Compiler-time memoization shares derived values between aggregate updates. Compact
+partition records retain the integer, not a string solely needed to recompute it.
+Existing numeric-only join/map consumers decline frame-dependent expressions.
+No new aggregate, map, scheduler, helper dependency or runtime setting.
+
+Focused complete HTTP queries, eight physical 9950X cores, 500M rows, two warm-ups
+and three measured requests per process; reversed process order and ordinary SQL
+outputs checked (floating AVG tolerance 1e-13):
+
+| Work | Pre-change LLVM | New LLVM |
+| --- | ---: | ---: |
+| Grouped AVG/SUM(length), COUNT(VARCHAR) | 1.136–1.150s | 0.382–0.384s |
+| Scalar SUM(length), COUNT(VARCHAR) | 0.467–0.523s | 0.138–0.139s |
+| Group by length, COUNT/SUM | 0.455–0.461s | 0.234–0.242s |
+| Length predicate, grouped COUNT/SUM | 0.490–0.493s | 0.367–0.369s |
+
+The first case's ordinary control is 1.149s. First complete LLVM request improves
+1.270s to 0.580–0.591s, including compilation/initialization. Instructions fall
+**549 to 163/input**, cycles **95 to 32**. Retiring-slot fraction moves 64% to 55%,
+oldest-load wait 17% to 23%, and controller reads 8.7 to 24.1GB/s. Prior Java samples
+attributed 47% to maps and 22% to length; the native-symbol profile now attributes
+98% of cycle samples to the generated scan/update kernel. This is dispatch/work
+removal, not a faster memory subsystem. Measured windows have zero process reads
+and major faults; no measured GC. Controller counters remain system-wide.
+
+Actual ClickBench **Q27**, 99,997,497 rows: stock/pre-change 289ms, new 263ms, matching
+ordered output. Instructions fall 250 to 145/input but cycles only 122 to 111.
+Oldest-load wait rises 59% to 70%; controller traffic is still 11.6GB/query.
+At the earlier 63.4GB/s stream ceiling that alone needs about 183ms, an optimistic
+floor, not an attainable full-query prediction. The 3x synthetic gain cannot
+transfer unchanged. Its scan/filter/aggregation now execute natively; the outer
+filter and encoded sort remain ordinary. No full-query coverage increase claimed.
+
+Focused checks cover LLVM/AsmJit/C, both worker modes, NULL/Unicode/CASE, DISTINCT,
+scalar promotion, compact fixed/variable records, reopen, column tops, Parquet,
+lazy conversion fallback and guarded loads at every word/tail boundary. Evidence:
+`/tmp/query-varchar-expressions-20261030/`; hardware study validated before editing.
+
+## 2026-10-30 — Capture matcher experiment: no universal winner
+
+Compared ordinary Java, PCRE2 10.46 JIT, and a generated, bounded capture matcher.
+The latter parses a general subset (concatenation, ASCII classes, greedy character
+repeats, optional groups/captures, anchors), generates C, then uses Clang IR and
+our LLVM ORC backend. This is an isolated **function-level** control: the remaining
+SQL operators stay ordinary, with one Java/native crossing per evaluated string.
+It is not an integrated generated regex pipeline or new ClickBench qualification.
+
+Each candidate passes 220,297 differential cases against the existing signed-byte
+Java view, including empty/unmatched captures, CR/LF/CRLF, Unicode bytes, overlapping
+optional prefixes and long failures. Seven generated cases exhaust its bounded
+work and return to Java; unsupported alternation, nested repetitions, lookaround,
+backreferences and lazy quantifiers decline. PCRE2 needs ANYCRLF newline semantics
+for this byte view. This validates the tested subset, not arbitrary Java regexes.
+
+Complete requests, same eight cores and two-warm/three-measured protocol, forward
+and reversed process order. All **120 responses match exactly**, including AVG:
+
+| Workload | Java | PCRE2 JIT | Generated capture |
+| --- | ---: | ---: | ---: |
+| Q28, 100M actual rows | 2.04–2.08s | 1.537–1.539s | 1.66–1.67s |
+| 500M, prefix capture + AVG/COUNT/MIN | 4.76–5.03s | 2.57–2.58s | 2.47–2.48s |
+| 500M, immediate prefix rejection + many groups | 3.12–3.27s | 3.35–3.43s | 2.82–2.91s |
+| 500M, overlapping optional prefix + COUNT/SUM | 5.02–5.30s | 1.82–1.92s | 1.69–1.75s |
+
+Q28 instructions/input are **3069 / 1665 / 2380**, cycles **830 / 620 / 673**.
+Branches/input fall **634 / 351 / 483**, while misses remain **5.10 / 4.82 / 4.54**.
+PCRE2 wins through less executed work, despite more misses than the generated
+candidate. The rejection control falsifies unconditional PCRE2 substitution:
+instructions rise **660 to 733**, cycles **276 to 290**, misses **0.645 to 0.876/input**.
+No measured process reads or major faults. These are full-query costs, not regex
+kernel timings; earlier Q28 profiling attributes 53% of samples to the matcher.
+
+A separate 500M-call trivial-kernel control costs 2.483s through per-row FFM versus
+0.176s inside one native loop: about **4.6ns/call** including the Java-loop difference.
+That suggests roughly 58ms/100M calls at perfect eight-core scaling; it is a lower
+complexity control, not a prediction for real regex calls. Generated first-request
+compilation also includes an external Clang process; the query compiler field is
+about 177ms versus 70ms for PCRE2 in the first pair. Do not mistake that scaffolding
+for a viable production compilation path.
+
+Decision: retain shared length binding, not either blanket matcher replacement.
+Next regex integration should compose existing literal rejection with a native
+capture helper inside the generated loop, preserve the proven admission/ownership
+contracts, and compare against this bounded generated control. No regex dependency,
+setting or matcher implementation was added to production. Scratch evidence/code:
+`/tmp/query-regex-experiment-20261030/`.
+
+## 2026-10-30 — Matched capture pipeline: LLVM reaches the handwritten reference
+
+Isolated experiment on `627421ea90`: ordinary Java, Java surrounding PCRE2,
+typed-IR/LLVM surrounding the same PCRE2, and independently handwritten C through
+the same LLVM O2/ORC backend. The native candidates retain OrderedMap's packed
+keys, hash, probing, key copies, aggregate state and growth/resume protocol.
+Both use scalar row loops (`prefetchRows=0`) and the existing scheduler, Java
+merge and final output operators. Bounded partition aggregation is disabled in
+the experimental adapter. These are matched diagnostic choices, not new defaults.
+The reference binds resolved capture/COUNT/AVG(length)/MIN(VARCHAR)/SUM(INT)
+shapes, without SQL spelling, pattern or data recognition.
+
+9950X, CPUs 0–7, eight query workers and one network worker in every comparison.
+Resident data, complete HTTP responses, two warm-ups and three measured requests;
+native/helper variants repeated in reverse process order. Entries below are
+medians from each process, in seconds. This is a focused experiment, not a new
+full ClickBench protocol run.
+
+| Work | Ordinary Java | Java + PCRE2 | IR + PCRE2 | Handwritten + PCRE2 |
+| --- | ---: | ---: | ---: | ---: |
+| Q28, 99,997,497 input rows | 2.045 | 1.543–1.545 | 1.193–1.195 | 1.189–1.197 |
+| 500M, capture + AVG/COUNT/MIN | 4.068 | 2.588–2.617 | 1.801–1.816 | 1.730–1.746 |
+| 500M, immediate prefix rejection (Java key fallback) | 3.082 | 3.374–3.696 | 3.311–3.384 | 3.467–3.491 |
+| 500M, optional prefix + COUNT/SUM (Java key fallback) | 4.434 | 1.852–1.934 | 1.874–1.919 | 1.929–1.951 |
+
+Admission audit correction: the last two rows selected UnorderedVarcharMap,
+whose computed VARCHAR keys were not bound by the adapter. Their IR/C-labelled
+configurations compiled aggregate batches but still evaluated keys in Java.
+The cumulative native-map counter stopped increasing after the first control;
+an isolated rejection run confirms zero native-map rows. These two rows measure
+the fallback path, not fusion, and cannot establish a fused-pipeline regression.
+Q28 and the AVG/COUNT/MIN control used OrderedMap and did execute the native scan.
+
+Q28 fusion is **1.29x** faster than the identical matcher in Java, **1.71x**
+versus ordinary Java, and within process variation of handwritten C. At one
+worker/core: PCRE2 control **10.898s**, IR **7.986s**, C **7.984s**. First complete
+eight-core requests, including preparation: PCRE2 **2.005–2.064s**, IR
+**1.735–1.781s**. The handwritten compiler still invokes Clang and compiles an
+unused generated scan before installing its reference; its compilation cost is
+not a production comparison. Java surrounding PCRE2 loses on immediate rejection;
+the fused rejection and optional-prefix controls must be rerun after admitting
+computed VARCHAR keys on their actual map layout. No universal replacement win.
+
+Fresh Q28 hardware evidence, PCRE2 control to IR:
+
+- Instructions **1701 to 1160/input**, cycles **626 to 483/input**. Native C uses
+  about 1217 instructions/input without a material time advantage.
+- Controller reads **21.68 to 20.85GB/query**, writes **4.05 to 3.96GB/query**;
+  read throughput rises **14.0 to 17.3GB/s**. Traffic falls only about 4%, versus
+  about 23% lower elapsed time. This is principally less execution/transition work,
+  not a bandwidth breakthrough. The earlier 63.4GB/s stream ceiling is a reference,
+  not proof that this access pattern can attain it.
+- Oldest-load-wait fraction remains **41% to 42%**; absolute load-wait cycles
+  fall. Retiring slots **28.6% to 24.3%**. Store-to-load conflict events fall
+  **5.72 to 2.64/input** (C: 3.84); these counters do not isolate one source site.
+- Native-IP sampling places about 17% of control cycles in the FFM downcall stub.
+  Its hottest sampled address follows `lock addl $0,-0x40(%rsp)`, the native-return
+  ordering barrier. Sampling skid prevents assigning every cycle to that precise
+  instruction, but this supports transition/ordering cost. The previous 4.6ns
+  trivial-call control substantially understates this real call site's cost.
+  Fusion retains native PCRE2 calls while amortizing Java/native transitions.
+- Generated symbols and assembly identify the remaining scan hot sites in the
+  serial hash loop, offset-table/entry loads and MIN string-prefix loads. The
+  generated scan is about 48% of cycle samples. PCRE2's executable arenas remain
+  anonymously labelled, so their exact source attribution is limited. No exclusive
+  cache-latency, execution-port or store-buffer bottleneck is claimed.
+
+Matched measured Q28 windows: 94–96% process CPU occupancy across eight allowed
+cores, at least 75.5GiB available memory, no process reads/major faults or sampled
+reclaim/swap activity; PMU groups run 100% without multiplexing. Scheduler waiting
+is nonzero with the fixed worker/owner topology and is retained in raw evidence.
+Controller counters are system-wide. No fresh GC-event recording or second-CPU
+replication; those remain evidence gaps.
+
+All **140** matrix responses match, including complete 500M-control results.
+Another 15 requests check every Q28 group through aggregate invariants: 3,008,997
+groups,81,032,736 selected rows,6,339,129,459 code points,285,259,323 key code points
+and 444,876,507 MIN-value code points, identical across Java/IR/C. These invariants
+supplement the exact top 25 comparison; they are not a full per-group checksum.
+**112** focused complete-SQL/reopen checks pass against the ordinary Java matcher
+across both worker modes, NULL/empty/Unicode/NUL/newline/long strings, optional
+captures, small frames and map growth. Forced slow-path runs exercise over 250k
+Java matcher callbacks per native variant. Benchmarks use no slow-path callbacks.
+
+Separate instrumented single-core Q28 runs: both native loops perform 81,038,412
+matcher calls versus 81,032,736 ordinary calls; 5676 extra calls are resumable growth
+retries. IR/C probes are 101.340M/101.382M and key comparisons 77.583M/77.584M,
+with identical selected-row counts/results. Ordinary matching returns 66.285M
+captures and 14.748M unchanged inputs; staged payload is about 1.93GB/query before
+length prefixes. This does not imply 1.93GB of extra DRAM traffic.
+
+Decision: retain the architectural result, not a blanket PCRE2 replacement.
+The IR is already near this algorithm's handwritten reference. Next integration
+needs a real slot-owned native-helper/lifetime contract and general cheap
+rejection before expensive matching; the rejection control must beat ordinary
+execution before default admission. Keep key representation/copy experiments
+separate. No production compiler changes, dependency, setting or full-query
+qualification were added. Only this log is retained in the checkout; isolated
+sources, scripts, assembly, semantic checks and raw counters are under
+`/tmp/query-fused-capture-20261030/` (`summary.json`, `hardware-summary.json`,
+`use-summary.json`, `matrix.py`, `profile-candidates.py`, `run-semantics.py`).
+
+## 2026-10-30 — Integrate slot-owned capture helpers; close the false-admission gap
+
+The earlier rejection/optional-prefix controls had Java key fallback, as corrected
+above. Computed VARCHAR keys now bind the actual UnorderedVarcharMap, including
+CASE expressions. They use its existing hashing, probing, unstable-key copy,
+growth, merge and sharding contracts. No forced map selection or scheduler change.
+
+The experimental compiler now has a typed, effectful native call on LLVM, AsmJit
+and C. Capture expressions use it directly, without IR text replacement. Each
+existing aggregate slot owns its PCRE2 matcher, tracked preparation allocations
+and Java fallback; descriptors carry borrowed pointers, not a global registry.
+Prefix rejection is generated inline from the admitted pattern grammar. The
+ordinary core function only exposes immutable pattern/group metadata. PCRE2 is a
+dependency of the optional compiler module, and admission requires the ordinary
+ASCII-byte capture contract. Unsupported patterns/predicate contexts stay ordinary.
+No new runtime toggle. PCRE2 executable allocation remains library-managed, outside
+per-query allocator accounting; this is not a claim of complete JIT RSS accounting.
+
+One pathological assumption was falsified: 30 optional empty groups followed by a
+required character can keep Java matching an empty input for over two seconds
+without calling charAt once. Cancellation through the byte view cannot interrupt
+that case. The admission parser now rejects nullable optional groups. Admitted
+native work/stack-limit failures use the Java matcher with cancellation polling;
+callback failures return through the ABI and are rethrown by KernelMemory.
+
+Controlled integration runs: 9950X, CPUs 0–7, eight query workers/one network worker,
+resident data; two warm-ups, three measured complete responses, balanced
+stock/LLVM/LLVM/stock process order. Both use the same server configuration;
+LLVM uses its existing default prefetch/merge/partition settings. Per-process
+server-execution medians in seconds (six measured requests per mode/case):
+
+| Work | Stock | Integrated LLVM | Approx. speedup |
+| --- | ---: | ---: | ---: |
+| Q28, 99,997,497 input rows | 2.004–2.041 | 1.096–1.098 | 1.84x |
+| 500M capture + AVG/COUNT/MIN | 3.985–4.034 | 1.714–1.715 | 2.34x |
+| 500M immediate prefix rejection | 3.125–3.161 | 0.904–0.906 | 3.47x |
+| 500M optional prefix + COUNT/SUM | 4.439–4.478 | 1.367–1.370 | 3.26x |
+
+First complete Q28 HTTP responses, including preparation: stock 2.551–2.786s,
+LLVM 1.535–1.537s. Both report FIBER_HOST, JIT mode 0 (enabled), sharding threshold 10,000
+and frame bounds 100,000–1,000,000; the harness installs the ordinary
+ResolvedQueryCompiler/LlvmBackend without an adapter override.
+
+Every request audits native-row **increments**: 500M per synthetic query and
+81,032,736 selected rows per Q28. All 80 matrix responses match exactly; 30 profile
+responses also match. Ten full-group invariant responses match stock:
+`[3008997, 81032736, 6339129459.0, 285259323, 444876507]`. These cover every group
+but are not a per-group checksum. This is a capture/aggregation experiment, not a
+full ClickBench rerun or a claim that Q28's remaining operators are all generated.
+
+Why it wins: Q28 falls from 3035–3071 to 1207 instructions/input and 815–834 to
+437–438 cycles/input. IPC is lower, not higher: less work explains the win.
+Rejection falls from 653–659 to 174 instructions/input and 266–269 to 76–77
+cycles/input. As a cycle-budget check, 500M * 77 / (8 * roughly 5.3GHz) is 0.91s,
+consistent with elapsed time; this accounting is not independent bottleneck proof.
+A separate scalar-loop diagnostic, holding the fused map path fixed, reduced
+rejection from 2.020s to 1.247s by adding the prefix guard: 418 to 163 instructions
+and 171 to 108 cycles/input. Final default settings also retain existing prefetch.
+
+Fresh Q28 controller reads fall 23.01 to 21.01GB/query and writes 4.23 to 3.98GB;
+read bandwidth rises 11.36 to 18.99GB/s. Roughly 8% less traffic cannot explain
+roughly 46% less time by itself. Oldest-load-wait fraction stays near 32%/31%,
+while absolute waits fall. Samples identify the generated scan (52%), anonymous
+executable arenas (26%, likely PCRE2 JIT but not individually symbolized), and
+native merge (7%). They do not establish an exclusive cache tier or execution-port
+bottleneck. PMU groups run 100% without multiplexing; sampling reports zero loss.
+Measured runs have 94–99% process occupancy over the eight CPUs, at least 75.9GiB
+available memory, zero process reads and major faults. Minor faults remain in Q28.
+This remains an exploratory prototype integration; no second-CPU replication or
+fresh GC-event attribution, and no claim that the hardware bottleneck is settled.
+
+Focused verification: 24 SQL cases across three backends and both worker modes,
+two native-call effect/order/live-value and cancellation/resource checks, and 41
+existing IR/optimizer/backend checks; all pass. Includes
+both maps, reopen, sharding/growth, column tops, Parquet, NULL/empty/high-byte/NUL/
+newline/long strings, optional captures, nested CASE and unsupported-pattern fallback.
+Only this log and implementation/tests are retained; raw evidence and scripts:
+`/tmp/query-capture-integration-20261030/` (`integrated-summary.json`,
+`integrated-use-summary.json`, `integrated-runs.py`, `integrated-profile.py`).

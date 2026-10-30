@@ -27,6 +27,7 @@ package org.questdb.experimental.codegen;
 import java.util.function.BiConsumer;
 
 import static org.questdb.experimental.codegen.Ir.*;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /**
  * Exact duplicate filter for fixed-width key-only aggregation. Each remembered key already
@@ -72,7 +73,7 @@ final class QuestKeyFilter {
             });
         };
         Var index = b.let(load(STATE));
-        Var selection = b.let(new Load(MemoryType.ADDRESS, at(STATE, 8)));
+        Var selection = b.let(new Load(MemoryType.ADDRESS, at(STATE, SELECTION)));
         if (filter != null) {
             ScanLowering.filteredRange(filter, null, b, selection, index, consume);
         } else {
@@ -86,7 +87,7 @@ final class QuestKeyFilter {
             });
         }
         b.store(at(STATE, scratch + 16), emitted);
-        if (filter != null) b.store(at(STATE, ResolvedAggregateKernel.FILTERED_ROWS), accepted);
+        if (filter != null) b.store(at(STATE, FILTERED_ROWS), accepted);
         b.exit(0);
         return new Program(b.block());
     }

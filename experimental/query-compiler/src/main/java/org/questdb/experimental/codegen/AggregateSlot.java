@@ -45,11 +45,13 @@ import io.questdb.std.Unsafe;
 import org.questdb.experimental.codegen.ResolvedAggregateKernel.Prepared;
 
 import static org.questdb.experimental.codegen.Ir.*;
-import static org.questdb.experimental.codegen.ResolvedAggregateKernel.NEED_CAPACITY;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 import static org.questdb.experimental.codegen.ResolvedAggregateKernel.prefetchScratch;
 
 /** Slot-local scratch, reused across batches. The caller owns map and frame lifetimes. */
 public final class AggregateSlot implements GroupByKernel.Updater {
+    private final ResolvedVarchar.Slot argumentHelpers;
+    private final ResolvedVarchar.Slot keyHelpers;
     // 128KiB of row IDs bounds the stage independently of frame/task scheduling.
     private static final int FILTER_STAGE_ROWS = 16 * 1024;
     // Rehash arguments, map views and sort/selection controls reuse this region by phase.
@@ -93,6 +95,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private long inputPartitionRemaining;
     private long inputPartitionWindow;
     private long localRows;
+    private final DictionaryAggregate.Slot dictionary;
     private long topKRows;
     private long topKMergeRows;
     private final Map.NativeRehash rehash;
@@ -121,8 +124,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         long keyBytes = 0;
         if (prepared.probe != null) {
             if (prepared.probe.variable()) keyBytes = prepared.probe.variableKey().descriptorBytes();
-            else if (prepared.probe.varchar()) keyBytes = 48;
-            else if (prepared.probe.fixedKey() != null) keyBytes = prepared.probe.fixedKey().columns().length * 8L;
+            else if (prepared.probe.varchar()) keyBytes = prepared.probe.varcharKey() != null ? prepared.probe.varcharKey().inputs().bytes() : 48;
+            else if (prepared.probe.fixedKey() != null) keyBytes = prepared.probe.fixedKey().descriptorBytes();
         }
         long sharedBytes = prepared.sharedMaps != null ? QuestSharedVarchar.SCRATCH_BYTES : 0;
         addressBytes = scratchOffset + PHASE_SCRATCH_BYTES + keyBytes
@@ -136,11 +139,26 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         partitions = prepared.localCapacity > 0 ? addresses + addressBytes - sharedBytes - QuestPartitions.STATE_BYTES : 0;
         inputPartitions = prepared.inputPartitionCode != null ? partitions - QuestPartitions.STATE_BYTES : 0;
         clear();
-        try { filter = prepared.filter != null ? prepared.filter.newSlot() : null; }
-        catch (Throwable failure) { Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); throw failure; }
+        ResolvedFilter.Slot slotFilter = null;
+        ResolvedVarchar.Slot arguments = null, keys = null;
+        try {
+            arguments = prepared.binding.inputs.newSlot(addresses + 8);
+            var keyInputs = prepared.probe == null ? null : prepared.probe.keyInputs();
+            keys = keyInputs == null ? null : keyInputs.newSlot(keyAddress);
+            slotFilter = prepared.filter != null ? prepared.filter.newSlot() : null;
+            dictionary = prepared.dictionaryAggregate != null ? prepared.dictionaryAggregate.newSlot(memory, scratchAddress) : null;
+        } catch (Throwable failure) {
+            try (var closeArguments = arguments; var closeKeys = keys; var closeFilter = slotFilter) { }
+            catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+            finally { Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); }
+            throw failure;
+        }
+        argumentHelpers = arguments;
+        keyHelpers = keys;
+        filter = slotFilter;
         if (prepared.mapCode != null) {
-            Unsafe.putLong(stateAddress + 40, 0);
-            Unsafe.putLong(stateAddress + 48, 0);
+            Unsafe.putLong(stateAddress + PROBE_COUNT, 0);
+            Unsafe.putLong(stateAddress + KEY_COMPARISONS, 0);
         }
         rehash = (oldStart, oldCapacity, newStart, newCapacity, entryStride) -> {
             long scratch = scratchAddress;
@@ -159,7 +177,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     public void close() {
         if (!closed) {
             closed = true;
-            try { if (filter != null) filter.close(); }
+            try (argumentHelpers; keyHelpers; filter) { if (dictionary != null) dictionary.close(); }
             finally { Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); }
         }
     }
@@ -203,6 +221,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         if (partitions != 0) io.questdb.std.Vect.memset(partitions, QuestPartitions.STATE_BYTES, 0);
         if (inputPartitions != 0) io.questdb.std.Vect.memset(inputPartitions, QuestPartitions.STATE_BYTES, 0);
     }
+
+    long dictionaryRows() { return dictionary != null ? dictionary.rows() : 0; }
 
     @Override
     public void partition(Map source, Runnable checkpoint) {
@@ -559,8 +579,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     long inputPartitionRows() { return inputPartitionRows; }
 
     long[] profileCounters() {
-        return new long[]{mapCalls, newGroups, prepared.mapCode == null ? 0 : Unsafe.getLong(stateAddress + 40),
-                prepared.mapCode == null ? 0 : Unsafe.getLong(stateAddress + 48)};
+        return new long[]{mapCalls, newGroups, prepared.mapCode == null ? 0 : Unsafe.getLong(stateAddress + PROBE_COUNT),
+                prepared.mapCode == null ? 0 : Unsafe.getLong(stateAddress + KEY_COMPARISONS)};
     }
 
     long[] topKCounters() { return new long[]{topKRows, topKMergeRows}; }
@@ -768,10 +788,10 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         if (probe == null || !canUpdate(record) || record.getPageAddress(probe.column()) == 0) return false;
         if (shards.size() != GroupByMapFragment.NUM_SHARDS) return false;
         final long state = stateAddress;
-        Unsafe.putLong(state + 8, rowIdsAddress);
-        Unsafe.putLong(state + 16, record.getPageAddress(probe.column()));
+        Unsafe.putLong(state + SELECTION, rowIdsAddress);
+        Unsafe.putLong(state + KEY_COLUMNS, record.getPageAddress(probe.column()));
         for (int i = 0; i < shards.size(); i++) {
-            shards.getQuick(i).writeNativeProbeView(state + QuestMapProbe.CONTROL_BYTES + (long) i * QuestMapProbe.VIEW_BYTES);
+            shards.getQuick(i).writeNativeProbeView(state + CONTROL_BYTES + (long) i * QuestMapProbe.VIEW_BYTES);
         }
         long position = 0;
         final Map lookup = shards.getQuick(0);
@@ -779,14 +799,14 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         try {
             while (position < rowCount) {
                 circuitBreaker.statefulThrowExceptionIfTripped();
-                Unsafe.putLong(state, position);
+                Unsafe.putLong(state + START_ROW, position);
                 long status = prepared.mapCode.run(addresses, rowCount, state);
                 if (PROFILE) mapCalls++;
                 memory.throwIfFailed();
-                if (status != 0 && status != QuestMapProbe.NEED_KEY) {
+                if (status != 0 && status != NEED_KEY) {
                     throw new IllegalStateException("Map/update kernel failed: " + status);
                 }
-                long end = status == 0 ? rowCount : Unsafe.getLong(state + 32);
+                long end = status == 0 ? rowCount : Unsafe.getLong(state + RESUME_ROW);
                 updatedRows += end - position;
                 mapRows += end - position;
                 position = end;
@@ -801,7 +821,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 key.commit();
                 long hash = key.hash();
                 int shardIndex = (int) (hash >>> GroupByMapFragment.NUM_SHARDS_SHR);
-                if (shardIndex != Unsafe.getLong(state + 24)) throw new IllegalStateException("Map hash ABI mismatch");
+                if (shardIndex != Unsafe.getLong(state + SHARD)) throw new IllegalStateException("Map hash ABI mismatch");
                 Map shard = shards.getQuick(shardIndex);
                 if (shard != lookup) {
                     MapKey target = shard.withKey();
@@ -812,8 +832,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 if (!value.isNew()) throw new IllegalStateException("Native probe missed an existing key");
                 functions.updateEmpty(value);
                 // Staging a key can also move OrderedMap's shard-zero heap.
-                lookup.writeNativeProbeView(state + QuestMapProbe.CONTROL_BYTES);
-                shard.writeNativeProbeView(state + QuestMapProbe.CONTROL_BYTES + (long) shardIndex * QuestMapProbe.VIEW_BYTES);
+                lookup.writeNativeProbeView(state + CONTROL_BYTES);
+                shard.writeNativeProbeView(state + CONTROL_BYTES + (long) shardIndex * QuestMapProbe.VIEW_BYTES);
             }
         } finally {
             memory.close();
@@ -852,7 +872,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         if (predicates == 0) return -1;
         long state = stateAddress;
         if (prepared.fusedFilterCode != null) {
-            Unsafe.putLong(state + 8, predicates);
+            Unsafe.putLong(state + SELECTION, predicates);
             long before = fusedSelectedRows;
             runMap(rowCount, map, shards, batchSize, circuitBreaker, prepared.fusedFilterCode);
             fusedInputRows += rowCount;
@@ -869,7 +889,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 long end = Math.min(rowCount, begin + FILTER_STAGE_ROWS);
                 long selected = filter.filterRange(begin, end, rows, circuitBreaker);
                 if (selected > 0) {
-                    Unsafe.putLong(state + 8, rows.getAddress());
+                    Unsafe.putLong(state + SELECTION, rows.getAddress());
                     runMutable(prepared.mapCode, addresses, selected, map, shards, true, 0, accepted > 0);
                     accepted += selected;
                 }
@@ -894,10 +914,16 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private boolean updateMaps(PageFrameMemoryRecord record, long rowCount, long rowIdsAddress,
                                Map map, ObjList<Map> shards, int batchSize, SqlExecutionCircuitBreaker circuitBreaker) {
         if (!canUpdate(record) || !prepareKeyColumns(record)) return false;
+        if (shards == null && rowIdsAddress == 0 && dictionary != null
+                && dictionary.update(addresses, rowCount, stateAddress, circuitBreaker)) {
+            updatedRows += rowCount;
+            mapRows += rowCount;
+            return true;
+        }
         long state = stateAddress;
-        Unsafe.putLong(state + 8, rowIdsAddress);
+        Unsafe.putLong(state + SELECTION, rowIdsAddress);
         if (prepared.sharedMaps != null && prepared.sharedMaps.isActive()
-                && Unsafe.getLong(Unsafe.getLong(state + 16) + 40) != 0) {
+                && Unsafe.getLong(Unsafe.getLong(state + KEY_COLUMNS) + 40) != 0) {
             memory.enter(circuitBreaker);
             try {
                 Unsafe.putLong(addresses, batchSize);
@@ -908,7 +934,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                         try { runMutable(prepared.mapCode, addresses, end, map, null, true, position); }
                         finally { publishViews(map, null); }
                     } else {
-                        prepared.sharedMaps.scan(prepared.sharedCode, Unsafe.getLong(state + 16), rowIdsAddress,
+                        prepared.sharedMaps.scan(prepared.sharedCode, Unsafe.getLong(state + KEY_COLUMNS), rowIdsAddress,
                                 position, end, sharedScratch, rehash, circuitBreaker);
                         updatedRows += end - position;
                         sharedRows += end - position;
@@ -930,7 +956,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         Unsafe.putLong(addresses, batchSize);
         writeViews(map, shards);
         if (probe.variable()) ((io.questdb.cairo.map.OrderedMap) (shards == null ? map : shards.getQuick(0)))
-                .writeNativeKeyStagingView(state + 64, 64);
+                .writeNativeKeyStagingView(state + VariableKey.STAGING_ADDRESS, 64);
     }
 
     private void runMap(long rowCount, Map map, ObjList<Map> shards,
@@ -956,13 +982,13 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         try {
             long position = begin;
             while (position < rows) {
-                Unsafe.putLong(stateAddress, position);
+                Unsafe.putLong(stateAddress + START_ROW, position);
                 long status = prepared.inputPartitionCode.run(addresses, rows, stateAddress);
                 memory.throwIfFailed();
                 if (status == 0) break;
-                if (status != QuestVariableKey.NEED_STAGING) throw new IllegalStateException("Input partition failed: " + status);
-                position = Unsafe.getLong(stateAddress + 32);
-                ((io.questdb.cairo.map.OrderedMap) map).writeNativeKeyStagingView(stateAddress + 64, Unsafe.getLong(stateAddress + 88));
+                if (status != NEED_STAGING) throw new IllegalStateException("Input partition failed: " + status);
+                position = Unsafe.getLong(stateAddress + RESUME_ROW);
+                ((io.questdb.cairo.map.OrderedMap) map).writeNativeKeyStagingView(stateAddress + VariableKey.STAGING_ADDRESS, Unsafe.getLong(stateAddress + VariableKey.REQUIRED_BYTES));
             }
             long accepted = rows - begin;
             updatedRows += accepted;
@@ -982,24 +1008,21 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         if (probe.variable()) {
             long descriptor = keyAddress;
             if (!probe.variableKey().prepare(record, descriptor)) return false;
-            Unsafe.putLong(state + 16, descriptor);
+            Unsafe.putLong(state + KEY_COLUMNS, descriptor);
         } else if (probe.varchar()) {
             long descriptor = keyAddress;
-            if (!record.writeNativeVarcharView(probe.column(), descriptor)) return false;
-            Unsafe.putLong(state + 16, descriptor);
+            if (probe.varcharKey() != null) {
+                if (!probe.varcharKey().inputs().prepare(record, descriptor)) return false;
+            } else if (!record.writeNativeVarcharView(probe.column(), descriptor)) return false;
+            Unsafe.putLong(state + KEY_COLUMNS, descriptor);
         } else if (probe.fixedKey() == null) {
             long page = record.getPageAddress(probe.column());
             if (page == 0) return false;
-            Unsafe.putLong(state + 16, page);
+            Unsafe.putLong(state + KEY_COLUMNS, page);
         } else {
             long pointers = keyAddress;
-            int[] keys = probe.fixedKey().columns();
-            for (int i = 0; i < keys.length; i++) {
-                long page = record.getPageAddress(keys[i]);
-                if (page == 0) return false;
-                Unsafe.putLong(pointers + i * 8L, page);
-            }
-            Unsafe.putLong(state + 16, pointers);
+            if (!probe.fixedKey().prepare(record, pointers)) return false;
+            Unsafe.putLong(state + KEY_COLUMNS, pointers);
         }
         return true;
     }
@@ -1075,7 +1098,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
             io.questdb.std.Vect.memset(keyFilterAddress, bytes, 0);
         }
         long scratch = ResolvedAggregateKernel.prefetchScratch(prepared.probe);
-        Unsafe.putLong(stateAddress, begin);
+        Unsafe.putLong(stateAddress + START_ROW, begin);
         Unsafe.putLong(stateAddress + scratch, keyFilterAddress);
         Unsafe.putLong(stateAddress + scratch + 8, partitions);
         long status = kernel.run(addresses, rows, stateAddress);
@@ -1083,7 +1106,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         memory.throwIfFailed();
         if (status != 0) throw new IllegalStateException("Key filter failed: " + status);
         partitionRows += Unsafe.getLong(stateAddress + scratch + 16);
-        long accepted = filtered ? Unsafe.getLong(stateAddress + ResolvedAggregateKernel.FILTERED_ROWS) : rows - begin;
+        long accepted = filtered ? Unsafe.getLong(stateAddress + FILTERED_ROWS) : rows - begin;
         updatedRows += accepted;
         mapRows += accepted;
         if (filtered) fusedSelectedRows += accepted;
@@ -1092,7 +1115,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private void writeViews(Map map, ObjList<Map> shards) {
         long state = stateAddress;
         Unsafe.putLong(state + DeferredDistinct.CONTROL, parallelMerge && shards == null ? 1 : 0);
-        Unsafe.putLong(state + 56, shards == null ? 0 : GroupByMapFragment.NUM_SHARDS - 1);
+        Unsafe.putLong(state + SHARD_MASK, shards == null ? 0 : GroupByMapFragment.NUM_SHARDS - 1);
         int count = shards == null ? 1 : shards.size();
         for (int i = 0; i < count; i++) {
             (shards == null ? map : shards.getQuick(i)).writeNativeMutationView(view(i));
@@ -1166,8 +1189,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         }
         long state = stateAddress;
         long position = begin;
-        if (prepared.probe.varchar()) Unsafe.putLong(state + 80, -1);
-        if (prepared.probe.variable()) Unsafe.putLong(state + 96, 0);
+        if (prepared.probe.varchar()) Unsafe.putLong(state + VarcharKey.COPIED_ROW, -1);
+        if (prepared.probe.variable()) Unsafe.putLong(state + VariableKey.SOURCE_OFFSET, 0);
         while (position < rows) {
             if (inputPartitionRemaining > 0 && update && kernel == prepared.mapCode) {
                 long end = position + Math.min(rows - position, inputPartitionRemaining);
@@ -1176,17 +1199,17 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 position = end;
                 if (position == rows) return;
             }
-            Unsafe.putLong(state, position);
+            Unsafe.putLong(state + START_ROW, position);
             long status = execution.run(input, rows, state);
             if (PROFILE && update) mapCalls++;
             memory.throwIfFailed();
-            if (status != 0 && status != QuestMapProbe.NEED_KEY && status != NEED_CAPACITY && status != QuestVarchar.NEED_COPY && status != QuestVariableKey.NEED_STAGING && status != QuestPartitions.NEED_FLUSH) {
+            if (status != 0 && status != NEED_KEY && status != NEED_CAPACITY && status != NEED_COPY && status != NEED_STAGING && status != NEED_FLUSH) {
                 throw new IllegalStateException("Map mutation failed: " + status);
             }
-            long end = status == 0 ? rows : Unsafe.getLong(state + 32);
+            long end = status == 0 ? rows : Unsafe.getLong(state + RESUME_ROW);
             if (update) {
                 long accepted = kernel == prepared.fusedFilterCode
-                        ? Unsafe.getLong(state + ResolvedAggregateKernel.FILTERED_ROWS) : end - position;
+                        ? Unsafe.getLong(state + FILTERED_ROWS) : end - position;
                 updatedRows += accepted;
                 mapRows += accepted;
                 if (kernel == prepared.fusedFilterCode) fusedSelectedRows += accepted;
@@ -1194,7 +1217,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
             }
             position = end;
             if (status == 0) return;
-            if (status == QuestPartitions.NEED_FLUSH) {
+            if (status == NEED_FLUSH) {
                 map.publishNativeMutationView(view(0));
                 // A full map supplies actual combining effectiveness. Revisit local
                 // aggregation within this frame: a distinct prefix can precede hot keys.
@@ -1226,24 +1249,24 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 }
                 continue;
             }
-            if (status == QuestVariableKey.NEED_STAGING) {
+            if (status == NEED_STAGING) {
                 ((io.questdb.cairo.map.OrderedMap) (shards == null ? map : shards.getQuick(0)))
-                        .writeNativeKeyStagingView(state + 64, Unsafe.getLong(state + 88));
+                        .writeNativeKeyStagingView(state + VariableKey.STAGING_ADDRESS, Unsafe.getLong(state + VariableKey.REQUIRED_BYTES));
                 continue;
             }
-            int shard = (int) Unsafe.getLong(state + 24);
+            int shard = (int) Unsafe.getLong(state + SHARD);
             Map target = shards == null ? map : shards.getQuick(shard);
             target.publishNativeMutationView(view(shard));
             try {
-                if (status == QuestVarchar.NEED_COPY) {
+                if (status == NEED_COPY) {
                     long copied = ((io.questdb.cairo.map.UnorderedVarcharMap) target).copyNativeKey(
-                            Unsafe.getLong(state + 64), (int) Unsafe.getLong(state + 72));
-                    Unsafe.putLong(state + 64, copied);
-                    Unsafe.putLong(state + 80, position);
+                            Unsafe.getLong(state + VarcharKey.COPY_ADDRESS), (int) Unsafe.getLong(state + VarcharKey.COPY_BYTES));
+                    Unsafe.putLong(state + VarcharKey.COPY_ADDRESS, copied);
+                    Unsafe.putLong(state + VarcharKey.COPIED_ROW, position);
                 } else if (status == NEED_CAPACITY) {
                     target.reserveNative(Math.min(rows - position, Unsafe.getLong(addresses)), rehash);
                 } else if (prepared.probe.variable()) {
-                    ((io.questdb.cairo.map.OrderedMap) target).growNative(Unsafe.getLong(state + 88), rehash);
+                    ((io.questdb.cairo.map.OrderedMap) target).growNative(Unsafe.getLong(state + VariableKey.REQUIRED_BYTES), rehash);
                 } else {
                     target.growNative(rehash);
                 }

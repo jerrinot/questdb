@@ -129,8 +129,21 @@ final class PortableVectorLowering {
             }
             case Load l -> new Load(l.width(), expr(l.address(), out));
             case AtomicLoad l -> new AtomicLoad(expr(l.address(), out), l.acquire());
-            case AtomicAdd a -> new AtomicAdd(expr(a.address(), out), expr(a.value(), out));
-            case CompareExchange c -> new CompareExchange(expr(c.address(), out), expr(c.expected(), out), expr(c.value(), out));
+            case AtomicAdd a -> {
+                Expr address = let(out, expr(a.address(), out));
+                yield new AtomicAdd(address, expr(a.value(), out));
+            }
+            case CompareExchange c -> {
+                Expr address = let(out, expr(c.address(), out));
+                Expr expected = let(out, expr(c.expected(), out));
+                yield new CompareExchange(address, expected, expr(c.value(), out));
+            }
+            case NativeCall c -> {
+                Expr function = let(out, expr(c.function(), out));
+                var arguments = new java.util.ArrayList<Expr>();
+                for (Expr argument : c.arguments()) arguments.add(let(out, expr(argument, out)));
+                yield new NativeCall(function, arguments);
+            }
             case Allocate a -> new Allocate(expr(a.bytes(), out));
             case Reallocate r -> {
                 Expr address = expr(r.address(), out);
@@ -171,6 +184,7 @@ final class PortableVectorLowering {
             case AtomicLoad l -> contains(l.address());
             case AtomicAdd a -> contains(a.address()) || contains(a.value());
             case CompareExchange c -> contains(c.address()) || contains(c.expected()) || contains(c.value());
+            case NativeCall ignored -> true;
             case Allocate a -> contains(a.bytes());
             case Reallocate r -> contains(r.address()) || contains(r.oldBytes()) || contains(r.newBytes());
             case ToDouble c -> contains(c.value());

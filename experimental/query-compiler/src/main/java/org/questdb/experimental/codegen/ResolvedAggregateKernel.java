@@ -43,6 +43,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.questdb.experimental.codegen.Ir.*;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** Compiles resolved updates and fused probes over existing QuestDB map state. */
 public final class ResolvedAggregateKernel {
@@ -96,8 +97,6 @@ public final class ResolvedAggregateKernel {
         return new Binding(new Program(b.block()), allocates, probe, prefetchRows, countSumReference, resolved, layout.getSizeInBytes(), valueTypes.getColumnCount(), List.copyOf(readers));
     }
 
-    static final int NEED_CAPACITY = 5;
-
     private static Program mapProgram(AggregateUpdates updates, QuestMapProbe probe, long valueBytes, int prefetchRows, int localCapacity) {
         return mapProgram(updates, probe, valueBytes, prefetchRows, localCapacity, null);
     }
@@ -116,17 +115,17 @@ public final class ResolvedAggregateKernel {
             addresses.add(b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, (i + 1L) * 8))));
         }
         Expr cardinalityAddress = at(COLUMNS, updates.cardinalityOffset());
-        Var rowIds = filter == null ? b.let(new Load(MemoryType.ADDRESS, at(STATE, 8))) : null;
+        Var rowIds = filter == null ? b.let(new Load(MemoryType.ADDRESS, at(STATE, SELECTION))) : null;
         var filterAddresses = new ArrayList<Var>();
         Var accepted = filter != null ? b.let(i64(0)) : null;
         if (filter != null) {
-            Var pointers = b.let(new Load(MemoryType.ADDRESS, at(STATE, 8)));
+            Var pointers = b.let(new Load(MemoryType.ADDRESS, at(STATE, SELECTION)));
             for (int i = 0; i < filter.input().size(); i++) {
                 filterAddresses.add(b.let(new Load(MemoryType.ADDRESS, at(pointers, 8L * i))));
             }
         }
         Var index = b.let(load(STATE));
-        Var batchEnd = b.let(probe.mutable() && !probe.variable() ? new Select(eq(load(at(STATE, 56)), i64(0)), index, ROWS) : ROWS);
+        Var batchEnd = b.let(probe.mutable() && !probe.variable() ? new Select(eq(load(at(STATE, SHARD_MASK)), i64(0)), index, ROWS) : ROWS);
         if (prefetchRows > 0) {
             emitPrefetched(b, index, batchEnd, rowIds, addresses, updates, cardinalityAddress, probe, valueBytes, prefetchRows, localCapacity, filter, filterAddresses, accepted, stagedDistinct);
         } else b.loop(binary(Op.LT, index, ROWS), loop -> {
@@ -136,18 +135,15 @@ public final class ResolvedAggregateKernel {
             Var rowIndex = loop.let(index);
             loop.when(ne(rowIds, nil()), filtered -> filtered.assign(rowIndex,
                     load(new Offset(rowIds, binary(Op.MUL, index, i64(8))))));
-            if (probe.variable()) { loop.store(at(STATE, 80), i64(0)); loop.store(at(STATE, 32), index); }
+            if (probe.variable()) { loop.store(at(STATE, VariableKey.STAGING_USED), i64(0)); loop.store(at(STATE, RESUME_ROW), index); }
             Var destination = probe.find(loop, probe.loadFrameKey(loop, rowIndex, at(STATE, prefetchScratch(probe) + 24)), index,
-                    probe.mutable() ? load(at(STATE, 56)) : null, null, updates::initialize);
+                    probe.mutable() ? load(at(STATE, SHARD_MASK)) : null, null, updates::initialize);
             updates.emitFrame(loop, rowIndex, addresses, destination, cardinalityAddress);
             loop.assign(index, add(index, i64(1)));
         });
         b.exit(0);
         return new Program(filter == null ? b.block() : saveAcceptedRows(b.block(), accepted));
     }
-
-    // This word exists only in the fused slot, between cardinality and deferred-merge state.
-    static final int FILTERED_ROWS = -24;
 
     /** Save progress at resumable exits; keep the counter in SSA during normal row updates. */
     private static Block saveAcceptedRows(Block block, Var accepted) {
@@ -180,7 +176,7 @@ public final class ResolvedAggregateKernel {
             batch.assign(batches, add(batches, i64(1)));
             Var limit = batch.let(new Select(binary(Op.LT, add(index, i64(batchRows)), batchEnd),
                     add(index, i64(batchRows)), batchEnd));
-            if (probe.variable()) { batch.store(at(STATE, 80), i64(0)); batch.store(at(STATE, 32), index); }
+            if (probe.variable()) { batch.store(at(STATE, VariableKey.STAGING_USED), i64(0)); batch.store(at(STATE, RESUME_ROW), index); }
             Var batchStart = filter != null ? batch.let(index) : null;
             Var mask = filter != null ? ScanLowering.mask(filter, batch, filterAddresses, batchStart, limit, batchRows) : null;
             Var remaining = filter != null ? batch.let(mask) : null;
@@ -296,9 +292,9 @@ public final class ResolvedAggregateKernel {
             fullMap = binary(Op.EITHER, fullMap, binary(Op.BOTH, binary(Op.GE, size, i64(64)),
                     binary(Op.LT, i64(CacheSizing.LOCAL_AGGREGATE_BYTES), footprint)));
         }
-        b.when(binary(Op.BOTH, eq(load(at(STATE, 56)), i64(0)), fullMap), full -> {
-            full.store(at(STATE, 32), index);
-            full.exit(QuestPartitions.NEED_FLUSH);
+        b.when(binary(Op.BOTH, eq(load(at(STATE, SHARD_MASK)), i64(0)), fullMap), full -> {
+            full.store(at(STATE, RESUME_ROW), index);
+            full.exit(NEED_FLUSH);
         });
     }
 
@@ -313,8 +309,8 @@ public final class ResolvedAggregateKernel {
                     ? binary(Op.LT, load(at(view, NativeMapView.Ordered.LIMIT)), add(load(at(view, NativeMapView.Ordered.APPEND)), binary(Op.MUL, batchRows, load(at(view, NativeMapView.STRIDE)))))
                     : binary(Op.GE, batchRows, load(at(view, NativeMapView.FREE)));
             boundary.when(needs, grow -> {
-                grow.store(at(STATE, 24), i64(0));
-                grow.store(at(STATE, 32), index);
+                grow.store(at(STATE, SHARD), i64(0));
+                grow.store(at(STATE, RESUME_ROW), index);
                 grow.exit(NEED_CAPACITY);
             });
             boundary.assign(batchEnd, add(index, batchRows));
@@ -387,9 +383,10 @@ public final class ResolvedAggregateKernel {
             int localCapacity = partitionOwner ? localCapacity(activeProbe) : 0;
             Prepared prepared = new Prepared(this, activeProbe, backend, artifacts, localCapacity);
             try {
-                prepared.code = prepared.compile(program);
+                prepared.dictionaryAggregate = DictionaryAggregate.bind(prepared);
+                prepared.code = prepared.compileFallback(() -> program);
                 if (activeProbe != null) {
-                    prepared.mapCode = prepared.compile(mapProgram(updates, activeProbe, valueBytes, prefetchRows, localCapacity));
+                    prepared.mapCode = prepared.compileFallback(() -> mapProgram(updates, activeProbe, valueBytes, prefetchRows, localCapacity));
                     if (activeProbe.mutable() && !activeProbe.ordered() && !activeProbe.varchar() && prefetchRows > 0 && localCapacity == 0
                             && updates.updates().stream().anyMatch(u -> u instanceof AggregateUpdates.DistinctUpdate)
                             && updates.updates().stream().allMatch(u -> !u.allocates() || u instanceof AggregateUpdates.DistinctUpdate)) {
@@ -398,11 +395,11 @@ public final class ResolvedAggregateKernel {
                         prepared.mapChoice = new AdaptiveKernel(prepared.mapCode, prepared.stagedMapCode, System::nanoTime);
                     }
                     if (activeProbe.mutable()) {
-                        prepared.rehashCode = prepared.compile(activeProbe.varchar() ? QuestVarchar.rehash(valueBytes) : activeProbe.orderedNative() ? QuestOrderedMap.rehash() : QuestMapMutation.rehash(activeProbe, valueBytes));
-                        prepared.mergeCode = prepared.compile(activeProbe.varchar() ? QuestVarchar.entries(activeProbe, updates, valueBytes) : activeProbe.orderedNative() ? QuestOrderedMap.entries(activeProbe, updates, valueBytes) : QuestMapMutation.entries(activeProbe, updates, valueBytes));
+                        prepared.rehashCode = prepared.compileFallback(() -> activeProbe.varchar() ? QuestVarchar.rehash(valueBytes) : activeProbe.orderedNative() ? QuestOrderedMap.rehash() : QuestMapMutation.rehash(activeProbe, valueBytes));
+                        prepared.mergeCode = prepared.compileFallback(() -> activeProbe.varchar() ? QuestVarchar.entries(activeProbe, updates, valueBytes) : activeProbe.orderedNative() ? QuestOrderedMap.entries(activeProbe, updates, valueBytes) : QuestMapMutation.entries(activeProbe, updates, valueBytes));
                     }
                 }
-                if (partitionOwner && localCapacity == 0 && activeProbe != null && activeProbe.varchar()
+                if (partitionOwner && localCapacity == 0 && activeProbe != null && activeProbe.varchar() && activeProbe.varcharKey() == null
                         && valueBytes == 8 && updates.updates().equals(List.of(new ScalarUpdate(new Pipeline.Count(), 0)))
                         && Boolean.getBoolean("query.codegen.sharedVarchar")) {
                     prepared.sharedCode = prepared.compile(QuestSharedVarchar.program());
@@ -485,6 +482,7 @@ public final class ResolvedAggregateKernel {
         final boolean finalizeResults;
         CompiledKernel code;
         CompiledKernel mapCode;
+        DictionaryAggregate dictionaryAggregate;
         CompiledKernel fusedFilterCode;
         final QuestMapProbe probe;
         CompiledKernel rehashCode;
@@ -546,7 +544,12 @@ public final class ResolvedAggregateKernel {
             return own(backend.compile(program, artifacts));
         }
 
-        private CompiledKernel defer(java.util.function.Supplier<Program> program) {
+        private CompiledKernel compileFallback(java.util.function.Supplier<Program> program) throws IOException {
+            // Array admission needs the cursor snapshot. Keep its alternative paths lazy.
+            return dictionaryAggregate != null ? defer(program) : compile(program.get());
+        }
+
+        CompiledKernel defer(java.util.function.Supplier<Program> program) {
             return own(CompiledKernel.defer(backend, program, artifacts));
         }
 
@@ -573,6 +576,7 @@ public final class ResolvedAggregateKernel {
         public void close() {
             if (closed) return;
             closed = true;
+            if (probe != null && probe.fixedKey() != null) probe.fixedKey().clearExecution();
             long totalCompilationNanos = compilationNanos();
             Throwable failure = null;
             for (int i = resources.size() - 1; i >= 0; i--) {

@@ -112,6 +112,7 @@ abstract class SourceEmitter {
             case AtomicLoad l -> atomicLoad(expression(l.address()), l.acquire());
             case AtomicAdd a -> atomicAdd(expression(a.address()), expression(a.value()));
             case CompareExchange c -> compareExchange(expression(c.address()), expression(c.expected()), expression(c.value()));
+            case NativeCall c -> nativeCall(expression(c.function()), c.arguments().stream().map(this::expression).toList());
             case Allocate a -> allocate(expression(a.bytes()));
             case Reallocate r -> reallocate(expression(r.address()), expression(r.oldBytes()), expression(r.newBytes()));
             case ToDouble c -> "((double)(" + expression(c.value()) + "))";
@@ -155,6 +156,7 @@ abstract class SourceEmitter {
     abstract String literal(Literal literal);
     abstract String load(MemoryType width, String address);
     abstract String store(MemoryType width, String address, String value);
+    String nativeCall(String function, java.util.List<String> arguments) { return "nativeCall(" + function + ", " + String.join(", ", arguments) + ")"; }
     abstract String allocate(String bytes);
     abstract String reallocate(String address, String oldBytes, String newBytes);
     abstract String free(String address, String bytes);

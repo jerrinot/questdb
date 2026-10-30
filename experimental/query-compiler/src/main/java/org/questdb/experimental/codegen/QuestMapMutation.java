@@ -27,6 +27,7 @@ package org.questdb.experimental.codegen;
 import io.questdb.cairo.ColumnType;
 
 import static org.questdb.experimental.codegen.Ir.*;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** Existing unordered-map relocation and merge algorithms, specialized for the bound layout. */
 final class QuestMapMutation {
@@ -80,7 +81,7 @@ final class QuestMapMutation {
             loop.when(binary(Op.EITHER, binary(Op.BOTH, eq(index, i64(0)), hasZero),
                     binary(Op.BOTH, ne(index, i64(0)), ne(key, i64(0)))), occupied -> {
                 Var inserted = occupied.let(bool(false));
-                Var destination = probe.find(occupied, key, index, load(at(STATE, 56)), null, (init, value) -> {
+                Var destination = probe.find(occupied, key, index, load(at(STATE, SHARD_MASK)), null, (init, value) -> {
                     copy(init, at(source, width.bytes), value, valueBytes);
                     init.assign(inserted, bool(true));
                 });

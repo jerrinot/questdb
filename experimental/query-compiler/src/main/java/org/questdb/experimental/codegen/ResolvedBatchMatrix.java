@@ -569,8 +569,8 @@ final class ResolvedBatchMatrix {
     // so the Java control runs against an entirely unmodified core classpath.
     private static final class Compilation {
         static void install(SqlExecutionContextImpl context, Path artifacts) {
-            context.setQueryCodeGenerator(new ResolvedQueryCompiler(new LlvmBackend(), artifacts,
-                    Boolean.getBoolean("query.codegen.handwritten")));
+            context.setQueryCodeGenerator(Boolean.getBoolean("query.codegen.handwritten")
+                    ? new HandwrittenCountSum(artifacts) : new ResolvedQueryCompiler(new LlvmBackend(), artifacts));
         }
 
         static void clear(SqlExecutionContextImpl context) {

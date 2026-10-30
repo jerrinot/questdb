@@ -29,10 +29,12 @@ import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.ListColumnFilter;
 import io.questdb.cairo.map.OrderedMap;
 import static org.questdb.experimental.codegen.Ir.*;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** Fixed-width RecordSink encoding; direct columns followed by resolved computed keys. */
-record QuestFixedKey(int[] columns, java.util.List<Pipeline.Column> inputs,
-                     java.util.List<Pipeline.Scalar> expressions, MemoryType[] widths, int bytes) {
+record QuestFixedKey(ResolvedVarchar.Binding frameInputs,
+                     java.util.List<Pipeline.Scalar> expressions, MemoryType[] widths, int bytes,
+                     java.util.List<SymbolExpression> dictionaries) {
     static QuestFixedKey bind(ColumnTypes inputs, ColumnTypes types, ListColumnFilter columns, OrderedMap map) {
         return bind(inputs, types, columns, null, map);
     }
@@ -42,7 +44,10 @@ record QuestFixedKey(int[] columns, java.util.List<Pipeline.Column> inputs,
         int computed = functions == null ? 0 : functions.size(), count = types.getColumnCount();
         if (count == 0 || count != columns.size() + computed) return null;
         var inputs = new ResolvedInputs(inputTypes);
+        var strings = new ResolvedVarchar(inputTypes, inputs);
         var expressions = new java.util.ArrayList<Pipeline.Scalar>();
+        var dictionaries = new java.util.ArrayList<SymbolExpression>();
+        var dictionaryPositions = new java.util.ArrayList<Integer>();
         MemoryType[] widths = new MemoryType[count];
         int bytes = 0;
         for (int i = 0; i < count; i++) {
@@ -64,7 +69,14 @@ record QuestFixedKey(int[] columns, java.util.List<Pipeline.Column> inputs,
                 var function = functions.getQuick(i - columns.size());
                 if (function.getType() != type) return null;
                 expression = inputs.scalar(function, type);
-                if (expression == null) return null;
+                if (expression == null) {
+                    var dictionary = SymbolExpression.bind(function);
+                    if (dictionary == null) return null;
+                    expression = inputs.column(dictionary.symbol(), ColumnType.SYMBOL);
+                    if (expression == null) return null;
+                    dictionaries.add(dictionary);
+                    dictionaryPositions.add(i);
+                }
             }
             expressions.add(expression);
             bytes += widths[i].bytes;
@@ -73,12 +85,43 @@ record QuestFixedKey(int[] columns, java.util.List<Pipeline.Column> inputs,
             if (bytes != ordered.getFixedKeySize()) return null;
         } else if (!(count == 1 && ((types.getColumnType(0) == ColumnType.INT || types.getColumnType(0) == ColumnType.SYMBOL) && map instanceof io.questdb.cairo.map.Unordered4Map
                 || types.getColumnType(0) == ColumnType.LONG && map instanceof io.questdb.cairo.map.Unordered8Map))) return null;
-        return new QuestFixedKey(inputs.indexes(), inputs.columns(), java.util.List.copyOf(expressions), widths, bytes);
+        for (int i = 0; i < dictionaries.size(); i++) {
+            int position = dictionaryPositions.get(i);
+            Expr pointers = new Load(MemoryType.ADDRESS, at(STATE, KEY_COLUMNS));
+            Expr table = new Load(MemoryType.ADDRESS, at(pointers, strings.binding().bytes() + i * 8L));
+            expressions.set(position, new Pipeline.DictionaryLookup(expressions.get(position), table));
+        }
+        return new QuestFixedKey(strings.binding(), java.util.List.copyOf(expressions), widths, bytes,
+                java.util.List.copyOf(dictionaries));
+    }
+
+    int[] columns() { return frameInputs.numericColumns(); }
+    java.util.List<Pipeline.Column> inputs() { return frameInputs.numericInputs(); }
+    long descriptorBytes() { return frameInputs.bytes() + dictionaries.size() * 8L; }
+
+    void prepareExecution(io.questdb.std.MemoryTracker tracker, io.questdb.cairo.sql.SqlExecutionCircuitBreaker breaker, long evaluationBudget) {
+        try {
+            for (var dictionary : dictionaries) dictionary.prepare(tracker, breaker, evaluationBudget);
+        } catch (Throwable failure) {
+            clearExecution();
+            throw failure;
+        }
+    }
+
+    void clearExecution() { for (var dictionary : dictionaries) dictionary.close(); }
+
+    boolean prepare(io.questdb.cairo.sql.PageFrameMemoryRecord record, long pointers) {
+        if (!frameInputs.prepare(record, pointers)) return false;
+        for (int i = 0; i < dictionaries.size(); i++) {
+            if (dictionaries.get(i).address() == 0) return false;
+            io.questdb.std.Unsafe.putLong(pointers + frameInputs.bytes() + i * 8L, dictionaries.get(i).address());
+        }
+        return true;
     }
 
     private Pipeline.Row loadRow(Builder b, Expr row) {
-        Var pointers = b.let(new Load(MemoryType.ADDRESS, at(STATE, 16)));
-        return ResolvedInputs.loadFrameRow(b, inputs, pointers, row);
+        Var pointers = b.let(new Load(MemoryType.ADDRESS, at(STATE, KEY_COLUMNS)));
+        return frameInputs.frame(ResolvedInputs.loadFrameRow(b, inputs(), pointers, row), row, pointers).numeric(b);
     }
 
     private Expr storedKey(Pipeline.Row row, int index) {

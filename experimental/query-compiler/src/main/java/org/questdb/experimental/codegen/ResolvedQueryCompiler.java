@@ -53,27 +53,21 @@ import java.nio.file.Path;
 public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     private final Path artifacts;
     private final Backend backend;
-    private final boolean handwritten;
     private final boolean fuseFilter;
 
     public ResolvedQueryCompiler(Backend backend, Path artifacts) {
         this(backend, artifacts, false);
     }
 
-    ResolvedQueryCompiler(Backend backend, Path artifacts, boolean handwritten) {
-        this(backend, artifacts, handwritten, false);
-    }
-
     /** Harness-only alternative; no global setting or automatic admission policy. */
     static ResolvedQueryCompiler filterFusionExperiment(Backend backend, Path artifacts) {
-        return new ResolvedQueryCompiler(backend, artifacts, false, true);
+        return new ResolvedQueryCompiler(backend, artifacts, true);
     }
 
-    private ResolvedQueryCompiler(Backend backend, Path artifacts, boolean handwritten, boolean fuseFilter) {
+    private ResolvedQueryCompiler(Backend backend, Path artifacts, boolean fuseFilter) {
         this.fuseFilter = fuseFilter;
         this.backend = backend;
         this.artifacts = artifacts;
-        this.handwritten = handwritten;
     }
 
     /** Read only after the owning frame sequence has joined; diagnostic coverage, not shared state. */
@@ -122,41 +116,36 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
             io.questdb.cairo.sql.RecordMetadata inputs, int keyColumn,
             ObjList<io.questdb.griffin.engine.groupby.vect.VectorAggregateFunction> functions,
             long rosti, int workerCount) {
-        return handwritten ? null : ResolvedSymbolAggregate.bind(inputs, keyColumn, functions, rosti, workerCount, backend, artifacts);
+        return ResolvedSymbolAggregate.bind(inputs, keyColumn, functions, rosti, workerCount, backend, artifacts);
     }
 
     @Override
     public CompiledScalarAggregate compileScalarAggregate(ColumnTypes inputs, ColumnTypes values,
             ObjList<GroupByFunction> functions, MapValue layout, Function filter) {
-        if (handwritten) return null;
         try { return ResolvedScalarAggregate.compile(inputs, values, functions, layout, filter, backend, artifacts); }
         catch (IOException failure) { throw CairoException.nonCritical().put("Scalar aggregate compilation failed: ").put(failure.getMessage()); }
     }
 
     @Override
     public CompiledCounter compileCounter(RecordCursorFactory input) {
-        if (handwritten) return null;
         try { return ResolvedCounter.compile(input, backend, artifacts); }
         catch (IOException failure) { throw CairoException.nonCritical().put("COUNT compilation failed: ").put(failure.getMessage()); }
     }
 
     @Override
     public io.questdb.griffin.engine.orderby.CompiledTopK compileTopK(ColumnTypes inputs, io.questdb.cairo.ListColumnFilter order, Function filter) {
-        if (handwritten) return null;
         try { return ResolvedTopK.compile(inputs, order, filter, backend, artifacts); }
         catch (IOException failure) { throw CairoException.nonCritical().put("Top-K build compilation failed: ").put(failure.getMessage()); }
     }
 
     @Override
     public CompiledFilters compileFilters(ColumnTypes inputs, Function predicate) {
-        if (handwritten) return null;
         try { return ResolvedStandaloneFilter.compile(inputs, predicate, backend, artifacts); }
         catch (IOException failure) { throw CairoException.nonCritical().put("Filter compilation failed: ").put(failure.getMessage()); }
     }
 
     @Override
     public CompiledProjection compileProjection(ColumnTypes inputs, int columnOffset, ObjList<Function> functions) {
-        if (handwritten) return null;
         try { return ResolvedProjection.compile(inputs, columnOffset, functions, backend, artifacts); }
         catch (IOException e) { throw new IllegalStateException("Could not compile projection", e); }
     }
@@ -185,7 +174,11 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
                             ObjList<Function> keyFunctions, Map layout) {
         boolean computed = keyFunctions != null && keyFunctions.size() > 0;
         boolean ordered = layout instanceof io.questdb.cairo.map.OrderedMap;
-        if (!handwritten && (ordered || computed)) {
+        if (computed) {
+            var key = QuestVarchar.Key.bind(inputs, keyTypes, keyColumns, keyFunctions, layout);
+            if (key != null) return compileBound(ResolvedAggregateKernel.bind(inputs, values, functions, QuestMapProbe.varchar(key)));
+        }
+        if (ordered || computed) {
             var variable = QuestVariableKey.bind(inputs, keyTypes, keyColumns, keyFunctions, layout);
             if (variable != null) return compileBound(ResolvedAggregateKernel.bind(inputs, values, functions,
                     QuestMapProbe.variable(variable)));
@@ -202,9 +195,9 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
             return null;
         }
         try {
-            var prepared = handwritten ? binding.compileHandwritten(artifacts) : binding.compile(backend, artifacts, true);
+            var prepared = binding.compile(backend, artifacts, true);
             try {
-                return new CompiledUpdates(prepared, handwritten ? "handwritten-c" : backend.name(), fuseFilter);
+                return new CompiledUpdates(prepared, backend.name(), fuseFilter);
             } catch (Throwable failure) {
                 try { prepared.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
                 throw failure;
@@ -218,7 +211,6 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     public CompiledJoin compileJoin(ColumnTypes joinedTypes, int probeColumnCount, ColumnTypes valueTypes,
                                     ObjList<GroupByFunction> functions, int probeKeyColumn, MapValue value,
                                     Function postJoinFilter, int groupKeyColumn, Map groupLayout) {
-        if (handwritten) return null;
         try {
             return ResolvedJoinKernel.compile(joinedTypes, probeColumnCount, valueTypes, functions,
                     probeKeyColumn, value, postJoinFilter, groupKeyColumn, groupLayout, backend, artifacts);
@@ -227,7 +219,7 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
         }
     }
 
-    private record CompiledUpdates(ResolvedAggregateKernel.Prepared prepared, String name, boolean fuseFilter) implements GroupByKernel {
+    record CompiledUpdates(ResolvedAggregateKernel.Prepared prepared, String name, boolean fuseFilter) implements GroupByKernel {
         @Override
         public CompiledMapAggregate compileMapAggregate(
                 CairoConfiguration configuration, ColumnTypes inputs,
@@ -247,13 +239,31 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
         }
 
         @Override
-        public void prepareExecution(io.questdb.std.MemoryTracker tracker) {
-            if (prepared.filter != null) prepared.filter.prepareExecution(tracker);
+        public void prepareExecution(io.questdb.std.MemoryTracker tracker, SqlExecutionCircuitBreaker breaker, long inputRows, int workerSlots) {
+            try {
+                if (prepared.filter != null) prepared.filter.prepareExecution(tracker);
+                if (prepared.probe != null && prepared.probe.fixedKey() != null)
+                    prepared.probe.fixedKey().prepareExecution(tracker, breaker, inputRows < 0 ? -1 : inputRows / workerSlots);
+                if (prepared.dictionaryAggregate != null) {
+                    prepared.dictionaryAggregate.prepare(inputRows < 0 ? -1 : inputRows / workerSlots);
+                    if (prepared.dictionaryAggregate.entries() == 0) prepared.mapCode.prepare();
+                }
+            } catch (Throwable failure) {
+                clearExecution();
+                throw failure;
+            }
         }
 
         @Override
         public void clearExecution() {
+            if (prepared.dictionaryAggregate != null) prepared.dictionaryAggregate.clear();
             if (prepared.filter != null) prepared.filter.clearExecution();
+            if (prepared.probe != null && prepared.probe.fixedKey() != null) prepared.probe.fixedKey().clearExecution();
+        }
+
+        @Override
+        public void finishScan(java.util.function.Supplier<Map> destination, Runnable checkpoint) {
+            if (prepared.dictionaryAggregate != null) prepared.dictionaryAggregate.finishScan(destination, checkpoint);
         }
 
         @Override

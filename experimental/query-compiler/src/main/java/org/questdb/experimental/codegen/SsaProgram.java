@@ -85,6 +85,7 @@ final class SsaProgram {
             case AtomicLoad l -> new AtomicLoad(map(l.address(), leaf), l.acquire());
             case AtomicAdd a -> new AtomicAdd(map(a.address(), leaf), map(a.value(), leaf));
             case CompareExchange c -> new CompareExchange(map(c.address(), leaf), map(c.expected(), leaf), map(c.value(), leaf));
+            case NativeCall c -> new NativeCall(map(c.function(), leaf), c.arguments().stream().map(a -> map(a, leaf)).toList());
             case Allocate a -> new Allocate(map(a.bytes(), leaf));
             case Reallocate r -> new Reallocate(map(r.address(), leaf), map(r.oldBytes(), leaf), map(r.newBytes(), leaf));
             case ToDouble c -> new ToDouble(map(c.value(), leaf));
@@ -260,6 +261,7 @@ final class SsaProgram {
                 case AtomicLoad l -> new AtomicLoad(emit(l.address()), l.acquire());
                 case AtomicAdd a -> new AtomicAdd(emit(a.address()), emit(a.value()));
                 case CompareExchange c -> new CompareExchange(emit(c.address()), emit(c.expected()), emit(c.value()));
+                case NativeCall c -> new NativeCall(emit(c.function()), c.arguments().stream().map(this::emit).toList());
                 case Allocate a -> new Allocate(emit(a.bytes()));
                 case Reallocate r -> new Reallocate(emit(r.address()), emit(r.oldBytes()), emit(r.newBytes()));
                 case ToDouble c -> new ToDouble(emit(c.value()));

@@ -36,10 +36,10 @@ import static org.questdb.experimental.codegen.Ir.*;
 /** Backend-neutral register/label stream. No SQL operators or query shapes reach the native bridge. */
 final class MachineCode {
     // Wire ABI shared with asmjit_backend.cpp. A version guards mismatched native builds.
-    static final int MAGIC=0x51444952, VERSION=9, HEADER_BYTES=24, INSTRUCTION_BYTES=24;
+    static final int MAGIC=0x51444952, VERSION=10, HEADER_BYTES=24, INSTRUCTION_BYTES=24;
     static final int CONST=1,MOVE=2,ADD=3,SUB=4,MUL=5,AND=6,XOR=7,USHR=8,
             EQ=9,NE=10,LT=11,GE=12,LOAD=13,STORE=14,LABEL=15,JUMP=16,
-            BR_FALSE=17,ALLOC=18,FREE=19,POLL=20,RETURN=21,COMPARE_BRANCH=22,BR_TRUE=23,CTZ=24,PREFETCH=25,FADD=26,FSUB=27,FMUL=28,FDIV=29,TO_DOUBLE=30,SDIV=31,ATOMIC_LOAD=32,COMPARE_EXCHANGE=33,ATOMIC_STORE=34,ATOMIC_ADD=35,BYTE_EQ_MASK=36,REALLOC=37,FEQ=38,FNE=39,FLT=40,FGE=41;
+            BR_FALSE=17,ALLOC=18,FREE=19,POLL=20,RETURN=21,COMPARE_BRANCH=22,BR_TRUE=23,CTZ=24,PREFETCH=25,FADD=26,FSUB=27,FMUL=28,FDIV=29,TO_DOUBLE=30,SDIV=31,ATOMIC_LOAD=32,COMPARE_EXCHANGE=33,ATOMIC_STORE=34,ATOMIC_ADD=35,BYTE_EQ_MASK=36,REALLOC=37,FEQ=38,FNE=39,FLT=40,FGE=41,NATIVE_CALL=42;
     private record Instruction(int op,int dst,int a,int b,long immediate) { }
     private final List<Instruction> code=new ArrayList<>();
     private final Map<Integer,Integer> variables=new HashMap<>(Map.of(0,0,1,1,2,2));
@@ -140,6 +140,15 @@ final class MachineCode {
             case Select s -> select(s.condition(),s.yes(),s.no());
             case BitCast c -> expression(c.value());
             case ToDouble c -> {int input=expression(c.value()),result=reg();emit(TO_DOUBLE,result,input,0,0);yield result;}
+            case NativeCall c -> {
+                int function = expression(c.function());
+                int[] arguments = c.arguments().stream().mapToInt(this::expression).toArray();
+                int first = registers;
+                for (int argument : arguments) emit(MOVE, reg(), argument, 0, 0);
+                int result = reg();
+                emit(NATIVE_CALL, result, function, first, arguments.length);
+                yield result;
+            }
             case Allocate a -> {int bytes=expression(a.bytes()),result=reg();emit(ALLOC,result,bytes,0,0);yield result;}
             case Reallocate r -> {int address=expression(r.address()),oldBytes=expression(r.oldBytes()),newBytes=expression(r.newBytes()),result=reg();emit(REALLOC,result,address,oldBytes,newBytes);yield result;}
         };

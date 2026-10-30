@@ -56,6 +56,12 @@ public final class CompiledKernel implements Kernel, AutoCloseable {
         return new CompiledKernel(kernel, () -> { }, null, 0);
     }
 
+    /** Compiles deferred code without executing it, before publishing work to slots. */
+    void prepare() {
+        if (kernel == null) throw new IllegalStateException("Compiled kernel is closed");
+        if (resource instanceof Deferred deferred) deferred.prepare();
+    }
+
     /** All worker calls must have joined when work returns, including failures. */
     void runBatch(long rows, Consumer<Kernel> work) {
         if (kernel == null) throw new IllegalStateException("Compiled kernel is closed");

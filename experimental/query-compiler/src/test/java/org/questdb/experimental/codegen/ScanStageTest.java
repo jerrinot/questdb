@@ -46,6 +46,29 @@ public class ScanStageTest {
     @Parameterized.Parameters(name="{0}") public static List<Object[]> parameters(){return List.of(
             new Object[]{"llvm",new LlvmBackend(2)},new Object[]{"c",new NativeBackend()},new Object[]{"asmjit",new AsmJitBackend()});}
 
+    @Test public void codePointLengthKeepsSliceBoundsAndMetadataFastPaths() throws Throwable {
+        Builder b = new Builder();
+        b.exit(ByteSequences.length(b, new Utf8Value(COLUMNS, ROWS, eq(STATE, at(nil(), 1)), eq(STATE, at(nil(), 2)), bool(true))));
+        var random = new java.util.Random(2891);
+        try (var code = backend.compile(new Program(b.block()), temporary.getRoot().toPath())) {
+            for (int size = 0; size <= 65; size++) for (boolean atEnd : new boolean[]{false, true}) {
+                try (var page = new GuardedPage(size, atEnd)) {
+                    byte[] bytes = new byte[size];
+                    random.nextBytes(bytes);
+                    var ordinary = new io.questdb.std.str.Utf8StringSink();
+                    for (int i = 0; i < size; i++) {
+                        Unsafe.putByte(page.address + i, bytes[i]);
+                        ordinary.putAny(bytes[i]);
+                    }
+                    assertEquals(io.questdb.std.str.Utf8s.length(ordinary), code.run(page.address, size, 0));
+                    // Neither NULL nor an ASCII-marked value needs payload access.
+                    assertEquals(-1, code.run(0, size, 1));
+                    assertEquals(size, code.run(0, size, 2));
+                }
+            }
+        }
+    }
+
     @Test public void literalSearchNeverReadsOutsideTheSlice() throws Throwable {
         var random = new java.util.Random(72571);
         for (int size = 1; size <= 8; size++) for (boolean repeated : new boolean[]{false, true}) {

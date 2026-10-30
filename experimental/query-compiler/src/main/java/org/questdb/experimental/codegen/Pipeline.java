@@ -84,8 +84,19 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    public sealed interface Scalar permits Column, Constant, FloatingConstant, ToFloating, Parameter, Add, Subtract, Multiply, Divide, TimestampPart, IPv4Subtract {
+    public sealed interface Scalar permits Column, Constant, FloatingConstant, ToFloating, Parameter, Add, Subtract, Multiply, Divide, TimestampPart, IPv4Subtract, DictionaryLookup, FrameScalar {
         Value emit(Row row);
+    }
+
+    /** Compiler-time access to borrowed string views; no runtime expression dispatch. */
+    sealed interface FrameScalar extends Scalar permits ResolvedVarchar.Length {
+        int columnType();
+        Value emit(Builder builder, ResolvedVarchar.Frame frame);
+        void collectColumns(java.util.BitSet columns);
+        @Override default Value emit(Row row) {
+            if (row.computed() == null) throw new IllegalArgumentException("Expression requires a frame or materialized value");
+            return row.computed().apply(this);
+        }
     }
 
     public record Column(int index, String name, int columnType) implements Scalar {
@@ -118,6 +129,20 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
     public record Constant(long value) implements Scalar {
         @Override
         public Value emit(Row row) { return new Value(i64(value), bool(value == Long.MIN_VALUE)); }
+    }
+
+    /** Snapshot-owned INT results, indexed by SYMBOL ID + 1 (entry zero represents NULL). */
+    public record DictionaryLookup(Scalar symbol, Expr table) implements Scalar {
+        public DictionaryLookup {
+            if (table.type() != Type.ADDRESS) throw new IllegalArgumentException("Dictionary address required");
+        }
+        @Override
+        public Value emit(Row row) {
+            Value key = symbol.emit(row);
+            Expr index = new Select(key.isNull(), i64(0), add(key.data(), i64(1)));
+            Expr data = new Load(MemoryType.I32, new Offset(table, binary(Op.MUL, index, i64(4))));
+            return new Value(data, eq(data, i64(Integer.MIN_VALUE)));
+        }
     }
 
     public record FloatingConstant(double value) implements Scalar {
@@ -431,8 +456,10 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         });
     }
 
-    public record Row(List<Column> columns, List<Value> values, List<Expr> parameters) {
+    public record Row(List<Column> columns, List<Value> values, List<Expr> parameters,
+                      java.util.function.Function<FrameScalar, Value> computed) {
         public Row(List<Column> columns, List<Value> values) { this(columns, values, List.of()); }
+        public Row(List<Column> columns, List<Value> values, List<Expr> parameters) { this(columns, values, parameters, null); }
     }
 
     public long entryBytes() { return aggregateOffset(aggregates.size()); }
@@ -590,7 +617,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         return new Program(builder.block());
     }
 
-    private static MemoryType widthOf(int columnType) {
+    static MemoryType widthOf(int columnType) {
         return switch (columnType) {
             case ColumnType.BYTE -> MemoryType.I8;
             case ColumnType.SHORT -> MemoryType.I16;

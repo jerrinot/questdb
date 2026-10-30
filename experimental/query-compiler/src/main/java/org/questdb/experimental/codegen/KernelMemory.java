@@ -100,6 +100,11 @@ public final class KernelMemory implements AutoCloseable {
                 context.getCircuitBreaker()::statefulThrowExceptionIfTrippedTimeThrottled);
     }
 
+    static void fail(Throwable failure) {
+        KernelMemory memory = CURRENT.get();
+        if (memory != null && memory.failure == null) memory.failure = failure;
+    }
+
     static void checkFailure() {
         KernelMemory current = CURRENT.get();
         if (current != null) { current.throwIfFailed(); }

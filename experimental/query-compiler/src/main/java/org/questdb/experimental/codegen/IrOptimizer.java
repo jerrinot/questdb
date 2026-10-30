@@ -135,6 +135,7 @@ public final class IrOptimizer {
             case AtomicLoad l -> new AtomicLoad(simplify(l.address(), facts), l.acquire());
             case AtomicAdd a -> new AtomicAdd(simplify(a.address(), facts), simplify(a.value(), facts));
             case CompareExchange c -> new CompareExchange(simplify(c.address(), facts), simplify(c.expected(), facts), simplify(c.value(), facts));
+            case NativeCall c -> new NativeCall(simplify(c.function(), facts), c.arguments().stream().map(a -> simplify(a, facts)).toList());
             case Allocate a -> new Allocate(simplify(a.bytes(), facts));
             case Reallocate r -> new Reallocate(simplify(r.address(), facts), simplify(r.oldBytes(), facts), simplify(r.newBytes(), facts));
             case ToDouble c -> {
@@ -272,6 +273,7 @@ public final class IrOptimizer {
             case SelectRows ignored -> false;
             case PopulationCount z -> discardable(z.value());
             case TrailingZeros z -> discardable(z.value());
+            case NativeCall ignored -> false;
             case Allocate ignored -> false;
             case Reallocate ignored -> false;
             case ToDouble c -> discardable(c.value());

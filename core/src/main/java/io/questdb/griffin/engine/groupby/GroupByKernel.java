@@ -44,11 +44,17 @@ import org.jetbrains.annotations.Nullable;
 
 /** Query-owned aggregate code. Slots borrow it until the existing frame sequence drains. */
 public interface GroupByKernel extends QuietCloseable {
-    /** Owner-only initialization after resolved functions init, before task dispatch. */
-    default void prepareExecution(io.questdb.std.MemoryTracker tracker) { }
+    /** Owner-only initialization after resolved functions init, before task dispatch.
+     * inputRows is the unfiltered input row count, or -1 when unknown or filtered.
+     * workerSlots includes the owner and the existing aggregate worker slots.
+     */
+    default void prepareExecution(io.questdb.std.MemoryTracker tracker, SqlExecutionCircuitBreaker breaker, long inputRows, int workerSlots) { }
 
     /** Releases execution state only after workers drain; cached code remains reusable. */
     default void clearExecution() { }
+
+    /** Owner-only, after all scan tasks drain: publish private partial state before map merging. */
+    default void finishScan(java.util.function.Supplier<Map> destination, Runnable checkpoint) { }
 
     /** Planning-only borrow of source output readers and existing exclusive worker slots. */
     default CompiledMapAggregate compileMapAggregate(CairoConfiguration configuration,

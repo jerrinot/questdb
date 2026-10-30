@@ -40,6 +40,7 @@ Unsupported plans keep ordinary execution.
 | Unkeyed reduction and worker-state merge | [ResolvedScalarAggregate](src/main/java/org/questdb/experimental/codegen/ResolvedScalarAggregate.java) |
 | Kernel preparation and ownership | [ResolvedAggregateKernel.Prepared](src/main/java/org/questdb/experimental/codegen/ResolvedAggregateKernel.java) |
 | Acquired-slot scratch, resumable calls and publication | [AggregateSlot](src/main/java/org/questdb/experimental/codegen/AggregateSlot.java) |
+| Map invocation layout and resumable status codes | [MapKernelState](src/main/java/org/questdb/experimental/codegen/MapKernelState.java) |
 | Existing map representation and generated probing | [NativeMapView](../../core/src/main/java/io/questdb/cairo/map/NativeMapView.java), [QuestMapProbe](src/main/java/org/questdb/experimental/codegen/QuestMapProbe.java) |
 | Typed IR, SSA and backend emission | [Ir](src/main/java/org/questdb/experimental/codegen/Ir.java), [SsaProgram](src/main/java/org/questdb/experimental/codegen/SsaProgram.java), [LlvmEmitter](src/main/java/org/questdb/experimental/codegen/LlvmEmitter.java) |
 | Native invocation and allocator/cancellation callbacks | [NativeCalls](src/main/java/org/questdb/experimental/codegen/NativeCalls.java), [KernelMemory](src/main/java/org/questdb/experimental/codegen/KernelMemory.java) |
@@ -59,6 +60,10 @@ conversions have separate eligibility rules; support for one does not imply all.
 
 `Prepared` owns code; `AggregateSlot` owns reusable descriptors and borrows the
 acquired slot's allocator. Optional partition/ranking kernels compile on first use.
+Dictionary arrays own their per-slot state and publish through the query owner's
+`finishScan` hook after workers drain. They borrow the existing slot allocators and
+scratch. Array candidates defer fallback kernels until needed; cursor preparation
+compiles the admitted scan without executing a dummy batch.
 All worker calls must finish before the code owner closes. Native callbacks record
 allocation/cancellation failures for Java to rethrow; Java exceptions do not
 unwind through native code.
@@ -108,6 +113,31 @@ expressions retain ordinary filtering. Parameterized aggregate filters currently
 produce selection vectors; the experimental map-fused ABI still accepts only
 column pointers. No additional configuration is needed.
 
+Eligible INT grouping expressions over one static SYMBOL also evaluate once per
+dictionary entry, using the ordinary resolved function for semantics. Generated
+scan/map loops load the result by SYMBOL ID. This supports `length` and literal
+`strpos`, with optional STRING casts and `lower`/`upper` composition. The lookup
+is query-memory-tracked, immutable while workers run, and rebuilt on cursor reopen.
+Preparation checks cancellation and includes the NULL entry. It is admitted only
+for known-size unfiltered scans when dictionary entries plus NULL are fewer than
+input rows divided by aggregate slots (workers plus owner). Other cases retain
+ordinary evaluation before map mutation. This conservative work bound avoids
+serial preparation with as much expression work as one parallel scan slot; it is
+not a complete cost model. STRING-valued group keys, dynamic dictionaries, runtime
+substring arguments and expressions involving multiple inputs remain ordinary.
+
+For a single dictionary-derived INT key and numeric, non-allocating aggregate
+state, that same preparation also proves the result's min/max range. If the range
+plus a NULL slot fits the existing per-worker cache budget and is smaller than the
+rows-per-worker preparation budget above, workers aggregate into
+private arrays. The arrays retain the ordinary packed aggregate state and share
+initialization/merge generation with direct-SYMBOL vector aggregation. After the
+scan drains, generated code merges the arrays directly; observed groups are then
+published once into the existing result map and combined with ordinary fallback
+frames. Wide ranges and composite keys keep generated hashing. No input-row
+statistics scan or additional setting is required. This optimizes bounded INT
+results, not general STRING-valued grouping.
+
 ## Supported scope
 
 The binders and focused tests are authoritative. Current families include:
@@ -125,12 +155,27 @@ The binders and focused tests are authoritative. Current families include:
   searched CASE string values.
 - Direct and computed fixed-width keys, SYMBOL IDs, VARCHAR keys and composite keys
   using existing map encodings. DOUBLE grouping preserves raw IEEE bits, including
-  signed zero and NaN payloads. NULL and empty strings remain distinct.
+  signed zero and NaN payloads. NULL and empty strings remain distinct. INT keys
+  derived from static SYMBOL dictionaries have the eligibility rules above.
 - DOUBLE arithmetic (+, -, *, /), integer-to-DOUBLE widening, tolerance-aware
   comparisons and NULL predicates in scan/filter/aggregate expressions
+- VARCHAR code-point `length` in numeric aggregate arguments, fixed/composite
+  grouping keys and residual predicates, including supported searched CASE values.
+  This reuses ordinary numeric aggregates and borrowed frame descriptors. ASCII
+  uses metadata; other values use the ordinary continuation-byte counting algorithm.
+  `length(NULL::varchar)` remains the ordinary INT value `-1`. Compact input records
+  store the computed integer; numeric-only join/finalized-map consumers retain
+  ordinary evaluation when they cannot supply a string descriptor.
 - Resolved COUNT (including static SYMBOL, DOUBLE and VARCHAR), integer/DOUBLE SUM/MIN/MAX/AVG,
   INT/LONG/static-SYMBOL DISTINCT and VARCHAR MIN/MAX
   implementations. Supported overloads depend on the selected map/update path.
+- Anchored single-capture `regexp_replace` on the ordinary ASCII-byte function,
+  composed with supported VARCHAR group keys and aggregate arguments. The admitted
+  language has concatenation, ASCII classes, greedy character repeats and optional
+  groups that consume at least one byte when taken; other patterns and capture predicates retain ordinary evaluation.
+  Generated prefix checks precede a PCRE2 JIT call through typed IR. Each slot owns
+  its matcher and a cancellable Java fallback for native work/stack limits. Captures
+  borrow the input slice; the existing map copies unstable keys on insertion.
 - Unkeyed COUNT and integer/DOUBLE SUM/MIN/MAX/AVG reductions over filtered frames and
   unfiltered expressions whose plan uses row-by-row updates. Existing vector and
   metadata specializations retain priority. Worker-state copying/merging is generated.
@@ -236,10 +281,12 @@ be overridden with `questdb.codegen.asmjit.library` and
 
 ## Build and test
 
-Requires JDK 25, Maven, CMake 3.22+, a C++17 compiler, `cc`, and LLVM 21.1 development
-files/shared library. The current build is exercised on Linux x86-64. Native
+Requires JDK 25, Maven, CMake 3.22+, a C++17 compiler, `cc`, LLVM 21.1 development
+files/shared library, pkg-config and PCRE2 development files with JIT support (tested with 10.46).
+The current build is exercised on Linux x86-64. Native
 bridges build through the module's Maven lifecycle; AsmJit uses the pin in
-`core/CMakeLists.txt`. LLVM belongs only to this optional module.
+`core/CMakeLists.txt`. LLVM and PCRE2 belong only to this optional module. The capture
+bridge lives beside the LLVM bridge; it adds no dependency to ordinary QuestDB.
 
 From the repository root:
 

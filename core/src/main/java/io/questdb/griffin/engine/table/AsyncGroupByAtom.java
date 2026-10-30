@@ -100,6 +100,8 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
     // Null when no per-query limit applies. Workers and operator code feed it to
     // tracker-aware Unsafe overloads to charge allocations to the active workload.
     private MemoryTracker memoryTracker;
+    private SqlExecutionCircuitBreaker executionCircuitBreaker;
+    private long inputRows;
     // Initialized lazily.
     private DirectLongLongSortedList ownerLongTopKList;
 
@@ -384,6 +386,13 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
         return batchSize;
     }
 
+    void finishScan(Runnable checkpoint) {
+        if (compiledAggregates != null) {
+            compiledAggregates.finishScan(shardingCtx.getFragment(-1)::reopenMap, checkpoint);
+        }
+        shardingCtx.finishScan(checkpoint);
+    }
+
     public @Nullable CharSequence getCompiledAggregateName() {
         return compiledAggregates != null ? compiledAggregates.getName() : null;
     }
@@ -545,6 +554,9 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
     @Override
     public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
         memoryTracker = executionContext.getMemoryTracker();
+        executionCircuitBreaker = executionContext.getCircuitBreaker();
+        inputRows = symbolTableSource instanceof io.questdb.cairo.sql.PageFrameCursor frames
+                && filterCtx.getFilter(-1) == null ? frames.size() : -1;
         filterCtx.initFilters(symbolTableSource, executionContext);
 
         if (ownerKeyFunctions != null) {
@@ -605,7 +617,7 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
                 allocator.reopen();
             }
         }
-        if (compiledAggregates != null) compiledAggregates.prepareExecution(memoryTracker);
+        if (compiledAggregates != null) compiledAggregates.prepareExecution(memoryTracker, executionCircuitBreaker, inputRows, perWorkerBatchLists.size() + 1);
     }
 
     public void resetLocalStats(int slotId) {

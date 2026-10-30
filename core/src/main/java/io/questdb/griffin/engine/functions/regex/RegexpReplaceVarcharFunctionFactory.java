@@ -231,7 +231,7 @@ public class RegexpReplaceVarcharFunctionFactory extends RegexpReplaceStrFunctio
      * Example:
      * ^https?://(?:www\.)?([^/]+)/.*$
      */
-    private static class SingleGroupAsciiFunc extends VarcharFunction implements UnaryFunction {
+    public static class SingleGroupAsciiFunc extends VarcharFunction implements UnaryFunction {
         private final int functionPos;
         private final int group;
         private final Matcher matcher;
@@ -267,6 +267,14 @@ public class RegexpReplaceVarcharFunctionFactory extends RegexpReplaceStrFunctio
         @Override
         public Function getArg() {
             return value;
+        }
+
+        public int getGroup() {
+            return group;
+        }
+
+        public String getPattern() {
+            return matcher.pattern().pattern();
         }
 
         @Override

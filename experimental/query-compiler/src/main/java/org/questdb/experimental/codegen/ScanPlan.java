@@ -118,6 +118,8 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case IPv4Subtract a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
             case Subtract a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
             case TimestampPart a -> validate(a.argument(), schema, parameters, checked);
+            case DictionaryLookup a -> validate(a.symbol(), schema, parameters, checked);
+            case FrameScalar ignored -> { }
             case ToFloating a -> validate(a.argument(), schema, parameters, checked);
             case Divide a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
             case Parameter p -> { if (p.index() >= parameters.size() || !p.equals(parameters.get(p.index()))) throw new IllegalArgumentException("Foreign parameter: " + p); }
@@ -150,6 +152,8 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case Divide a -> new Divide(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings));
             case Parameter p -> p;
             case TimestampPart a -> new TimestampPart(rewrite(a.argument(), schema, bindings), a.unitTicks(), a.period());
+            case DictionaryLookup a -> new DictionaryLookup(rewrite(a.symbol(), schema, bindings), a.table());
+            case FrameScalar ignored -> throw new IllegalArgumentException("Frame expressions cannot be substituted into a numeric scan");
             case Add a -> new Add(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
             case Multiply a -> new Multiply(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
             case IPv4Subtract a -> new IPv4Subtract(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings));
@@ -172,6 +176,8 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
         switch (e) {
             case Column c -> used.set(c.index());
             case TimestampPart a -> collect(a.argument(), used);
+            case DictionaryLookup a -> collect(a.symbol(), used);
+            case FrameScalar expression -> expression.collectColumns(used);
             case ToFloating a -> collect(a.argument(), used);
             case Divide a -> { collect(a.left(), used); collect(a.right(), used); }
             case Add a -> { collect(a.left(), used); collect(a.right(), used); }
@@ -183,7 +189,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case Parameter ignored -> { }
         }
     }
-    private static void collect(Predicate p, BitSet used) {
+    static void collect(Predicate p, BitSet used) {
         switch (p) {
             case All ignored -> { }
             case Compare c -> { collect(c.left(), used); collect(c.right(), used); }

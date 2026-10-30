@@ -57,6 +57,7 @@ public class DeferredKernelTest {
         code.close();
         assertEquals(1, closed.get());
         assertThrows(IllegalStateException.class, () -> code.run(1, 2, 3));
+        assertThrows(IllegalStateException.class, code::prepare);
     }
 
     @Test public void unusedCodeDoesNotGenerateAProgram() {
@@ -76,9 +77,12 @@ public class DeferredKernelTest {
             }
         };
         try (var code = CompiledKernel.defer(backend, () -> {var b=new Ir.Builder();b.exit(0);return new Ir.Program(b.block());}, null)) {
-            assertThrows(CairoException.class, () -> code.run(0,0,0));
+            assertThrows(CairoException.class, code::prepare);
             assertEquals(0, calls.get());
             assertEquals(0, code.compilationNanos());
+            code.prepare();
+            code.prepare();
+            assertEquals(0, calls.get());
             assertEquals(1, code.run(0,0,0));
             assertEquals(2, code.run(0,0,0));
             assertEquals(2, attempts.get());

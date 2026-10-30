@@ -99,6 +99,9 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
             if (sourceReads == null) return null;
         }
         final Read[] reads = sourceReads;
+        // Dictionary and string descriptors belong to frames; this consumer reads numeric map cells.
+        if (!key.dictionaries().isEmpty() || !key.frameInputs().expressions().isEmpty()
+                || !binding.updates.inputs().expressions().isEmpty()) return null;
         for (int i : key.columns()) if (reads[i] == null) return null;
         for (int i : binding.updates.sourceIndexes()) if (reads[i] == null) return null;
 

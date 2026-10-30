@@ -160,6 +160,12 @@ public final class NativeBackend implements Backend {
         @Override
         String store(MemoryType width, String address, String value) { return "store_" + width + "(" + address + ", " + value + ")"; }
         @Override
+        String nativeCall(String function, java.util.List<String> arguments) {
+            String types = arguments.isEmpty() ? "void" : String.join(", ", java.util.Collections.nCopies(arguments.size(), "uint64_t"));
+            return "((int64_t (*)(" + types + "))(uintptr_t)(" + function + "))("
+                    + arguments.stream().map(a -> "(uint64_t)(" + a + ")").collect(java.util.stream.Collectors.joining(", ")) + ")";
+        }
+        @Override
         String allocate(String bytes) { return "((uint64_t (*)(int64_t))(uintptr_t)alloc_fn)(" + bytes + ")"; }
         String reallocate(String address, String oldBytes, String newBytes) {
             return "((uint64_t (*)(uint64_t, int64_t, int64_t))(uintptr_t)realloc_fn)(" + address + ", " + oldBytes + ", " + newBytes + ")";

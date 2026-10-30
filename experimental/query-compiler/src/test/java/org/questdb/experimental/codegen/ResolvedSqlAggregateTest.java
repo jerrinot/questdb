@@ -570,6 +570,7 @@ public class ResolvedSqlAggregateTest {
 
     @Test
     public void searchedCaseVarcharKeysUseGeneratedMaps() throws Exception {
+        mapEntrySize = 64;
         engine.execute("create table choices as (select cast(x%7 as int) mode,"
                 + "cast(case when x%11=0 then null when x%13=0 then '' else 'ž-key-'||cast(x%29 as string) end as varchar) a,"
                 + "cast('other-long-prefix-'||cast(x%17 as string) as varchar) b,x v from long_sequence(4001))", context);
@@ -583,6 +584,9 @@ public class ResolvedSqlAggregateTest {
                     "case when mode<2 then cast('left' as varchar) else 'right' end")) {
                 long before = compiler.mapRows.get();
                 assertMatches("select mode," + expression + " k,count(),sum(v) from choices group by mode,k", true);
+                assertEquals(lastPlan, 8002, compiler.mapRows.get() - before);
+                before = compiler.mapRows.get();
+                assertMatches("select " + expression + " k,count(),sum(v) from choices group by k", true);
                 assertEquals(lastPlan, 8002, compiler.mapRows.get() - before);
             }
         }
@@ -598,6 +602,7 @@ public class ResolvedSqlAggregateTest {
 
     @Test
     public void searchedCaseKeysPreserveStorageAndLiteralLifetimes() throws Exception {
+        mapEntrySize = 64;
         engine.execute("create table choices as (select cast(case when x%7=0 then null else x%5 end as int) mode,"
                 + "cast(case when x%11=0 then null when x%13=0 then '' else 'ž-'||cast(x%17 as string) end as varchar) a,"
                 + "x v,timestamp_sequence('2024-01-01',3600000000L) ts from long_sequence(48)) "
@@ -618,6 +623,55 @@ public class ResolvedSqlAggregateTest {
             // Retain every group: order ties cannot change the selected set.
             assertMatches(sql + " order by total desc limit 100", true);
             assertTrue(lastPlan, compiler.topKRows.get() > ranked);
+        }
+        assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+    }
+
+    @Test
+    public void captureKeysUseSlotOwnedHelpersAndExistingMaps() throws Exception {
+        mapEntrySize = 64;
+        shardingThreshold = 2;
+        engine.execute("create table captures as (select cast(case when x%11=0 then null when x%13=0 then '' "
+                + "when x%17=0 then 'ab' when x%19=0 then 'pre:end' when x%3=0 then '☃-123' "
+                + "else 'https://www.é-'||x%127||'/tail' end as varchar) label,cast(x%19 as int) i from long_sequence(2003))", context);
+        for (String value : List.of("http://foo/x\n", "http://foo/x\r\n", "http://foo/x\r", "http://foo/a\nb", "http://🙂é/x", "ab\0", "a".repeat(4096)))
+            engine.execute("insert into captures values ('" + value + "',7)", context);
+        long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        for (String pattern : List.of("^https?://(?:www\\.)?([^/]+)/.*$", "^([^0-9]+)[0-9]+$", "^missing-([a-z]+):.*$",
+                "^(?:station-)?([^0-9]+)[0-9]+$", "^(a?)(b?)$", "^(a)?(b?)$", "^(?:pre)?(.*):end$", "^(a*)a*b$")) {
+            for (String aggregates : List.of("count(),sum(i)", "avg(length(label)),count(),min(label)")) {
+                long before = compiler.mapRows.get();
+                assertMatches("select regexp_replace(label,'" + pattern + "','$1') k," + aggregates + " from captures group by k", true);
+                assertEquals(lastPlan, 4020, compiler.mapRows.get() - before);
+            }
+        }
+        assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+        // Java-specific class intersection and Unicode matching remain ordinary expressions.
+        for (String pattern : List.of("^([a&&b]+)$", "^(\\w+)$", "^(a|b)$")) {
+            long before = compiler.mapRows.get();
+            assertMatches("select cast(regexp_replace(label,'" + pattern + "','$1') as varchar) k,count() from captures group by k", true);
+            assertEquals(before, compiler.mapRows.get());
+        }
+    }
+
+    @Test
+    public void captureValuesComposeWithCaseLengthAndColumnTops() throws Exception {
+        mapEntrySize = 64;
+        engine.execute("create table captures as (select cast(x%7 as int) i,x v,"
+                + "timestamp_sequence('2024-01-01',3600000000L) ts from long_sequence(48)) timestamp(ts) partition by day bypass wal", context);
+        engine.execute("alter table captures add column label varchar", context);
+        engine.execute("insert into captures select cast(x%7 as int),x,timestamp_sequence('2024-01-03',3600000000L),"
+                + "cast(case when x%3=0 then null else 'prefix-☃-'||x%17 end as varchar) from long_sequence(24)", context);
+        long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
+        String expression = "regexp_replace(case when i<4 then label else 'literal-🙂123' end,'^([^0-9]+)[0-9]+$','$1')";
+        for (boolean parquet : new boolean[]{false, true}) {
+            if (parquet) engine.execute("alter table captures convert partition to parquet list '2024-01-03'", context);
+            long before = compiler.mapRows.get();
+            assertMatches("select " + expression + " k,count(),sum(v) from captures group by k", true);
+            assertEquals(lastPlan, 144, compiler.mapRows.get() - before);
+            assertMatches("select i,min(" + expression + "),max(" + expression + "),sum(length(" + expression + ")) from captures group by i", true);
+            assertScalarMatches("select count(" + expression + "),sum(length(" + expression + ")) from captures", true);
+            assertMatches("select length(" + expression + ") k,count() from captures group by k", true);
         }
         assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
     }
@@ -2217,7 +2271,7 @@ public class ResolvedSqlAggregateTest {
         }
         long before = compiler.filterRows.get();
         assertMatches("select k,count() from predicates where a is null or k<10 group by k", true);
-        assertEquals("Unsupported mixed OR retains the ordinary filter", before, compiler.filterRows.get());
+        assertEquals("Mixed OR evaluates both numeric and string branches natively", 40006, compiler.filterRows.get() - before);
         engine.execute("alter table predicates add column top varchar", context);
         assertMatches("select k,count() from predicates where k<10 and top is null group by k", true);
         assertEquals(compiler.created.get(), compiler.closed.get());
@@ -2432,6 +2486,72 @@ public class ResolvedSqlAggregateTest {
     }
 
     @Test
+    public void varcharLengthsComposeAcrossAggregatesKeysAndPredicates() throws Exception {
+        engine.execute("create table lengths as (select cast(x%7 as int) k,x v,"
+                + "cast(case when x%11=0 then null when x%5=0 then '' when x%5=1 then 'ASCII' "
+                + "when x%5=2 then 'Žluť🙂' when x%5=3 then '中🙂-longer-than-inline' else 'ééééééééééééééééé' end as varchar) s "
+                + "from long_sequence(1003))", context);
+        for (String argument : List.of("s", "case when k<3 then s else 'literal-🙂' end")) {
+            long before = compiler.rows.get();
+            assertMatches("select k,sum(length(" + argument + ")),avg(length(" + argument + ")),"
+                    + "count(length(" + argument + ")),min(length(" + argument + ")+2),max(length(" + argument + ")) "
+                    + "from lengths group by k", true);
+            assertEquals(2006, compiler.rows.get() - before);
+            before = compiler.scalarRows.get();
+            assertScalarMatches("select sum(length(" + argument + ")),avg(length(" + argument + ")),count(length(" + argument + ")) from lengths", true);
+            assertEquals(2006, compiler.scalarRows.get() - before);
+        }
+        for (String keys : List.of("length(s)", "k,length(s)+1", "s,length(s)")) {
+            assertMatches("select " + keys + ",count(),sum(v) from lengths group by " + keys, true);
+        }
+        assertMatches("select k,count_distinct(length(case when k<3 then s else '🙂' end)) from lengths group by k", true);
+        for (String predicate : List.of("length(s)>5", "length(s)=-1 or k=2", "not(length(s)>5 and k<3)",
+                "(s like '%ASCII%' or length(s)=4) and v>0", "length(case when k<3 then s else '🙂literal' end)>6")) {
+            long before = compiler.filterRows.get();
+            assertMatches("select k,count(),sum(v) from lengths where " + predicate + " group by k", true);
+            assertEquals(predicate, 2006, compiler.filterRows.get() - before);
+        }
+        // This producer exposes numeric map cells, without a frame's literal/string descriptors.
+        assertMatches("select length(case when n>3 then 'abc'::varchar else 'x'::varchar end) key,sum(n) "
+                + "from (select k,sum(length(s)) n from lengths group by k) group by key", true);
+        String nested = "s";
+        for (int i = 0; i < 40; i++) nested = "case when length(" + nested + ")>0 then s else null::varchar end";
+        assertScalarMatches("select sum(length(" + nested + ")) from lengths", false);
+    }
+
+    @Test
+    public void partitionedLengthsStoreNumericResultsAndPreserveColumnTops() throws Exception {
+        String previous = System.getProperty("query.codegen.localCapacity");
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(64, 2048);
+            mapEntrySize = 64;
+            engine.execute("create table lengths as (select cast(x%1009 as int) k,cast(x%31 as varchar) tag,"
+                    + "cast(case when x%17=0 then null when x%13=0 then '' else '中-long-prefix-'||cast(x as string) end as varchar) s,"
+                    + "x v,timestamp_sequence('2024-01-01',60000000L) ts from long_sequence(10003)) timestamp(ts) partition by day bypass wal", context);
+            for (boolean parquet : new boolean[]{false, true}) {
+                if (parquet) engine.execute("alter table lengths convert partition to parquet list '2024-01-01'", context);
+                for (String key : List.of("k", "k,tag")) {
+                    long before = compiler.inputPartitionRows.get();
+                    // Allocating string states intentionally keep variable-key maps unbounded.
+                    String extrema = key.equals("k") ? ",min(s)" : "";
+                    assertMatches("select " + key + ",sum(length(s)),avg(length(s))" + extrema + ",count(s),sum(v),count(v) "
+                            + "from lengths group by " + key, true);
+                    assertTrue("Compact records must carry derived lengths: " + key, compiler.inputPartitionRows.get() > before);
+                }
+            }
+            engine.execute("alter table lengths add column top varchar", context);
+            assertMatches("select length(top) k,sum(length(top)),count(length(top)),count() from lengths group by k", true);
+            engine.execute("alter table lengths alter column v type varchar", context);
+            assertMatches("select k,sum(length(v)),count() from lengths group by k", true);
+            assertEquals(0, engine.getBusyReaderCount());
+        } finally {
+            if (previous == null) System.clearProperty("query.codegen.localCapacity");
+            else System.setProperty("query.codegen.localCapacity", previous);
+        }
+    }
+
+    @Test
     public void partitionedVarcharCountsRetainOnlyNullStatusAndReopen() throws Exception {
         System.setProperty("query.codegen.localCapacity", "64");
         try {
@@ -2627,17 +2747,23 @@ public class ResolvedSqlAggregateTest {
 
     @Test
     public void executionFailureIsDrainedAndNotReplayed() throws Exception {
+        engine.execute("create table array_failure as (select cast(k as symbol) s,v from t)", context);
         context.setQueryCodeGenerator(compiler);
-        compiler.failUpdate = true;
-        try (var factory = Demo.compileSql(engine, context, "select k,sum(v) from t where k>=0 group by k", true)) {
-            assertThrows(CairoException.class, () -> Demo.readSql(factory, context, 2));
-            compiler.failUpdate = false;
-            var actual = Demo.readSql(factory, context, 2);
-            context.setQueryCodeGenerator(null);
-            try (var baseline = Demo.compileSql(engine, context, "select k,sum(v) from t where k>=0 group by k", true)) {
-                assertEquals(Demo.readSql(baseline, context, 2), actual);
+        for (String sql : List.of("select k,sum(v) from t where k>=0 group by k",
+                "select length(s) k,count(),sum(v) from array_failure group by k")) {
+            compiler.failUpdate = true;
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                int columns = factory.getMetadata().getColumnCount();
+                assertThrows(CairoException.class, () -> Demo.readSql(factory, context, columns));
+                compiler.failUpdate = false;
+                var actual = Demo.readSql(factory, context, columns);
+                context.setQueryCodeGenerator(null);
+                try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+                    assertEquals(Demo.readSql(baseline, context, columns), actual);
+                } finally { context.setQueryCodeGenerator(compiler); }
             }
         }
+        assertTrue(compiler.delegates.values().stream().anyMatch(updater -> ((AggregateSlot) updater).dictionaryRows() > 0));
         assertEquals(compiler.slots.get(), compiler.closedSlots.get());
         assertEquals(0, engine.getBusyReaderCount());
     }
@@ -2675,7 +2801,7 @@ public class ResolvedSqlAggregateTest {
     public void handwrittenCountSumMatchesSqlThroughExistingLifecycle() throws Exception {
         Assume.assumeTrue(backend instanceof LlvmBackend);
         long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
-        compiler = new TrackingCompiler(new ResolvedQueryCompiler(backend, temporary.newFolder().toPath(), true));
+        compiler = new TrackingCompiler(new HandwrittenCountSum(temporary.newFolder().toPath()));
         engine.execute("create table ref as (select cast(case when x%19=0 then null else x%101-50 end as int) i,"
                 + "case when x%23=0 then null else x%103-51 end k,"
                 + "case when x%13=0 then null when x%29=0 then 9223372036854775806 else x*3 end v,"
@@ -2925,6 +3051,9 @@ public class ResolvedSqlAggregateTest {
             created.incrementAndGet();
             return new GroupByKernel() {
                 @Override public CharSequence getName() { return code.getName(); }
+                @Override public void prepareExecution(io.questdb.std.MemoryTracker tracker, SqlExecutionCircuitBreaker breaker, long inputRows, int workerSlots) { code.prepareExecution(tracker, breaker, inputRows, workerSlots); }
+                @Override public void clearExecution() { code.clearExecution(); }
+                @Override public void finishScan(java.util.function.Supplier<io.questdb.cairo.map.Map> destination, Runnable checkpoint) { code.finishScan(destination, checkpoint); }
                 @Override public void prepareLongTopK(Function function) { code.prepareLongTopK(function); }
                 @Override public void prepareLongTopK(Function function, boolean ascending, int limit) { code.prepareLongTopK(function, ascending, limit); }
                 @Override public void prepareFilter(ColumnTypes inputs, Function function) { code.prepareFilter(inputs, function); }

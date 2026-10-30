@@ -29,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 
 import static org.questdb.experimental.codegen.Ir.*;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** Compact input records with query-safe string payloads when local aggregation does not reduce work. */
 final class QuestPartitionInputs {
@@ -64,6 +65,7 @@ final class QuestPartitionInputs {
     static long numericBytes(AggregateUpdates updates) {
         long bytes = 0;
         for (var column : updates.columns()) bytes += column.width().bytes;
+        for (var expression : updates.inputs().expressions()) bytes += Pipeline.widthOf(expression.columnType()).bytes;
         return bytes;
     }
 
@@ -71,7 +73,7 @@ final class QuestPartitionInputs {
         Builder b = new Builder();
         Var partitions = b.let(new Load(MemoryType.ADDRESS, COLUMNS));
         Var sketch = b.let(new Load(MemoryType.ADDRESS, at(partitions, QuestPartitions.SKETCH_OFFSET)));
-        Var rowIds = b.let(new Load(MemoryType.ADDRESS, at(STATE, 8)));
+        Var rowIds = b.let(new Load(MemoryType.ADDRESS, at(STATE, SELECTION)));
         var addresses = new ArrayList<Var>();
         for (int i = 0; i < updates.columns().size(); i++) {
             addresses.add(b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, (i + 1L) * 8))));
@@ -82,7 +84,7 @@ final class QuestPartitionInputs {
             Var inputRow = entry.let(index);
             entry.when(ne(rowIds, nil()), filtered -> filtered.assign(inputRow,
                     load(new Offset(rowIds, binary(Op.MUL, index, i64(8))))));
-            if (probe.variable()) { entry.store(at(STATE, 80), i64(0)); entry.store(at(STATE, 32), index); }
+            if (probe.variable()) { entry.store(at(STATE, VariableKey.STAGING_USED), i64(0)); entry.store(at(STATE, RESUME_ROW), index); }
             Var key = probe.loadFrameKey(entry, inputRow, at(STATE, ResolvedAggregateKernel.prefetchScratch(probe) + 24));
             Var keyBytes = probe.variable() ? entry.let(QuestVariableKey.bytes(key)) : null;
             Var hash = probe.hash(entry, key);
@@ -105,8 +107,14 @@ final class QuestPartitionInputs {
                 entry.store(width, at(valueAddress, offset), values.values().get(i).data());
                 offset += width.bytes;
             }
-            offset = stringOffset(probe, updates);
             var frame = updates.inputs().frame(values, inputRow, at(COLUMNS, 8));
+            var computed = frame.numeric(entry);
+            for (var expression : updates.inputs().expressions()) {
+                var width = Pipeline.widthOf(expression.columnType());
+                entry.store(width, at(valueAddress, offset), expression.emit(computed).data());
+                offset += width.bytes;
+            }
+            offset = stringOffset(probe, updates);
             for (var argument : stringArguments(updates)) {
                 if (argument.payload) {
                     var value = frame.value(entry, argument.expression);
@@ -221,7 +229,17 @@ final class QuestPartitionInputs {
             values.add(column.value(value));
             offset += column.width().bytes;
         }
-        return new Pipeline.Row(layout.columns(), values);
+        var computed = new LinkedHashMap<Pipeline.FrameScalar, Pipeline.Value>();
+        for (var expression : layout.inputs().expressions()) {
+            var column = new Pipeline.Column(0, "computed", expression.columnType());
+            computed.put(expression, column.value(b.let(new Load(column.width(), at(address, offset)))));
+            offset += column.width().bytes;
+        }
+        return new Pipeline.Row(layout.columns(), values, List.of(), expression -> {
+            var value = computed.get(expression);
+            if (value == null) throw new IllegalArgumentException("Unmaterialized numeric expression");
+            return value;
+        });
     }
 
     private static long stringOffset(QuestMapProbe probe, AggregateUpdates layout) {

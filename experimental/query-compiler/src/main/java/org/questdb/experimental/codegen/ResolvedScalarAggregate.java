@@ -146,7 +146,7 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
             strings.put(count.argument(), new Pipeline.Utf8Value(nil(), i64(0), isNull, bool(false), bool(true)));
         }
         Builder emitted = loop.fork();
-        updates.emit(emitted, new ResolvedVarchar.Frame(values, row, nil(), nil(), strings), STATE, nil());
+        updates.emit(emitted, new ResolvedVarchar.Frame(frame.numeric(loop), row, nil(), nil(), strings), STATE, nil());
         loop.append(promote(emitted.block(), registers));
     }
 
@@ -230,7 +230,13 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
         private final long bytes = filterOffset + (filter == null ? 0 : filter.bytes());
         private final KernelMemory memory = KernelMemory.reusable((Runnable) null);
         private long addresses = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
+        private final ResolvedVarchar.Slot helpers;
         private long nativeRows;
+
+        Slot() {
+            try { helpers = inputs.newSlot(addresses + 8); }
+            catch (Throwable failure) { addresses = Unsafe.free(addresses, bytes, MemoryTag.NATIVE_JIT); throw failure; }
+        }
 
         @Override public long getNativeRows() { return nativeRows; }
         @Override public long filterAndUpdate(PageFrameMemoryRecord record, long rows,
@@ -274,7 +280,10 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
             }
         }
         @Override public void close() {
-            if (addresses != 0) addresses = Unsafe.free(addresses, bytes, MemoryTag.NATIVE_JIT);
+            if (addresses != 0) {
+                try { if (helpers != null) helpers.close(); }
+                finally { addresses = Unsafe.free(addresses, bytes, MemoryTag.NATIVE_JIT); }
+            }
         }
     }
 }

@@ -246,7 +246,7 @@ class AsyncGroupByRecordCursor implements RecordCursor {
         if (!isScanComplete) {
             prepareFrames();
             frameSequence.dispatchAndAwait();
-            shardingCtx.finishScan();
+            atom.finishScan(circuitBreaker::statefulThrowExceptionIfTrippedNoThrottle);
             isScanComplete = true;
         }
         if (!atom.isSharded()) {

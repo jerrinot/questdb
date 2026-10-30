@@ -85,6 +85,7 @@ final class ResolvedJoinKernel {
         var updates = AggregateUpdates.bind(valueTypes, functions,
                 index -> groupLayout != null ? packed.getOffset(index) : layout.getAddress(index) - base, false, inputs);
         if (updates == null) return null;
+        if (!updates.inputs().expressions().isEmpty()) return null;
         // Joined rows currently carry numeric cells, not VARCHAR frame descriptors.
         for (var update : updates.updates()) if (update instanceof AggregateUpdates.VarcharCount) return null;
         var target = new Target(mapProbe, groupKey);
@@ -250,7 +251,7 @@ final class ResolvedJoinKernel {
             memory = KernelMemory.reusable(checkpoint);
             argumentBytes = ARGUMENTS + (long) ARGUMENT_BYTES * prepared.indexes.length;
             bytes = argumentBytes + (prepared.probe == null ? 0
-                    : QuestMapProbe.CONTROL_BYTES + (long) GroupByMapFragment.NUM_SHARDS * QuestMapProbe.VIEW_BYTES);
+                    : MapKernelState.CONTROL_BYTES + (long) GroupByMapFragment.NUM_SHARDS * QuestMapProbe.VIEW_BYTES);
             arguments = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
         }
 
@@ -321,7 +322,7 @@ final class ResolvedJoinKernel {
                 if (shards != null && count != GroupByMapFragment.NUM_SHARDS) return false;
                 for (int i = 0; i < count; i++) {
                     Map current = shards == null ? map : shards.getQuick(i);
-                    current.writeNativeProbeView(state + QuestMapProbe.CONTROL_BYTES + (long) i * QuestMapProbe.VIEW_BYTES);
+                    current.writeNativeProbeView(state + MapKernelState.CONTROL_BYTES + (long) i * QuestMapProbe.VIEW_BYTES);
                 }
                 Unsafe.putLong(arguments + SHARD_MASK, count - 1);
                 Unsafe.putLong(arguments + POSITION, 0);
@@ -332,10 +333,10 @@ final class ResolvedJoinKernel {
                         long status = prepared.code.run(arguments, rowCount, state);
                         memory.throwIfFailed();
                         if (status == 0) break;
-                        if (status != QuestMapProbe.NEED_KEY) throw new IllegalStateException("Join map kernel failed: " + status);
+                        if (status != MapKernelState.NEED_KEY) throw new IllegalStateException("Join map kernel failed: " + status);
                         // A miss has not updated its match. Keep its probe and duplicate positions;
                         // the ordinary map remains the only owner of insertion and growth.
-                        Unsafe.putLong(arguments + POSITION, Unsafe.getLong(state + 32));
+                        Unsafe.putLong(arguments + POSITION, Unsafe.getLong(state + MapKernelState.RESUME_ROW));
                         long rawKey = Unsafe.getLong(arguments + MISSING_KEY);
                         MapKey key = map.withKey();
                         if (prepared.probe.keyType() == ColumnType.INT) key.putInt((int) rawKey);
@@ -343,7 +344,7 @@ final class ResolvedJoinKernel {
                         key.commit();
                         long hash = key.hash();
                         int shardIndex = shards == null ? 0 : (int) (hash >>> GroupByMapFragment.NUM_SHARDS_SHR);
-                        if (shardIndex != Unsafe.getLong(state + 24)) throw new IllegalStateException("Join map hash ABI mismatch");
+                        if (shardIndex != Unsafe.getLong(state + MapKernelState.SHARD)) throw new IllegalStateException("Join map hash ABI mismatch");
                         Map target = shards == null ? map : shards.getQuick(shardIndex);
                         if (target != map) {
                             MapKey targetKey = target.withKey();
@@ -355,8 +356,8 @@ final class ResolvedJoinKernel {
                         functions.updateEmpty(value);
                         mapMisses++;
                         // OrderedMap scratch-key writes may also move shard zero's heap.
-                        map.writeNativeProbeView(state + QuestMapProbe.CONTROL_BYTES);
-                        target.writeNativeProbeView(state + QuestMapProbe.CONTROL_BYTES + (long) shardIndex * QuestMapProbe.VIEW_BYTES);
+                        map.writeNativeProbeView(state + MapKernelState.CONTROL_BYTES);
+                        target.writeNativeProbeView(state + MapKernelState.CONTROL_BYTES + (long) shardIndex * QuestMapProbe.VIEW_BYTES);
                     }
                 } finally {
                     memory.close();

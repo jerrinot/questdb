@@ -1,9 +1,30 @@
 # Compiler cleanup
 
-Wall-clock profiling and benchmark suites remain paused while the host is in use.
 Preserve the measured algorithms, generated memory accesses and existing QuestDB
 ownership/scheduling. Validate structure changes with focused correctness checks
-and before/after generated IR; make no new performance claim.
+and before/after generated IR; make no new performance claim. Add no runtime
+dispatch, configuration or allocation for a structural cleanup.
+
+## Map invocation protocol (2026-10-30)
+
+`MapKernelState` now defines the common control words, resumable status codes and
+the distinct VARCHAR-copy and variable-key staging extensions. Java callers and
+emitters use the same definition, including the join path's borrowed map probes.
+The contract records first-unconsumed-row progress, key-copy ownership, staging
+rebuilds and map-view invalidation. Numeric offsets and status values are unchanged.
+
+Validation: 12 existing growth/merge/failure cases pass across LLVM, AsmJit and C;
+8 SQL aggregation cases and 2 join cases pass, including legacy/fiber execution,
+VARCHAR copies, oversized key staging, partition retries, cancellation and reopen.
+All 146 captured kernels from 12 SQL shapes emit byte-identical LLVM IR, covering
+the default prefetch path and scalar probes with counters enabled. Artifacts are
+in `/tmp/query-map-protocol-cleanup`; no timing claim or new test framework.
+
+This pass covers the map invocation block. Rehash/merge-source descriptors and
+deferred-DISTINCT contexts remain separate follow-ups. Keep those changes bounded
+before changing expression binding or execution strategy selection.
+
+## Earlier cleanup
 
 1. Give prepared code one resource owner. Validate before allocation; preserve
    the primary failure, close every adopted resource, and count every kernel.
@@ -21,7 +42,7 @@ and before/after generated IR; make no new performance claim.
 Complete one item at a time. Record checks and any deferred work here; keep raw
 comparison artifacts outside the repository.
 
-## Completed
+Completed:
 
 - Prepared code now adopts each resource immediately, validates capacity before
   allocation, closes in reverse order without masking the original failure, and
@@ -52,7 +73,7 @@ merge/finalization, bounded/shared maps, sorting/LIMIT, selection and projection
 All 58 captured kernels from nine SQL shapes emit byte-identical LLVM IR before
 and after cleanup. This is bounded equivalence evidence, not a throughput claim.
 
-Wall-clock profiling and ClickBench remain paused. The interrupted full-suite run
-is excluded from performance conclusions; the earlier staged VARCHAR prefetch
-candidate is preserved. Raw checks are outside the repository in
-`/tmp/query-code-cleanup`; no result archive was added here.
+That pass ran during the earlier profiling pause; its interrupted full-suite run
+is excluded from performance conclusions. Profiling subsequently resumed; README
+and PROGRESS describe the later coverage and measurements. Raw structural checks
+remain outside the repository in `/tmp/query-code-cleanup`.

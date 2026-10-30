@@ -32,6 +32,7 @@ import io.questdb.griffin.engine.functions.columns.VarcharColumn;
 import io.questdb.griffin.engine.functions.conditional.CaseFunctionFactory;
 import io.questdb.griffin.engine.functions.conditional.VarcharCaseFunction;
 import io.questdb.griffin.engine.functions.constants.StrConstant;
+import io.questdb.griffin.engine.functions.regex.RegexpReplaceVarcharFunctionFactory;
 import io.questdb.std.Unsafe;
 
 import java.io.ByteArrayOutputStream;
@@ -44,12 +45,27 @@ import static org.questdb.experimental.codegen.Ir.*;
 final class ResolvedVarchar {
     private final ColumnTypes types;
     private final ResolvedInputs numeric;
-    private final ArrayList<Integer> columns = new ArrayList<>();
-    private final ByteArrayOutputStream literals = new ByteArrayOutputStream();
+    private final ArrayList<Integer> columns;
+    private final ByteArrayOutputStream literals;
+    private final ArrayList<NativeCapture.Plan> captures;
+    private final ArrayList<Pipeline.FrameScalar> expressions = new ArrayList<>();
 
     ResolvedVarchar(ColumnTypes types, ResolvedInputs numeric) {
+        this(types, numeric, new ArrayList<>(), new ByteArrayOutputStream(), new ArrayList<>());
+    }
+
+    ResolvedVarchar(ColumnTypes types, ResolvedInputs numeric, ArrayList<Integer> columns, ByteArrayOutputStream literals) {
+        this(types, numeric, columns, literals, null); // Filter descriptors have no helper owner yet.
+    }
+
+    private ResolvedVarchar(ColumnTypes types, ResolvedInputs numeric, ArrayList<Integer> columns,
+                            ByteArrayOutputStream literals, ArrayList<NativeCapture.Plan> captures) {
+        this.captures = captures;
         this.types = types;
         this.numeric = numeric;
+        this.columns = columns;
+        this.literals = literals;
+        numeric.bindStrings(this);
     }
 
     Expression column(int index) {
@@ -60,13 +76,28 @@ final class ResolvedVarchar {
     }
 
     Expression bind(Function function) { return bind(function, 0); }
-    Binding binding() {
-        return new Binding(numeric.indexes(), numeric.columns(), columns.stream().mapToInt(Integer::intValue).toArray(), literals.toByteArray());
+    Pipeline.FrameScalar length(Function function, int depth) {
+        Expression argument = bind(function, depth);
+        if (argument == null) return null;
+        var length = new Length(argument);
+        if (!expressions.contains(length)) expressions.add(length);
+        return length;
     }
 
-    /** Numeric page pointers, then pinned UTF-8 views, then slot-owned literal bytes. */
-    record Binding(int[] numericColumns, List<Pipeline.Column> numericInputs, int[] varcharColumns, byte[] literals) {
-        long bytes() { return (numericColumns.length * 8L + varcharColumns.length * 48L + literals.length + 7) & -8L; }
+    Binding binding() {
+        return new Binding(numeric.indexes(), numeric.columns(), columns.stream().mapToInt(Integer::intValue).toArray(), literals.toByteArray(), List.copyOf(expressions), captures == null ? List.of() : List.copyOf(captures));
+    }
+
+    /** Numeric page pointers, then pinned UTF-8 views, then slot-owned literal bytes and helper pointers. */
+    record Binding(int[] numericColumns, List<Pipeline.Column> numericInputs, int[] varcharColumns, byte[] literals,
+                   List<Pipeline.FrameScalar> expressions, List<NativeCapture.Plan> captures) {
+        Binding(int[] numericColumns, List<Pipeline.Column> numericInputs, int[] varcharColumns, byte[] literals) {
+            this(numericColumns, numericInputs, varcharColumns, literals, List.of(), List.of());
+        }
+        long helperOffset() { return (numericColumns.length * 8L + varcharColumns.length * 48L + literals.length + 7) & -8L; }
+        long bytes() { return helperOffset() + (long) captures.size() * NativeCapture.DESCRIPTOR_BYTES; }
+
+        Slot newSlot(long descriptor) { return captures.isEmpty() ? null : new Slot(captures, descriptor + helperOffset()); }
 
         boolean prepare(PageFrameMemoryRecord record, long descriptor) {
             for (int i = 0; i < numericColumns.length; i++) {
@@ -86,7 +117,7 @@ final class ResolvedVarchar {
 
         Frame frame(Pipeline.Row numeric, Expr row, Expr descriptor) {
             Expr views = at(descriptor, numericColumns.length * 8L);
-            return new Frame(numeric, row, views, at(views, varcharColumns.length * 48L));
+            return new Frame(numeric, row, views, at(views, varcharColumns.length * 48L), at(descriptor, helperOffset()), null);
         }
     }
 
@@ -100,11 +131,20 @@ final class ResolvedVarchar {
             for (int i = 0; i < value.size(); i++) literals.write(value.byteAt(i));
             return new Literal(offset, value.size(), false, value.isAscii());
         }
+        if (captures != null && function instanceof RegexpReplaceVarcharFunctionFactory.SingleGroupAsciiFunc capture) {
+            var plan = NativeCapture.Plan.bind(capture.getPattern(), capture.getGroup());
+            if (plan == null) return null;
+            var argument = bind(capture.getArg(), depth + 1);
+            if (argument == null) return null;
+            int index = captures.size();
+            captures.add(plan);
+            return new NativeCapture.Expression(argument, plan, index);
+        }
         if (function instanceof VarcharCaseFunction conditional
                 && conditional.getPicker() instanceof CaseFunctionFactory.SearchedCasePicker picker) {
             var branches = new ArrayList<Branch>();
             for (int i = 0; i < picker.getBranchCount(); i++) {
-                var condition = numeric.predicate(picker.getCondition(i));
+                var condition = numeric.predicate(picker.getCondition(i), depth + 1);
                 var value = bind(picker.getValue(i), depth + 1);
                 if (condition == null || value == null) return null;
                 branches.add(new Branch(condition, value));
@@ -115,10 +155,43 @@ final class ResolvedVarchar {
         return null;
     }
 
-    record Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals,
+    static final class Slot implements AutoCloseable {
+        private final NativeCapture.Slot[] captures;
+        Slot(List<NativeCapture.Plan> plans, long descriptor) {
+            captures = new NativeCapture.Slot[plans.size()];
+            try {
+                for (int i = 0; i < captures.length; i++)
+                    captures[i] = new NativeCapture.Slot(plans.get(i), descriptor + (long) i * NativeCapture.DESCRIPTOR_BYTES);
+            } catch (Throwable failure) {
+                try { close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
+        }
+        @Override public void close() {
+            Throwable failure = null;
+            for (int i = captures.length - 1; i >= 0; i--) if (captures[i] != null) {
+                try { captures[i].close(); }
+                catch (Throwable cleanup) { if (failure == null) failure = cleanup; else failure.addSuppressed(cleanup); }
+            }
+            if (failure instanceof Error error) throw error;
+            if (failure instanceof RuntimeException error) throw error;
+        }
+    }
+
+    record Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals, Expr helpers,
                  java.util.Map<Expression, Pipeline.Utf8Value> materialized) {
         Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals) {
-            this(numeric, row, columns, literals, null);
+            this(numeric, row, columns, literals, nil(), null);
+        }
+        Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals,
+              java.util.Map<Expression, Pipeline.Utf8Value> materialized) {
+            this(numeric, row, columns, literals, nil(), materialized);
+        }
+        Pipeline.Row numeric(Builder builder) {
+            if (numeric.computed() != null) return numeric;
+            var values = new java.util.HashMap<Pipeline.FrameScalar, Pipeline.Value>();
+            return new Pipeline.Row(numeric.columns(), numeric.values(), numeric.parameters(),
+                    expression -> values.computeIfAbsent(expression, key -> key.emit(builder, this)));
         }
         Pipeline.Utf8Value value(Builder b, Expression argument) {
             if (materialized == null) return argument.emit(b, this);
@@ -131,9 +204,29 @@ final class ResolvedVarchar {
         }
     }
 
-    sealed interface Expression permits Column, Literal, Conditional {
+    sealed interface Expression permits Column, Literal, Conditional, NativeCapture.Expression {
         Pipeline.Utf8Value emit(Builder builder, Frame frame);
         Expr isNull(Builder builder, Frame frame);
+    }
+
+    record Length(Expression argument) implements Pipeline.FrameScalar {
+        @Override public int columnType() { return ColumnType.INT; }
+        @Override public Pipeline.Value emit(Builder builder, Frame frame) {
+            // Utf8s.length(NULL) is -1, an ordinary INT value rather than INT NULL.
+            return new Pipeline.Value(ByteSequences.length(builder, frame.value(builder, argument)), bool(false));
+        }
+        @Override public void collectColumns(java.util.BitSet columns) { collect(argument, columns); }
+    }
+
+    private static void collect(Expression expression, java.util.BitSet columns) {
+        if (expression instanceof NativeCapture.Expression capture) collect(capture.argument(), columns);
+        else if (expression instanceof Conditional conditional) {
+            for (Branch branch : conditional.branches) {
+                ScanPlan.collect(branch.condition, columns);
+                collect(branch.value, columns);
+            }
+            collect(conditional.otherwise, columns);
+        }
     }
 
     private record Column(int index) implements Expression {
@@ -161,7 +254,7 @@ final class ResolvedVarchar {
         @Override public Expr isNull(Builder b, Frame frame) {
             Var isNull = b.let(bool(true)), matched = b.let(bool(false));
             for (Branch branch : branches) {
-                b.when(eq(matched, bool(false)), next -> next.when(branch.condition.emit(frame.numeric), selected -> {
+                b.when(eq(matched, bool(false)), next -> next.when(branch.condition.emit(frame.numeric(next)), selected -> {
                     selected.assign(isNull, branch.value.isNull(selected, frame));
                     selected.assign(matched, bool(true));
                 }));
@@ -175,7 +268,7 @@ final class ResolvedVarchar {
             Var address = b.let(frame.literals), size = b.let(i64(0)), isNull = b.let(bool(true));
             Var isAscii = b.let(bool(true)), stable = b.let(bool(false)), matched = b.let(bool(false));
             for (Branch branch : branches) {
-                b.when(eq(matched, bool(false)), next -> next.when(branch.condition.emit(frame.numeric), selected -> {
+                b.when(eq(matched, bool(false)), next -> next.when(branch.condition.emit(frame.numeric(next)), selected -> {
                     assign(selected, branch.value.emit(selected, frame), address, size, isNull, isAscii, stable);
                     selected.assign(matched, bool(true));
                 }));

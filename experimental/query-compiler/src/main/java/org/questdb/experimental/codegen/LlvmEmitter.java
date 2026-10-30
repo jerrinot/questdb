@@ -160,6 +160,11 @@ final class LlvmEmitter {
             case SelectRows s -> selectRows(result, s);
             case ToDouble c -> line(result + " = sitofp i64 " + operand(c.value()) + " to double");
             case BitCast c -> line(result + " = bitcast " + type(c.value().type()) + " " + operand(c.value()) + " to " + type(c.type()));
+            case NativeCall c -> {
+                String function = temp("inttoptr i64 " + operand(c.function()) + " to ptr");
+                String arguments = c.arguments().stream().map(a -> "i64 " + operand(a)).collect(java.util.stream.Collectors.joining(", "));
+                line(result + " = call i64 " + function + "(" + arguments + ")");
+            }
             case Allocate a -> line(result + " = call i64 %alloc_fn(i64 " + operand(a.bytes()) + ")");
             case Reallocate r -> line(result + " = call i64 %realloc_fn(i64 " + operand(r.address()) + ", i64 " + operand(r.oldBytes()) + ", i64 " + operand(r.newBytes()) + ")");
             default -> throw new IllegalArgumentException("Unexpected SSA expression: " + expression);

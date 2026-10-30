@@ -24,22 +24,48 @@
 
 package org.questdb.experimental.codegen;
 
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.NativeMapView;
+import io.questdb.cairo.map.UnorderedVarcharMap;
+import io.questdb.cairo.sql.Function;
+import io.questdb.std.ObjList;
 import io.questdb.griffin.engine.table.GroupByMapFragment;
 
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import static org.questdb.experimental.codegen.Ir.*;
+import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** VARCHAR frame decoding and UnorderedVarcharMap's existing byte-key algorithms. */
 final class QuestVarchar {
-    static final int NEED_COPY = 6;
     static final int INVALID_FRAME = -7;
     private static final long PTR_MASK = Long.MAX_VALUE;
     private static final long M2 = 0x517cc1b727220a95L;
 
     private QuestVarchar() { }
+
+    record Key(ResolvedVarchar.Binding inputs, ResolvedVarchar.Expression expression) {
+        static Key bind(ColumnTypes inputs, ColumnTypes keys,
+                        ListColumnFilter columns, ObjList<Function> functions,
+                        Map map) {
+            if (!(map instanceof UnorderedVarcharMap) || keys.getColumnCount() != 1
+                    || keys.getColumnType(0) != ColumnType.VARCHAR || columns.size() != 0
+                    || functions == null || functions.size() != 1) return null;
+            var strings = new ResolvedVarchar(inputs, new ResolvedInputs(inputs));
+            var expression = strings.bind(functions.getQuick(0));
+            return expression == null ? null : new Key(strings.binding(), expression);
+        }
+
+        Var stage(Builder b, Expr row, Expr scratch) {
+            Var descriptor = b.let(new Load(MemoryType.ADDRESS, at(STATE, KEY_COLUMNS)));
+            var numeric = ResolvedInputs.loadFrameRow(b, inputs.numericInputs(), descriptor, row);
+            return QuestVarchar.stage(b, expression.emit(b, inputs.frame(numeric, row, descriptor)), scratch);
+        }
+    }
 
     // Native split and Parquet slice headers both carry NULL at bit 2.
     static Var header(Builder b, Expr descriptor, Expr row) {
@@ -97,7 +123,10 @@ final class QuestVarchar {
 
     // Staged key: packed hash/size/flags, pointer with lifetime bit, full hash for sharding.
     static Var stage(Builder b, Expr row, Expr scratch) {
-        var value = decode(b, new Load(MemoryType.ADDRESS, at(STATE, 16)), row);
+        return stage(b, decode(b, new Load(MemoryType.ADDRESS, at(STATE, KEY_COLUMNS)), row), scratch);
+    }
+
+    static Var stage(Builder b, Pipeline.Utf8Value value, Expr scratch) {
         Var hash = hash(b, value.address(), value.size());
         Expr flags = new Select(value.isNull(), i64(0xc000_0000L),
                 new Select(binary(Op.EITHER, value.isAscii(), eq(value.size(), i64(0))), i64(0x8000_0000L), i64(0)));
@@ -150,7 +179,7 @@ final class QuestVarchar {
 
     static QuestMapProbe.Candidate prepare(QuestMapProbe probe, Builder b, Var key, long valueBytes,
                                           BiConsumer<Builder, Var> hint) {
-        var lookup = probe.lookup(b, key, load(at(STATE, 56)));
+        var lookup = probe.lookup(b, key, load(at(STATE, SHARD_MASK)));
         Var entry = b.let(new Offset(lookup.base(), binary(Op.MUL, lookup.slot(), load(at(lookup.view(), NativeMapView.STRIDE)))));
         b.prefetch(entry, true);
         if (16 + valueBytes > 1) b.prefetch(at(entry, 16 + valueBytes - 1), true);
@@ -163,32 +192,32 @@ final class QuestVarchar {
         var lookup = probe.lookup(b, key, shardMask);
         Var destination = b.let(nil()), stride = b.let(load(at(lookup.view(), NativeMapView.STRIDE)));
         b.loop(eq(destination, nil()), step -> {
-            QuestMapProbe.count(step, 40);
+            QuestMapProbe.count(step, PROBE_COUNT);
             Var entry = step.let(new Offset(lookup.base(), binary(Op.MUL, lookup.slot(), stride)));
             step.when(eq(load(entry), i64(0)), missing -> {
                 missing.when(binary(Op.LT, load(at(lookup.view(), NativeMapView.FREE)), i64(2)), full ->
                         QuestMapProbe.miss(full, position, lookup.shard(), beforeMiss));
                 Var ptr = missing.let(load(at(key, 8)));
                 missing.when(binary(Op.BOTH, binary(Op.LT, ptr, i64(0)), ne(size(key), i64(0))), unstable -> {
-                    unstable.when(ne(load(at(STATE, 80)), position), copy -> {
-                        copy.store(at(STATE, 64), binary(Op.AND, ptr, i64(PTR_MASK)));
-                        copy.store(at(STATE, 72), size(key));
-                        copy.store(at(STATE, 24), lookup.shard());
-                        copy.store(at(STATE, 32), position);
+                    unstable.when(ne(load(at(STATE, VarcharKey.COPIED_ROW)), position), copy -> {
+                        copy.store(at(STATE, VarcharKey.COPY_ADDRESS), binary(Op.AND, ptr, i64(PTR_MASK)));
+                        copy.store(at(STATE, VarcharKey.COPY_BYTES), size(key));
+                        copy.store(at(STATE, SHARD), lookup.shard());
+                        copy.store(at(STATE, RESUME_ROW), position);
                         copy.exit(NEED_COPY);
                     });
-                    unstable.assign(ptr, load(at(STATE, 64)));
+                    unstable.assign(ptr, load(at(STATE, VarcharKey.COPY_ADDRESS)));
                 });
                 initialize.accept(missing, at(entry, 16));
                 missing.store(entry, load(key));
                 missing.store(at(entry, 8), ptr);
                 missing.store(at(lookup.view(), NativeMapView.FREE), binary(Op.SUB, load(at(lookup.view(), NativeMapView.FREE)), i64(1)));
                 missing.store(at(lookup.view(), NativeMapView.SIZE), add(load(at(lookup.view(), NativeMapView.SIZE)), i64(1)));
-                missing.store(at(STATE, 80), i64(-1));
+                missing.store(at(STATE, VarcharKey.COPIED_ROW), i64(-1));
                 missing.assign(destination, at(entry, 16));
             });
             step.when(eq(destination, nil()), occupied -> {
-                QuestMapProbe.count(occupied, 48);
+                QuestMapProbe.count(occupied, KEY_COMPARISONS);
                 occupied.when(equal(occupied, entry, key), match -> match.assign(destination, at(entry, 16)));
             });
             step.assign(lookup.slot(), binary(Op.AND, add(lookup.slot(), i64(1)), lookup.mask()));
@@ -221,7 +250,7 @@ final class QuestVarchar {
     static Program entries(QuestMapProbe probe, AggregateUpdates updates, long valueBytes) {
         Builder b = new Builder();
         Var base = b.let(new Load(MemoryType.ADDRESS, COLUMNS)), stride = b.let(load(at(COLUMNS, 24)));
-        Var merge = b.let(eq(load(at(STATE, 56)), i64(0))), index = b.let(load(STATE));
+        Var merge = b.let(eq(load(at(STATE, SHARD_MASK)), i64(0))), index = b.let(load(STATE));
         Expr scratch = at(STATE, probe.controlBytes() + (long) GroupByMapFragment.NUM_SHARDS * probe.viewBytes());
         b.loop(binary(Op.LT, index, ROWS), loop -> {
             loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
@@ -233,7 +262,7 @@ final class QuestVarchar {
                 occupied.when(eq(merge, bool(false)), shard -> shard.assign(hash, hash(shard, pointer(source), size(source))));
                 occupied.store(at(scratch, 16), hash);
                 Var inserted = occupied.let(bool(false));
-                Var destination = probe.find(occupied, occupied.let(scratch), index, load(at(STATE, 56)), null, (init, value) -> {
+                Var destination = probe.find(occupied, occupied.let(scratch), index, load(at(STATE, SHARD_MASK)), null, (init, value) -> {
                     QuestMapMutation.copy(init, at(source, 16), value, valueBytes);
                     init.assign(inserted, bool(true));
                 });

@@ -77,7 +77,7 @@ final class ResolvedFilter implements AutoCloseable {
         var inputs = new ResolvedInputs(types, parameters);
         var leaves = new java.util.ArrayList<Function>();
         if (!conjuncts(function, leaves, 0)) return null;
-        var residuals = new ResidualBinder(types, inputs, parameters);
+        var remaining = new java.util.ArrayList<Function>();
         var tests = new java.util.ArrayList<ScanLowering.RowPredicate>();
         Pipeline.Predicate numeric = new Pipeline.All();
         for (Function leaf : leaves) {
@@ -85,10 +85,15 @@ final class ResolvedFilter implements AutoCloseable {
             if (predicate != null) {
                 numeric = numeric instanceof Pipeline.All ? predicate : new Pipeline.And(numeric, predicate);
             } else {
-                var test = residuals.bind(leaf, 0);
-                if (test == null) return null;
-                tests.add(test);
+                remaining.add(leaf);
             }
+        }
+        // Frame-dependent operands belong to the residual branches, not SIMD numeric inputs.
+        var residuals = new ResidualBinder(types, inputs, parameters);
+        for (Function leaf : remaining) {
+            var test = residuals.bind(leaf, 0);
+            if (test == null) return null;
+            tests.add(test);
         }
         // Only top-level numeric conjuncts may reject a row before the residual tree.
         // Numeric leaves inside OR must stay in that branch.
@@ -123,6 +128,7 @@ final class ResolvedFilter implements AutoCloseable {
             this.types = types;
             this.inputs = inputs;
             this.parameters = parameters;
+            new ResolvedVarchar(types, inputs, strings, literals);
         }
 
         private long stringOffset() { return (inputs.columns().size() + parameters.size()) * 8L; }
@@ -131,15 +137,6 @@ final class ResolvedFilter implements AutoCloseable {
 
         private ScanLowering.RowPredicate bind(Function function, int depth) {
             if (depth > 64) return null;
-            var numeric = inputs.predicate(function);
-            if (numeric != null) return (builder, descriptors, row) -> {
-                var columns = inputs.columns();
-                var addresses = new java.util.ArrayList<Expr>();
-                for (int i = 0; i < columns.size(); i++) addresses.add(new Load(MemoryType.ADDRESS, at(descriptors, i * 8L)));
-                var values = new java.util.ArrayList<Expr>();
-                for (int i = 0; i < parameters.size(); i++) values.add(new Load(MemoryType.I32, at(descriptors, (columns.size() + i) * 8L)));
-                return numeric.emit(ScanLowering.row(columns, addresses, row, true, values));
-            };
             if (function.getClass() == NotFunctionFactory.Func.class) {
                 var child = bind(((NotFunctionFactory.Func) function).getArg(), depth + 1);
                 return child == null ? null : (builder, descriptors, row) -> eq(child.emit(builder, descriptors, row), bool(false));
@@ -159,6 +156,18 @@ final class ResolvedFilter implements AutoCloseable {
                 }
                 return combine(List.copyOf(tests), disjunction);
             }
+            var numeric = inputs.predicate(function);
+            if (numeric != null) return (builder, descriptors, row) -> {
+                var columns = inputs.columns();
+                var addresses = new java.util.ArrayList<Expr>();
+                for (int i = 0; i < columns.size(); i++) addresses.add(new Load(MemoryType.ADDRESS, at(descriptors, i * 8L)));
+                var values = new java.util.ArrayList<Expr>();
+                for (int i = 0; i < parameters.size(); i++) values.add(new Load(MemoryType.I32, at(descriptors, (columns.size() + i) * 8L)));
+                var source = ScanLowering.row(columns, addresses, row, true, values);
+                var frame = new ResolvedVarchar.Frame(source, row, at(descriptors, stringOffset()),
+                        literals.size() == 0 ? nil() : new Load(MemoryType.ADDRESS, at(descriptors, literalOffset())));
+                return numeric.emit(frame.numeric(builder));
+            };
             if (function instanceof SymbolKeySetProvider source) {
                 Function argument = function instanceof UnaryFunction unary ? unary.getArg()
                         : function instanceof BinaryFunction binary ? binary.getLeft() : null;

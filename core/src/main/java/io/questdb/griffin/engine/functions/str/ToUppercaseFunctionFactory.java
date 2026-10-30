@@ -53,7 +53,7 @@ public class ToUppercaseFunctionFactory implements FunctionFactory {
         return new ToUppercaseFunc(args.get(0));
     }
 
-    private static class ToUppercaseFunc extends StrFunction implements UnaryFunction {
+    public static class ToUppercaseFunc extends StrFunction implements UnaryFunction {
         private final Function arg;
         private final StringSink sinkA = new StringSink();
         private final StringSink sinkB = new StringSink();
