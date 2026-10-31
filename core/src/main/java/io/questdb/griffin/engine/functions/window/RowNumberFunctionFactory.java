@@ -129,7 +129,7 @@ public class RowNumberFunctionFactory implements FunctionFactory {
         return new SequenceRowNumberFunction();
     }
 
-    private static class RowNumberFunction extends LongFunction implements WindowFunction, Reopenable {
+    public static class RowNumberFunction extends LongFunction implements WindowFunction, Reopenable {
         private final CairoConfiguration configuration;
         private final ColumnTypes keyColumnTypes;
         private final VirtualRecord partitionByRecord;
@@ -319,6 +319,16 @@ public class RowNumberFunctionFactory implements FunctionFactory {
         @Override
         public long getLong(Record rec) {
             return rowNumber;
+        }
+
+        @Override
+        public int getColumnIndex() {
+            return columnIndex;
+        }
+
+        /** Borrowed resolved partition expressions; the function retains ownership. */
+        public ObjList<? extends Function> getPartitionByFunctions() {
+            return partitionByRecord.getFunctions();
         }
 
         @Override

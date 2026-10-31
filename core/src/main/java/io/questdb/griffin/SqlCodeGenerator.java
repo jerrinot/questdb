@@ -5214,7 +5214,48 @@ public class SqlCodeGenerator implements Mutable, Closeable {
         if (tryFuseKeepFlagFilter(factory, where, model)) {
             return factory;
         }
+        RecordCursorFactory topK = tryGroupedTopKFilter(factory, where, executionContext);
+        if (topK != null) {
+            model.setWhereClause(null);
+            return topK;
+        }
         return generateFilter0(factory, model, executionContext);
+    }
+
+    private @Nullable RecordCursorFactory tryGroupedTopKFilter(
+            RecordCursorFactory factory,
+            ExpressionNode where,
+            SqlExecutionContext executionContext
+    ) {
+        if (executionContext.getQueryCodeGenerator() == null || !(factory instanceof CachedWindowLightRecordCursorFactory window)) {
+            return null;
+        }
+        ExpressionNode rank = where.lhs;
+        ExpressionNode bound = where.rhs;
+        boolean strict = Chars.equals(where.token, '<');
+        boolean supported = strict || Chars.equals(where.token, "<=");
+        if (Chars.equals(where.token, '>') || Chars.equals(where.token, ">=")) {
+            rank = where.rhs;
+            bound = where.lhs;
+            strict = Chars.equals(where.token, '>');
+            supported = true;
+        }
+        if (!supported || rank == null || bound == null || rank.type != ExpressionNode.LITERAL || bound.type != ExpressionNode.CONSTANT) {
+            return null;
+        }
+        try {
+            long n = Numbers.parseLong(bound.token);
+            if (n > 0 && n <= Integer.MAX_VALUE) {
+                int limit = (int) n - (strict ? 1 : 0);
+                int column = factory.getMetadata().getColumnIndexQuiet(rank.token);
+                if (limit > 0 && column >= 0) {
+                    return window.tryGroupedTopK(column, limit, executionContext);
+                }
+            }
+        } catch (NumericException ignored) {
+            // Non-integer bounds retain ordinary expression resolution.
+        }
+        return null;
     }
 
     // Conservative pattern match for the single-keep-flag fusion. Fuses ONLY when:

@@ -239,6 +239,42 @@ public class ResolvedSymbolAggregateTest {
         }
     }
 
+    @Test public void largerArraysRequireEnoughInputAndRespectRetainedDictionaries() throws Exception {
+        // Fits the conservative fallback cache budget as well as ordinary data caches.
+        Assume.assumeTrue(CacheSizing.LOCAL_AGGREGATE_BYTES >= 128 * 1024);
+        // Avoid symbol-capacity housekeeping invalidating a factory between reopens.
+        engine.execute("create table t (k symbol capacity 8192, v int)", context);
+        engine.execute("insert into t select cast(x%1000 as symbol),cast(x%97 as int) "
+                + "from long_sequence(30001)", context);
+        String sql = "select k,sum(v),avg(v),min(v),max(v),count() from t group by k";
+        context.setQueryCodeGenerator(compiler);
+        try (var candidate = engine.select(sql, context)) {
+            var kernel = vector(candidate).getCompiledAggregate();
+            assertNotNull(kernel);
+            assertMatches(sql, candidate);
+            assertEquals(30001, kernel.getNativeRows());
+        }
+        // The symbol snapshot can be much larger than the current active domain.
+        engine.execute("truncate table t keep symbol maps", context);
+        engine.execute("insert into t select cast(x%3 as symbol),cast(x as int) from long_sequence(9)", context);
+        try (var candidate = engine.select(sql, context)) {
+            var kernel = vector(candidate).getCompiledAggregate();
+            assertNotNull(kernel);
+            assertMatches(sql, candidate);
+            assertEquals(0, kernel.getNativeRows());
+
+            engine.execute("insert into t select cast(x%1000 as symbol),cast(x%97 as int) from long_sequence(30001)", context);
+            assertMatches(sql, candidate);
+            assertEquals(30010, kernel.getNativeRows());
+
+            // No speculative allocation for unbounded or unknown-sized domains.
+            assertFalse(kernel.open(Integer.MAX_VALUE, Long.MAX_VALUE, context.getMemoryTracker()));
+            assertFalse(kernel.open(1000, -1, context.getMemoryTracker()));
+            assertMatches(sql, candidate);
+            assertEquals(60020, kernel.getNativeRows());
+        }
+    }
+
     @Test public void columnTopsNullKeysAndEmptyInput() throws Exception {
         engine.execute("create table t as (select x v from long_sequence(1000))", context);
         engine.execute("alter table t add column k symbol", context);

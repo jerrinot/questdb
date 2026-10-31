@@ -301,6 +301,7 @@ public final class Demo {
                         case ColumnType.IPv4 -> (long) record.getIPv4(i);
                         case ColumnType.DATE -> record.getDate(i);
                         case ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> record.getTimestamp(i);
+                        case ColumnType.FLOAT -> (long) Float.floatToIntBits(record.getFloat(i));
                         case ColumnType.DOUBLE -> Double.doubleToLongBits(record.getDouble(i));
                         default -> throw new IllegalArgumentException("Expected integer SQL result columns");
                     };

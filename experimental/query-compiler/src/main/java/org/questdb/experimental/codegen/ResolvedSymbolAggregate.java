@@ -52,7 +52,7 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
     private final ObjList<VectorAggregateFunction> functions; // borrowed from the vector factory
     private final boolean floatingInputs;
     private final int stride;
-    private final long maxSlotBytes;
+    private final long initialSlotBytes;
     private final long[] slots;
     private final long[] nativeRows; // separate cache lines for exclusive worker slots
     private final CompiledKernel code;
@@ -120,8 +120,7 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
         this.functions = functions;
         floatingInputs = updates.columns().stream().anyMatch(column -> column.columnType() == ColumnType.DOUBLE);
         stride = Math.toIntExact(Rosti.getSlotSize(rosti));
-        // Bound array replication by the slot storage the ordinary factory already allocated.
-        maxSlotBytes = Math.multiplyExact(Rosti.getCapacity(rosti) + 1, stride);
+        initialSlotBytes = Math.multiplyExact(Rosti.getCapacity(rosti) + 1, stride);
         slots = new long[workers];
         nativeRows = new long[workers * 8];
         name = backend.name();
@@ -130,7 +129,7 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
     }
 
     @Override
-    public boolean open(int count, MemoryTracker tracker) {
+    public boolean open(int count, long rowCount, MemoryTracker tracker) {
         clear();
         if (count < 0) return false;
         long entries = (long) count + 1;
@@ -138,7 +137,12 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
         keysOffset = (seenOffset + entries + 7) & ~7L;
         argsOffset = (keysOffset + entries * 4 + 7) & ~7L;
         slotBytes = argsOffset + (indexes.length + 3L) * 8;
-        if (slotBytes > maxSlotBytes) return false;
+        // Small arrays cost no more than the map's initial slot storage. Larger
+        // dictionaries must fit the existing local-state cache budget, and the
+        // known input must amortize scanning a dictionary per worker at merge.
+        // Unknown interval sizes retain the small-array bound without a prescan.
+        if (slotBytes > initialSlotBytes
+                && (slotBytes > CacheSizing.LOCAL_AGGREGATE_BYTES || entries > rowCount / slots.length)) return false;
         symbolCount = count;
         this.tracker = tracker;
         try {

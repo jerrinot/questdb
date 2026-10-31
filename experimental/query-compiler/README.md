@@ -159,6 +159,10 @@ The binders and focused tests are authoritative. Current families include:
   derived from static SYMBOL dictionaries have the eligibility rules above.
 - DOUBLE arithmetic (+, -, *, /), integer-to-DOUBLE widening, tolerance-aware
   comparisons and NULL predicates in scan/filter/aggregate expressions
+- FLOAT inputs widened into the existing DOUBLE expressions and aggregates,
+  including AVG(FLOAT) and explicit FLOAT-to-DOUBLE casts. Captured inputs retain
+  four-byte storage. FLOAT arithmetic, grouping and SUM(FLOAT) retain ordinary
+  execution; FLOAT accumulation has a separate rounding/state contract.
 - VARCHAR code-point `length` in numeric aggregate arguments, fixed/composite
   grouping keys and residual predicates, including supported searched CASE values.
   This reuses ordinary numeric aggregates and borrowed frame descriptors. ASCII
@@ -244,6 +248,22 @@ compaction, scratch-heap copying and heap-offset restoration keep the existing
 algorithm. Lazy type conversions decline before mutation and retain ordinary
 build/compaction. SQL binding remains one physical VARCHAR key; the generic sorter
 does not by itself qualify composite ordering or partially ordered plans.
+
+Bounded partitioned `ROW_NUMBER()` can become a generated group-by when its outer
+filter is exactly `rn <= K` (or the equivalent strict/reversed comparison), with
+constant `1 <= K <= 64`. Each group keeps a sorted prefix of K values; partial
+prefixes merge through the existing group-by scheduler and maps. The existing
+Unnest cursor expands final prefixes and supplies row numbers. There is no new
+runtime toggle. EXPLAIN shows `Grouped Top K`; aggregate native-row counters
+establish actual generated execution.
+
+This rewrite accepts one direct INT/LONG/FLOAT/DOUBLE ordering column and direct
+INT/LONG/SYMBOL/DOUBLE/VARCHAR partition columns. Output may contain only partition
+keys, the ranked value and row number, so ties do not require retaining arbitrary
+row payloads. NULL ordering and duplicates follow the ordinary window. Other
+window functions, computed keys, multiple ordering columns, payload columns,
+nonconstant or larger bounds retain ordinary execution. State is O(groups * K),
+not constant total memory; existing query memory limits still apply.
 
 Filter/aggregate fusion is a separate harness experiment exposed by
 `ResolvedQueryCompiler.filterFusionExperiment`; ordinary construction does not

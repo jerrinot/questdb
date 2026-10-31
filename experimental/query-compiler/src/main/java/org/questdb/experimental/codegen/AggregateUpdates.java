@@ -96,6 +96,25 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         for (int i = 0; i < functions.size(); i++) {
             GroupByFunction function = functions.getQuick(i);
             Class<?> implementation = function.getClass();
+            if (implementation == GroupedTopKAggregate.class) {
+                var topK = (GroupedTopKAggregate) function;
+                int start = topK.getValueIndex();
+                if (start < 0 || start > valueTypes.getColumnCount() - topK.limit - 1) {
+                    throw new IllegalArgumentException("Top-K state exceeds its assigned slots");
+                }
+                long offset = offsets.applyAsLong(start);
+                for (int j = 0; j <= topK.limit; j++) {
+                    if (valueTypes.getColumnType(start + j) != ColumnType.LONG || !assignedSlots.add(start + j)
+                            || offsets.applyAsLong(start + j) != offset + j * 8L) {
+                        throw new IllegalArgumentException("Top-K requires contiguous LONG state slots");
+                    }
+                }
+                int type = topK.getArg().getType();
+                var argument = inputs.scalar(topK.getArg(), type == ColumnType.FLOAT ? ColumnType.DOUBLE : type);
+                if (argument == null) return null;
+                updates.add(new GroupedTopKAggregate.Update(argument, offset, topK.limit, topK.ascending));
+                continue;
+            }
             int argumentType;
             boolean average = isAverage(implementation);
             boolean floating = implementation == SumDoubleGroupByFunction.class || implementation == MinDoubleGroupByFunction.class
@@ -270,7 +289,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         return isAverage(function.getClass())
                 ? DoubleColumn.newInstance(((GroupByFunction) function).getValueIndex()) : function;
     }
-    sealed interface Update permits ScalarUpdate, IntegerExtremum, DoubleSum, DoubleExtremum, DistinctUpdate, AverageUpdate, VarcharCount, VarcharExtremum, VectorSumUpdate, VectorLongAverageUpdate, VectorDoubleCount, VectorDoubleExtremum {
+    sealed interface Update permits ScalarUpdate, IntegerExtremum, DoubleSum, DoubleExtremum, DistinctUpdate, AverageUpdate, VarcharCount, VarcharExtremum, VectorSumUpdate, VectorLongAverageUpdate, VectorDoubleCount, VectorDoubleExtremum, GroupedTopKAggregate.Update {
         long offset();
         void initialize(Builder b, Expr destination);
         void merge(Builder b, Expr source, Expr destination);

@@ -31,8 +31,8 @@ import io.questdb.std.QuietCloseable;
 
 /** Optional fused aggregation. The vector factory owns worker slots and finalizes exported Rosti groups. */
 public interface CompiledVectorAggregate extends QuietCloseable {
-    /** Bind the current reader snapshot. False retains ordinary vector aggregation. */
-    boolean open(int symbolCount, MemoryTracker memoryTracker);
+    /** Bind the current reader snapshot; rowCount may be -1. False retains ordinary vector aggregation. */
+    boolean open(int symbolCount, long rowCount, MemoryTracker memoryTracker);
 
     /** Called under the existing exclusive worker-slot lock. */
     void aggregate(PageFrameMemory frame, long rows, int slot, ExecutionCircuitBreaker circuitBreaker);

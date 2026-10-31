@@ -42,12 +42,16 @@ final class QuestSortValue {
             }
             case ColumnType.DOUBLE -> {
                 Var value = b.let(new Load(MemoryType.F64, address));
-                // Double.doubleToLongBits canonicalizes every NaN, preserving signed zeros/infinities.
-                Var bits = b.let(new Select(binary(Op.FNE, value, value),
-                        i64(Double.doubleToLongBits(Double.NaN)), new BitCast(value)));
-                yield b.let(binary(Op.XOR, bits, new Select(binary(Op.LT, bits, i64(0)), i64(Long.MAX_VALUE), i64(0))));
+                yield encodeDouble(b, value);
             }
             default -> throw new IllegalArgumentException("Unsupported numeric sort type: " + type);
         };
+    }
+
+    static Var encodeDouble(Builder b, Expr value) {
+        // Double.doubleToLongBits canonicalizes every NaN, preserving signed zeros/infinities.
+        Var bits = b.let(new Select(binary(Op.FNE, value, value),
+                i64(Double.doubleToLongBits(Double.NaN)), new BitCast(value)));
+        return b.let(binary(Op.XOR, bits, new Select(binary(Op.LT, bits, i64(0)), i64(Long.MAX_VALUE), i64(0))));
     }
 }

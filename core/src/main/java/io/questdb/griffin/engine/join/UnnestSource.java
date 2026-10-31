@@ -72,6 +72,10 @@ public interface UnnestSource {
         throw new UnsupportedOperationException();
     }
 
+    default float getFloat(int sourceCol, int elementIndex) {
+        throw new UnsupportedOperationException();
+    }
+
     default int getInt(int sourceCol, int elementIndex) {
         throw new UnsupportedOperationException();
     }

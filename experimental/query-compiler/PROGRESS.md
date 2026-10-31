@@ -6510,3 +6510,196 @@ newline/long strings, optional captures, nested CASE and unsupported-pattern fal
 Only this log and implementation/tests are retained; raw evidence and scripts:
 `/tmp/query-capture-integration-20261030/` (`integrated-summary.json`,
 `integrated-use-summary.json`, `integrated-runs.py`, `integrated-profile.py`).
+
+## 2026-10-30 — Full ClickBench after capture integration
+
+Fresh stock/LLVM/DuckDB round: 43 queries, 99,997,497 rows, CPUs 0–7 on the
+9950X. Repository protocol: one cache drop per query, three executions; QuestDB
+stays running, DuckDB starts a fresh CLI per query. Stock `8da4e347f9`, LLVM
+`135821e1b6`, DuckDB 2.0.0/d54cbbe3df with verified uncompressed storage.
+Identical QuestDB configuration, eight query and eight network workers; default
+JIT, sharding and frame sizes. No compiler changes during this comparison.
+
+Sum of each query's best hot execution: stock **22.552s**, LLVM **7.941s**,
+DuckDB **13.673s**. Corresponding CPU totals: **168.35 / 60.80 / 107.53 CPU-s**.
+LLVM wins 40/43 against stock and 26/43 against DuckDB; 29/43 exceed 1.5x versus
+stock in this single pass. The stock total is within 1% of the previous round.
+Q28 improves 2.092 -> 1.075s and 16.11 -> 8.13 CPU-s; the gain includes PCRE2,
+not just compilation. Q27 improves 0.283 -> 0.250s. Both are now **partial**:
+native counter increments verify aggregation, but outer filtering/sorting remain
+ordinary. Other coverage is unchanged: **34 full, 4 partial, 5 ordinary**.
+
+All 387 timed responses validated, with independent tie checks and the known
+Q5/Q27/Q28 cross-engine SQL differences reproduced. Warm QuestDB runs have zero
+major faults, about 1MB total physical reads per suite, no memory pressure and
+about 0.2 cores of background activity. Lower CPU consumption at similar core
+occupancy supports less CPU work; no new PMU profile or bottleneck claim here.
+First-run sums are 34.072 / 20.020 / 36.025s; engine lifecycles differ, so these
+are not equivalent cold-cache tests. Standard HTML updated at
+`target/clickbench.html`, with current coverage badges and downloadable evidence.
+Scripts and raw results: `/tmp/query-clickbench-round-20261030/`.
+
+## 2026-10-31 — Independent H2O control, 500M rows
+
+Frozen stock `8da4e347f9`, LLVM `135821e1b6`, DuckDB 2.0.0; official
+db-benchmark generator `2f05a6fca951`. Ten aggregation families at one/eight
+physical cores, plus separate cardinality, NULL, ordering and exact FLOAT-to-DOUBLE
+controls. Full native result materialization; median of three warm executions.
+Original FLOAT-schema coverage is only **3/10 generated aggregations**: Q1/Q2/Q7.
+
+The large result is two-key SUM with **1M groups**: stock **12.814s**, LLVM
+**0.913s**, DuckDB **2.683s**. Gated profiles support the roughly 14x stock gain:
+controller traffic **164 -> 26.6 GB/query**, L2 demand misses **2.24 -> 0.24/row**,
+load-wait cycles **92% -> 30%**. Peak process RSS is **6.27 GiB stock / 12.37 GiB LLVM**.
+The 100-symbol array reaches **72ms**, near its approximately **68ms** measured
+streaming floor. NULL and sorted-input controls preserve gains over stock.
+
+The control also exposes boundaries: 1,000 symbols reject the array's initial
+allocation budget; FLOAT binding blocks the existing partitioned pipeline.
+Exact widening makes Q3 run **15.86 / 3.20 / 4.07s** (stock/LLVM/DuckDB), with
+native peak RSS **47.0 GiB** versus stock **21.8 GiB**. Grouped top-two remains an
+ordinary window path; both QuestDB modes OOM at 64 GiB on eight-core Q10.
+
+All **29** combinations with three completed engines pass full-result comparison;
+eight-core Q10 has only DuckDB complete. **75 valid profiles**, 100% counter running
+time; frozen class/native hashes reverified. Sorted DuckDB retains constant ENUM
+segments despite its uncompressed setting. Results apply to this 9950X, not every
+CPU. No compiler changes during the control. Bulk datasets removed afterward.
+Report: [target/h2o-control.md](target/h2o-control.md). Evidence and scripts:
+`/run/media/jara/test/query-h2o-control-20261030/`.
+
+## 2026-10-31 — FLOAT inputs unlock existing aggregation pipelines
+
+Added four-byte FLOAT loads widened to DOUBLE in the typed IR and all three
+backends. Resolved AVG(FLOAT) and explicit FLOAT-to-DOUBLE casts now reuse existing
+aggregate states, partitioning and merge code. SUM(FLOAT) keeps its ordinary
+FLOAT accumulation contract; FLOAT arithmetic and grouping remain unsupported.
+
+Original H2O FLOAT data, 500M rows, eight physical cores, unchanged configuration:
+warm medians (stock / LLVM / DuckDB) are Q3 **15.862 / 3.180 / 4.047s**,
+Q4 **0.600 / 0.265 / 0.266s**, Q5 **5.786 / 1.170 / 4.112s**. Every group and
+aggregate value matches across engines; counters verify 500M generated input
+rows per execution. One-core Q3 is **115.890 / 19.745 / 20.604s**. These are
+capability gains from reaching existing algorithms, not a new aggregation algorithm.
+
+Gated eight-core Q3 profiles: instructions/input **647 -> 624**, cycles/input
+**1384 -> 238**, L2 demand misses/input **4.40 -> 1.71**, oldest-load-wait fraction
+**90% -> 40%**. Controller traffic falls **232 -> 111 GB/query** while aggregate
+read/write bandwidth rises **14.6 -> 35.3 GB/s**. All counter groups run 100%.
+An approximate traffic budget is 18GB of input plus 28GB of packed partial states
+written and read; write allocation adds up to another 28GB. Most partitioned
+records are partial states, not raw input captures. Whole-process peak RSS remains
+high: **45.0 GiB LLVM versus 19.9 GiB stock**, including materialization/export.
+No cgroup OOM events. UMC is system-wide; this does not isolate each prior
+optimization or establish a fresh calibrated bandwidth ceiling.
+
+Verification: 12 floating-IR checks, three focused SQL backend cases and 33 existing
+backend/optimizer checks pass. Covers guarded four-byte loads, narrowing, signed
+zero, subnormals, nonfinite values, vector tails, packed capture, NULLs, column
+tops, Parquet, reopen and SUM(FLOAT) fallback. Evidence and scripts:
+`/run/media/jara/test/query-h2o-followup-20261031/`.
+
+## 2026-10-31 — SYMBOL arrays beyond the initial Rosti allocation
+
+The initial Rosti slot allocation was an accidental hard limit: 1,000 symbols
+could exceed it once array bookkeeping was included, even though Rosti itself
+must grow. Larger arrays now qualify when they fit the existing per-worker local
+cache budget and known snapshot rows amortize one dictionary traversal per worker.
+Unknown interval sizes keep the previous small-array bound; no prescan or new
+configuration. All allocations still use the query memory tracker. EXPLAIN labels
+this as a candidate, since execution can decline for the current snapshot.
+
+500M-row controls: 1,000-key SUM falls **154 -> 85ms** on eight cores and
+**1.031 -> 0.350s** on one. A 1,000-key SUM/AVG/MIN/MAX/COUNT falls
+**685 -> 120ms**. Instructions/input fall **62.5 -> 29.6**, cycles/input
+**11.7 -> 6.2** for the eight-core SUM; all counter groups run 100%.
+The existing 100-key path is **72 -> 74ms**. The 16,384/65,536-key cases
+correctly retain Rosti fallback, with zero generated symbol rows; timing variation
+there is not attributed to LLVM. All groups match stock in all twelve comparisons.
+
+The 28 existing SYMBOL SQL cases pass, plus four new backend/worker cases for
+larger states, retained sparse dictionaries, growing input, unknown sizes and
+oversized domains. Explicit test symbol capacity avoids metadata invalidation
+from automatic dictionary-capacity housekeeping. The 4GB input stream gives a
+roughly 67ms lower bound at the previous 59.5GB/s eight-core read calibration;
+the short eight-core timings should not be treated as a fresh bandwidth diagnosis.
+Controller traffic stays about 4.2GB/query; useful work is removed rather than input
+bytes. The gated short runs include nine major faults each during materialization.
+Evidence: `symbols-before` / `symbols-after` in the follow-up directory above.
+
+## 2026-10-31 — Packed direct-VARCHAR trial: useful boundary, rejected default
+
+Tested copying VARCHAR bytes beside partial states in the existing partition
+pages, with final UnorderedVarcharMap entries borrowing those query-owned bytes.
+No new map, scheduler or allocator. Six backend/worker checks passed, including
+NULL/empty/non-ASCII keys, oversized strings, Parquet, reopen and allocation failure.
+
+500M-row H2O Q7: default **4.551s**, old pointer partitions **3.911s**, packed
+partitions **3.048s**. Packed versus default: **215 -> 460 instructions/input**,
+**348 -> 200 cycles/input**, **4.88 -> 2.02 L2 misses/input**, **90.5% -> 44.5%**
+oldest-load-wait fraction, **204 -> 90 GB/query** controller traffic. The two-key
+computed-VARCHAR control stays **471 / 467 / 473ms** across those three modes.
+All three Q7 profiles include 80,328 major faults over three executions. A separate
+fault-address trace attributes these to the materialized `ans` output files,
+with zero lost samples; they are not evidence of cold input scans.
+
+The actual ClickBench URL/COUNT Top-K control falsifies a universal change:
+**835 / 1009 / 1074ms**, with packed instructions **248 -> 425/input** and traffic
+**40.3 -> 46.3 GB/query** versus default. All output groups/values match stock.
+Copying can replace expensive dependent reads, but can also add work and writes
+without enough locality benefit. Do not derive a key-length threshold from these
+two cases. Trial implementation removed; small reproduction patch and raw evidence
+remain in `/run/media/jara/test/query-h2o-followup-20261031/`. No new toggle retained.
+
+Q10 now binds FLOAT into its generated six-key aggregation, but reaches the
+unchanged **56 GiB query memory limit during shard merge** (32MiB growth request,
+about 56GiB already charged). This is a controlled query error, not a completed
+benchmark. Raw capture alone is roughly 26GB (52 bytes/input); retaining it beside
+all final group maps explains why a bounded local map does not bound query memory.
+Releasing/streaming completed partitions must also preserve random-access cursor
+and borrowed-key lifetimes; merely freeing allocator pages is unsafe.
+
+## 2026-10-31 — Bounded grouped ranking replaces a full window sort
+
+Eligible partitioned ROW_NUMBER filters now lower to ordinary parallel group-by
+with generated bounded-prefix updates and merges. Reuses existing maps, worker
+slots, partitioning, memory tracking and Unnest/ordinality cursors. No new toggle,
+query-name match or new scheduler. Supports one INT/LONG/FLOAT/DOUBLE ordering
+column, direct INT/LONG/SYMBOL/DOUBLE/VARCHAR keys, constant K up to 64, and output
+containing only keys, ranked value and row number. Other shapes retain the window.
+
+Original H2O Q8, 500M rows, five million groups, top two, native materialization:
+eight-core warm medians **141.941s stock / 1.208s LLVM / 5.190s DuckDB**.
+One-core LLVM/DuckDB: **5.704 / 25.709s**. Full ten-million-row multisets match,
+including duplicates; generated counters advance by 500M input rows each execution.
+Stock uses about 148 CPU-seconds per run versus LLVM's 7.8: most of the gain is
+removing sorting work, with parallel group-by adding concurrency. This is not an
+isolated JIT-versus-interpreter comparison. DuckDB uses its grouped max(v, K)
+operator and native temporary-table sink; this remains an adapted H2O control.
+
+Gated stock versus LLVM profiles show **1050 -> 137 instructions/input** and
+**1621 -> 80 cycles/input**. Stock was profiled for one complete warm execution;
+LLVM for three, normalized by their actual input counts. An unschedulable six-event
+stock group was discarded and repeated with the validated three-event group.
+LLVM shows **0.356 L2 demand misses/input**, **29.1% oldest-load-wait fraction**, and
+**33.1 GB/query controller traffic** at **28.3 GB/s**. All counter groups run 100%.
+Four GB of input plus about 4.25GB of captured input/partial records written and
+read already exceeds a pure-scan traffic budget; ordinary write allocation and
+map accesses add more. It is not established as bandwidth-bound. Profiles include
+34,020 major faults over three materialized executions; no cold-input attribution
+is inferred from that counter. Factory compilation is 164ms; first execution is
+2.919s and includes lazy initialization. Whole-process peak RSS falls from
+19.6GiB stock to 8.5GiB LLVM; neither run reports cgroup OOM events.
+
+State remains O(groups * K), with retained partition records and existing query
+memory limits. General payload ranking, multiple sort keys, computed partitions,
+larger K and general window compilation remain outside this rewrite. Evidence:
+`grouped-topk` under `/run/media/jara/test/query-h2o-followup-20261031/`.
+
+Final build and 54 focused checks pass: 20 grouped-ranking backend/worker cases,
+12 floating-IR checks, six numeric/FLOAT aggregate cases, four SYMBOL admission
+cases and 12 existing numeric Top-K cases. Includes VARCHAR/composite partition
+keys, NULLs/nonfinite values, exact LONG ordering, column tops, Parquet, rewinds,
+early close, memory-limit failure/reuse and unsupported-shape fallback. Temporary
+36GiB QuestDB and 49GiB DuckDB datasets and saved class snapshots removed after
+validation; compact evidence and scripts retained.

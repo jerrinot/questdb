@@ -139,9 +139,10 @@ final class LlvmEmitter {
             case Offset o -> line(result + " = add i64 " + operand(o.address()) + ", " + operand(o.bytes()));
             case Load l -> {
                 String pointer = temp("inttoptr i64 " + operand(l.address()) + " to ptr");
-                String memoryType = l.width() == MemoryType.F64 ? "double" : "i" + l.width().bytes * 8;
+                String memoryType = memoryType(l.width());
                 String load = "load " + memoryType + ", ptr " + pointer + ", align 1";
-                if (l.width().bytes < 8) line(result + " = sext " + memoryType + " " + temp(load) + " to i64");
+                if (l.width() == MemoryType.F32) line(result + " = fpext float " + temp(load) + " to double");
+                else if (l.width().bytes < 8) line(result + " = sext " + memoryType + " " + temp(load) + " to i64");
                 else line(result + " = " + load);
             }
             case AtomicLoad l -> {
@@ -191,9 +192,13 @@ final class LlvmEmitter {
     }
     private void store(Store s) {
         String pointer = temp("inttoptr i64 " + operand(s.address()) + " to ptr");
-        String memoryType = s.width() == MemoryType.F64 ? "double" : "i" + s.width().bytes * 8, value = operand(s.value());
-        if (s.width().bytes < 8) value = temp("trunc i64 " + value + " to " + memoryType);
+        String memoryType = memoryType(s.width()), value = operand(s.value());
+        if (s.width() == MemoryType.F32) value = temp("fptrunc double " + value + " to float");
+        else if (s.width().bytes < 8) value = temp("trunc i64 " + value + " to " + memoryType);
         line("store " + memoryType + " " + value + ", ptr " + pointer + ", align 1");
+    }
+    static String memoryType(MemoryType width) {
+        return width == MemoryType.F32 ? "float" : width == MemoryType.F64 ? "double" : "i" + width.bytes * 8;
     }
     private String temp(String expression) { String name = "%t" + temporary++; line(name + " = " + expression); return name; }
     private void line(String text) { out.append("  ").append(text).append('\n'); }

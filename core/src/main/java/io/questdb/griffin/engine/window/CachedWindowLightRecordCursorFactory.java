@@ -42,7 +42,10 @@ import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.SymbolFunction;
+import io.questdb.griffin.engine.functions.columns.ColumnFunction;
+import io.questdb.griffin.engine.functions.window.RowNumberFunctionFactory;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.IntList;
 import io.questdb.std.MemoryTag;
@@ -75,6 +78,7 @@ public class CachedWindowLightRecordCursorFactory extends AbstractRecordCursorFa
     private final ObjList<ObjList<WindowFunction>> orderedFunctions;
     private final int orderedGroupCount;
     private final ObjList<IntList> sortKeys;
+    private final IntList sourceMap;
     private final ObjList<WindowFunction> unordered2PassFunctions;
     // True iff at least one unordered two-pass function reads the base Record in pass2 (precomputed).
     private final boolean unordered2PassNeedsRecord;
@@ -121,6 +125,7 @@ public class CachedWindowLightRecordCursorFactory extends AbstractRecordCursorFa
         this.windowMapGroups = windowMapGroups;
         try {
             this.base = base;
+            this.sourceMap = sourceMap;
             this.windowSymbolFunctions = windowSymbolFunctions;
             this.orderedGroupCount = sortKeys.size();
             assert orderedGroupCount == orderedFunctions.size();
@@ -270,6 +275,68 @@ public class CachedWindowLightRecordCursorFactory extends AbstractRecordCursorFa
     @Override
     public RecordCursorFactory getBaseFactory() {
         return base;
+    }
+
+    /** Replace a bounded, value-only ROW_NUMBER with a prepared grouped Top-K operator. */
+    public @Nullable RecordCursorFactory tryGroupedTopK(int rankColumn, int limit, SqlExecutionContext context) {
+        var compiler = context.getQueryCodeGenerator();
+        if (compiler == null || rowSelecting || allFunctions.size() != 1 || orderedGroupCount != 1
+                || sortKeys.getQuick(0).size() != 1
+                || allFunctions.getQuick(0).getClass() != RowNumberFunctionFactory.RowNumberFunction.class) {
+            return null;
+        }
+        var rowNumber = (RowNumberFunctionFactory.RowNumberFunction) allFunctions.getQuick(0);
+        if (rowNumber.getColumnIndex() != rankColumn || rowNumber.getTombstoneValueIndex() >= 0) {
+            return null;
+        }
+        var functions = rowNumber.getPartitionByFunctions();
+        int[] keys = new int[functions.size()];
+        for (int i = 0; i < keys.length; i++) {
+            if (!(functions.getQuick(i) instanceof ColumnFunction column)) {
+                return null;
+            }
+            int index = column.getColumnIndex();
+            if (index < 0 || index >= sourceMap.size() || sourceMap.getQuick(index) < 0) {
+                return null;
+            }
+            keys[i] = sourceMap.getQuick(index);
+        }
+        int order = sortKeys.getQuick(0).getQuick(0);
+        int orderColumn = sourceMap.getQuick(Math.abs(order) - 1);
+        if (orderColumn < 0 || keys.length == 0) {
+            return null;
+        }
+        int[] outputs = new int[getMetadata().getColumnCount()];
+        for (int i = 0; i < outputs.length; i++) {
+            if (i == rankColumn) {
+                outputs[i] = -1;
+                continue;
+            }
+            int column = sourceMap.getQuick(i);
+            boolean supported = column == orderColumn;
+            for (int key : keys) {
+                supported |= column == key;
+            }
+            if (column < 0 || !supported) {
+                return null;
+            }
+            outputs[i] = column;
+        }
+        var plan = new QueryCodeGenerator.GroupedTopK(
+                GenericRecordMetadata.copyOfNew(getMetadata()), keys, orderColumn, order > 0, limit, outputs);
+        var build = compiler.prepareGroupedTopK(base, plan, context);
+        if (build == null) {
+            return null;
+        }
+        RecordCursorFactory input = base;
+        base = null;
+        try {
+            close();
+        } catch (Throwable failure) {
+            Misc.free(input, failure);
+            throw failure;
+        }
+        return build.apply(input);
     }
 
     /**

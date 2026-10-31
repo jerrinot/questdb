@@ -119,6 +119,9 @@ final class ResolvedInputs {
         } else if (function.getClass() == io.questdb.griffin.engine.functions.columns.DoubleColumn.class && readType == ColumnType.DOUBLE) {
             index = ((io.questdb.griffin.engine.functions.columns.DoubleColumn) function).getColumnIndex();
             type = ColumnType.DOUBLE;
+        } else if (function.getClass() == io.questdb.griffin.engine.functions.columns.FloatColumn.class && readType == ColumnType.DOUBLE) {
+            index = ((io.questdb.griffin.engine.functions.columns.FloatColumn) function).getColumnIndex();
+            type = ColumnType.FLOAT;
         } else if (function.getClass() == IntColumn.class) {
             index = ((IntColumn) function).getColumnIndex();
             type = ColumnType.INT;
@@ -353,7 +356,7 @@ final class ResolvedInputs {
                 && (readType == ColumnType.INT || readType == ColumnType.LONG)) {
             return strings.length(((UnaryFunction) function).getArg(), depth + 1);
         }
-        if (type == ColumnType.DOUBLE) return null;
+        if (type == ColumnType.FLOAT || type == ColumnType.DOUBLE) return null;
         if (type == ColumnType.SYMBOL && readType == ColumnType.SYMBOL) {
             // Only direct static dictionaries have stable IDs shared by frame and merge paths.
             return column(function, readType);
@@ -429,6 +432,7 @@ final class ResolvedInputs {
 
     private Pipeline.Scalar floating(Function function, int depth) {
         int type = function.getType();
+        if (type == ColumnType.FLOAT) return column(function, ColumnType.DOUBLE);
         if (type != ColumnType.DOUBLE) {
             if (type != ColumnType.BYTE && type != ColumnType.SHORT && type != ColumnType.INT && type != ColumnType.LONG) return null;
             var value = scalar(function, type, depth + 1);
@@ -438,7 +442,8 @@ final class ResolvedInputs {
         if (implementation == DoubleConstant.class) return new Pipeline.FloatingConstant(function.getDouble(null));
         if (Boolean.parseBoolean(System.getProperty("query.codegen.expressions", "true"))) {
             if (implementation == CastByteToDoubleFunctionFactory.Func.class || implementation == CastShortToDoubleFunctionFactory.Func.class
-                    || implementation == CastIntToDoubleFunctionFactory.Func.class || implementation == CastLongToDoubleFunctionFactory.Func.class)
+                    || implementation == CastIntToDoubleFunctionFactory.Func.class || implementation == CastLongToDoubleFunctionFactory.Func.class
+                    || implementation == CastFloatToDoubleFunctionFactory.Func.class)
                 return scalar(((UnaryFunction) function).getArg(), ColumnType.DOUBLE, depth + 1);
             if (implementation == AddDoubleFunctionFactory.Func.class || implementation == SubDoubleFunctionFactory.Func.class
                     || implementation == MulDoubleFunctionFactory.Func.class || implementation == DivDoubleFunctionFactory.Func.class) {

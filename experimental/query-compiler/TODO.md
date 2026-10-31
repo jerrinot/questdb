@@ -527,3 +527,19 @@ near-parity small-set cases.
   explains ordered submatch tracking. [PCRE2 JIT](https://pcre.org/current/doc/html/pcre2jit.html)
   supplies a native compiled control, including ARM64 and x86; Java compatibility
   and per-worker scratch ownership remain obligations, not assumed equivalence.
+
+## H2O control follow-up
+
+- Direct VARCHAR partition locality needs an admission rule backed by a key-width,
+  cardinality and skew matrix. Packed bytes improved 500M-row H2O Q7 from 4.551 to
+  3.048s, but regressed actual ClickBench URL/COUNT Top-K from 835 to 1074ms. The
+  unconditional trial was removed; do not reintroduce it from one benchmark win.
+- Bound total partition/result memory. Generated H2O Q10 reaches the 56GiB query
+  limit during merge. About 26GB of raw input records remain live alongside final
+  maps. Existing cursors promise random access and final VARCHAR entries can borrow
+  partition bytes; page release needs an explicit consumer/ownership contract.
+- Grouped Top-K currently reserves K value slots per group. Nearly unique keys
+  with larger K can consume much more state than a window, even when each group
+  contains few rows. Budget failure/reopen is tested; measure cardinality, skew,
+  monotone arrival and K before widening admission. Consider compact prefixes
+  with overflow storage using the existing allocator, not another memory subsystem.

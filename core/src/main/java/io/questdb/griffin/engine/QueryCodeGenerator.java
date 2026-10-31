@@ -40,6 +40,14 @@ import org.jetbrains.annotations.Nullable;
 
 /** Optional compilation of resolved operators. Core has no dependency on a backend. */
 public interface QueryCodeGenerator {
+    /** Planning-only preparation. A successful builder adopts its input, including on failure. */
+    default @Nullable java.util.function.UnaryOperator<RecordCursorFactory> prepareGroupedTopK(
+            RecordCursorFactory input, GroupedTopK plan, io.questdb.griffin.SqlExecutionContext context) { return null; }
+
+    /** Direct base-column indexes; outputColumns maps window output columns to the base, or -1 for row number. */
+    record GroupedTopK(io.questdb.cairo.sql.RecordMetadata outputMetadata, int[] partitionColumns,
+                      int orderColumn, boolean ascending, int limit, int[] outputColumns) { }
+
     /** Borrows resolved vector functions and their initialized Rosti layout during binding. */
     default @Nullable io.questdb.griffin.engine.groupby.vect.CompiledVectorAggregate compileVectorAggregate(
             io.questdb.cairo.sql.RecordMetadata inputs, int keyColumn,

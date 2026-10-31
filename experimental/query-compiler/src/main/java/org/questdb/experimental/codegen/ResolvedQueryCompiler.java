@@ -112,6 +112,12 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     }
 
     @Override
+    public java.util.function.UnaryOperator<RecordCursorFactory> prepareGroupedTopK(
+            RecordCursorFactory input, GroupedTopK plan, io.questdb.griffin.SqlExecutionContext context) {
+        return ResolvedGroupedTopK.prepare(input, plan, context, this);
+    }
+
+    @Override
     public io.questdb.griffin.engine.groupby.vect.CompiledVectorAggregate compileVectorAggregate(
             io.questdb.cairo.sql.RecordMetadata inputs, int keyColumn,
             ObjList<io.questdb.griffin.engine.groupby.vect.VectorAggregateFunction> functions,

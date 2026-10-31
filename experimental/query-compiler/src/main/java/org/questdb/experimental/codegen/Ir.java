@@ -46,8 +46,9 @@ public final class Ir {
 
     public enum Type { I64, BOOL, ADDRESS, F64 }
 
+    /** Narrow loads widen; narrow stores round/truncate back to the storage width. */
     public enum MemoryType {
-        I8(1, Type.I64), I16(2, Type.I64), I32(4, Type.I64), I64(8, Type.I64), F64(8, Type.F64), ADDRESS(8, Type.ADDRESS);
+        I8(1, Type.I64), I16(2, Type.I64), I32(4, Type.I64), I64(8, Type.I64), F32(4, Type.F64), F64(8, Type.F64), ADDRESS(8, Type.ADDRESS);
 
         public final int bytes;
         public final Type resultType;

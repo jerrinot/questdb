@@ -186,10 +186,11 @@ public class UnnestRecord implements Record {
         return sources.getQuick(srcIdx).getDouble(srcCol, arrayIndex);
     }
 
-    // FLOAT is not a supported unnest column type; col is always a base table column.
     @Override
     public float getFloat(int col) {
-        return baseRecord.getFloat(col);
+        if (col < split) return baseRecord.getFloat(col);
+        int unnestCol = col - split;
+        return sources.getQuick(colToSourceIndex[unnestCol]).getFloat(colToSourceCol[unnestCol], arrayIndex);
     }
 
     // GEO types are not supported unnest column types; col is always a base table column.

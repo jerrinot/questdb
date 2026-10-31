@@ -87,6 +87,56 @@ public class AggregateTypeTest {
         assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
     }
 
+    @Test public void floatInputsReuseDoubleAggregatesAndPackedPartitions() throws Exception {
+        String previous = System.getProperty("query.codegen.localCapacity");
+        System.setProperty("query.codegen.localCapacity", "64");
+        try {
+            context.changePageFrameSizes(64, 2048);
+            engine.execute("create table floats as (select cast(x%257 as int) k,cast(x%257 as varchar) s,"
+                    + "cast(x%17 as int) i,cast(case when x%13=0 then null else (x%41-20)*0.25 end as float) f,"
+                    + "timestamp_sequence('2024-01-01',1000000) ts from long_sequence(16421)) "
+                    + "timestamp(ts) partition by day bypass wal", context);
+            for (String sql : List.of("select s,sum(i),avg(f) from floats group by s",
+                    "select k,sum(cast(f as double)),avg(f) from floats group by k",
+                    "select k,avg(f) from floats where cast(f as double)>-1.0 group by k",
+                    "select avg(f) from floats where k>0")) {
+                try (var candidate = compile(sql)) {
+                    check(sql, candidate); check(sql, candidate);
+                    assertTrue(sql, nativeRows(candidate) > 0);
+                    if (sql.startsWith("select s,")) {
+                        long partitioned = 0;
+                        for (var factory = candidate; factory != null; factory = factory.getBaseFactory()) {
+                            if (factory instanceof AsyncGroupByRecordCursorFactory group)
+                                for (int i = -1; i < 2; i++)
+                                    if (group.getAtom().getCompiledUpdater(i) instanceof AggregateSlot slot)
+                                        partitioned += slot.inputPartitionRows();
+                        }
+                        assertTrue("FLOAT values must survive packed input capture and merge", partitioned > 0);
+                    }
+                }
+            }
+            engine.execute("alter table floats add column late float", context);
+            String sql = "select k,avg(f),avg(late) from floats group by k";
+            try (var candidate = compile(sql)) {
+                check(sql, candidate);
+                engine.execute("insert into floats values (1,'1',1,0.5,'2024-01-02',1.25)", context);
+                check(sql, candidate);
+                assertTrue(nativeRows(candidate) > 0);
+            }
+            // FLOAT accumulation has a different state/rounding contract and remains ordinary.
+            sql = "select k,sum(f) from floats group by k";
+            try (var candidate = compile(sql)) { check(sql, candidate); assertEquals(0, nativeRows(candidate)); }
+            engine.execute("alter table floats convert partition to parquet list '2024-01-01'", context);
+            sql = "select s,sum(i),avg(f) from floats group by s";
+            try (var candidate = compile(sql)) { check(sql, candidate); }
+            engine.execute("truncate table floats", context);
+            try (var candidate = compile("select avg(f) from floats where k>0")) { check("select avg(f) from floats where k>0", candidate); }
+        } finally {
+            if (previous == null) System.clearProperty("query.codegen.localCapacity");
+            else System.setProperty("query.codegen.localCapacity", previous);
+        }
+    }
+
     @Test public void symbolCountSharesOrdinaryStateAcrossMapsAndScalarMerge() throws Exception {
         engine.execute("create table counts as (select cast(x%7 as int) k,x id,"
                 + "cast(case when x%7=0 then null else cast(x%17 as string) end as symbol) s,"

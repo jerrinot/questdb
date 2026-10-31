@@ -254,7 +254,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         final PageFrameCursor pageFrameCursor = base.getPageFrameCursor(executionContext, ORDER_ASC);
         try {
             compiledActive = compiled != null && compiled.open(
-                    pageFrameCursor.getSymbolTable(keyColumnIndex).getSymbolCount(), executionContext.getMemoryTracker());
+                    pageFrameCursor.getSymbolTable(keyColumnIndex).getSymbolCount(),
+                    pageFrameCursor.size(), executionContext.getMemoryTracker());
             return cursor.of(
                 base.getMetadata(),
                 pageFrameCursor,
@@ -305,7 +306,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         sink.type("GroupBy");
         sink.meta("vectorized").val(true);
         sink.meta("workers").val(workerCount);
-        if (compiled != null) sink.meta("compiledSymbolArray").val(compiled.getName());
+        if (compiled != null) sink.meta("compiledSymbolArrayCandidate").val(compiled.getName());
         sink.attr("keys").val("[").putBaseColumnName(keyColumnIndex).val("]");
         sink.optAttr("values", vafList, true);
         sink.child(base);

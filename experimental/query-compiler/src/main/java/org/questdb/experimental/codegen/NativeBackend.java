@@ -110,12 +110,13 @@ public final class NativeBackend implements Backend {
                 _Static_assert(sizeof(void*) == 8, "64-bit addresses required");
                 """);
         for (MemoryType width : MemoryType.values()) {
-            String cType = width == MemoryType.F64 ? "double" : width == MemoryType.ADDRESS ? "uint64_t" : "int" + width.bytes * 8 + "_t";
+            String cType = width == MemoryType.F32 ? "float" : width == MemoryType.F64 ? "double"
+                    : width == MemoryType.ADDRESS ? "uint64_t" : "int" + width.bytes * 8 + "_t";
             source.append("static inline ").append(cType).append(" load_").append(width)
                     .append("(uint64_t p) { ").append(cType)
                     .append(" v; memcpy(&v, (const void*)(uintptr_t)p, sizeof(v)); return v; }\n");
             source.append("static inline void store_").append(width).append("(uint64_t p, ")
-                    .append(width == MemoryType.F64 ? "double" : width == MemoryType.ADDRESS ? "uint64_t" : "int64_t").append(" value) { ")
+                    .append(width.resultType == Type.F64 ? "double" : width == MemoryType.ADDRESS ? "uint64_t" : "int64_t").append(" value) { ")
                     .append(cType).append(" v = (").append(cType)
                     .append(")value; memcpy((void*)(uintptr_t)p, &v, sizeof(v)); }\n");
         }

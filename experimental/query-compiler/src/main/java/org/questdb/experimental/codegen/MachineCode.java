@@ -36,10 +36,10 @@ import static org.questdb.experimental.codegen.Ir.*;
 /** Backend-neutral register/label stream. No SQL operators or query shapes reach the native bridge. */
 final class MachineCode {
     // Wire ABI shared with asmjit_backend.cpp. A version guards mismatched native builds.
-    static final int MAGIC=0x51444952, VERSION=10, HEADER_BYTES=24, INSTRUCTION_BYTES=24;
+    static final int MAGIC=0x51444952, VERSION=11, HEADER_BYTES=24, INSTRUCTION_BYTES=24;
     static final int CONST=1,MOVE=2,ADD=3,SUB=4,MUL=5,AND=6,XOR=7,USHR=8,
             EQ=9,NE=10,LT=11,GE=12,LOAD=13,STORE=14,LABEL=15,JUMP=16,
-            BR_FALSE=17,ALLOC=18,FREE=19,POLL=20,RETURN=21,COMPARE_BRANCH=22,BR_TRUE=23,CTZ=24,PREFETCH=25,FADD=26,FSUB=27,FMUL=28,FDIV=29,TO_DOUBLE=30,SDIV=31,ATOMIC_LOAD=32,COMPARE_EXCHANGE=33,ATOMIC_STORE=34,ATOMIC_ADD=35,BYTE_EQ_MASK=36,REALLOC=37,FEQ=38,FNE=39,FLT=40,FGE=41,NATIVE_CALL=42;
+            BR_FALSE=17,ALLOC=18,FREE=19,POLL=20,RETURN=21,COMPARE_BRANCH=22,BR_TRUE=23,CTZ=24,PREFETCH=25,FADD=26,FSUB=27,FMUL=28,FDIV=29,TO_DOUBLE=30,SDIV=31,ATOMIC_LOAD=32,COMPARE_EXCHANGE=33,ATOMIC_STORE=34,ATOMIC_ADD=35,BYTE_EQ_MASK=36,REALLOC=37,FEQ=38,FNE=39,FLT=40,FGE=41,NATIVE_CALL=42,LOAD_F32=43,STORE_F32=44;
     private record Instruction(int op,int dst,int a,int b,long immediate) { }
     private final List<Instruction> code=new ArrayList<>();
     private final Map<Integer,Integer> variables=new HashMap<>(Map.of(0,0,1,1,2,2));
@@ -128,7 +128,7 @@ final class MachineCode {
                 };
                 emit(op,result,left,right,0);yield result;
             }
-            case Load l -> {var address=address(l.address());int result=reg();emit(LOAD,result,address.base(),address.offset(),l.width().bytes);yield result;}
+            case Load l -> {var address=address(l.address());int result=reg();emit(l.width()==MemoryType.F32?LOAD_F32:LOAD,result,address.base(),address.offset(),l.width().bytes);yield result;}
             case Offset o -> {int address=expression(o.address()),offset=expression(o.bytes()),result=reg();emit(ADD,result,address,offset,0);yield result;}
             case PopulationCount ignored -> throw new IllegalArgumentException("Population count requires portable lowering");
             case TrailingZeros z -> { int input=expression(z.value()),result=reg();emit(CTZ,result,input,0,0);yield result; }
@@ -245,7 +245,7 @@ final class MachineCode {
             case Define d -> {int target=reg();variables.put(d.variable().id(),target);emit(MOVE,target,expression(d.value()),0,0);}
             case Assign a -> emit(MOVE,variable(a.variable()),expression(a.value()),0,0);
             case AtomicStore atomic -> {int address=expression(atomic.address()),value=expression(atomic.value());emit(ATOMIC_STORE,0,address,value,0);}
-            case Store s -> {var address=address(s.address());int value=expression(s.value());emit(STORE,address.offset(),address.base(),value,s.width().bytes);}
+            case Store s -> {var address=address(s.address());int value=expression(s.value());emit(s.width()==MemoryType.F32?STORE_F32:STORE,address.offset(),address.base(),value,s.width().bytes);}
             case Free f -> {int address=expression(f.address()),bytes=expression(f.bytes());emit(FREE,0,address,bytes,0);}
             case Poll ignored -> emit(POLL,0,0,0,0);
             case Call ignored -> throw new IllegalArgumentException("Expand helpers before machine lowering");

@@ -117,9 +117,9 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
 
         public long nullValue() { return nullValueOf(columnType); }
-        public Expr nullLiteral() { return columnType == ColumnType.DOUBLE ? f64(Double.NaN) : i64(nullValue()); }
+        public Expr nullLiteral() { return width().resultType == Type.F64 ? f64(Double.NaN) : i64(nullValue()); }
         public Value value(Expr data) {
-            return new Value(data, columnType == ColumnType.DOUBLE ? doubleNull(data)
+            return new Value(data, width().resultType == Type.F64 ? doubleNull(data)
                     : nullable() ? eq(data, i64(nullValue())) : bool(false));
         }
         public boolean nullable() { return isNullable(columnType); }
@@ -183,7 +183,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
 
     private static boolean isNullable(int type) {
         return type == ColumnType.INT || type == ColumnType.LONG || type == ColumnType.SYMBOL
-                || type == ColumnType.IPv4 || type == ColumnType.DATE || type == ColumnType.DOUBLE || ColumnType.isTimestamp(type);
+                || type == ColumnType.IPv4 || type == ColumnType.DATE || type == ColumnType.FLOAT || type == ColumnType.DOUBLE || ColumnType.isTimestamp(type);
     }
 
     /** Numbers.isNull(double): NaNs and both infinities have an all-ones exponent. */
@@ -623,6 +623,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
             case ColumnType.SHORT -> MemoryType.I16;
             case ColumnType.INT, ColumnType.SYMBOL, ColumnType.IPv4 -> MemoryType.I32;
             case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> MemoryType.I64;
+            case ColumnType.FLOAT -> MemoryType.F32;
             case ColumnType.DOUBLE -> MemoryType.F64;
             default -> throw new IllegalArgumentException("Prototype does not support " + ColumnType.nameOf(columnType));
         };

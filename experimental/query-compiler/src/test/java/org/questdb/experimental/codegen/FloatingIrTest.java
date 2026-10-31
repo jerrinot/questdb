@@ -48,6 +48,56 @@ public class FloatingIrTest {
                 new Object[]{"c", new NativeBackend()});
     }
 
+    @Test public void floatMemoryWidensAndNarrowsWithoutReadingPastTheColumn() throws Throwable {
+        var b = new Builder();
+        b.store(MemoryType.F32, STATE, new Load(MemoryType.F32, COLUMNS));
+        b.store(MemoryType.F64, at(STATE, 8), new Load(MemoryType.F32, COLUMNS));
+        b.store(MemoryType.F32, at(STATE, 16), new Load(MemoryType.F64, at(STATE, 24)));
+        b.exit(0);
+        float[] values = {Float.NaN, Float.intBitsToFloat(0xffc01234), Float.POSITIVE_INFINITY,
+                Float.NEGATIVE_INFINITY, -0.0f, 0.0f, Float.MIN_VALUE, -Float.MIN_VALUE,
+                Float.MIN_NORMAL, Float.MAX_VALUE, -17.25f, 1.0000001f};
+        try (var code = backend.compile(new Program(b.block()), temporary.newFolder().toPath());
+             var input = new ScanStageTest.GuardedPage(4); var arena = Arena.ofConfined()) {
+            long output = arena.allocate(32, 8).address();
+            for (float value : values) {
+                Unsafe.putFloat(input.address, value);
+                Unsafe.putInt(output + 4, 0x12345678);
+                Unsafe.putDouble(output + 24, (double) value / 3);
+                assertEquals(0, code.run(input.address, 1, output));
+                assertEquals(Float.floatToIntBits(value), Float.floatToIntBits(Unsafe.getFloat(output)));
+                assertEquals(Double.doubleToLongBits(value), Double.doubleToLongBits(Unsafe.getDouble(output + 8)));
+                assertEquals(Float.floatToIntBits((float) ((double) value / 3)), Float.floatToIntBits(Unsafe.getFloat(output + 16)));
+                assertEquals(0x12345678, Unsafe.getInt(output + 4));
+            }
+        }
+        var column = new Pipeline.Column(0, "f", io.questdb.cairo.ColumnType.FLOAT);
+        var plan = ScanPlan.of(List.of(column), new Pipeline.FloatingCompare(Op.GE, column, new Pipeline.FloatingConstant(0)));
+        try (var code = backend.compile(ScanLowering.selection(plan), temporary.newFolder().toPath());
+             var arena = Arena.ofConfined(); var memory = KernelMemory.bind(null, () -> { })) {
+            long descriptor = arena.allocate(8, 8).address(), output = arena.allocate(130 * 8, 8).address();
+            for (int rows : new int[]{0, 1, 7, 8, 9, 63, 64, 65, 129}) {
+                try (var input = new ScanStageTest.GuardedPage(rows * 4)) {
+                    for (int n = 0; n < rows; n++) Unsafe.putFloat(input.address + n * 4L, values[n % values.length]);
+                    for (boolean top : new boolean[]{false, true}) {
+                        Unsafe.putLong(descriptor, top ? 0 : input.address);
+                        Unsafe.putLong(output + rows * 8L, -7);
+                        long count = code.run(descriptor, rows, output), expected = 0;
+                        for (int n = 0; n < rows; n++) {
+                            double value = top ? Double.NaN : values[n % values.length];
+                            if (Numbers.equals(value, 0) || value > 0) {
+                                assertTrue(expected < count);
+                                assertEquals(n, Unsafe.getLong(output + expected++ * 8));
+                            }
+                        }
+                        assertEquals(expected, count);
+                        assertEquals(-7, Unsafe.getLong(output + rows * 8L));
+                    }
+                }
+            }
+        }
+    }
+
     @Test public void sqlArithmeticAndIntegerWideningPreserveGetterSemantics() throws Exception {
         var left = new Pipeline.Column(0, "d", ColumnType.DOUBLE);
         var right = new Pipeline.Column(1, "e", ColumnType.DOUBLE);

@@ -51,9 +51,10 @@ final class LlvmVectorEmitter {
             case Literal ignored -> splat(e);
             case Load l -> {
                 String pointer = temp.apply("inttoptr i64 " + invariant(l.address()) + " to ptr");
-                String memoryType = "<" + lanes + " x " + (l.width() == MemoryType.F64 ? "double" : "i" + l.width().bytes * 8) + ">";
+                String memoryType = "<" + lanes + " x " + LlvmEmitter.memoryType(l.width()) + ">";
                 String loaded = temp.apply("load " + memoryType + ", ptr " + pointer + ", align 1");
-                yield l.width().bytes == 8 ? loaded : temp.apply("sext " + memoryType + " " + loaded + " to " + vector(Type.I64));
+                yield l.width().bytes == 8 ? loaded : temp.apply((l.width() == MemoryType.F32 ? "fpext " : "sext ")
+                        + memoryType + " " + loaded + " to " + vector(l.type()));
             }
             case Binary b -> {
                 String left = value(b.left()), right = value(b.right());
