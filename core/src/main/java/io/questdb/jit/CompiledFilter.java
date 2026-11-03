@@ -56,6 +56,9 @@ public class CompiledFilter implements Closeable {
     /** Releases execution state only after workers drain; cached code remains reusable. */
     public void clearExecution() { }
 
+    /** Owner-only, after dependent join builds and before frame workers are dispatched. */
+    public void prepareForDispatch() { }
+
     private static final CarrierLocal<FiltersCompiler.JitError> tlJitError = new CarrierLocal<>(FiltersCompiler.JitError::new);
     private long fnAddress;
 

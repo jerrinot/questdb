@@ -6703,3 +6703,621 @@ keys, NULLs/nonfinite values, exact LONG ordering, column tops, Parquet, rewinds
 early close, memory-limit failure/reuse and unsupported-shape fallback. Temporary
 36GiB QuestDB and 49GiB DuckDB datasets and saved class snapshots removed after
 validation; compact evidence and scripts retained.
+
+## 2026-10-31 — Reclaim consumed aggregation partitions
+
+Bounded aggregation now releases input pages after a shard's last merge/replay
+pass. Page allocations use the existing FastGroupByAllocator with one allocation
+per page, separate from aggregate-state lifetimes. Final maps and borrowed VARCHAR
+payloads remain valid until cursor close. Existing scheduling, map layouts and
+random-access cursors are unchanged; no new configuration switch.
+
+Official H2O Q10, 500M rows, eight physical cores: the frozen baseline fails all
+four attempts at the unchanged 56GiB query limit. The candidate completes all five
+attempts with **40.5–40.9GiB peak live aggregation allocations**. The memory budget
+explains the result: approximately **24.6GiB input pages + 40GiB final maps** cannot
+coexist under that limit. Consumed pages now disappear as final maps grow. A 32GiB
+baseline control retains the same input volume but fails earlier in map growth.
+All-row multiset checksums match the original input across all eight output fields;
+all 500M output counts are one. This is checksum validation, not a full sorted diff.
+
+This fixes query-budget completion, not total physical memory. Peak process RSS
+is **76.7GiB**, including mapped input/output and allocator retention. The unchanged
+64GiB cgroup reports reclaim but no OOM kills; shared file-page charges mean its
+limit is not an RSS bound. Three repeated executions materializing all 500M rows
+take **127.3 / 117.7 / 129.3s**, about **99.8 CPU-seconds/run**. Each reads about
+12.4GB and writes 31GB on the USB SSD, busy 91–92% of the interval. The initial
+input-resident trial builds final maps and releases pages by approximately 7.8s,
+but takes 69.3s including output. Failed baseline times cannot establish a speedup.
+
+500M-row before/after controls, median of three repeated executions: Q3
+**3.192 / 3.197s**, Q5 **1.182 / 1.174s**, grouped Top-K Q8 **1.187 / 1.181s**.
+Instructions/input are **624.43 / 624.80**, **145.34 / 145.77**, **137.25 / 137.03**;
+cycles/input **238.5 / 242.2**, **81.0 / 82.0**, **80.10 / 80.11**. All PMU groups
+run 100%; these controls show no meaningful throughput regression or new speedup.
+
+106 focused checks pass across the affected SQL, cursor, allocation and grouped
+ranking paths. Covers all three backends, both worker modes, oversized pages,
+borrowed strings, late replay, cancellation, budget failure/reuse, rewind and saved
+row IDs. The string-allocation failure test now forces one large sink growth in a
+single frame: its former small-group budget sweep could fail only in another
+worker's map allocation. Evidence: `/run/media/jara/test/query-memory-20261031/`.
+Removed approximately 53GiB of generated tables, CSV and saved class snapshots
+after validation; retained 26MiB of scripts, checksums and compressed evidence.
+
+## 2026-10-31 — SSB control exposes join coverage and fixes build orientation
+
+All 13 original star-schema queries, SF100 **600,037,902 fact rows**, eight physical
+cores. Frozen stock / frozen LLVM / LLVM with the planner fix / DuckDB 2.0.0 sums
+of per-query warm medians: **243.346 / 244.437 / 200.370 / 2.254s**. These sums are
+not one measured batch latency. Each fresh process prepares separately, then runs
+one first and three complete repeated executions, including output and close.
+All result multisets and requested ordering match. Warm headline runs have zero
+physical reads and major faults. Same affinity and memory caps; baseline engine
+order rotates. No indexes, denormalization or stock execution-default changes.
+
+**0/13 fully generated.** Three queries generate fact-side probing/aggregation but
+retain interpreted numeric BETWEEN filtering and a Java build. They account for
+only 0.8% of stock suite time. The other ten generate dimension filters only;
+their ordinary multiway joins use about one core. This control exposes a major
+coverage gap, not a generalized compiler breakthrough.
+
+Q4.1 revealed an ordinary planner side effect: asking every aggregate's input
+scan direction pins a hash join's probe input, disabling its existing smaller-build
+choice. Aggregate assembly now asks only for TWAP/sparkline order validation,
+preserving their previous contract. Original SQL improves **69.725 -> 26.640s**;
+same-checkout Java is **26.442s**, repeated old LLVM **69.539s**. No query-specific
+rule or switch. Other twelve medians change -2.31% to +0.68% against frozen LLVM.
+
+The removed fact-side row-ID chain costs **7.20GB** logically. Peak process RSS
+falls **20.6 -> 13.9GiB**; load-wait cycles/input **545 -> 135**, L2 demand-load
+misses/input **3.32 -> 1.90**, instructions/input **569 -> 580**. Original controller
+traffic is only 3.36GB/s against a measured 59.8GB/s read ceiling, including idle
+system traffic. Runtime join-orientation audits, a separately validated fact-first
+SQL control and profiles support dependent-access latency as the original Q4.1
+bottleneck. Detailed hardware attribution covers this case, not all thirteen.
+
+DuckDB's actual Q4.1 profile scans all 600M fact rows but emits only **9,598,961**
+to its joins after four build-derived prefix-range membership filters. All four
+joins emit that same count. Version-pinned source shows exact bitmaps for these
+bounded integer domains. This identifies runtime filtering as another concrete
+target alongside multiway fusion and parallelism; no filter-disabled ablation
+has yet isolated its contribution to DuckDB's 0.308s execution.
+
+110 focused checks pass, including the new failing-before small-build regression
+and sparkline join-order preservation. All thirteen SF100 patched results match
+the baseline. Evidence and full table: `target/ssb-control.md`, linked to
+`/run/media/jara/test/query-ssb-control-20261031/RESULTS.md`. Deleted **77.6GiB** of
+temporary native/smoke fixtures after verification; raw SF100 text was already
+removed after import validation. Canonical QuestDB data is untouched.
+
+## 2026-10-31 — Join ordering and early membership counterfactuals
+
+Original SSB SF100 Q4.1, **600,037,902 fact rows**, eight physical cores and the
+same validated planner fix. All 24 fixed-fact left-deep orders range from
+**19.138s (customer/supplier/part/date)** to **48.959s**. Original SQL brackets the
+matrix at **26.854 / 26.712s**. Static order helps about 1.4x, but cannot close the
+gap. This is one plan family, not every legal plan. No planner heuristic was added.
+
+At the best fixed order, repeated ordinary execution is **19.415s**, early
+membership in existing maps **16.045s**, and exact bounded bitmaps **9.839s**.
+Ordinary joins still establish matches, payloads and duplicate multiplicity.
+Filter construction is inside timing: **582,648 bytes**, **14.904ms** median.
+All 600M rows are inspected; **9,598,961** reach the joins. Independent diagnostics
+show ordinary join probes **753.4M -> 38.4M** and successful row-ID traversal /
+recordAt positioning **163.0M -> 38.4M**. These are not payload-byte counters.
+
+Fixed-work evidence supports reduced dependent-load latency: oldest-load-wait
+cycles/input **116.34 -> 58.41**, L2 demand-load misses/input **1.778 -> 0.348**,
+branch misses/input **0.707 -> 0.213**, total cycles/input **183.70 -> 93.49**.
+Controller traffic is **2.15 / 3.08GB/s**, far below the fresh **58.14GB/s** read
+calibration. Saving 90 cycles across 600M rows is about 9.5s at 5.7GHz, consistent
+with the 9.58s elapsed gain. Existing-map prefiltering barely changes L2 misses;
+the compact representation supplies the larger gain beyond delayed positioning.
+
+The negative control matters: two tiny all-match builds over the same 600M fact
+rows regress **18.396 -> 20.797s (13.1%)**. Only 16 bytes of bitmaps are built, but
+instructions/input rise **786 -> 931** without rejecting rows. Unconditional
+filtering is not justified. Also, marginal selectivity misses temporal locality:
+customer and supplier each retain about 20%, but adjacent customer keys repeat
+75% of the time and supplier keys almost never do. No shuffle ablation yet.
+
+This is a **serial C2 scratch counterfactual**, not new LLVM coverage. The bitmap
+predicate accounts for 44% of sampled Java execution; ordinary row positioning
+and map lookup remain substantial. Next: existing compiled frame-filter path at
+one worker, then eight, with explicit complete-build publication and tracked
+drain-before-free ownership; measure nonselective bypass separately. Current
+compiled-filter preparation runs before ordinary builds are ready. Existing
+membership IR and scheduling should be reused. Strict SSB coverage remains **0/13**.
+
+All 174 selective result files and 17 all-match control files validate; warm runs
+have zero physical reads/major faults and 100% PMU running time. Both scratch
+variants pass focused duplicate/NULL/negative/sparse/empty/reopen checks. Existing
+production code changes were preserved unchanged. Removed **98.2GiB** of generated
+text/native tables; retained **32MiB** of scripts, results and profiles. Full
+evidence, limitations and code-grounded next experiment: `target/join-planning.md`,
+linked to `/run/media/jara/test/query-join-planning-20261031/RESULTS.md`.
+
+## 2026-11-01 — Generated multi-build filtering reaches the common probe
+
+Existing compiled frame filtering now consumes completed INT join builds, copying
+query-tracked membership before dispatch and retaining it until workers drain.
+It preserves ordinary join orientation, payloads and duplicate multiplicity; the
+common scan may sit on either side of the first join. No new scheduler or toggle.
+
+Official SSB SF100, **600,037,902 rows**: original Q4.1 improves **26.034 -> 5.255s**
+at eight physical cores with the same planner and dimension filters. This is
+against the candidate with the new filter disabled, not a fresh stock comparison.
+At one core and fixed best order, ordinary / C2 bitmap / generated execution is
+**18.297 / 9.206 / 6.951s**. Complete execution includes build, publication and close;
+compilation is separate. Only **9,598,961** rows reach ordinary payload joins.
+
+Fixed-work instructions/input fall **286 -> 52**, cycles **171 -> 66**, and separate
+load-counter passes show L2 misses **1.70 -> 0.27/input**. Original generated traffic
+is **4.8GB/s** against a fresh ~58GB/s ceiling. Eight-core execution uses only ~1.4
+cores; generated membership accounts for ~18% of gated PC samples. Ordinary join
+record access, map probes and payload positioning remain the major next gap.
+
+Rejected 64-row staging: +6.7% one-core time and more instructions/branch misses.
+An unmatched INT_MAX key exposed a sparse binary-search regression to **35.3s**;
+conservative bounds recover **7.16s** while ordinary joins reject false positives.
+All-match behavior is inconclusive: an earlier one-warm run regressed 5.5%, but
+final three-warm medians improved 3%. No adaptive bypass or universal win claimed.
+
+Six new integration checks and six focused SYMBOL checks pass; 120 complete large
+results validate, including fourfold duplicates and all-match controls. Three
+broader SYMBOL assertions fail identically with the original implementation.
+Strict fully generated SSB coverage remains **0/13**. Full counter evidence,
+controls and limits: `target/join-native.md`, linked to
+`/run/media/jara/test/query-join-native-20261101/RESULTS.md`.
+Removed about **98.2GiB** of regenerated text/native data after verification;
+compact results, counters and generated-code sampling evidence remain.
+
+## 2026-11-01 — Multiple exact joins share one generated probe loop
+
+Generalized the existing join emitter to independent INT builds on a common probe.
+Exact lookups precede payload reads and duplicate expansion; group-map growth saves
+every duplicate position for retry. Single-build callers use the same emitter.
+Existing frozen maps, aggregate state and frame workers remain in use. No new toggle.
+The compiler API supports multiple builds; automatic SQL admission still owns one.
+
+On **500M rows / eight physical cores**, ordinary candidate SQL / fused Java / fused
+LLVM medians are **41.498 / 2.125 / 1.249s** for unique all-match builds,
+**14.042 / 2.638 / 1.605s** with duplicate cross-products, and
+**1.230 / 0.894 / 0.673s** with 2.86% joint survival. All builds and close are timed;
+compilation is separate. This uses a harness binding for the additional build and
+the existing fused factory, not automatic three-table SQL or a stock-release control.
+The initial weaker Java control was corrected and its timings excluded.
+
+Most of the all-match gain comes from parallel fused execution and frozen build
+representation: ordinary uses 1.06 effective cores, LLVM 7.87. LLVM adds **1.70x**
+over fused Java. Instructions/input fall **353 to 121**, cycles **181 to 106**;
+37.4B saved cycles at ~5.4GHz/eight cores predict the observed ~0.87s improvement.
+One-core oldest-load waits fall **113 to 76 cycles/input**, despite L2 demand misses
+rising **2.21 to 2.36/input**. Generated code holds 86.7% of native PC samples;
+lookup and payload dependencies remain. Controller traffic is **12.1GB/s** against
+a fresh **59.5GB/s** read ceiling. This does not establish cache-miss reduction.
+
+The selective control uses **2.8x more total CPU** than ordinary generated membership,
+despite finishing sooner. Preserve useful compact filtering when integrating exact
+multiway probes; unconditional exact probing is not a universal efficiency win.
+Next: generalize per-build ownership and joined-column binding before relaxing
+`HashJoinGroupByCandidate`'s two-model gate. Strict SSB generated coverage stays 0/13.
+
+Four focused checks pass, including three-build payloads/predicates, build-derived
+grouping, map growth and cancellation inside a million-result cross-product.
+64 complete large results validate. The existing single-join suite has 24 passes
+and four stale assertions that also fail with its original emitter. Core build passes.
+Removed **7.48GiB** of owned fixture data; retained **14MiB** of compact evidence.
+Details and limits: `target/multiway-fusion.md`, linked to
+`/run/media/jara/test/query-multiway-fusion-20261101/RESULTS.md`.
+
+
+## 2026-11-01 — Automatic multiway SQL fusion
+
+Independent INT inner joins on a common probe now enter one generated probe and
+aggregate pipeline through SQL planning. Per-build contexts reuse existing frozen
+maps, serial/parallel build rounds, payload readers/copying and worker locks.
+Column binding spans every dimension; unsupported frames have exact Java fallback.
+No new scheduler or toggle. Builds and final merge remain Java.
+
+500M rows, full three-table SQL, three warm executions, eight physical cores:
+all-match **41.554 -> 1.262s**, duplicate products **13.627 -> 1.603s**, selective
+2.86% survival **0.994 -> 0.663s**. Ordinary retains the candidate's generated
+membership filters; this is not a stock-release comparison. All-match one-core
+execution is **42.280 -> 8.973s**. Its 33x eight-core gain combines parallelism and
+lower per-row work: effective cores **1.06 -> 7.91**, cycles/input **484 -> 106**,
+instructions/input **785 -> 120**. Remaining load-wait fraction is 72%; controller
+traffic ~12GB/s versus a fresh 59.5GB/s read ceiling. Native code holds 93% of samples.
+
+**Falsification:** selective fusion consumes ~3x the CPU at eight cores and is
+**3.90x slower on one core (1.289 -> 5.029s)**. Preserve useful compact filtering
+before exact probes next; more workers hide excess work. No broad performance or
+new fully generated SSB coverage claim. 56 complete large outputs validate;
+199 focused checks pass, two skip. Corrected two stale multiplication admission
+expectations after verifying their existing resolved-function binding.
+Evidence and limits: `target/multiway-sql.md` ->
+`/run/media/jara/test/query-multiway-sql-20261101/RESULTS.md`.
+
+
+## 2026-11-02 — Compact membership restores selective multiway CPU efficiency
+
+Frozen builds now feed the existing INT range/bitmap representation. Exact and
+filtered loops share the existing frame-level adaptive policy; exact is the initial
+choice, and universal sets bypass sampling. No configuration toggle or query rule.
+500M input rows, one first execution plus three warm executions, execution setup/merge
+included and compilation separate: selective **4.991 -> 1.064s on one core**, **0.667 -> 0.155s on eight**;
+ordinary execution with generated membership is **1.401s / 0.966s**. Duplicate-product
+control **1.612 -> 1.170s** on eight cores. Cycles/input **55.6 -> 12.0**, branch misses
+**0.955 -> 0.068**, load-wait cycles **28.2 -> 5.8**, L2 demand misses **1.62 -> 0.16**.
+All-match remains within a few percent (latest pair 1.200 -> 1.243s); full-INT sparse
+bounds **1.267 -> 1.269s** after removing redundant sampling. A genuine thin probe
+regresses **78.4 -> 87.9ms**, explained mostly by its **7.9ms** preparation pass:
+measure build-time key bounds next. Compilation adds roughly **35-66ms**. All full
+results match controls; **90 focused tests pass**. No new SQL/type coverage claim.
+Evidence: `target/multiway-membership.md` ->
+`/run/media/jara/test/query-multiway-membership-20261101/RESULTS.md`.
+
+## 2026-11-02 — Original SSB composite grouping joins the fused path
+
+Reused the existing fixed-key encoder and OrderedMap lookup for numeric/SYMBOL
+composite groups and supported numeric expressions after common-probe INT joins.
+No new map or toggle. Unchanged SF100 Q4.1, **600,037,902 rows**: paired warm medians
+**5.253 -> 0.507s on eight cores**, **6.867 -> 3.554s on one**. Load-wait cycles/input
+fall **50.0 -> 21.1**; eight-core occupancy rises **1.40 -> 7.63**. This includes
+physical-plan/parallelism gains, not LLVM alone. DuckDB remains **0.298s** on eight
+cores. Generated membership/probe code is now the measured next target; builds,
+final merge and sorting remain ordinary. **109 focused checks** pass and **91 full
+results** match the cross-engine oracle. One query/CPU, no full-workload claim.
+Evidence and limits: `target/multiway-composite.md` ->
+`/run/media/jara/test/query-multiway-composite-20261102/RESULTS.md`.
+
+## 2026-11-02 — Join membership contract reduces work, not the latency bottleneck
+
+Generated join checks now use their existing range/bitmap contract and bitmap pointer
+as the representation tag; exact IN keeps sorted storage. No new toggle or algorithm.
+Original 600M-row SSB Q4.1, alternating pairs: **3.566 -> 3.377s on one core**,
+**496 -> 477ms on eight**. Instructions/input **67.1 -> 48.4**, but load waits remain
+about **21 cycles/input** and branch misses about **0.18/input**. This is a modest win,
+not the breakthrough. Deferring exact-probe descriptors regressed and was reverted.
+500M-row selective, dense, duplicate, universal-range and thin controls preserve results;
+selective one-core and thin cases are unchanged. **24 focused checks and 176 complete
+large outputs** validate. First-query latency is not a demonstrated win. Next experiment:
+overlap independent probes, measuring load waits and traffic rather than code size alone.
+Evidence: `target/join-membership-contract.md` ->
+`/run/media/jara/test/query-join-membership-contract-20261102/RESULTS.md`.
+
+## 2026-11-02 — Probe overlap experiments rejected; original loop retained
+
+Tested first-membership masks, all-membership masks and explicit lookahead prefetch
+with unchanged maps, join order and adaptive selection. Original 600M-row SSB Q4.1:
+baseline **3.384s / 497ms** on one/eight cores; first mask **3.563s / 525ms**;
+integer all-mask **4.160s / 593ms**; scalar prefetch **4.158s / 571ms**.
+Prefetch lowers load waits **21.68 -> 16.48 cycles/input**, but instructions rise
+**48.3 -> 128.8**. Added **7.27 cycles/input** predicts the observed **0.77s** loss.
+DRAM traffic stays around **14GB/query**; bandwidth saturation is not the explanation.
+Boolean mask combination initially did worse because `BOTH` lowers through control
+flow; integer AND reduces branch misses **0.769 -> 0.234/input**, still no net win.
+Independent 500M-row selective controls regress **20-26%**; dense cases are unchanged.
+**21 focused checks and 162 full outputs** validate. Restored source and six class files
+match the starting version; final baseline **3.349s / 473ms**. A stale incremental-build
+restoration check was excluded and rerun with verified bytecode. No new toggles or code
+retained. Next: filter-construction economics, then measured membership-check ordering.
+Evidence and limits: `target/join-overlap.md` ->
+`/run/media/jara/test/query-join-overlap-20261102/RESULTS.md`.
+
+## 2026-11-02 — Build-time bounds remove a redundant join preparation pass
+
+Existing serial and partitioned INT builds accumulate min/max on distinct-key insertion;
+freeze reduces partition bounds. Membership reuses them, retaining optional-producer
+fallbacks and allocating bitmaps only when iteration yields a key. No new toggle or
+generated probe algorithm. Final paired 500M-row thin control, eight cores: **86.5 -> 78.6ms**;
+preparation **7.83 -> 0.03ms**. One-million-key bitmap preparation **11.48 -> 6.81ms**,
+cycles/key **61.4 -> 36.3**, branch misses/key **1.76 -> 0.88**: one hash-slot scan disappears.
+Build work is not free: two distinct-key build pairs regress **5-8%**, another reverses;
+conditional extrema stores were rejected for data-order sensitivity. Selective controls
+show setup savings but no consistent overall gain; original 600M-row SSB Q4.1 is unchanged
+within variation (**474 -> 465ms**). **72 focused checks and 272 full outputs** validate.
+No new SQL coverage or general breakthrough. Remaining work: bitmap-construction economics
+and measured membership-check ordering. Evidence: `target/join-bounds.md` ->
+`/run/media/jara/test/query-join-bounds-20261102/RESULTS.md`.
+
+## 2026-11-02 — Whole-workload baseline and generated constant ranges
+
+Refreshed all 13 original SSB SF100 queries (600M fact rows), all 43 ClickBench
+queries and five independent 500M-row H2O controls. SSB warm sums: **240.925s stock,
+197.933s current LLVM-off, 4.829s LLVM B0, 2.262s DuckDB**. Stock-to-LLVM includes
+physical-plan and parallelism gains. Hardware profiles cover **84%** of B0 SSB time.
+The ordinary first-family predicates consume **39%** of current LLVM time.
+
+Bound existing resolved constant BETWEEN functions to existing typed comparisons;
+no SQL rewriting, new IR operation or toggle. Paired full-SSB sums **4.817 -> 3.330s**,
+geomean **1.43x**; Q1.1/1.2/1.3 improve **2.9x/5.3x/5.7x**. Q1.2 instructions/input
+**51.2 -> 6.4**, branch misses **0.97 -> 0.13**, traffic **13.1 -> 12.7 bytes/input**.
+The saved cycles predict about **0.56s** versus **0.576s** observed. Independent SYMBOL
+grouping with INT/LONG ranges improves conservatively **2.1x/3.9x**, all-match **1.4x**.
+LLVM compile cost grows **31ms** and code **3.0 -> 6.1KB**; complete Q1.2 first request
+still improves **913 -> 346ms**. Five focused tests pass; all large outputs validate.
+
+ClickBench retains **27/43 fully generated and >=1.5x stock in both passes**. Initial
+candidate differences on Q11/Q35/Q36 do not repeat above both **5% and 1ms** in balanced
+checks. Full SSB generation remains **0/13**: builds/merge/sort are ordinary. This is
+a three-query-family win, not the cycle's whole-query target. Next: query-wide filter
+construction/representation economics; separately close structural generation gaps.
+The query tracker omits filter row-ID lists, so its peak is not total live memory.
+Evidence and distributions: `target/whole-query.md` ->
+`/run/media/jara/test/query-whole-baseline-20261102/RESULTS.md`.
+
+## 2026-11-02 — Shared runtime-filter budgets: gains measured, static policy rejected
+
+All 13 original SSB queries, 600M rows, eight physical cores: guarded shared bitmap
+allowance improves the sum **3.325 -> 2.866s**, geomean **1.15x**. Q2.2/Q2.3/Q3.3 gain
+**1.79x/2.35x/1.57x**. Q2.3 cycles/input fall **24.51 -> 10.29**, branch misses
+**0.395 -> 0.035**; saved cycles predict **198ms**, versus **201ms** observed.
+Independent 500M-row selective controls gain **1.69x** and **1.31-1.37x** with duplicates.
+
+Construction needs a work bound: an unguarded expanded bitmap costs thin/empty probes
+another **7-8ms**. Reusing the existing frame-count barrier and declining expansion when
+residual probe filters make qualifying counts unknown removes that repeatable loss.
+The final scratch allowance pools distinct-key storage, reserves existing filters and
+caps added work; no CPU-cache constants or new switches.
+
+Still rejected: Q3.4 loses **17% at one core / 8% at eight**, wins **1.29x at sixteen**.
+At eight, traffic falls **12.42 -> 9.29 bytes/input** while load-wait fraction rises
+**0.25 -> 0.47**. Source-matched native profiles locate the membership loop; emitted
+objects are byte-identical. Less traffic/branch recovery does not guarantee a faster
+pipeline when an extra dependent bitmap lookup changes overlap. The current chooser
+cannot recover the old membership representation after expansion replaces it.
+
+**23 focused candidate checks**, **1,263 complete SSB outputs** and **567 independent
+control outputs** validate. No production source/bytecode change or new coverage retained.
+Next: keep old and expanded membership as alternatives in the existing frame chooser,
+with construction and selection costs included; do not gate on query names/core counts.
+Evidence: `target/runtime-filter-economics.md` ->
+`/run/media/jara/test/query-filter-economics-20261102/RESULTS.md`.
+
+## 2026-11-02 — Representation choices retain gains and recover the old fast path
+
+Kept exact probes, original membership and expanded membership in the existing frame
+chooser. Both membership choices share one compiled loop; only slot-owned descriptors
+change around a complete frame, including growth retries/failure. The existing query
+owner passes known unfiltered probe counts at its preparation barrier. Shared distinct-key
+budget reserves old filters and bounds expansion work; unknown qualifying counts keep
+old admission. No new toggle, third compiled loop, scheduler or policy constants.
+
+All 13 SSB queries, 600M rows/eight physical cores: **3.327 -> 2.867s**, geomean **1.154x**.
+Q2.2/Q2.3/Q3.3 gain **1.84x/2.36x/1.57x**; Q3.4 returns to baseline (**147 -> 146ms**).
+Q2.3 cycles/input fall **24.53 -> 9.99**, branch misses **0.396 -> 0.028**; saved cycles
+predict **200ms**, versus **204ms** observed. Q3.4 load-wait fraction stays **0.252**.
+Strategy diagnostics select expansion for 97% of Q2.3 rows and original membership
+for 90-97% of Q3.4 rows at eight cores. Matched emitted objects are byte-identical.
+
+Two balanced 500M-row control passes: selective **1.71-1.89x**, selective duplicates
+**1.42-1.46x**; no repeatable regression above both 5% and 1ms. **52 focused checks**,
+**935 full SSB outputs**, **224 independently checked control outputs** pass.
+
+Fresh cycle B0/current: **4.764 -> 2.823s**, geomean **1.640x**, **six/13** above 1.5x.
+Strict full SSB generation remains **0/13**; cycle targets are not met. Sixteen-core
+Q3.4 still misses the forced winner by 17-25%: noisy frame timings, local choices and
+hysteresis remain an open selection problem. Next distinguish noise from shared
+resource effects before adding coordinated strategy windows. No core-count heuristic.
+Evidence: `target/runtime-filter-choice.md` ->
+`/run/media/jara/test/query-filter-choice-20261102/RESULTS.md`.
+
+
+## 2026-11-02 — General typed joins, with domain-dependent gains
+
+Generalized single/common-probe generated joins to full-width LONG, translated SYMBOL
+and fixed composites, retaining INT's table and reusing ordinary maps/builds/workers.
+The same typed contracts admit mixed independent joins. Integral bounds/bitmaps use
+full-width arithmetic; composite probes reuse existing hashing/equality. No new toggle,
+hash table or scheduler. Dictionary misses and aggregation-map growth preserve every
+resume position; the legacy single-INT compiler hook cannot discard composite keys.
+
+Independent 500M-row controls, eight physical cores, before/after LLVM-enabled checkout:
+selective INT **546 -> 105ms**, SYMBOL **806 -> 139ms**, bounded LONG above 2^52
+**652 -> 152ms**. Sparse LONG gains only **829 -> 758ms**; composite **1192 -> 1046ms**.
+SYMBOL misses/input fall **1.054 -> 0.062**; sparse/composite remain near one. Bounded
+LONG reaches ~54GB/s controller traffic against a measured ~59GB/s eight-core ceiling:
+~8.14GB/query implies ~138ms traffic floor, close to 152ms execution. Sixteen cores
+reach 130ms. All-match INT's initial 2.8% regression does not repeat; wider all-match
+controls gain unevenly. Sparse LONG compilation + first execution regresses ~10%.
+
+Mixed LONG/SYMBOL multiway: **8.76s -> 167ms** includes admission to the existing
+parallel fused plan. A matching fused Java fallback takes **1.14s**, isolating a
+**6.84x** pipeline/early-rejection gain. One-core generated execution takes **1.19s**.
+All 500M probe rows execute natively; independent arithmetic validates complete outputs.
+
+**56 compiler checks + 40 core map/translator checks**, **636 complete result outputs**
+pass. Installed classes are checked; owned 21GiB generated data was removed after validation
+and can be regenerated from retained DDL. No fresh stock/ClickBench/SSB score or cross-CPU claim. Dependent
+payload-to-key joins, broader multiplicity elimination and generated build/merge/order
+remain open. Plan: `JOIN_GENERALIZATION_PLAN.md`; evidence: `target/join-generalization.md`
+-> `/run/media/jara/test/query-join-general-20261102/RESULTS.md`.
+
+
+## 2026-11-02 — Dependent joins execute through the typed pipeline
+
+Closed the payload-to-key boundary for INT, full-width LONG, SYMBOL and mixed-source
+fixed composites. Chains and branches retain the optimizer's existing order. Dependent
+lookups run inside producer duplicate loops; dictionary and group-map exits preserve
+every selected prefix. Existing maps, builders, frame workers and memory ownership
+remain. No toggle, alternate hash table or CPU/query-specific rule.
+
+Six independent 500M-row controls at eight physical cores: ordinary fallback plans
+**8.61-21.92s -> 0.56-1.40s**. This includes parallel admission. The same fused Java
+factory takes **1.78-2.88s**, isolating **1.49-3.18x** from generated execution and its
+rejection choices. INT all-match drops **612 -> 136 instructions/input**, **204 -> 73
+cycles/input** versus fused Java. Saved cycles predict **1.52s**, observed **1.53s**.
+Native symbols locate about **98%** of samples in generated kernels. Sparse LONG
+selective retains **1.27 branch misses/input**; controller traffic is far below the
+streaming ceiling. First requests, compile cost, and one/sixteen-core controls recorded.
+
+**60 compiler + 84 core tests**, **260 complete large-result outputs** pass. Installed
+classes reproduce the result. An independent multiway control's initial 8.5% loss does
+not repeat in two balanced six-warm pairs; other retained controls remain stable.
+
+Replanned next work from the counterfactual: prejoining the selective builds costs
+**41ms**, then scans in **119ms INT / 770ms LONG / 113ms SYMBOL**, beating generated
+chains with construction included. All-match materialization costs **3.1s** and loses.
+Next compare selective build-side pruning and bounded reuse of dependency results;
+do not adopt unconditional materialization. Generated build/merge/order and broader
+multiplicity elimination remain open. No new ClickBench/SSB score or cross-CPU claim.
+Evidence: `target/join-dependencies.md` ->
+`/run/media/jara/test/query-join-dependencies-20261102/RESULTS.md`. No commit.
+
+## 2026-11-02 — Transfer build-only rejection before walking join chains
+
+Owner-side preparation now resolves necessary child membership once per producer key,
+using existing frozen probes and SYMBOL translators. Generated execution uses compact
+bitmaps or the existing split-block Bloom layout for sparse full-width keys. Exact
+joins retain payloads and duplicate multiplicity. Composite child keys work when all
+components come from one producer; composite producer reduction remains open. No new
+map, worker, toggle or CPU/query rule. Unknown probe work and tight budgets bypass it.
+
+500M rows, eight physical cores, preceding LLVM -> installed LLVM, six warm runs:
+selective INT **562 -> 198ms (2.84x)**, LONG **1414 -> 346ms (4.08x)**, SYMBOL
+**679 -> 249ms (2.72x)**, including **9-19ms** preparation. One/sixteen-core gains
+remain **2.44-4.37x**; skew with duplicates gains **3.59-6.19x**. LONG branch misses
+fall **1.272 -> 0.129/input**, cycles **121.8 -> 28.5/input**. Saved cycles at eight
+cores/~5.4GHz predict **1080ms**, observed **1068ms**. Controller bytes/query barely
+change; throughput rises to 23.5GB/s, below the earlier ~59GB/s ceiling. This removes
+repeated lookup work; it is not an LLVM instruction-selection improvement.
+
+All-match is not the win. SYMBOL lost 7.3% in individual process pairs; both profiles
+spend ~95% in identical exact machine code. Forced alternatives reverse the loss or
+differ by 0.4%. Six further balanced process pairs average **+0.5%** (descriptive
+bootstrap interval -2.5% to +4.1%); baseline processes themselves vary >7%. Fixed code
+addresses do not explain the variation. Retain this uncertainty, without a layout
+patch. Independent/thin controls have no repeatable above-gate loss; independent
+kernels' optimized IR is identical. Thin residual input skips preparation (~3us).
+
+**64 compiler + 84 core tests**, **740 complete result outputs** pass, including NULLs,
+dictionaries, high LONG bits, duplicate branches, mixed/composite keys, cancellation,
+reopen and memory limits. Installed class/source hashes checked. Reused the 500M-row
+dataset. No new stock/DuckDB/ClickBench/SSB score, strict full-generation coverage or
+cross-CPU claim. Next measure bounded reuse of successful dependency links; do not
+materialize duplicate products unconditionally. Evidence: `target/join-dependency-filter.md`
+-> `/run/media/jara/test/query-join-reuse-20261102/RESULTS.md`. No commit.
+
+## 2026-11-02 — Reuse successful dependent lookups
+
+Retained one compressed child-chain head per producer row. The owner prepares it
+through existing probes/translators; generated consumers load four bytes instead of
+repeating key loads, translation and hash probing. Existing duplicate chains, maps,
+workers and ownership remain. Composite producers/children work; mixed-source keys
+retain exact probes. No new toggle or query/CPU-specific rule.
+
+500M rows, eight physical cores, preceding LLVM -> new LLVM, two balanced process
+pairs with six warm executions each: all-match INT **917 -> 614ms (1.49x)**, LONG
+**1355 -> 784ms (1.73x)**, SYMBOL **1059 -> 668ms (1.59x)**. Selective cases gain
+another **18-22%**. LONG+SYMBOL composite controls gain **1.46-1.57x**. All-match gains
+persist at one/sixteen cores; duplicate-skew controls gain **11-25%**.
+
+LONG falls **115 -> 65 cycles/input**, **197 -> 142 instructions/input**, **0.91 ->
+0.48 branch misses/input**. Saved cycles predict **578ms**, observed **571ms**.
+Controller traffic stays near **8.5GB/query**, far below streaming saturation.
+Disabling cache publication with the same lowering restores the old probe costs.
+This shares physical work; it is not an LLVM instruction-selection improvement.
+
+Preparation takes **1.3-2.1ms**, retaining **1MiB** for 262,144 producer rows. Unknown
+post-filter work skips it. No-root-match input wastes ~1.8ms: an initial 7.8% loss
+does not repeat; six balanced pairs average **78.5 -> 80.1ms (+2%)**. This fixed cost
+is real; scanned-row admission does not guarantee useful reuse. Independent controls
+remain stable. First requests improve; strict all-operator coverage is unchanged.
+
+**64 compiler + 155 core checks**, **752 complete large outputs** pass, including
+composite keys, NULLs, dictionary changes, duplicate branches, memory limits,
+cancellation and reopen. Installed source/class identities checked. No new fact data
+copy, stock/DuckDB/whole-benchmark score, or cross-CPU claim. Next profile duplicate
+products and test multiplicity-aware consumption through existing countKeyRows.
+Evidence: `target/join-dependency-links.md` ->
+`/run/media/jara/test/query-join-links-20261102/RESULTS.md`. No commit.
+
+
+## 2026-11-02 — Consume duplicate multiplicities in generated COUNT
+
+Unobserved join leaves can now contribute chain counts to the existing COUNT state.
+A query-owned, non-destructive copy reuses HashJoinRowHeap's backward-link recurrence;
+ordinary maps, payloads, workers and fallback remain. Resolved predicates, grouping
+and later key inputs exclude observed builds. INT/full-width LONG/SYMBOL/composites
+share the proof. Unknown work, unique builds and tight budgets skip the copy. No toggle.
+
+500M rows, eight cores, preceding LLVM -> retained LLVM: two-leaf branching INT
+**1954 -> 1032ms**, LONG **2338 -> 1424ms**, SYMBOL **2292 -> 1085ms**. The original
+2x-on-two-representations target was missed. An unchanged-code third-leaf control
+shows **3.35/2.91/3.52x**; grouped COUNT gains **1.70x**. Composite lookup gains only
+7%. One/sixteen-core branching controls gain **1.55-1.86x**. This is fanout-sensitive.
+
+LONG drops **199 -> 120 cycles/input**, **483 -> 265 instructions/input**, and
+**118 -> 67 load-wait cycles/input**. Saved cycles account for **914ms**, matching
+elapsed saving; the stall fraction remains ~0.57. Controller traffic stays far below
+the streaming ceiling. Withholding count publication restores the instruction cost.
+Each 12,288-row leaf adds 96KiB; its copy loop takes ~0.09-0.11ms in diagnostics.
+
+Rejected dormant per-row checks after repeatable unique-child losses of 5-8% and
+16% more instructions. Frame dispatch restores that control (+3% speed). Longer
+unique/thin controls stay stable; observed/independent controls retain small ~3%
+losses. Eligible compilation adds ~20-65ms; no-match compile-plus-first loses ~12%.
+The win does not erase setup costs or remaining producer traversal.
+
+**67 compiler + 155 core checks**, **1,221 complete outputs**, native input counts,
+seven source hashes and **76 installed classes** validate, including dictionary/NULL,
+reopen/cancellation, memory failure/bypass, fallback, map growth and COUNT overflow.
+No new fact copy, stock/DuckDB score, strict coverage or cross-CPU claim. Next measure
+closed build-only subtree weights before broader aggregates. Evidence:
+`target/join-multiplicities.md` -> `/run/media/jara/test/query-join-counts-20261102/RESULTS.md`.
+No commit.
+
+## 2026-11-03 — Fold closed COUNT forests before probing
+
+Retained build-only subtree multiplicities over existing cached heads and frozen
+heaps. The compiler requires probe-only predicates/grouping and one producer per
+dependent key. Reverse-order products/sums preserve original links and payloads;
+workers probe roots and update the existing COUNT state. Construction is query-
+tracked and transactional; budget/unsupported/overflow decline keeps the preceding
+paths. Zero weights reject before group creation. No new map, toggle or CPU rule.
+
+500M rows, eight cores, two balanced process pairs with six warm executions/process,
+preceding LLVM -> new LLVM: typed chains gain **1.84-1.98x**, branches **2.76-2.99x**,
+grouped COUNT **2.08x**, composite keys **1.24x**. A deeper LONG -> SYMBOL -> LONG
+forest plus an independent INT root gains **3.83x**. One/sixteen-core controls agree
+on this CPU. Preparation and normal build/merge/output are included.
+
+LONG branching falls **1387 -> 503ms**, **117 -> 41 cycles/input**, **265 -> 82
+instructions/input**, and **68 -> 26 load-wait cycles/input**. Saved cycles predict
+895ms against 883ms observed. The wait fraction stays ~57%; native IBS now points
+mainly to root map/head loads. Controller traffic falls **7.46 -> 4.45GB/query**, far
+below streaming saturation. Disabling publication with unchanged lowering restores
+the preceding instruction cost. This removes dependent work, not its latency floor.
+
+Initial unique-key regression does not repeat; no special-case patch was added.
+Excluded controls stay within the gate; non-COUNT LONG loses 3.7% with unchanged
+instructions/input. Main/deep compilation adds ~9-24ms; no-root compile-plus-first
+loses 4.9%. Preparation diagnostics show first ~21-25ms, warm ~2-13ms. A 4MiB root
+array replaces cached heads and leaf counts; two-child branches retain 192KiB less.
+
+**69 compiler + 155 core checks**, **761 complete outputs**, native input counts,
+six source hashes and **32 installed classes** pass, including depth/branches/roots,
+typed/composite/NULL/dictionary cases, zero groups, cancellation/reopen, partitioned
+heaps, memory/overflow/unsupported decline and ordinary fallback. Existing 500M-row
+fixture reused. No stock/DuckDB score, strict coverage increase or cross-CPU claim.
+Next separate root lookup from grouping costs; broader aggregates need their own
+semantic proof. Evidence: `target/join-subtrees.md` ->
+`/run/media/jara/test/query-join-subtrees-20261102/RESULTS.md`. No commit.
+
+## 2026-11-03 — Refresh SSB control after join generalization
+
+All 13 original SF100 queries, 600M rows/eight physical cores, first + six warm
+executions: installed LLVM sums **2.690s**, pinned uncompressed DuckDB **2.252s**.
+LLVM takes **19.4%** more summed time, geomean time ratio **1.213x**, and wins three
+queries. Four DuckDB warm-I/O cases were repeated unchanged; substituted repeats sum
+2.244s, with Q4.3 retaining small reads. The ~20% gap persists. **210 complete outputs
+and ordering checks** pass; installed binary hashes are unchanged.
+
+Largest absolute gaps: Q4.1 (+146ms), Q2.1 (+71ms), Q3.4 (+62ms). Q4.1's probe/
+aggregation phase takes ~437ms versus ~7ms build and <1ms merge. Basic PMUs locate
+extra CPU cost; this refresh does not establish a new microarchitectural cause.
+All SSB queries use SUM: the recent closed-COUNT gains do not apply. Strict full
+coverage remains **0/13**; stock was not rerun. No production change or new dataset.
+Evidence: `target/ssb-current.md` -> `/run/media/jara/test/ssb-current-20261103/RESULTS.md`.

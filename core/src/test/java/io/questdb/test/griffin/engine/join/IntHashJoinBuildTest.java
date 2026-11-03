@@ -273,13 +273,16 @@ public class IntHashJoinBuildTest extends AbstractCairoTest {
                             int count = execution == 0 ? 0 : 4097;
                             for (int r = 0; r < count; r++) {
                                 int key = execution == 3 ? (r % 7) : execution == 2 && r == count - 1 ? 0 : r;
-                                key = key == 1 ? Numbers.INT_NULL : key == 2 ? Integer.MAX_VALUE : key == 3 ? -1 : key;
+                                key = execution == 4 ? r + 17
+                                        : key == 1 ? Numbers.INT_NULL : key == 2 ? Integer.MAX_VALUE : key == 3 ? -1 : key;
                                 expected.computeIfAbsent(key, ignored -> new ArrayList<>()).add(r);
                                 build.append(key, r);
                             }
                             FrozenHashJoinBuild.IntKeyed frozen = hasPayload ? build.freeze(payloads) : build.freeze();
                             Assert.assertEquals(count, frozen.getRowCount());
                             Assert.assertEquals(expected.size(), frozen.getKeyCount());
+                            Assert.assertEquals(expected.isEmpty() ? Integer.MAX_VALUE : Collections.min(expected.keySet()).intValue(), frozen.getMinKey());
+                            Assert.assertEquals(expected.isEmpty() ? Integer.MIN_VALUE : Collections.max(expected.keySet()).intValue(), frozen.getMaxKey());
                             Assert.assertEquals(tracker.getUsed(), frozen.getSizeInBytes());
                             if (reusable == null) {
                                 reusable = frozen.newProbe();
@@ -406,7 +409,23 @@ public class IntHashJoinBuildTest extends AbstractCairoTest {
                     build.append(7, 0);
                     build.append(7, 1);
                     build.append(8, 2);
-                    reusable = build.freeze().newProbe();
+                    final FrozenHashJoinBuild.IntKeyed snapshot = build.freeze();
+                    try (io.questdb.std.DirectLongList counts = new io.questdb.std.DirectLongList(3, io.questdb.std.MemoryTag.NATIVE_DEFAULT)) {
+                        Assert.assertTrue(snapshot.copyKeyRowCounts(counts.getAddress()));
+                        Assert.assertEquals(1, io.questdb.std.Unsafe.getLong(counts.getAddress()));
+                        Assert.assertEquals(2, io.questdb.std.Unsafe.getLong(counts.getAddress() + 8));
+                        Assert.assertEquals(1, io.questdb.std.Unsafe.getLong(counts.getAddress() + 16));
+                        counts.set(0, 3);
+                        counts.set(1, 0);
+                        counts.set(2, 7);
+                        Assert.assertTrue(snapshot.sumKeyRowWeights(counts.getAddress()));
+                        Assert.assertEquals(3, counts.get(1));
+                        Assert.assertEquals(7, counts.get(2));
+                        counts.set(0, Long.MAX_VALUE);
+                        counts.set(1, 1);
+                        Assert.assertFalse(snapshot.sumKeyRowWeights(counts.getAddress()));
+                    }
+                    reusable = snapshot.newProbe();
                     reusable.find(7);
                     reusable.next();
                     reusable.next();
@@ -423,6 +442,7 @@ public class IntHashJoinBuildTest extends AbstractCairoTest {
                     build.append(8, 2);
                     final FrozenHashJoinBuild.IntKeyed counted = build.freeze();
                     counted.countKeyRows();
+                    Assert.assertFalse(counted.sumKeyRowWeights(0));
                     reusable.reopen();
                     Assert.assertEquals(2, reusable.findRowCountUnchecked(7));
                     Assert.assertEquals(1, reusable.findRowCountUnchecked(8));

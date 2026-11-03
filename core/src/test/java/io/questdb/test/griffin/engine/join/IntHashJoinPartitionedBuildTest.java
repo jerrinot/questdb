@@ -831,6 +831,8 @@ public class IntHashJoinPartitionedBuildTest extends AbstractCairoTest {
         }
         Assert.assertEquals(rowCount, frozen.getRowCount());
         Assert.assertEquals(expected.size(), frozen.getKeyCount());
+        Assert.assertEquals(expected.keySet().stream().mapToInt(Integer::intValue).min().orElse(Integer.MAX_VALUE), frozen.getMinKey());
+        Assert.assertEquals(expected.keySet().stream().mapToInt(Integer::intValue).max().orElse(Integer.MIN_VALUE), frozen.getMaxKey());
         final boolean isUnique = rowCount == expected.size();
         try (FrozenHashJoinBuild.IntProbe probe = frozen.newProbe()) {
             final IntList keys = new IntList();

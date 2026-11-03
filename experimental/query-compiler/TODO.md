@@ -1,5 +1,51 @@
 # Deferred aggregation performance work
 
+Active experiment order (2026-11-03): [whole-query plan](WHOLE_QUERY_PLAN.md).
+Join and multiway-join acceleration remain goals through a general architecture.
+SSB supplies controls and opportunities, not query-count targets or distribution
+assumptions. Require property-based admission and independent join controls for each
+mechanism; no requirement that a join improvement also accelerate single-table work.
+W0 and the first resolved-range predicate boundary are complete; see
+[current whole-workload evidence](target/whole-query.md). The static filter-budget
+experiment was rejected; retaining original and expanded membership in the existing
+frame chooser now improves the full SSB sum 3.327 -> 2.867s without the repeatable Q3.4
+regression. Current cycle score: 1.640x geomean over B0, six/13 above 1.5x, strict full
+generation 0/13. See [representation-choice evidence](target/runtime-filter-choice.md).
+Next selection experiment: separate noisy frame timing/hysteresis from shared resource
+coupling before testing query-wide strategy windows. Sixteen-core selection still
+misses a faster forced path; no CPU-count gate or scheduler change was retained.
+The current implementation slice is [typed join generalization](JOIN_GENERALIZATION_PLAN.md).
+INT, full-width LONG, SYMBOL and fixed composite probing now execute natively across
+single, independent and dependent multiway joins, with engine-owned maps and translation caches.
+Measured limits: sparse LONG retains about one branch miss/input; composite exact probes
+remain expensive; all-match INT varies around baseline across repeated pairs. No claim of
+new full-query benchmark coverage. [Evidence](target/join-generalization.md).
+Dependent payload-to-key execution is implemented, preserving duplicates and symbol
+domains. The 500M-row controls gain 1.49-3.18x over the same fused Java plan; the larger
+12.2-24.2x gain over previous ordinary plans includes parallel admission.
+[Evidence and limitations](target/join-dependencies.md). Build-only membership transfer
+now improves selective typed chains another 2.72-4.08x, including preparation, using
+existing maps/probes and bitmap/Bloom membership. [Evidence](target/join-dependency-filter.md).
+All-match SYMBOL has substantial process-to-process variance: individual pairs lose
+7.3%, while six further balanced pairs average +0.5%. Exact machine code is unchanged;
+fixed code addresses do not explain the variation. Keep this uncertainty visible.
+Bounded exact dependency links are now retained: one compressed child-chain head per
+producer row, including composite producers/children, without materializing products.
+500M-row all-match INT/LONG/SYMBOL improve another 1.49/1.73/1.59x; selective cases
+gain 18-22%. No-root-match input pays ~1.8ms of wasted preparation, averaging +2%.
+[Evidence and limits](target/join-dependency-links.md). Unobserved COUNT leaves and
+closed build forests now reuse non-destructive heap counts/weighted sums; typed
+branches gain another 2.76-2.99x over leaf folding. See [subtree evidence](target/join-subtrees.md).
+Next separate remaining root lookup cost from grouping work before broadening the
+aggregate proof. Composite producer membership reduction remains open.
+The local-loop items below remain candidates, not the next automatic sequence.
+
+- [ ] Complete live-query memory accounting for filter row-ID/address lists.
+  `AsyncFilterContext` allocates these as NATIVE_OFFLOAD but `initMemoryPools` attaches
+  the query tracker only to frame memory pools. Q1.2's sampled 768-byte tracker peak
+  therefore is not total query memory. Reuse existing MemoryTracker ownership and
+  lifecycle; report RSS and tracked bytes separately until this is closed.
+
 Type expansion checkpoint, 2026-10-30: retained changes and final protocol results
 are committed; see README for current coverage and PROGRESS for measured gains,
 regressions and rejected experiments. Shared VARCHAR-to-numeric binding now supports
@@ -534,12 +580,142 @@ near-parity small-set cases.
   cardinality and skew matrix. Packed bytes improved 500M-row H2O Q7 from 4.551 to
   3.048s, but regressed actual ClickBench URL/COUNT Top-K from 835 to 1074ms. The
   unconditional trial was removed; do not reintroduce it from one benchmark win.
-- Bound total partition/result memory. Generated H2O Q10 reaches the 56GiB query
-  limit during merge. About 26GB of raw input records remain live alongside final
-  maps. Existing cursors promise random access and final VARCHAR entries can borrow
-  partition bytes; page release needs an explicit consumer/ownership contract.
+- Finish bounding total partition/result memory. Consumed input pages now have an
+  explicit release boundary after the shard's last merge/replay pass. Final maps
+  still retain every output group for random access; transient VARCHAR payloads
+  also outlive page release. No spill exists, and libc can retain freed pages in
+  fragmented arenas. Measure resident memory separately from tracked live bytes
+  before extending this into a claim of bounded physical memory.
 - Grouped Top-K currently reserves K value slots per group. Nearly unique keys
   with larger K can consume much more state than a window, even when each group
   contains few rows. Budget failure/reopen is tested; measure cardinality, skew,
   monotone arrival and K before widening admission. Consider compact prefixes
   with overflow storage using the existing allocator, not another memory subsystem.
+
+## SSB control follow-up
+
+- [x] Stop ordinary aggregation from accidentally pinning hash-join orientation.
+  Resolve scan direction only for order-dependent aggregates; preserve TWAP and
+  sparkline checks. SF100 Q4.1 improves 69.725 to 26.640s, including ordinary Java.
+- [x] Separate join-order cost from runtime-filter opportunity. All 24 fixed-fact,
+  left-deep orders on SF100 Q4.1 range from 19.138 to 48.959s. Original SQL is
+  26.854s; static order alone does not close the gap. This enumerates one plan
+  family, not all legal plans. Actual build orientation and full results checked.
+- [x] Test build-derived membership before ordinary joins, with construction timed.
+  At the best fixed order, repeated ordinary execution is 19.415s, early membership
+  in existing maps 16.045s, and bounded exact bitmaps 9.839s. Separate diagnostics
+  show join probes falling from 753.4M to 38.4M; L2 demand-load misses/input fall
+  from 1.78 to 0.35. This is a serial C2 counterfactual, not new LLVM coverage.
+  Small duplicate/NULL/negative/sparse/empty/reopen controls pass. A 600M-row
+  all-match control regresses 18.396 to 20.797s: unconditional filtering is wrong.
+- [x] Integrate multi-build membership into the existing compiled frame filter.
+  Raw INT keys on a common scan in an uninterrupted inner-join chain now use
+  generated range/bitmap checks, including a first join that swaps at execution.
+  The owner copies completed map keys before dispatch; query-tracked copies survive
+  until frame workers drain. Reuses the frame scheduler and SYMBOL membership IR.
+  Original SF100 Q4.1 improves about 26.03 to 5.25s at eight cores; ordinary joins,
+  aggregation and sorting remain. This is partial execution, not full LLVM coverage.
+  Bounded 64-row staging lost on one core and was removed. Sparse join domains use
+  conservative bounds: an unmatched INT_MAX outlier made exact binary search cost
+  35.3s on one core; bounds recover about 7s with ordinary joins checking membership.
+- [ ] Measure a bounded runtime bypass policy for filters that save no downstream
+  work. Use ordinary probe batches, not a preliminary fact scan; build-key density
+  is not probe survival. All-match results vary: an earlier one-warm run regressed
+  5.5%, while the final three-warm median improved 3%; there is no robust gain.
+  Include tiny probes, changing selectivity, skew, duplicates, wide/sparse domains
+  and correlated predicates. Record admission and bypass costs before proposing a
+  planner heuristic or fixed threshold. The ordinary filter-only path has no runtime
+  bypass policy; fused multiway joins now reuse the existing adaptive kernel policy.
+- [x] Generalize `ResolvedJoinKernel` to multiple common-probe INT builds. Exact
+  lookups precede duplicate expansion; group-map insertion resumes all duplicate
+  positions. Existing frozen maps, payload descriptors and aggregate states remain
+  the owners. Two/three-build checks cover payloads, predicates, grouping, NULLs,
+  selected rows, map growth, empty builds, cancellation and unsupported bindings.
+  The 500M-row harness uses the existing frame workers, not a new executor.
+- [x] Integrate multiway build ownership and SQL planning for independent INT inner
+  joins on a common probe. `HashJoinBuildContext` reuses existing build rounds,
+  payload retention and drain-before-close; joined-column binding and Java fallback
+  support every build. LLVM acceptance gates admission. No new scheduler or toggle.
+  A full three-table SQL control at 500M rows reproduces the harness gain; see
+  `target/multiway-sql.md`. The later typed/dependent milestones extend this admission;
+  see `JOIN_GENERALIZATION_PLAN.md`.
+- [x] Preserve compact runtime filtering in fused multiway joins. Reuse the existing
+  INT membership representation over frozen build keys, and choose exact or filtered
+  execution using the existing whole-frame adaptive policy. Universal sets bypass
+  alternative sampling. At 500M rows / 2.86% joint survival, one-core execution falls
+  from 4.99s to 1.06s and eight-core execution from 0.667s to 0.155s. Cycles/input fall
+  55.6 -> 12.0; exact results, duplicates, cancellation and reopen remain intact.
+  See `target/multiway-membership.md`; this does not expand SQL/type coverage.
+- [x] Eliminate bounds-only membership scans over frozen builds. Accumulate exact
+  min/max on distinct-key insertion in the existing serial and partitioned builders;
+  reduce partition bounds during freeze. Thin probes (4,783 survivors from 500M rows)
+  improve **86.5 -> 78.6ms** on eight cores; preparation **7.83 -> 0.03ms**. Bitmap
+  preparation still needs one pass. Isolated distinct builds can regress **5-8%**;
+  this is a setup saving, not a free build optimization. Empty/extreme domains,
+  duplicates, reuse and optional producer capabilities are covered. See `target/join-bounds.md`.
+- [x] Reuse fixed-key encoding for composite numeric/SYMBOL grouping after multiway
+  joins. Original SSB Q4.1 at SF100 now executes all 600,037,902 fact rows through
+  the fused pipeline: 5.253 -> 0.507s on eight cores and 6.867 -> 3.554s on one.
+  Exact results match stock/DuckDB; builds, final merge and sorting remain ordinary.
+  No query recognition, new map or configuration switch. See `target/multiway-composite.md`.
+- [x] Specialize generated join membership for its existing range/bitmap contract.
+  No sorted-set search or separate live count tag; exact IN retains sparse sets.
+  Paired SF100 Q4.1 warm medians: 3.566 -> 3.377s on one core, 496 -> 477ms on eight.
+  Instructions/input fall 67.1 -> 48.4, but load waits remain about 21 cycles/input.
+  Delayed exact-probe descriptor loads regressed and were reverted. First-query latency
+  is not a demonstrated win. 24 focused checks and 176 full large outputs validate;
+  500M-row controls include duplicates, universal ranges and thin probes.
+  See `target/join-membership-contract.md`; this is a modest gain, not a breakthrough.
+- [ ] Reduce dependent loads in the generated multiway membership/probe loop.
+  Q4.1 still trails the preceding DuckDB control substantially. Similar L2 miss counts,
+  unchanged load waits and branch misses reject instruction count as the main remaining
+  problem. Bounded scalar masks and explicit 16-row prefetch were tested and rejected:
+  waits fell but extra checks/address calculations outweighed overlap. Original 600M-row
+  Q4.1: baseline 3.384s; first-mask 3.563s, integer all-mask 4.160s, scalar-prefetch 4.158s
+  on one core; all also lose on eight. 500M selective controls regress 20-26%.
+  Source and bytecode restored; no new toggle. See `target/join-overlap.md`.
+  This does not reject vector gathers or AMAC generally; sample attribution alone does
+  not prove spill causality. Next test filter-construction economics before more loop variants.
+- [ ] Avoid remaining unprofitable join-filter construction. Frozen bounds now avoid
+  the first scan; bitmap construction still runs before probe survival is known.
+  Do not infer probe survival from build density. Measure the existing adaptive
+  policy's convergence when build selectivity changes: exploration costs CPU and
+  can retain a previous winner for 128 frame calls. See `target/join-bounds.md` for
+  build-cost and full-query controls; no broad SSB improvement was demonstrated.
+- [ ] Measure ordering of independent membership checks, preserving exact join order,
+  payload binding and duplicate expansion. Use conditional rejection and check cost,
+  not build cardinality alone; avoid factorial code variants. Establish the hardware
+  cost and a falsifying control before changing the generated loop.
+- [ ] Improve build choice when filtered cursors report size -1. Existing ordinary
+  join reordering uses structural costs, not cardinality; investigate snapshot-safe
+  bounds or actual build counts before introducing estimates. The order-pin fix
+  cannot make an unknown size known.
+- [ ] Bind numeric BETWEEN through its resolved function contract. Original SSB
+  Q1 filters still materialize interpreted selection row IDs; equivalent range
+  comparisons qualify on the small fixture. Preserve NULL and boundary behavior,
+  then measure original SQL at scale rather than replacing benchmark predicates.
+- Sorting and Java hash builds still prevent strict full-query generated coverage
+  on this control. There are **0/13** fully generated queries. The original October 31
+  baseline had three partial fact pipelines representing **0.8%** of stock runtime;
+  Q4.1 now has a fused fact pipeline, but the full suite has not been rerun. Report time-weighted
+  coverage with query count. Full protocol, profiles, source links and next-step
+  reasoning: `target/ssb-control.md` / `query-ssb-control-20261031/RESULTS.md`.
+  Join-order and early-membership counterfactuals: `target/join-planning.md` /
+  `query-join-planning-20261031/RESULTS.md`.
+
+  Generated membership, staged-loop rejection and sparse control: `target/join-native.md` /
+  `query-join-native-20261101/RESULTS.md`.
+
+
+### Multiplicity-aware COUNT: closed forests retained, broader aggregates open
+
+Unobserved leaves and closed build-only forests now fold counts across
+INT/LONG/SYMBOL/composites, preserving ordinary heaps and fallback. The forest proof
+requires probe-only predicate/grouping inputs and one producer per dependent key.
+500M-row typed branches gain another 2.76-2.99x; deeper mixed-type controls gain
+3.83x. See `JOIN_GENERALIZATION_PLAN.md` and `target/join-subtrees.md`.
+Remaining root hash probes are latency-sensitive. Profile them alongside grouping
+before choosing the next representation. SUM/AVG, COUNT(value), DISTINCT, observed
+build values and mixed-source keys need separate semantic proofs. Include query
+memory and compile-plus-first latency: this slice adds ~9-24ms compilation in main/
+deep cases, and no-match first-request time loses 4.9% despite stable warm execution.

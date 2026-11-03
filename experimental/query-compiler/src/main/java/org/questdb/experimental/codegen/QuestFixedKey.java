@@ -41,10 +41,15 @@ record QuestFixedKey(ResolvedVarchar.Binding frameInputs,
 
     static QuestFixedKey bind(ColumnTypes inputTypes, ColumnTypes types, ListColumnFilter columns,
                              io.questdb.std.ObjList<io.questdb.cairo.sql.Function> functions, io.questdb.cairo.map.Map map) {
+        return bind(new ResolvedInputs(inputTypes), types, columns, functions, map);
+    }
+
+    static QuestFixedKey bind(ResolvedInputs inputs, ColumnTypes types, ListColumnFilter columns,
+                             io.questdb.std.ObjList<io.questdb.cairo.sql.Function> functions, io.questdb.cairo.map.Map map) {
+        ColumnTypes inputTypes = inputs.types();
         int computed = functions == null ? 0 : functions.size(), count = types.getColumnCount();
         if (count == 0 || count != columns.size() + computed) return null;
-        var inputs = new ResolvedInputs(inputTypes);
-        var strings = new ResolvedVarchar(inputTypes, inputs);
+        var strings = inputs.strings();
         var expressions = new java.util.ArrayList<Pipeline.Scalar>();
         var dictionaries = new java.util.ArrayList<SymbolExpression>();
         var dictionaryPositions = new java.util.ArrayList<Integer>();

@@ -145,6 +145,46 @@ final class HashJoinRowHeap implements Closeable {
         circuitBreaker = null;
     }
 
+    /** Copies chain lengths without changing the links or the frozen snapshot. */
+    void copyChainCounts(long destination) {
+        assert !hasChainLengths;
+        final long base = rows.address;
+        final int shift = hasRowId ? 4 : 3;
+        // Same backward-link recurrence as countChains, with a separate dense destination.
+        // Keeping links intact lets ordinary probes and generated consumers share this heap.
+        for (long ordinal = 0, count = getRowCount(); ordinal < count; ordinal++) {
+            if ((ordinal & (ROWS_PER_CHECK - 1)) == 0) {
+                circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+            }
+            final long link = Unsafe.getLong(base + (ordinal << shift));
+            assert link == 0 || ((link - LINK_SIZE) >> shift) < ordinal;
+            final long previous = link == 0 ? 0 : Unsafe.getLong(destination + (((link - LINK_SIZE) >> shift) << 3));
+            Unsafe.putLong(destination + (ordinal << 3), previous + 1);
+        }
+    }
+
+    /** Same backward-link recurrence, starting with caller-supplied row weights. */
+    boolean sumChainWeights(long weights) {
+        assert !hasChainLengths;
+        final long base = rows.address;
+        final int shift = hasRowId ? 4 : 3;
+        for (long ordinal = 0, count = getRowCount(); ordinal < count; ordinal++) {
+            if ((ordinal & (ROWS_PER_CHECK - 1)) == 0) {
+                circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+            }
+            final long link = Unsafe.getLong(base + (ordinal << shift));
+            assert link == 0 || ((link - LINK_SIZE) >> shift) < ordinal;
+            final long previous = link == 0 ? 0 : Unsafe.getLong(weights + (((link - LINK_SIZE) >> shift) << 3));
+            final long weight = Unsafe.getLong(weights + (ordinal << 3));
+            assert weight >= 0 && previous >= 0;
+            if (weight > Long.MAX_VALUE - previous) {
+                return false;
+            }
+            Unsafe.putLong(weights + (ordinal << 3), weight + previous);
+        }
+        return true;
+    }
+
     /**
      * Replaces every row's link with the length of the chain that the row heads: the row itself
      * plus every row that its link reached. Every build links a row to the row of its key that it

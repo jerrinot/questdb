@@ -481,8 +481,29 @@ public class MapHashJoinBuildTest extends AbstractCairoTest {
                             Assert.assertEquals(0, build.getSizeInBytes());
                             continue;
                         }
+                        try (io.questdb.std.DirectLongList counts = new io.questdb.std.DirectLongList(2000, io.questdb.std.MemoryTag.NATIVE_DEFAULT);
+                             FrozenHashJoinBuild.RecordProbe check = frozen.newProbe(sink)) {
+                            Assert.assertTrue(frozen.copyKeyRowCounts(counts.getAddress()));
+                            for (int row = 0; row < 2000; row++) {
+                                Assert.assertEquals(row < 1700 ? row / 17 + 1 : 1,
+                                        io.questdb.std.Unsafe.getLong(counts.getAddress() + row * 8L));
+                            }
+                            for (int row = 0; row < 2000; row++) counts.set(row, 3);
+                            Assert.assertTrue(frozen.sumKeyRowWeights(counts.getAddress()));
+                            for (int row = 0; row < 2000; row++) {
+                                Assert.assertEquals(3L * (row < 1700 ? row / 17 + 1 : 1), counts.get(row));
+                            }
+                            for (int row = 0; row < 2000; row++) counts.set(row, Long.MAX_VALUE);
+                            Assert.assertFalse(frozen.sumKeyRowWeights(counts.getAddress()));
+                            check.findUnchecked(isLongKey ? source(1, 0) : source("k1", 0));
+                            int matches = 0;
+                            while (check.hasNext()) { check.next(); matches++; }
+                            Assert.assertEquals(100, matches);
+                        }
                         final long used = tracker.getUsed();
                         frozen.countKeyRows();
+                        Assert.assertFalse(frozen.copyKeyRowCounts(0));
+                        Assert.assertFalse(frozen.sumKeyRowWeights(0));
                         Assert.assertEquals("the count runs in place", used, tracker.getUsed());
                         final FrozenHashJoinBuild.RecordProbe probe = frozen.newProbe(isLongKey ? new LongKeySink() : new StrKeySink());
                         try {

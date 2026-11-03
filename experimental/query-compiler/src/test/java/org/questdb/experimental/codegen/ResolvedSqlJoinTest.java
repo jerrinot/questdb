@@ -212,10 +212,10 @@ public class ResolvedSqlJoinTest {
     @Test
     public void unsupportedShapesAndColumnTopsKeepJavaSemantics() throws Exception {
         matches("select count() from p join d on p.k=d.k", false);
-        matches("select sum(p.v),count() from p join d on p.k=d.k where p.v*d.v>0", false);
+        matches("select sum(p.v),count() from p join d on p.k=d.k where p.v*d.v>0", true);
         matches("select sum(p.v+d.v),count() from p join d on p.k=d.k where p.v>d.v", true);
-        matches("select sum(p.v*d.v),count() from p join d on p.k=d.k where p.v>d.v", false);
-        matches("select p.k,d.v,sum(p.v) from p join d on p.k=d.k group by p.k,d.v", false, 2);
+        matches("select sum(p.v*d.v),count() from p join d on p.k=d.k where p.v>d.v", true);
+        matches("select p.k,d.v,sum(p.v) from p join d on p.k=d.k group by p.k,d.v", true, 2);
         matches("select sum(p.v),count() from p left join d on p.k=d.k", false);
         engine.execute("alter table p add column late long", context);
         engine.execute("insert into p select cast(x%131-65 as int),x,cast(x as int),cast(x as short),x*7 from long_sequence(500)", context);

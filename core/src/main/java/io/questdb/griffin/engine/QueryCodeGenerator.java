@@ -71,6 +71,18 @@ public interface QueryCodeGenerator {
     record CompiledFilters(io.questdb.jit.CompiledFilter rows, io.questdb.jit.CompiledCountOnlyFilter count) { }
 
     /**
+     * A completed ordinary INT join map, borrowed only during owner-thread preparation.
+     * A null map means pass-through (for example, the join swapped build/probe sides).
+     * Generated filters must copy keys into their own tracked state before worker dispatch.
+     */
+    record IntJoinFilterSource(int probeColumn, int mapKeyColumn, java.util.function.Supplier<Map> completedBuild) { }
+
+    /** The row kernel owns execution state; the Java fallback and count kernel borrow it. */
+    record JoinFilter(Function fallback, CompiledFilters compiled) { }
+
+    default @Nullable JoinFilter compileJoinFilter(ColumnTypes inputs, ObjList<IntJoinFilterSource> sources) { return null; }
+
+    /**
      * Borrows planning inputs only for this call. Return null for unsupported implementations;
      * preparation failures propagate. Do not initialize or retain the resolved functions.
      * The caller adopts a successful result and closes it after all slot updaters finish.
@@ -105,7 +117,7 @@ public interface QueryCodeGenerator {
     }
 
     /**
-     * Optional INNER join pipeline. Joined columns place probe columns before build payloads.
+     * Legacy single-INT INNER join pipeline. Joined columns place probe columns before build payloads.
      * A non-null groupLayout denotes keyed state; otherwise value supplies scalar state offsets.
      * The caller excludes SYMBOL translation and existing count-only specializations. Functions,
      * the resolved post-join predicate and layouts are borrowed only during compilation. Reject
@@ -116,6 +128,40 @@ public interface QueryCodeGenerator {
                                                int probeKeyColumn, @Nullable MapValue value, @Nullable Function postJoinFilter,
                                                int groupKeyColumn, @Nullable Map groupLayout) {
         return null;
+    }
+
+    /** Common-probe INNER joins; payload columns follow the probe in build-list order. */
+    default @Nullable CompiledJoin compileJoin(ColumnTypes joinedTypes, int probeColumnCount,
+                                               ColumnTypes valueTypes, ObjList<GroupByFunction> functions,
+                                               ObjList<CompiledJoin.Build> builds, @Nullable MapValue value,
+                                               @Nullable Function postJoinFilter, int groupKeyColumn, @Nullable Map groupLayout) {
+        // The legacy hook describes one INT key; never discard typed/composite components.
+        if (builds.size() != 1 || builds.getQuick(0).keyColumns().length != 1
+                || builds.getQuick(0).keyTypes().length != 1
+                || builds.getQuick(0).keyTypes()[0] != io.questdb.cairo.ColumnType.INT) {
+            return null;
+        }
+        return compileJoin(joinedTypes, probeColumnCount, valueTypes, functions,
+                builds.getQuick(0).keyColumn(), value, postJoinFilter, groupKeyColumn, groupLayout);
+    }
+
+    /** Group keys use the same RecordSink layout as ordinary aggregation. Planning-only borrow. */
+    default @Nullable CompiledJoin compileJoin(ColumnTypes joinedTypes, int probeColumnCount,
+                                               ColumnTypes valueTypes, ObjList<GroupByFunction> functions,
+                                               ObjList<CompiledJoin.Build> builds, @Nullable MapValue value,
+                                               @Nullable Function postJoinFilter, ColumnTypes keyTypes,
+                                               io.questdb.cairo.ListColumnFilter keyColumns,
+                                               @Nullable ObjList<Function> keyFunctions, @Nullable Map groupLayout) {
+        int key = -1;
+        if (groupLayout != null) {
+            if (keyTypes.getColumnCount() != 1 || keyColumns.size() != 1 || keyColumns.getQuick(0) <= 0
+                    || keyFunctions != null && keyFunctions.size() != 0) {
+                return null;
+            }
+            key = keyColumns.getQuick(0) - 1;
+        }
+        return compileJoin(joinedTypes, probeColumnCount, valueTypes, functions, builds, value,
+                postJoinFilter, key, groupLayout);
     }
 
     /** Pure expressions over a random-access input. The factory owns the compiled buffers/code. */

@@ -88,6 +88,7 @@ public final class KernelMemory implements AutoCloseable {
         if (circuitBreaker != null) circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
         else if (phaseCheckpoint != null) phaseCheckpoint.run();
         else if (checkpoint != null) checkpoint.run();
+        else if (previous != null) previous.checkpoint();
     }
 
     static KernelMemory open(GroupByAllocator allocator) { return new KernelMemory(allocator); }

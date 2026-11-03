@@ -60,6 +60,7 @@ import java.util.ArrayDeque;
  * before releasing symbol backing. No model or expression nodes survive compilation.
  */
 public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSource {
+    private final ListColumnFilter columnFilter = new ListColumnFilter();
     private final ObjList<GroupByFunction> groupByFunctions = new ObjList<>();
     private final ObjList<Function> innerFunctions = new ObjList<>();
     private final ObjList<Function> keyFunctions = new ObjList<>();
@@ -94,9 +95,8 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
         try {
             RecordMetadata joined = metadata.getJoinedMetadata();
             IntList flags = new IntList();
-            ListColumnFilter columnFilter = new ListColumnFilter();
             GroupByUtils.assembleGroupByFunctions(parser, new ArrayDeque<>(), model, executionContext,
-                    joined, -1, false, true, groupByFunctions, new IntList(), outputFunctions,
+                    joined, -1, null, true, groupByFunctions, new IntList(), outputFunctions,
                     innerFunctions, new IntList(), flags, outputMetadata, valueTypes, keyTypes,
                     columnFilter, null, false, metadata.getColumns(), null);
             for (int i = 0; i < innerFunctions.size(); i++) {
@@ -202,6 +202,10 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
 
     public ObjList<GroupByFunction> getGroupByFunctions(int slot) {
         return slot < 0 || workerGroupByFunctions == null ? groupByFunctions : workerGroupByFunctions.getQuick(slot);
+    }
+
+    public ListColumnFilter getKeyColumns() {
+        return columnFilter;
     }
 
     public ObjList<Function> getKeyFunctions(int slot) {

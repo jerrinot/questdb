@@ -24,6 +24,7 @@
 
 package org.questdb.experimental.codegen;
 
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapKey;
@@ -32,6 +33,7 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameFilteredMemoryRecord;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.griffin.engine.groupby.FastGroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.GroupByKernel;
@@ -39,6 +41,7 @@ import io.questdb.griffin.engine.table.GroupByMapFragment;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.MemoryTracker;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
 import io.questdb.std.Unsafe;
@@ -109,6 +112,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private boolean parallelMerge;
     private int mergePreparationStage;
     private boolean finalizeDeferred;
+    private FastGroupByAllocator partitionAllocator;
+    private KernelMemory partitionMemory;
 
     AggregateSlot(Prepared prepared, GroupByAllocator allocator) {
         this.prepared = prepared;
@@ -117,6 +122,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
             throw new IllegalArgumentException("Allocated aggregate state requires the owning slot allocator");
         }
         memory = prepared.binding.allocates || prepared.mapCode != null ? KernelMemory.reusable(allocator) : null;
+        // Standalone kernels borrow the caller's arena. SQL execution binds a page arena below.
+        partitionMemory = KernelMemory.reusable(allocator);
         // Cardinality and deferred-merge words precede STATE; fusion adds an accepted-row count.
         long columnBytes = prepared.binding.inputs.bytes() + 32 + (prepared.fusedFilterCode != null ? 8 : 0);
         long scratchOffset = columnBytes + (prepared.mapCode != null
@@ -178,8 +185,25 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         if (!closed) {
             closed = true;
             try (argumentHelpers; keyHelpers; filter) { if (dictionary != null) dictionary.close(); }
-            finally { Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); }
+            finally {
+                try { if (partitionAllocator != null) partitionAllocator.close(); }
+                finally { Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); }
+            }
         }
+    }
+
+    @Override
+    public void prepareExecution(CairoConfiguration configuration, MemoryTracker tracker) {
+        if (prepared.localCapacity == 0) return;
+        if (partitionAllocator == null) {
+            // Each page must be an entire allocation: the ordinary slot arena can pack
+            // multiple pages into a chunk that cannot be freed independently.
+            partitionAllocator = new FastGroupByAllocator(QuestPartitions.PAGE_BYTES,
+                    configuration.getGroupByAllocatorMaxChunkSize(), true, false);
+            partitionMemory = KernelMemory.reusable(partitionAllocator);
+        }
+        partitionAllocator.setMemoryTracker(tracker);
+        partitionAllocator.reopen();
     }
 
     @Override
@@ -203,6 +227,10 @@ public final class AggregateSlot implements GroupByKernel.Updater {
 
     @Override
     public void clear() {
+        if (partitionAllocator != null) {
+            partitionAllocator.clear();
+            partitionAllocator.setMemoryTracker(null);
+        }
         if (prepared.sharedMaps != null) prepared.sharedMaps.clear();
         keyFilterAddress = 0;
         rankScratch = 0;
@@ -244,9 +272,12 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         long descriptor = scratchAddress + 32;
         source.writeNativeMutationView(descriptor);
         long rows = Unsafe.getLong(descriptor + NativeMapView.MASK) + (prepared.probe.varchar() ? 1 : 2);
-        long status = prepared.flushCode.run(descriptor, rows, partitions);
-        memory.throwIfFailed();
-        if (status != 0) throw new IllegalStateException("Partial-state partition failed: " + status);
+        partitionMemory.enter(null);
+        try {
+            long status = prepared.flushCode.run(descriptor, rows, partitions);
+            partitionMemory.throwIfFailed();
+            if (status != 0) throw new IllegalStateException("Partial-state partition failed: " + status);
+        } finally { partitionMemory.close(); }
         partitioned = true;
         partitionRows += source.size();
         source.clear();
@@ -256,6 +287,34 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     @Override
     public void mergePartition(Map destination, GroupByKernel.Updater sourceUpdater, int partition, Runnable checkpoint) {
         mergePartition(destination, sourceUpdater, partition, checkpoint, prepared.partitionMergeCode, prepared.inputPartitionMergeCode);
+    }
+
+    @Override
+    public void releasePartition(int partition) {
+        if (partitionAllocator == null) return;
+        // Scan allocation has finished. Shard consumers are disjoint, but the allocator's
+        // chunk index is shared; serialize only page reclamation, never row processing.
+        synchronized (partitionAllocator) {
+            releasePages(partitions, partition);
+            if (inputPartitions != 0) releasePages(inputPartitions, partition);
+        }
+    }
+
+    private void releasePages(long states, int partition) {
+        long bucket = states + (long) QuestPartitions.BUCKET_BYTES * partition;
+        long page = Unsafe.getLong(bucket);
+        Unsafe.putLong(bucket, 0);
+        Unsafe.putLong(bucket + QuestPartitions.BUCKET_TAIL_OFFSET, 0);
+        while (page != 0) {
+            long next = Unsafe.getLong(page);
+            long bytes = prepared.probe.variable()
+                    ? QuestPartitions.VARIABLE_HEADER_BYTES + Unsafe.getLong(page + QuestPartitions.PAGE_CAPACITY_OFFSET)
+                    : QuestPartitions.PAGE_BYTES;
+            partitionAllocator.free(page, bytes);
+            page = next;
+        }
+        // Separate VARCHAR payload blobs can still be referenced by final keys/states.
+        // Their arena remains alive until clear(), after the result cursor closes.
     }
 
     private void mergePartition(Map destination, GroupByKernel.Updater sourceUpdater, int partition, Runnable checkpoint,
@@ -979,12 +1038,13 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private void partitionInputs(long begin, long rows, Map map) {
         long batchSize = Unsafe.getLong(addresses);
         Unsafe.putLong(addresses, inputPartitions);
+        partitionMemory.enter(null);
         try {
             long position = begin;
             while (position < rows) {
                 Unsafe.putLong(stateAddress + START_ROW, position);
                 long status = prepared.inputPartitionCode.run(addresses, rows, stateAddress);
-                memory.throwIfFailed();
+                partitionMemory.throwIfFailed();
                 if (status == 0) break;
                 if (status != NEED_STAGING) throw new IllegalStateException("Input partition failed: " + status);
                 position = Unsafe.getLong(stateAddress + RESUME_ROW);
@@ -999,6 +1059,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
             if (PROFILE) mapCalls++;
         } finally {
             Unsafe.putLong(addresses, batchSize);
+            partitionMemory.close();
         }
     }
 

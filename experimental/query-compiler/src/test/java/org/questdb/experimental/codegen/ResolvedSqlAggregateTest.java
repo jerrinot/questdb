@@ -2663,7 +2663,9 @@ public class ResolvedSqlAggregateTest {
                 + "(2,'a'),(2,'z-longer-than-original'),(2,'zz'),(3,null),(4,'中'),(4,'ž')", context);
         assertMatches("select k,min(value),max(value),count() from extrema group by k", true);
         shardingThreshold = 2;
-        engine.execute("insert into extrema select cast(x%2003 as int),cast('long-value-'||cast(x as string) as varchar) from long_sequence(10003)", context);
+        // Keep one frame and force a large sink growth. With many small groups, a
+        // map allocation on another worker can win every budget failure instead.
+        engine.execute("insert into extrema values (1,'" + "z".repeat(1 << 20) + "')", context);
         String sql = "select k,min(value),max(value),count() from extrema group by k";
         context.setQueryCodeGenerator(compiler);
         try (var factory = Demo.compileSql(engine, context, sql, true)) {
@@ -3074,6 +3076,10 @@ public class ResolvedSqlAggregateTest {
                     var update = code.newUpdater(allocator);
                     slots.incrementAndGet();
                     Updater wrapped = new Updater() {
+                        @Override public void prepareExecution(io.questdb.cairo.CairoConfiguration configuration, io.questdb.std.MemoryTracker tracker) {
+                            update.prepareExecution(configuration, tracker);
+                        }
+                        @Override public void releasePartition(int partition) { update.releasePartition(partition); }
                         private void recordUpdate(long beforeInputs, long count) {
                             if (update instanceof AggregateSlot slot) inputPartitionRows.addAndGet(slot.inputPartitionRows() - beforeInputs);
                             if (failInputPartition && update instanceof AggregateSlot slot && slot.inputPartitionRows() > beforeInputs) {

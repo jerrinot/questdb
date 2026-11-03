@@ -54,6 +54,7 @@ public final class HashJoinGroupByKeys {
     private final BitSet buildTimestampAsNanos = new BitSet();
     private final IntList buildTypes = new IntList();
     private final IntList probeColumns = new IntList();
+    private final IntList probeSources = new IntList();
     private final BitSet probeStringAsVarchar = new BitSet();
     private final BitSet probeTimestampAsNanos = new BitSet();
     private final IntList probeTypes = new IntList();
@@ -90,6 +91,11 @@ public final class HashJoinGroupByKeys {
      * The caller discards these keys when this returns false, so a rejected pair may stay appended.
      */
     public boolean add(int probeColumn, int probeType, int buildColumn, int buildType) {
+        return add(-1, probeColumn, probeType, buildColumn, buildType);
+    }
+
+    /** Source is a join-model index; -1 retains the single-probe caller's namespace. */
+    public boolean add(int source, int probeColumn, int probeType, int buildColumn, int buildType) {
         if (!isSupportedKeyType(probeType) || !isSupportedKeyType(buildType)) {
             return false;
         }
@@ -133,6 +139,7 @@ public final class HashJoinGroupByKeys {
             type = probeType;
         }
         probeColumns.add(probeColumn);
+        probeSources.add(source);
         probeTypes.add(probeType);
         buildColumns.add(buildColumn);
         buildTypes.add(buildType);
@@ -150,6 +157,10 @@ public final class HashJoinGroupByKeys {
 
     public int getProbeColumn(int key) {
         return probeColumns.getQuick(key);
+    }
+
+    public int getProbeSource(int key) {
+        return probeSources.getQuick(key);
     }
 
     public int getProbeType(int key) {
@@ -237,7 +248,8 @@ public final class HashJoinGroupByKeys {
 
     private boolean hasEncodingConflict(int key) {
         for (int i = 0; i < key; i++) {
-            if (probeColumns.getQuick(i) == probeColumns.getQuick(key)
+            if (probeSources.getQuick(i) == probeSources.getQuick(key)
+                    && probeColumns.getQuick(i) == probeColumns.getQuick(key)
                     && (probeStringAsVarchar.get(i) != probeStringAsVarchar.get(key)
                     || probeTimestampAsNanos.get(i) != probeTimestampAsNanos.get(key)
                     || symbolAsString.get(i) != symbolAsString.get(key)

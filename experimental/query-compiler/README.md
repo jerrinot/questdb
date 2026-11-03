@@ -4,6 +4,9 @@ This optional module generates native query pipelines inside QuestDB's ordinary
 SQL execution. The aim is faster complete queries through specialization and better
 execution strategies. ClickBench is a coverage/performance proxy; query names and
 benchmark distributions must not determine code generation.
+SSB serves the same role for joins. Faster joins, including multiway joins, remain
+a goal through reusable contracts and specialization on proven execution properties,
+validated on independent inputs beyond SSB's star schema.
 
 The module also contains standalone physical-plan and handwritten controls. Their
 algorithms, scheduling and result materialization can differ from integrated SQL.
@@ -144,6 +147,8 @@ The binders and focused tests are authoritative. Current families include:
 
 - INT/LONG addition, subtraction and multiplication, widening casts, comparisons,
   boolean predicates and constant membership;
+  resolved constant BETWEEN/NOT BETWEEN on supported integer expressions and direct
+  TIMESTAMP/TIMESTAMP_NS columns, preserving reversed bounds, units and NULL semantics;
   static SYMBOL equality/inequality against literals and small IN/NOT IN sets
   (up to 16 values, including runtime constants), with AND/OR/NOT composition;
   static SYMBOL LIKE/ILIKE/regex through the existing dictionary match sets,
@@ -202,10 +207,81 @@ The binders and focused tests are authoritative. Current families include:
   admission, worker-result merge, survivor heap packing, compaction/final sorting
   and final LIMIT prefix selection in the existing EncodedTopKBuffer. EXPLAIN uses
   `compiledTopK`; execution counters and result checks establish actual coverage.
-- INT inner-join probe pipelines with supported COUNT and integer/DOUBLE SUM/MIN/MAX/AVG, post-join
-  predicates and direct INT/LONG grouping. They borrow the existing frozen join;
+- INT, full-width LONG, static-SYMBOL and composite fixed-width inner-join probe pipelines
+  with supported COUNT and integer/DOUBLE SUM/MIN/MAX/AVG, post-join
+  predicates and supported fixed-width grouping. They borrow the existing frozen join;
   Java retains build and runtime ownership. Outer joins and general join-to-DISTINCT
   remain outside this binding.
+- The join kernel accepts independent typed builds and dependent inner-join chains
+  and branches. Keys can read the scan or earlier joined payloads, including composite
+  keys from multiple inputs. Dependent lookups execute inside their producer's duplicate
+  loop; dictionary resolution and group-map growth preserve every selected position.
+  Build-only child membership can be transferred to a single INT/LONG/SYMBOL producer
+  key before scanning, using existing probes and dictionary views. Compact keys use
+  a bitmap; sparse keys use QuestDB's split-block Bloom layout. Exact joins retain
+  duplicate multiplicity. Preparation requires known amortizable probe work and
+  available query memory; mixed-source conditions remain in the exact pipeline.
+  When all child key components come from one build, preparation can also cache
+  its exact child-chain head per producer row. This supports composite producers
+  and children and costs four bytes per producer row, without copying duplicate
+  products. Generated consumers retain the ordinary chains and exact fallback.
+  The known-work guard does not predict rejection by earlier joins; see
+  [measured gains and preparation limits](target/join-dependency-links.md).
+  COUNT(*) can consume an unobserved build's multiplicity instead of enumerating
+  its duplicate rows. Eligibility follows resolved sources: predicates, grouping
+  and later join keys must not read that build. A bounded, query-owned copy of the
+  existing heap's chain counts preserves ordinary probes and fallback. Independent
+  leaves multiply their counts; observed producer rows still iterate. Unique builds,
+  unknown probe work and insufficient memory skip the copy. A frame-level dispatch
+  keeps those executions on the ordinary loop. COUNT state and wrapping arithmetic
+  use the existing aggregate operation; SUM/AVG and COUNT(value) are not admitted
+  by this proof. See [multiplicity evidence](target/join-multiplicities.md).
+  Closed COUNT forests can also fold producer duplicates before the fact scan.
+  Predicates/grouping must read only the probe, and each dependent key must read
+  one producer. Reverse-order sums/products reuse cached heads and the frozen
+  heap's backward links; generated consumers then probe only roots. This supports
+  deeper trees, branches, independent roots and the same typed/composite keys.
+  Query-owned root weights replace intermediate counts/heads only after complete
+  success. Unsupported heaps, insufficient memory or subtree overflow preserve
+  ordinary execution. Zero weights reject before creating a group; final COUNT
+  arithmetic still wraps. See [subtree evidence and costs](target/join-subtrees.md).
+  SQL planning retains the existing join order when no common probe fits, admitting
+  supported plans into one fused aggregate factory. Each build reuses the existing serial/parallel
+  build, payload and probe lifecycle; all share the ordinary frame workers. Scalar
+  output and composite numeric/SYMBOL grouping use the existing fixed-key encoder
+  and maps; supported numeric expressions share the aggregate input bindings.
+  INT/SYMBOL lookup retains the narrow table. LONG/composite lookup borrows existing
+  Unordered8Map/OrderedMap views, using the same generated hashing/equality as other
+  map consumers. SYMBOL keys translate through the existing per-execution cache;
+  unresolved entries resume after ordinary dictionary lookup. Mixed key components
+  preserve RecordSink encoding. Range arithmetic never narrows LONG values.
+  SYMBOL payloads retain their source dictionaries. Dictionary-derived grouping
+  expressions and variable-width grouping remain outside this binding. Unsupported frames
+  use an exact Java fallback; unsupported plans retain ordinary execution. No new toggle.
+  Completed scalar integral keys feed shared conservative bounds or exact bitmaps,
+  including full-width LONG and translated SYMBOL IDs. Unknown map bounds use a
+  construction scan only when known probe work can amortize it. Composite keys use
+  exact probes. All-composite plans compile only that exact loop. The standalone
+  filter-only integration below is still INT-only. An alternative generated loop checks all sets before exact probing;
+  the existing adaptive policy measures complete frames, including map-growth retries.
+  Exact probing is the initial choice. Universal sets bypass alternative sampling.
+  Sets are shared immutable execution state, charged to the query and freed after drain.
+  Known unfiltered probe counts can admit larger exact bitmaps within a shared
+  distinct-key budget; existing filters retain their allowance. Unknown qualifying
+  counts keep the existing representation. The frame chooser retains both existing
+  and expanded membership, sharing the same compiled loop through slot-owned
+  descriptors. It changes no descriptor while another worker uses it and preserves
+  the selected representation across every growth retry. This adds no user switch
+  or third compiled loop. Frame timing remains sensitive to scheduling and shared
+  resources; it is not a guarantee of the best whole-query strategy.
+- Build-derived filters for an uninterrupted chain of INT inner joins sharing a
+  frame scan. Generated checks reject rows before ordinary joins fetch payloads;
+  duplicate multiplicity remains the joins' responsibility. Completed build keys
+  become query-owned ranges/bitmaps before frame dispatch, using the existing
+  scheduler. Sparse domains retain conservative bounds. Both sides of the first
+  join can supply the common scan without changing its ordinary build choice.
+  These are partial generated pipelines. The ordinary filter-only path still lacks
+  the fused path's adaptive bypass for filters that reject few rows.
 
 Integer MIN/MAX accepts LONG, INT and SHORT inputs and preserves the ordinary
 8-byte LONG or 4-byte INT state. Generated ordering normalizes SHORT/INT/LONG/DOUBLE results into signed 64-bit

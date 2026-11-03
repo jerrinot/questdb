@@ -76,6 +76,7 @@ public class PartitionLimitTest {
         var config = new DefaultCairoConfiguration(temporary.newFolder().toString()) {
             @Override public int getSqlPageFrameMaxRows() { return 2048; }
             @Override public int getSqlPageFrameMinRows() { return 256; }
+            @Override public long getGroupByAllocatorDefaultChunkSize() { return 128 * 1024; }
         };
         engine = new CairoEngine(config);
         pool = new WorkerPool(new WorkerPoolConfiguration() {
@@ -112,6 +113,7 @@ public class PartitionLimitTest {
                 assertEquals(10, rows.size());
                 assertEquals("A partition prefix is not the full result", -1, cursor.size());
                 assertEquals(INPUT_ROWS, nativeRows(physical));
+                long partitionBytes = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_GROUP_BY_FUNCTION);
                 long[] firstIds = new long[10];
                 Row[] first = new Row[10];
                 for (int i = 0; i < 10; i++) {
@@ -139,6 +141,8 @@ public class PartitionLimitTest {
                 cursor.calculateSize(context.getCircuitBreaker(), count);
                 assertEquals(expected.size(), count.get());
                 assertEquals(expected.size(), cursor.size());
+                assertTrue("Consumed partition pages must be released before the cursor closes",
+                        Unsafe.getMemUsedByTag(MemoryTag.NATIVE_GROUP_BY_FUNCTION) <= partitionBytes - QuestPartitions.PAGE_BYTES);
                 assertFalse(cursor.hasNext());
                 assertEquals(INPUT_ROWS, nativeRows(physical));
                 cursor.toTop();

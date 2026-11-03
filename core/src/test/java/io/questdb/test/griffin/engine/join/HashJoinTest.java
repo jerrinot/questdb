@@ -24,6 +24,7 @@
 
 package io.questdb.test.griffin.engine.join;
 
+import io.questdb.PropertyKey;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.sql.RecordCursor;
@@ -258,6 +259,27 @@ public class HashJoinTest extends AbstractCairoTest {
                             1\t10
                             2\t20
                             """);
+        });
+    }
+
+    @Test
+    public void testHashJoinGroupByBuildsSmallerInputWithoutTimestamp() throws Exception {
+        // Each small build fits in one chain page; building the 40K-row input does not.
+        setProperty(PropertyKey.CAIRO_SQL_HASH_JOIN_LIGHT_VALUE_MAX_PAGES, 1);
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE d AS (SELECT ((x - 1) % 4 + 1)::int k FROM long_sequence(8))");
+            execute("CREATE TABLE f AS (SELECT ((x - 1) % 4 + 1)::int k, x v FROM long_sequence(40_000))");
+            execute("CREATE TABLE e AS (SELECT x::int k FROM long_sequence(4))");
+            drainWalQueue();
+            final String sql = "SELECT d.k, sum(f.v) FROM d JOIN f ON d.k = f.k JOIN e ON f.k = e.k GROUP BY d.k ORDER BY d.k";
+            final String expected = "k\tsum\n1\t399980000\n2\t400000000\n3\t400020000\n4\t400040000\n";
+            try (RecordCursorFactory factory = select(sql)) {
+                for (int i = 0; i < 3; i++) {
+                    try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                        TestUtils.assertCursor(expected, cursor, factory.getMetadata(), true, sink);
+                    }
+                }
+            }
         });
     }
 

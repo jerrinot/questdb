@@ -84,6 +84,40 @@ public class FilterFusionTest {
     }
 
     @Test
+    public void constantRangesPreserveNullsReversedBoundsAndWidening() throws Exception {
+        for (String predicate : new String[]{
+                "p between 10 and 50",
+                "p between 50 and 10",
+                "not (p between 10 and 50)",
+                "v between -2147483649 and 2147483648",
+                "v between -9223372036854775807 and 9223372036854775807",
+                "cast(a as int) between 3 and 25",
+                "p+v between 10 and 50",
+                "p between 10 and 50 or p between null and 50"
+        }) {
+            assertMatches("select k,count(),sum(v) from t where " + predicate + " group by k", true);
+        }
+        assertMatches("select k,count(),sum(v) from t where p between k and v group by k", false);
+        engine.execute("alter table t add column top int", context);
+        assertMatches("select k,count(),sum(v) from t where top between 10 and 50 group by k", false);
+    }
+
+    @Test
+    public void constantTimestampRangesUseResolvedUnits() throws Exception {
+        engine.execute("create table times as (select cast(x%17 as int) k,"
+                + "cast(case when x%11=0 then null else 1735689600000000+x*1000000 end as timestamp) ts,"
+                + "cast(case when x%13=0 then null else 1735689600000000000+x*1000000000 end as timestamp_ns) ns "
+                + "from long_sequence(10003))", context);
+        for (String column : new String[]{"ts", "ns"}) {
+            String bounds = "cast('2025-01-01T00:02:00Z' as timestamp) and cast('2025-01-01T00:01:00Z' as timestamp)";
+            assertMatches("select k,count() from times where " + column + " between " + bounds + " group by k", true);
+            assertMatches("select k,count() from times where not (" + column + " between " + bounds + ") group by k", true);
+        }
+        assertMatches("select k,count() from times where cast(ts as date) between "
+                + "cast('2025-01-01T00:01:00Z' as timestamp) and cast('2025-01-01T00:02:00Z' as timestamp) group by k", false);
+    }
+
+    @Test
     public void masksTailsGrowthAndFlushPreserveResultsOnReopen() throws Exception {
         String old = System.getProperty("query.codegen.localCapacity");
         System.setProperty("query.codegen.localCapacity", "64");

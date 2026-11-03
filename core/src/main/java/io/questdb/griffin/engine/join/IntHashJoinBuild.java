@@ -40,6 +40,7 @@ import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 
 import java.io.Closeable;
+import java.util.function.IntConsumer;
 
 import static io.questdb.griffin.engine.join.IntHashJoinKeyTable.SLOT_SIZE;
 
@@ -314,7 +315,7 @@ public final class IntHashJoinBuild implements Closeable {
                     Unsafe.putInt(slot, key);
                     Unsafe.putInt(slot + 4, CompressedOffsets.compressBiased8(offset));
                     if (previous == 0) {
-                        table.keyCount++;
+                        table.recordNewKey(key);
                     }
                 }
                 continue;
@@ -333,7 +334,7 @@ public final class IntHashJoinBuild implements Closeable {
                 Unsafe.putInt(slot, key);
                 Unsafe.putInt(slot + 4, CompressedOffsets.compressBiased8(offset));
                 if (previous == 0) {
-                    table.keyCount++;
+                    table.recordNewKey(key);
                 }
             }
         }
@@ -441,15 +442,19 @@ public final class IntHashJoinBuild implements Closeable {
             checkPayloadSource(payloads);
             directory.allocate((long) partitionCount * DIRECTORY_ENTRY_SIZE, false);
             long keyCount = 0;
+            int minKey = Integer.MAX_VALUE;
+            int maxKey = Integer.MIN_VALUE;
             for (int p = 0; p < partitionCount; p++) {
                 final IntHashJoinKeyTable table = tables.getQuick(p);
                 final long entry = directory.address + (long) p * DIRECTORY_ENTRY_SIZE;
                 Unsafe.putLong(entry, table.slots.address);
                 Unsafe.putLong(entry + Long.BYTES, table.slotCount - 1);
                 keyCount += table.keyCount;
+                minKey = Math.min(minKey, table.minKey);
+                maxKey = Math.max(maxKey, table.maxKey);
             }
             final PartitionedFrozen partitioned = reusablePartitionedFrozen != null ? reusablePartitionedFrozen : new PartitionedFrozen();
-            partitioned.of(payloads, keyCount);
+            partitioned.of(payloads, keyCount, minKey, maxKey);
             frozen = partitioned;
             return partitioned;
         } catch (Throwable th) {
@@ -627,7 +632,7 @@ public final class IntHashJoinBuild implements Closeable {
         Unsafe.putInt(slot, key);
         Unsafe.putInt(slot + 4, CompressedOffsets.compressBiased8(offset));
         if (previous == 0) {
-            keys.keyCount++;
+            keys.recordNewKey(key);
         }
     }
 
@@ -726,6 +731,8 @@ public final class IntHashJoinBuild implements Closeable {
         long generation;
         long handleBase;
         long keysCount;
+        int maxKey;
+        int minKey;
         HashJoinPayloadSource payloads;
         long rowsAddress;
         long rowsCount;
@@ -750,8 +757,45 @@ public final class IntHashJoinBuild implements Closeable {
         }
 
         @Override
+        public int getMaxKey() {
+            return maxKey;
+        }
+
+        @Override
+        public int getMinKey() {
+            return minKey;
+        }
+
+        @Override
         public long getRowCount() {
             return rowsCount;
+        }
+
+        @Override
+        public long getRowHandle(long ordinal) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            assert ordinal >= 0 && ordinal < rowsCount;
+            return heap.hasChainLengths() ? -1 : handleBase + ordinal * heap.getRowSize();
+        }
+
+        @Override
+        public boolean copyKeyRowCounts(long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            if (heap.hasChainLengths()) return false;
+            heap.copyChainCounts(address);
+            return true;
+        }
+
+        @Override
+        public boolean sumKeyRowWeights(long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            return !heap.hasChainLengths() && heap.sumChainWeights(address);
         }
 
         @Override
@@ -774,9 +818,11 @@ public final class IntHashJoinBuild implements Closeable {
                     && payloads.writeNativeColumn(column, address);
         }
 
-        void ofHeap(HashJoinPayloadSource payloads, long keysCount) {
+        void ofHeap(HashJoinPayloadSource payloads, long keysCount, int minKey, int maxKey) {
             handleBase = heap.nextHandleBase();
             this.keysCount = keysCount;
+            this.minKey = minKey;
+            this.maxKey = maxKey;
             rowsAddress = heap.getAddress();
             rowsCount = heap.getRowCount();
             size = IntHashJoinBuild.this.getSizeInBytes();
@@ -788,6 +834,15 @@ public final class IntHashJoinBuild implements Closeable {
     private class Frozen extends AbstractFrozen {
         private long keysAddress;
         private int slots;
+
+        @Override
+        public boolean forEachKey(IntConsumer visitor, SqlExecutionCircuitBreaker circuitBreaker) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            keys.forEachKey(visitor, circuitBreaker);
+            return true;
+        }
 
         @Override
         public boolean writeLookup(long address) {
@@ -816,7 +871,7 @@ public final class IntHashJoinBuild implements Closeable {
         private void of(HashJoinPayloadSource payloads) {
             keysAddress = keys.slots.address;
             slots = keys.slotCount;
-            ofHeap(payloads, keys.keyCount);
+            ofHeap(payloads, keys.keyCount, keys.minKey, keys.maxKey);
         }
 
         private class View extends AbstractHashJoinProbe implements FrozenHashJoinBuild.IntProbe {
@@ -916,6 +971,17 @@ public final class IntHashJoinBuild implements Closeable {
         private int partitionShift;
 
         @Override
+        public boolean forEachKey(IntConsumer visitor, SqlExecutionCircuitBreaker circuitBreaker) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            for (int i = 0, n = partitions.getPartitionCount(); i < n; i++) {
+                tables.getQuick(i).forEachKey(visitor, circuitBreaker);
+            }
+            return true;
+        }
+
+        @Override
         public boolean writeLookup(long address) {
             if (frozen != this || generation != heap.getGeneration()) {
                 throw new IllegalStateException("hash join build has expired");
@@ -939,10 +1005,10 @@ public final class IntHashJoinBuild implements Closeable {
             return new View();
         }
 
-        private void of(HashJoinPayloadSource payloads, long keyCount) {
+        private void of(HashJoinPayloadSource payloads, long keyCount, int minKey, int maxKey) {
             directoryAddress = directory.address;
             partitionShift = partitions.getPartitionShift();
-            ofHeap(payloads, keyCount);
+            ofHeap(payloads, keyCount, minKey, maxKey);
         }
 
         private class View extends AbstractHashJoinProbe implements FrozenHashJoinBuild.IntProbe {

@@ -428,7 +428,7 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
         }
         final int type = payloadTypes[column];
         if (type != ColumnType.BYTE && type != ColumnType.SHORT && type != ColumnType.INT
-                && type != ColumnType.LONG && type != ColumnType.DOUBLE) {
+                && type != ColumnType.LONG && type != ColumnType.DOUBLE && type != ColumnType.SYMBOL) {
             return false;
         }
         if (copyAddress != 0) {

@@ -58,6 +58,8 @@ import org.jetbrains.annotations.TestOnly;
  * holds that worker's pair of symbol tables and reads the shared cache.
  */
 public final class SymbolKeyTranslator implements QuietCloseable {
+    // Shared cache ABI: translated keys are nonnegative, VALUE_IS_NULL or VALUE_NOT_FOUND, never -1.
+    public static final int UNRESOLVED = -1;
     // Clearing checks the breaker once per MiB, as the build's buffers do.
     private static final long FILL_CHUNK_SIZE = 1024 * 1024;
     // Filling from the build checks the breaker once per 1,024 build keys.
@@ -78,8 +80,6 @@ public final class SymbolKeyTranslator implements QuietCloseable {
     // Fills from the build only when that takes at most an eighth of the lookups that resolving
     // every probe key would.
     private static final int FILL_FROM_BUILD_MIN_PROBE_RATIO = 8;
-    // Translated keys are nonnegative, VALUE_IS_NULL or VALUE_NOT_FOUND, never -1.
-    private static final int UNRESOLVED = -1;
     private long cacheAddress;
     private int cacheKeyCount;
     private long cacheSize;
@@ -258,6 +258,15 @@ public final class SymbolKeyTranslator implements QuietCloseable {
             cacheKeyCount = 0;
             probeKeyTable = null;
             buildKeyTable = null;
+        }
+
+        /** Native readers use these only while the slot's dictionaries remain pinned. */
+        public long getCacheAddress() {
+            return cacheAddress;
+        }
+
+        public int getCacheKeyCount() {
+            return cacheKeyCount;
         }
 
         /**

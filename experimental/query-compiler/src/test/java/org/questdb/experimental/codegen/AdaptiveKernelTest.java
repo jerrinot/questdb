@@ -58,6 +58,19 @@ public class AdaptiveKernelTest {
         assertEquals(101,calls[0]);assertEquals(0,calls[1]);
     }
 
+    @Test public void ineligibleAlternativesDoNotRunOrChangeLearnedCosts() {
+        long[] time = {0};
+        Kernel first = (c, r, s) -> { time[0] += 9 * r; return 0; };
+        Kernel second = (c, r, s) -> { time[0] += r; return 0; };
+        var adaptive = new AdaptiveKernel(first, second, () -> time[0]);
+        for (int i = 0; i < 14; i++) adaptive.runBatch(65536, kernel -> kernel.run(0, 65536, 0));
+        for (int i = 0; i < 256; i++) adaptive.runBatch(65536, false, kernel -> {
+            assertSame(first, kernel);
+            kernel.run(0, 65536, 0);
+        });
+        adaptive.runBatch(65536, kernel -> assertSame(second, kernel));
+    }
+
     @Test public void nearTiesKeepTheCurrentWinner() {
         long[] time={0};int[] calls={0,0};
         var adaptive=new AdaptiveKernel((c,r,s)->{time[0]+=100*r;calls[0]++;return 0;},

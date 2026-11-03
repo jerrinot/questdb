@@ -151,6 +151,12 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     }
 
     @Override
+    public JoinFilter compileJoinFilter(ColumnTypes inputs, ObjList<IntJoinFilterSource> sources) {
+        try { return ResolvedJoinFilter.compile(inputs, sources, backend, artifacts); }
+        catch (IOException failure) { throw CairoException.nonCritical().put("Join filter compilation failed: ").put(failure.getMessage()); }
+    }
+
+    @Override
     public CompiledProjection compileProjection(ColumnTypes inputs, int columnOffset, ObjList<Function> functions) {
         try { return ResolvedProjection.compile(inputs, columnOffset, functions, backend, artifacts); }
         catch (IOException e) { throw new IllegalStateException("Could not compile projection", e); }
@@ -220,6 +226,31 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
         try {
             return ResolvedJoinKernel.compile(joinedTypes, probeColumnCount, valueTypes, functions,
                     probeKeyColumn, value, postJoinFilter, groupKeyColumn, groupLayout, backend, artifacts);
+        } catch (IOException failure) {
+            throw CairoException.nonCritical().put("Join compilation failed: ").put(failure.getMessage());
+        }
+    }
+
+    @Override
+    public CompiledJoin compileJoin(ColumnTypes joinedTypes, int probeColumnCount, ColumnTypes valueTypes,
+                                    ObjList<GroupByFunction> functions, ObjList<CompiledJoin.Build> builds, MapValue value,
+                                    Function postJoinFilter, int groupKeyColumn, Map groupLayout) {
+        try {
+            return ResolvedJoinKernel.compile(joinedTypes, probeColumnCount, valueTypes, functions,
+                    builds, value, postJoinFilter, groupKeyColumn, groupLayout, backend, artifacts);
+        } catch (IOException failure) {
+            throw CairoException.nonCritical().put("Join compilation failed: ").put(failure.getMessage());
+        }
+    }
+
+    @Override
+    public CompiledJoin compileJoin(ColumnTypes joinedTypes, int probeColumnCount, ColumnTypes valueTypes,
+                                    ObjList<GroupByFunction> functions, ObjList<CompiledJoin.Build> builds, MapValue value,
+                                    Function postJoinFilter, ColumnTypes keyTypes, io.questdb.cairo.ListColumnFilter keyColumns,
+                                    ObjList<Function> keyFunctions, Map groupLayout) {
+        try {
+            return ResolvedJoinKernel.compile(joinedTypes, probeColumnCount, valueTypes, functions,
+                    builds, value, postJoinFilter, keyTypes, keyColumns, keyFunctions, groupLayout, backend, artifacts);
         } catch (IOException failure) {
             throw CairoException.nonCritical().put("Join compilation failed: ").put(failure.getMessage());
         }

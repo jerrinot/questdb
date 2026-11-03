@@ -404,7 +404,10 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         public long initialValue() { return 0; }
         @Override
         public void emit(Builder builder, Row row, Expr address) {
-            builder.store(address, add(load(address), i64(1)));
+            addRows(builder, address, i64(1));
+        }
+        public void addRows(Builder builder, Expr address, Expr rows) {
+            builder.store(address, add(load(address), rows));
         }
         @Override
         public void merge(Builder builder, Expr source, Expr destination) {

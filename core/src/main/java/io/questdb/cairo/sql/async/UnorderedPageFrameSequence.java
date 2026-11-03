@@ -513,6 +513,7 @@ public class UnorderedPageFrameSequence<T extends StatefulAtom> extends Abstract
 
     public void prepareForDispatch() {
         if (!isReadyToDispatch) {
+            atom.prepareForDispatch();
             buildAddressCache();
             isReadyToDispatch = true;
         }

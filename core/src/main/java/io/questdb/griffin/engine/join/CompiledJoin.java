@@ -27,20 +27,53 @@ package io.questdb.griffin.engine.join;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
-import io.questdb.griffin.engine.join.FrozenHashJoinBuild;
+import io.questdb.std.MemoryTracker;
 import io.questdb.std.ObjList;
 import io.questdb.std.QuietCloseable;
 import org.jetbrains.annotations.Nullable;
 
 /** Query-owned native join pipeline; acquired slots borrow the pinned build and input. */
 public interface CompiledJoin extends QuietCloseable {
+    /** Releases execution-owned state after every probe worker has drained. */
+    default void clearExecution() {
+    }
+
+    /** Prepares shared state before probe publication; probeRows is -1 when filtering makes it unknown. */
+    default void prepareBuilds(FrozenHashJoinBuild[] builds, long probeRows, MemoryTracker tracker,
+                              SqlExecutionCircuitBreaker circuitBreaker) {
+    }
+
+    /**
+     * Resolved keys in RecordSink order. Column indexes address the scan followed by earlier
+     * builds' payloads; this build appends its payload to that prefix after selecting a match.
+     */
+    record Build(int[] keyColumns, int[] keyTypes, int payloadColumnCount) {
+        public Build(int keyColumn, int payloadColumnCount) {
+            this(new int[]{keyColumn}, new int[]{io.questdb.cairo.ColumnType.INT}, payloadColumnCount);
+        }
+
+        public int keyColumn() {
+            return keyColumns[0];
+        }
+    }
+
     CharSequence getName();
 
     /** A cached slot-local check of the existing sequence's cancellation and breaker state. */
     Updater newUpdater(Runnable checkpoint);
 
     interface Updater extends QuietCloseable {
+        /** Owner-only preparation using this execution's bound dictionary views, before worker publication. */
+        default void prepareDependencies(FrozenHashJoinBuild[] builds, long probeRows, MemoryTracker tracker,
+                                         SqlExecutionCircuitBreaker breaker) {
+        }
+
+        /** Borrows a slot's dictionary translator; its tables/cache refresh on every reopen. */
+        default void bindSymbol(int build, int key, SymbolKeyTranslator.View translator) {
+        }
+
         /** Diagnostics read only after the frame sequence has drained. */
         long getNativeRows();
 
@@ -55,11 +88,24 @@ public interface CompiledJoin extends QuietCloseable {
          * a slot with no joined rows must not participate in the scalar merge.
          */
         boolean update(PageFrameMemoryRecord record, long rowCount, long rowIdsAddress,
-                       FrozenHashJoinBuild.IntKeyed build, MapValue value);
+                       FrozenHashJoinBuild build, MapValue value);
+
+        /** All builds are immutable and pinned until the caller's frame work drains. */
+        default boolean updateMulti(PageFrameMemoryRecord record, long rowCount, long rowIdsAddress,
+                                    FrozenHashJoinBuild[] builds, MapValue value) {
+            return builds.length == 1 && update(record, rowCount, rowIdsAddress, builds[0], value);
+        }
+
+        /** Same ownership as updateMulti; a retry must preserve every duplicate position. */
+        default boolean updateKeyedMulti(PageFrameMemoryRecord record, long rowCount, long rowIdsAddress,
+                                         FrozenHashJoinBuild[] builds, Map map, @Nullable ObjList<Map> shards,
+                                         GroupByFunctionsUpdater functions) {
+            return builds.length == 1 && updateKeyed(record, rowCount, rowIdsAddress, builds[0], map, shards, functions);
+        }
 
         /** Ordinary maps own insertion/growth; a sharded frame supplies its existing shard list. */
         default boolean updateKeyed(PageFrameMemoryRecord record, long rowCount, long rowIdsAddress,
-                                    FrozenHashJoinBuild.IntKeyed build, Map map, @Nullable ObjList<Map> shards,
+                                    FrozenHashJoinBuild build, Map map, @Nullable ObjList<Map> shards,
                                     GroupByFunctionsUpdater functions) {
             return false;
         }

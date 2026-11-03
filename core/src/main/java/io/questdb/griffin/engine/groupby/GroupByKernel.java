@@ -111,6 +111,9 @@ public interface GroupByKernel extends QuietCloseable {
     record MergeTask(long address, long index, int phase) { }
 
     interface Updater extends QuietCloseable {
+        /** Owner-only, before dispatch: bind slot-owned scratch to this execution's tracker. */
+        default void prepareExecution(CairoConfiguration configuration, io.questdb.std.MemoryTracker tracker) { }
+
         /** Restrict a full frame or compact existing row IDs in place. -1 leaves the input unchanged. */
         default long filterGroups(PageFrameMemoryRecord record, long rowCount, boolean filtered,
                                   DirectLongList rows, SqlExecutionCircuitBreaker circuitBreaker) { return -1; }
@@ -162,8 +165,11 @@ public interface GroupByKernel extends QuietCloseable {
         /** Called after all scan tasks drain, before choosing the ordinary merge path. */
         default boolean hasPartitions() { return false; }
 
-        /** Append remaining local state; storage belongs to the query's slot allocator. */
+        /** Append remaining local state; storage lives until its partition is released or the query closes. */
         default void partition(Map source, Runnable checkpoint) { throw new UnsupportedOperationException(); }
+
+        /** The shard's exclusive consumer has finished every merge/replay pass. Other shards may still run. */
+        default void releasePartition(int partition) { }
 
         /** Source is read-only after scan completion; destination belongs to this acquired slot. */
         default void mergePartition(Map destination, Updater source, int partition, Runnable checkpoint) {

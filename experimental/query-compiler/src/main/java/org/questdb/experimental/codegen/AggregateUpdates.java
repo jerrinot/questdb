@@ -73,6 +73,20 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     int[] sourceIndexes() { return inputs.numericColumns(); }
     long cardinalityOffset() { return 8 + inputs.bytes(); }
 
+    boolean countsRowsOnly() {
+        for (var update : updates) {
+            if (!(update instanceof ScalarUpdate scalar) || !(scalar.operation instanceof Pipeline.Count)) return false;
+        }
+        return true;
+    }
+
+    void addCountedRows(Builder builder, Expr destination, Expr rows) {
+        for (var update : updates) {
+            var scalar = (ScalarUpdate) update;
+            ((Pipeline.Count) scalar.operation).addRows(builder, at(destination, scalar.offset), rows);
+        }
+    }
+
     /** Shared resolved-function binding; state offsets come from the owning engine value layout. */
     static AggregateUpdates bind(ColumnTypes inputTypes, ColumnTypes valueTypes, ObjList<GroupByFunction> functions,
                            IntToLongFunction offsets, boolean allowDistinct) {
@@ -91,7 +105,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             return null;
         }
         var updates = new ArrayList<Update>();
-        var strings = new ResolvedVarchar(inputs.types(), inputs);
+        var strings = inputs.strings();
         var assignedSlots = new HashSet<Integer>();
         for (int i = 0; i < functions.size(); i++) {
             GroupByFunction function = functions.getQuick(i);

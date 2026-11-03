@@ -1,5 +1,8 @@
 # Compiler experiment plan: own the parallel program
 
+Active sequence as of 2026-11-02: [whole-query experiments and goals](WHOLE_QUERY_PLAN.md).
+The dated sequence below remains historical evidence and design context.
+
 Current instruction (2026-10-29): expand SYMBOL and INT/LONG/DOUBLE coverage,
 then VARCHAR, then pursue another measured architectural experiment. Profiling
 has resumed. The older checkpoint and pause statements below describe their

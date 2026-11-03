@@ -40,12 +40,18 @@ import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.async.PageFrameReduceTaskFactory;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.QueryCodeGenerator;
+import io.questdb.griffin.engine.table.AsyncJitFilteredRecordCursorFactory;
+import io.questdb.griffin.engine.table.FilteredRecordCursorFactory;
 import io.questdb.griffin.engine.table.SymbolTranslatingRecord;
 import io.questdb.griffin.model.JoinContext;
+import io.questdb.std.IntHashSet;
 import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
 import io.questdb.std.Transient;
 import org.jetbrains.annotations.Nullable;
 
@@ -53,9 +59,13 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
     private final RecordSink masterSink;
     private final int @Nullable [] masterSymbolKeyColumnIndices;
     private final RecordSink slaveKeySink;
+    private final int runtimeProbeColumn;
+    private final int runtimeSlaveColumn;
     private final int @Nullable [] slaveSymbolKeyColumnIndices;
     private HashJoinRecordCursor cursor;
     private boolean masterDetermined = false;
+    private AsyncJitFilteredRecordCursorFactory runtimeFilterFactory;
+    private boolean runtimeFilterOnSlave;
     private @Nullable SymbolTranslatingRecord symbolTranslatingRecord;
 
     public HashJoinLightRecordCursorFactory(
@@ -70,9 +80,13 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
             int columnSplit,
             JoinContext joinContext,
             int @Nullable [] masterSymbolKeyColumnIndices,
-            int @Nullable [] slaveSymbolKeyColumnIndices
+            int @Nullable [] slaveSymbolKeyColumnIndices,
+            int runtimeProbeColumn,
+            int runtimeSlaveColumn
     ) {
         super(metadata, joinContext, masterFactory, slaveFactory);
+        this.runtimeProbeColumn = runtimeProbeColumn;
+        this.runtimeSlaveColumn = runtimeSlaveColumn;
         this.masterSymbolKeyColumnIndices = masterSymbolKeyColumnIndices;
         this.slaveSymbolKeyColumnIndices = slaveSymbolKeyColumnIndices;
         this.symbolTranslatingRecord = masterSymbolKeyColumnIndices != null ?
@@ -103,8 +117,8 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
             masterCursor = masterFactory.getCursor(executionContext);
             boolean swapped = false;
             if (masterFactory.recordCursorSupportsRandomAccess() && !masterDetermined) {
-                long masterSize = masterCursor.size();
-                long slaveSize = slaveCursor.size();
+                long masterSize = runtimeFilterFactory == null || runtimeFilterOnSlave ? masterCursor.size() : runtimeFilterFactory.getUnfilteredSize();
+                long slaveSize = runtimeFilterFactory == null || !runtimeFilterOnSlave ? slaveCursor.size() : runtimeFilterFactory.getUnfilteredSize();
 
                 if (masterSize > 0 && slaveSize > 0 && masterSize < slaveSize) {
                     RecordCursor temp = masterCursor;
@@ -137,6 +151,69 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
     @Override
     public boolean recordCursorSupportsRandomAccess() {
         return false;
+    }
+
+    /** Push redundant membership through an uninterrupted INNER chain to its common frame scan. */
+    public void prepareRuntimeFilter(SqlExecutionContext context, PageFrameReduceTaskFactory tasks) {
+        ObjList<HashJoinLightRecordCursorFactory> joins = new ObjList<>();
+        HashJoinLightRecordCursorFactory inner = this;
+        while (true) {
+            if (inner.runtimeProbeColumn < 0 || inner.runtimeFilterFactory != null) {
+                return;
+            }
+            joins.add(inner);
+            if (!(inner.masterFactory instanceof HashJoinLightRecordCursorFactory next)) {
+                break;
+            }
+            inner = next;
+        }
+        int masterColumns = inner.masterFactory.getMetadata().getColumnCount();
+        // An ordinary first join can swap at execution time. The common scan can therefore
+        // appear on either side in the resolved SQL; outer keys identify its column interval.
+        boolean onSlave = joins.size() > 1 && joins.getQuick(0).runtimeProbeColumn >= masterColumns;
+        RecordCursorFactory base = onSlave ? inner.slaveFactory : inner.masterFactory;
+        int offset = onSlave ? masterColumns : 0;
+        // Single-build pipelines already have their own compilation path. Do not cross filters,
+        // projections, outer joins or other operators whose semantics need separate reasoning.
+        if (joins.size() < 2 || !base.supportsPageFrameCursor()
+                || base instanceof AsyncJitFilteredRecordCursorFactory || base instanceof FilteredRecordCursorFactory) {
+            return;
+        }
+        ObjList<QueryCodeGenerator.IntJoinFilterSource> sources = new ObjList<>(joins.size());
+        IntHashSet columns = new IntHashSet();
+        for (int i = joins.size() - 1; i >= 0; i--) {
+            HashJoinLightRecordCursorFactory join = joins.getQuick(i);
+            int column = join == inner ? (onSlave ? join.runtimeSlaveColumn : join.runtimeProbeColumn)
+                    : join.runtimeProbeColumn - offset;
+            if (column < 0 || column >= base.getMetadata().getColumnCount()) {
+                return;
+            }
+            boolean expectedSwap = join == inner && onSlave;
+            // The map record stores two INT chain endpoints before its single key.
+            sources.add(new QueryCodeGenerator.IntJoinFilterSource(column, 2,
+                    () -> join.cursor.isMapBuilt && join.cursor.swapped == expectedSwap ? join.cursor.joinKeyMap : null));
+            columns.add(column);
+        }
+        QueryCodeGenerator.JoinFilter generated = context.getQueryCodeGenerator().compileJoinFilter(base.getMetadata(), sources);
+        if (generated == null) {
+            return;
+        }
+        try {
+            AsyncJitFilteredRecordCursorFactory filtered = new AsyncJitFilteredRecordCursorFactory(
+                    context.getCairoEngine(), context.getCairoEngine().getConfiguration(), context.getMessageBus(), base,
+                    new ObjList<>(), generated.compiled().rows(), generated.compiled().count(), generated.fallback(),
+                    columns, tasks, null, null, null, 0, context.getSharedQueryWorkerCount(), false
+            );
+            if (onSlave) inner.slaveFactory = filtered;
+            else inner.masterFactory = filtered;
+            inner.runtimeFilterFactory = filtered;
+            inner.runtimeFilterOnSlave = onSlave;
+        } catch (Throwable failure) {
+            Misc.free(generated.compiled().rows(), failure);
+            Misc.free(generated.compiled().count(), failure);
+            Misc.free(generated.fallback(), failure);
+            throw failure;
+        }
     }
 
     @Override

@@ -301,6 +301,9 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
                 }
             }
             compiled.finalizeMap(destMap, checkpoint);
+            for (int i = 0; i < compiledUpdaters.size(); i++) {
+                compiledUpdaters.getQuick(i).releasePartition(shardIndex);
+            }
             if (configuration.isGroupByPresizeEnabled()) {
                 lastShardStats.getQuick(shardIndex).update(0, -1, destMap.size(), destMap.getHeapSize());
             }

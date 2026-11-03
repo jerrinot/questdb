@@ -309,6 +309,20 @@ public class SparklineGroupByFunctionFactoryTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testJoinPreservesInputOrder() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE d AS (SELECT x::int k, x::double val FROM long_sequence(3))");
+            execute("CREATE TABLE f AS (SELECT ((6 - x) % 3 + 1)::int k FROM long_sequence(6))");
+            // Swapping the join would follow f's descending keys instead of d's forward order.
+            assertQuery("SELECT sparkline(d.val) FROM d JOIN f ON d.k = f.k")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("sparkline\n▁▁▄▄██\n");
+        });
+    }
+
+    @Test
     public void testOrderBySparkline() throws Exception {
         // ORDER BY on the sparkline result drives the sort comparator,
         // which fetches getVarcharA and getVarcharB from the same Function

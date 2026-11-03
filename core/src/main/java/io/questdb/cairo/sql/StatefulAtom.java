@@ -39,6 +39,10 @@ public interface StatefulAtom extends QuietCloseable, Mutable {
     default void close() {
     }
 
+    /** Owner-only publication of late-bound state, before any frame task can run. */
+    default void prepareForDispatch() {
+    }
+
     /**
      * Initializes state required for filtering, such as child atoms, symbol table sources,
      * bind variable values, circuit breakers, etc.

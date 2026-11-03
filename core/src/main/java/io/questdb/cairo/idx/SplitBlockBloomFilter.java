@@ -61,6 +61,21 @@ public final class SplitBlockBloomFilter {
     private SplitBlockBloomFilter() {
     }
 
+    /** Compile-time salt access for consumers generating the same native block probes. */
+    public static int getSalt(int lane) {
+        return switch (lane) {
+            case 0 -> SALT_0;
+            case 1 -> SALT_1;
+            case 2 -> SALT_2;
+            case 3 -> SALT_3;
+            case 4 -> SALT_4;
+            case 5 -> SALT_5;
+            case 6 -> SALT_6;
+            case 7 -> SALT_7;
+            default -> throw new IndexOutOfBoundsException(lane);
+        };
+    }
+
     public static long allocate(int filterSize) {
         long addr = Unsafe.malloc(filterSize, MemoryTag.NATIVE_INDEX_READER);
         Unsafe.setMemory(addr, filterSize, (byte) 0);

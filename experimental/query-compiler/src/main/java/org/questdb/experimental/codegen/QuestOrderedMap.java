@@ -64,6 +64,10 @@ final class QuestOrderedMap {
             Var packed = loop.let(load(slotAddress));
             Var raw = loop.let(binary(Op.AND, packed, i64(0xffff_ffffL)));
             loop.when(eq(raw, i64(0)), missing -> {
+                if (!probe.mutable()) {
+                    QuestMapProbe.miss(missing, position, lookup.shard(), beforeMiss);
+                    return;
+                }
                 Var entry = missing.let(new Load(MemoryType.ADDRESS, at(view, NativeMapView.Ordered.APPEND)));
                 Var bytes = missing.let(probe.variable() ? QuestVariableKey.stride(key, load(at(view, NativeMapView.STRIDE))) : load(at(view, NativeMapView.STRIDE)));
                 missing.when(binary(Op.EITHER, binary(Op.LT, load(at(view, NativeMapView.FREE)), i64(2)),

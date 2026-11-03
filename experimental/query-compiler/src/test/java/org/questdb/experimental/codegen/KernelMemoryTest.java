@@ -43,6 +43,28 @@ public class KernelMemoryTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test
+    public void nestedPageArenaInheritsCancellationAndRestoresOuterAllocator() {
+        try (var state = new FastGroupByAllocator(64, 1024);
+             var pages = new FastGroupByAllocator(64, 1024)) {
+            var outer = KernelMemory.reusable(state);
+            var inner = KernelMemory.reusable(pages);
+            var failure = new IllegalStateException("cancelled");
+            outer.enterCheckpoint(() -> { throw failure; });
+            try (outer) {
+                inner.enter(null);
+                try (inner) {
+                    assertSame(pages, KernelMemory.allocator());
+                    assertEquals(0, KernelMemory.malloc(64));
+                    assertSame(failure, assertThrows(IllegalStateException.class, inner::throwIfFailed));
+                    assertEquals(0, pages.allocated());
+                }
+                assertSame(state, KernelMemory.allocator());
+            }
+            assertThrows(IllegalStateException.class, KernelMemory::allocator);
+        }
+    }
+
+    @Test
     public void nativeCallbacksThrottleOnlyConnectionChecksAndReleaseFailedScopes() throws Exception {
         AtomicLong clock = new AtomicLong(1_000);
         var config = new DefaultSqlExecutionCircuitBreakerConfiguration() {

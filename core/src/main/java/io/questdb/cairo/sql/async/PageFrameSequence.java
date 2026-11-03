@@ -336,6 +336,11 @@ public class PageFrameSequence<T extends StatefulAtom> extends AbstractPageFrame
         return frameCursor;
     }
 
+    /** Snapshot size before filtering; not the number of rows returned by this sequence. */
+    public long getUnfilteredSize() {
+        return frameCursor.size();
+    }
+
     public PageFrameReduceTask getTask(long cursor) {
         assert cursor > -1;
         if (cursor == LOCAL_TASK_CURSOR) {
@@ -494,6 +499,7 @@ public class PageFrameSequence<T extends StatefulAtom> extends AbstractPageFrame
      */
     public void prepareForDispatch() {
         if (!readyToDispatch) {
+            atom.prepareForDispatch();
             buildAddressCache();
             readyToDispatch = true;
         }

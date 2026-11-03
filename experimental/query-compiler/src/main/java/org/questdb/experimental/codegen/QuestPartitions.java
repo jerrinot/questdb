@@ -44,7 +44,7 @@ final class QuestPartitions {
     // Variable pages add used/capacity bytes; each record is hash + aligned OrderedMap key/state.
     static final int VARIABLE_HEADER_BYTES = 4 * Long.BYTES;
     private static final int PAGE_USED_OFFSET = 2 * Long.BYTES;
-    private static final int PAGE_CAPACITY_OFFSET = 3 * Long.BYTES;
+    static final int PAGE_CAPACITY_OFFSET = 3 * Long.BYTES;
     static final int SKETCH_OFFSET = GroupByMapFragment.NUM_SHARDS * BUCKET_BYTES;
     // A reserved word follows the sketch pointer.
     private static final int BLOB_OFFSET = SKETCH_OFFSET + 2 * Long.BYTES;

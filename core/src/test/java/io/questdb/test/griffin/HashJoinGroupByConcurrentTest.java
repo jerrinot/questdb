@@ -35,6 +35,7 @@ import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.griffin.engine.table.AsyncHashJoinGroupByAtom;
+import io.questdb.griffin.engine.table.HashJoinBuildContext;
 import io.questdb.griffin.engine.table.AsyncHashJoinGroupByRecordCursorFactory;
 import io.questdb.mp.Worker;
 import io.questdb.mp.WorkerPoolMode;
@@ -928,7 +929,7 @@ public class HashJoinGroupByConcurrentTest extends AbstractCairoTest {
      * inside the atom.
      */
     private static final class AllWorkersProbeLatch extends CountDownLatch {
-        private static final String ATOM_CLASS_NAME = AsyncHashJoinGroupByAtom.class.getName();
+        private static final String ATOM_CLASS_NAME = HashJoinBuildContext.class.getName();
         private static final String FACTORY_CLASS_NAME = AsyncHashJoinGroupByRecordCursorFactory.class.getName();
         private static final StackWalker STACK_WALKER = StackWalker.getInstance();
         private final CyclicBarrier probing;

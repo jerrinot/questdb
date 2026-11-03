@@ -36,6 +36,7 @@ import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.griffin.engine.functions.test.TestFaultFunctionFactory;
 import io.questdb.griffin.engine.functions.test.TestLatchedCounterFunctionFactory;
 import io.questdb.griffin.engine.table.AsyncHashJoinGroupByAtom;
+import io.questdb.griffin.engine.table.HashJoinBuildContext;
 import io.questdb.griffin.engine.table.AsyncHashJoinGroupByRecordCursorFactory;
 import io.questdb.griffin.engine.table.HashJoinBuildFrames;
 import io.questdb.mp.WorkerPoolMode;
@@ -77,7 +78,7 @@ import static io.questdb.test.griffin.HashJoinGroupByQualificationTest.result;
  * take effect fails the case too.
  */
 public class HashJoinGroupByCancellationTest extends AbstractCairoTest {
-    private static final String ATOM = AsyncHashJoinGroupByAtom.class.getName();
+    private static final String ATOM = HashJoinBuildContext.class.getName();
     private static final String FACTORY = AsyncHashJoinGroupByRecordCursorFactory.class.getName();
     // Each key shape and the prefix of its probe loops: the INT layout, a key staged into the build's
     // map, and the INT layout's translated SYMBOL key.

@@ -96,7 +96,7 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
             @NotNull IntHashSet filterUsedColumnIndexes,
             @NotNull PageFrameReduceTaskFactory reduceTaskFactory,
             @Nullable ObjList<Function> perWorkerFilters,
-            @NotNull ExpressionNode filterExpr,
+            @Nullable ExpressionNode filterExpr,
             @Nullable Function limitLoFunction,
             int limitLoPos,
             int workerCount,
@@ -329,9 +329,14 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
         return true;
     }
 
+    /** Used by a redundant join filter to preserve the ordinary join's build-side choice. */
+    public long getUnfilteredSize() {
+        return frameSequence.getUnfilteredSize();
+    }
+
     @Override
     public boolean supportsFilterStealing() {
-        return limitLoFunction == null;
+        return limitLoFunction == null && filterExpr != null;
     }
 
     @Override
@@ -581,6 +586,11 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
         public void clear() {
             compiledFilter.clearExecution();
             super.clear();
+        }
+
+        @Override
+        public void prepareForDispatch() {
+            compiledFilter.prepareForDispatch();
         }
 
         @Override

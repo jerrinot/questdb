@@ -64,9 +64,13 @@ public final class CompiledKernel implements Kernel, AutoCloseable {
 
     /** All worker calls must have joined when work returns, including failures. */
     void runBatch(long rows, Consumer<Kernel> work) {
+        runBatch(rows, true, work);
+    }
+
+    void runBatch(long rows, boolean allowAlternatives, Consumer<Kernel> work) {
         if (kernel == null) throw new IllegalStateException("Compiled kernel is closed");
         if (rows < 0) throw new IllegalArgumentException("Negative row count");
-        if (kernel instanceof AdaptiveKernel adaptive) adaptive.runBatch(rows, work);
+        if (kernel instanceof AdaptiveKernel adaptive) adaptive.runBatch(rows, allowAlternatives, work);
         else work.accept(this);
     }
 

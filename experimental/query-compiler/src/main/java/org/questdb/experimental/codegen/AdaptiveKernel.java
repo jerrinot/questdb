@@ -99,6 +99,12 @@ final class AdaptiveKernel implements Kernel {
 
     /** The caller joins every use of the selected code before returning. */
     void runBatch(long rows, Consumer<Kernel> work) {
+        runBatch(rows, true, work);
+    }
+
+    /** A proven-redundant alternative need not be sampled; preserve feedback for later batches. */
+    void runBatch(long rows, boolean allowAlternatives, Consumer<Kernel> work) {
+        if (!allowAlternatives) { work.accept(alternatives[0]); return; }
         Policy policy = policies.get();
         if (rows < MIN_SAMPLE_ROWS) { work.accept(alternatives[policy.winner]); return; }
         if (policy.remaining > 0) {

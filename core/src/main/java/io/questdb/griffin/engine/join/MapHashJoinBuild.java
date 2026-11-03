@@ -33,7 +33,10 @@ import io.questdb.cairo.SingleColumnType;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.map.MapProbeView;
+import io.questdb.cairo.map.MapRecord;
+import io.questdb.cairo.map.MapRecordCursor;
 import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.map.NativeMapView;
 import io.questdb.cairo.map.OrderedMap;
 import io.questdb.cairo.map.Unordered8Map;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
@@ -1044,6 +1047,33 @@ public final class MapHashJoinBuild implements Closeable {
         }
 
         @Override
+        public long getRowHandle(long ordinal) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            assert ordinal >= 0 && ordinal < rowsCount;
+            return heap.hasChainLengths() ? -1 : handleBase + ordinal * heap.getRowSize();
+        }
+
+        @Override
+        public boolean copyKeyRowCounts(long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            if (heap.hasChainLengths()) return false;
+            heap.copyChainCounts(address);
+            return true;
+        }
+
+        @Override
+        public boolean sumKeyRowWeights(long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            return !heap.hasChainLengths() && heap.sumChainWeights(address);
+        }
+
+        @Override
         public long getRowId(long ordinal) {
             assert heap.hasRowId() && ordinal >= 0 && ordinal < rowsCount && generation == heap.getGeneration();
             return HashJoinRowHeap.getRowIdAt(rowsAddress, ordinal);
@@ -1052,6 +1082,60 @@ public final class MapHashJoinBuild implements Closeable {
         @Override
         public long getSizeInBytes() {
             return size;
+        }
+
+        @Override
+        public boolean forEachIntegralKey(java.util.function.LongConsumer visitor, SqlExecutionCircuitBreaker breaker) {
+            if (keyTypes.getColumnCount() != 1 || !Unordered8Map.isSupportedKeyType(keyTypes.getColumnType(0))) return false;
+            if (frozen != this || generation != heap.getGeneration()) throw new IllegalStateException("hash join build has expired");
+            for (int i = 0, n = getNativeMapCount(); i < n; i++) {
+                breaker.statefulThrowExceptionIfTripped();
+                MapRecordCursor cursor = (n == 1 ? map : maps.getQuick(i)).getCursor();
+                MapRecord record = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    breaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    visitor.accept(record.getLong(1));
+                }
+            }
+            return true;
+        }
+
+        @Override
+        public int getNativeMapCount() {
+            return this instanceof PartitionedFrozen p ? p.partitionCount : 1;
+        }
+
+        @Override
+        public void writeNativeMapViews(long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            for (int i = 0, n = getNativeMapCount(); i < n; i++) {
+                (n == 1 ? map : maps.getQuick(i)).writeNativeProbeView(address + (long) i * NativeMapView.PROBE_BYTES);
+            }
+        }
+
+        @Override
+        public boolean writeLookup(long address, long mapViews) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            if (heap.hasChainLengths() || mapViews == 0) return false;
+            Unsafe.putLong(address, mapViews);
+            Unsafe.putLong(address + 8, getNativeMapCount() - 1);
+            Unsafe.putLong(address + 16, 0);
+            Unsafe.putLong(address + 24, this instanceof PartitionedFrozen p ? p.partitionShift : 32);
+            Unsafe.putLong(address + 32, rowsAddress);
+            return true;
+        }
+
+        @Override
+        public boolean writeNativePayload(int column, long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            return !heap.hasChainLengths() && heap.hasRowId() && payloads != null
+                    && payloads.writeNativeColumn(column, address);
         }
 
         void ofHeap(HashJoinPayloadSource payloads, long keysCount) {

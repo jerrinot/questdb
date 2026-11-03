@@ -617,7 +617,12 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
                 allocator.reopen();
             }
         }
-        if (compiledAggregates != null) compiledAggregates.prepareExecution(memoryTracker, executionCircuitBreaker, inputRows, perWorkerBatchLists.size() + 1);
+        if (compiledAggregates != null) {
+            compiledAggregates.prepareExecution(memoryTracker, executionCircuitBreaker, inputRows, perWorkerBatchLists.size() + 1);
+            for (int i = 0; i < compiledUpdaters.size(); i++) {
+                compiledUpdaters.getQuick(i).prepareExecution(configuration, memoryTracker);
+            }
+        }
     }
 
     public void resetLocalStats(int slotId) {

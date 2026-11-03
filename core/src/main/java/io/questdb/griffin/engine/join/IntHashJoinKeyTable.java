@@ -33,6 +33,8 @@ import io.questdb.std.QuietCloseable;
 import io.questdb.std.Unsafe;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.function.IntConsumer;
+
 /**
  * One key table of {@link IntHashJoinBuild}: linear probing at a maximum load of 1/2, eight-byte
  * slots of an INT key and the key's chain head, zero marking an unused slot. A serial build fills
@@ -48,6 +50,8 @@ final class IntHashJoinKeyTable implements QuietCloseable {
     // Read directly by the build and its frozen snapshots.
     final HashJoinBuffer slots = new HashJoinBuffer(MAX_BUFFER_SIZE);
     int keyCount;
+    int maxKey = Integer.MIN_VALUE;
+    int minKey = Integer.MAX_VALUE;
     int slotCount;
     private SqlExecutionCircuitBreaker circuitBreaker;
 
@@ -81,6 +85,8 @@ final class IntHashJoinKeyTable implements QuietCloseable {
     public void close() {
         slots.close();
         keyCount = slotCount = 0;
+        maxKey = Integer.MIN_VALUE;
+        minKey = Integer.MAX_VALUE;
         circuitBreaker = null;
     }
 
@@ -89,6 +95,18 @@ final class IntHashJoinKeyTable implements QuietCloseable {
      */
     long getSizeInBytes() {
         return slots.capacity;
+    }
+
+    void forEachKey(IntConsumer visitor, SqlExecutionCircuitBreaker circuitBreaker) {
+        for (int i = 0; i < slotCount; i++) {
+            if ((i & (KEY_SLOTS_PER_CHECK - 1)) == 0) {
+                circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+            }
+            long address = slots.address + (long) i * SLOT_SIZE;
+            if (Unsafe.getInt(address + 4) != 0) {
+                visitor.accept(Unsafe.getInt(address));
+            }
+        }
     }
 
     /**
@@ -101,6 +119,12 @@ final class IntHashJoinKeyTable implements QuietCloseable {
         circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
         slots.allocate((long) slotCount * SLOT_SIZE, true);
         this.slotCount = slotCount;
+    }
+
+    void recordNewKey(int key) {
+        keyCount++;
+        minKey = Math.min(minKey, key);
+        maxKey = Math.max(maxKey, key);
     }
 
     /**

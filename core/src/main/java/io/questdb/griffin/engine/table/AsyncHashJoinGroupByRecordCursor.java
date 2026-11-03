@@ -198,7 +198,7 @@ final class AsyncHashJoinGroupByRecordCursor implements RecordCursor {
                     for (int i = 0, n = frameSequence.getFrameCount(); i < n; i++) {
                         probeRows += frameSequence.getFrameRowCount(i);
                     }
-                    atom.maybeCopyPayload(probeRows, circuitBreaker);
+                    atom.prepareProbe(probeRows, circuitBreaker);
                     atom.getFilterContext().initMemoryPools(frameSequence.getPageFrameAddressCache(), frameSequence.getMemoryTracker());
                     frameSequence.dispatchAndAwait();
                 }

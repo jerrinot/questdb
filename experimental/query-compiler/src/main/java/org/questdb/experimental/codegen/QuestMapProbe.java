@@ -120,7 +120,7 @@ final class QuestMapProbe {
 
     static QuestMapProbe bind(int column, int type, Map map) {
         // A direct SYMBOL key is the table's stable 32-bit dictionary ID. The map
-        // and result cursor retain the existing symbol table and NULL (-1) contract.
+        // and result cursor retain the existing symbol table and NULL contract.
         if (type == ColumnType.SYMBOL || type == ColumnType.IPv4) type = ColumnType.INT;
         else if (type == ColumnType.DATE || ColumnType.isTimestamp(type)) type = ColumnType.LONG;
         if (column >= 0 && type == ColumnType.VARCHAR && map instanceof io.questdb.cairo.map.UnorderedVarcharMap) {
@@ -312,7 +312,18 @@ final class QuestMapProbe {
     /** Existing QuestDB probe, with an empty slot returning NULL instead of inserting. */
     Var findExisting(Builder b, Var key) {
         if (variable() || varchar()) throw new IllegalArgumentException("Fixed-width map required");
-        Lookup lookup = lookup(b, key, i64(0));
+        return findExisting(b, key, lookup(b, key, i64(0)));
+    }
+
+    /** Lookup in a borrowed frozen join map, outside aggregate state/sharding. */
+    Var findExisting(Builder b, Var key, Var view, Var hash) {
+        Var base = b.let(new Load(MemoryType.ADDRESS, view));
+        Var mask = b.let(load(at(view, NativeMapView.MASK)));
+        return findExisting(b, key, new Lookup(key, hash, null, view, base, mask,
+                b.let(binary(Op.AND, hash, mask))));
+    }
+
+    private Var findExisting(Builder b, Var key, Lookup lookup) {
         Var destination = b.let(nil()), done = b.let(bool(false));
         Var slot = lookup.slot();
         MemoryType width = keyType == ColumnType.INT ? MemoryType.I32 : MemoryType.I64;
@@ -328,6 +339,7 @@ final class QuestMapProbe {
                     occupied.when(keysEqual(occupied, entry, key), hit -> hit.assign(destination, valueAddress(entry)));
                 });
                 next.assign(slot, binary(Op.AND, add(slot, i64(1)), lookup.mask()));
+                next.when(eq(binary(Op.AND, slot, i64(1023)), i64(0)), Builder::poll);
             });
         } else {
             b.when(eq(key, i64(0)), zero -> {
@@ -342,6 +354,7 @@ final class QuestMapProbe {
                 next.assign(done, eq(stored, i64(0)));
                 next.when(eq(stored, key), hit -> hit.assign(destination, at(entry, width.bytes)));
                 next.assign(slot, binary(Op.AND, add(slot, i64(1)), lookup.mask()));
+                next.when(eq(binary(Op.AND, slot, i64(1023)), i64(0)), Builder::poll);
             });
         }
         return destination;

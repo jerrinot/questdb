@@ -26,8 +26,12 @@ package io.questdb.griffin.engine.join;
 
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.std.QuietCloseable;
+
+import java.util.function.IntConsumer;
+import java.util.function.LongConsumer;
 
 /**
  * Immutable lookup backing, borrowed from its builder for one execution. Publish
@@ -45,6 +49,42 @@ import io.questdb.std.QuietCloseable;
  * {@link Probe}.
  */
 public interface FrozenHashJoinBuild {
+    int LOOKUP_BYTES = 40;
+
+    /** Conservative integral bounds; min > max means unavailable. */
+    default long getMinIntegralKey() {
+        return Long.MAX_VALUE;
+    }
+
+    default long getMaxIntegralKey() {
+        return Long.MIN_VALUE;
+    }
+
+    /** Optional distinct integral-key iteration, before worker publication. */
+    default boolean forEachIntegralKey(LongConsumer visitor, SqlExecutionCircuitBreaker breaker) {
+        return false;
+    }
+
+    /** Number of NativeMapView descriptors required by a staged-key native lookup. */
+    default int getNativeMapCount() {
+        return 0;
+    }
+
+    /** Writes immutable map snapshots on the owner before probe publication. */
+    default void writeNativeMapViews(long address) {
+        throw new UnsupportedOperationException();
+    }
+
+    /** Five-word lookup header; mapViews is borrowed until all frame workers drain. */
+    default boolean writeLookup(long address, long mapViews) {
+        return false;
+    }
+
+    /** Borrowed payload descriptor, with the same lifetime as the frozen lookup. */
+    default boolean writeNativePayload(int column, long address) {
+        return false;
+    }
+
     /**
      * Replaces each key's chain of rows with the key's row count, for a query that only counts the
      * joined pairs: a probe then adds the rows a key matches without visiting them, through
@@ -59,9 +99,39 @@ public interface FrozenHashJoinBuild {
      */
     void countKeyRows();
 
+    /**
+     * Optionally copies each heap row's chain length into caller-owned LONG storage of
+     * {@code getRowCount() * 8} bytes, indexed by heap ordinal. Preserves the ordinary links
+     * and payloads. Called on the owner before worker publication; polls the build's breaker.
+     * Returns false when unsupported or when links have already been replaced by counts.
+     */
+    default boolean copyKeyRowCounts(long address) {
+        return false;
+    }
+
+    /**
+     * Optionally replaces caller-owned, nonnegative row weights with their chain sums,
+     * indexed as in {@link #copyKeyRowCounts(long)}. Preserves this build's links and payloads.
+     * Called before worker publication and polls the build's breaker. Returns false when
+     * unsupported, already counted, or a sum exceeds Long.MAX_VALUE; the caller must then
+     * discard the partially written weights. Throws if this frozen build has expired.
+     */
+    default boolean sumKeyRowWeights(long address) {
+        return false;
+    }
+
     long getKeyCount();
 
     long getRowCount();
+
+    /**
+     * Optional opaque handle for a frozen heap ordinal, suitable for {@link Probe#recordAt(long)}.
+     * The ordinal order is the same as {@link #getRowId(long)}. Returns -1 when unsupported
+     * or when the heap's chains have been replaced with counts. Handles expire with this build.
+     */
+    default long getRowHandle(long ordinal) {
+        return -1;
+    }
 
     /**
      * The id of the build row that the build appended ordinal-th, counting from zero. Rows keep
@@ -79,7 +149,48 @@ public interface FrozenHashJoinBuild {
      * A build whose probes look up a single INT key.
      */
     interface IntKeyed extends FrozenHashJoinBuild {
-        int LOOKUP_BYTES = 40;
+        @Override
+        default long getMinIntegralKey() {
+            return getMinKey();
+        }
+
+        @Override
+        default long getMaxIntegralKey() {
+            return getMaxKey();
+        }
+
+        @Override
+        default boolean forEachIntegralKey(LongConsumer visitor, SqlExecutionCircuitBreaker breaker) {
+            return forEachKey(key -> visitor.accept(key), breaker);
+        }
+
+        @Override
+        default boolean writeLookup(long address, long mapViews) {
+            return writeLookup(address);
+        }
+
+        /**
+         * Conservative inclusive bounds on this execution's keys, including the INT null sentinel.
+         * A minimum greater than the maximum means bounds are unavailable, as in the defaults.
+         * Bounds have no meaning when {@link #getKeyCount()} is zero.
+         */
+        default int getMaxKey() {
+            return Integer.MIN_VALUE;
+        }
+
+        /** @see #getMaxKey() */
+        default int getMinKey() {
+            return Integer.MAX_VALUE;
+        }
+
+        /**
+         * Visits each distinct key, including null, on the owner before probe publication.
+         * Optional: false means unsupported and must not invoke the visitor. The snapshot
+         * remains pinned for the whole visit; cancellation also covers empty table slots.
+         */
+        default boolean forEachKey(IntConsumer visitor, SqlExecutionCircuitBreaker circuitBreaker) {
+            return false;
+        }
 
         /**
          * Optional native lookup snapshot: five eight-byte words containing serial key-table
@@ -152,6 +263,15 @@ public interface FrozenHashJoinBuild {
      * {@link #reopen()} brings a closed probe back for the next execution.
      */
     interface Probe extends SymbolTableSource, QuietCloseable {
+        /**
+         * Optional native next-row link: byte offset plus eight, zero at the chain end,
+         * or -1 when unavailable. Borrows the same immutable heap as {@link FrozenHashJoinBuild#writeLookup(long, long)};
+         * does not advance the iterator. Valid only until the frozen build closes.
+         */
+        default long getNextRowLink() {
+            return -1;
+        }
+
         /**
          * The payload columns of the last row that {@link #next()}, a unique lookup or
          * {@link #recordAt(long)} positioned; null for a build without payload columns.

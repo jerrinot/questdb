@@ -30,6 +30,7 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.griffin.engine.functions.bool.AndFunctionFactory;
+import io.questdb.griffin.engine.functions.bool.BetweenTimestampFunctionFactory;
 import io.questdb.griffin.engine.functions.bool.InLongFunctionFactory;
 import io.questdb.griffin.engine.functions.bool.InSymbolFunctionFactory;
 import io.questdb.griffin.engine.functions.bool.OrFunctionFactory;
@@ -98,6 +99,10 @@ final class ResolvedInputs {
     }
 
     ColumnTypes types() { return types; }
+
+    ResolvedVarchar strings() {
+        return strings == null ? new ResolvedVarchar(types, this) : strings;
+    }
 
     static Pipeline.Row loadFrameRow(Ir.Builder b, List<Pipeline.Column> columns, Ir.Expr pointers, Ir.Expr row) {
         var values = new ArrayList<Pipeline.Value>();
@@ -217,6 +222,18 @@ final class ResolvedInputs {
         if (implementation == NotFunctionFactory.Func.class) {
             var value = predicateNode(((NotFunctionFactory.Func) function).getArg(), depth + 1);
             return value == null ? null : new Pipeline.Not(value);
+        }
+        if (implementation == BetweenTimestampFunctionFactory.ConstFunc.class) {
+            var range = (BetweenTimestampFunctionFactory.ConstFunc) function;
+            var argument = range.getArg();
+            // The factory normalizes non-null bounds into the argument's timestamp unit.
+            // Integral timestamp getters widen like getLong(); DATE uses a different scale.
+            var value = argument.getClass() == TimestampColumn.class
+                    ? column(((TimestampColumn) argument).getColumnIndex(), argument.getType())
+                    : scalar(argument, ColumnType.LONG, depth + 1);
+            return value == null ? null : new Pipeline.And(
+                    new Pipeline.SqlCompare(Ir.Op.GE, value, new Pipeline.Constant(range.getLowerBound())),
+                    new Pipeline.SqlCompare(Ir.Op.GE, new Pipeline.Constant(range.getUpperBound()), value));
         }
         if (parameters != null) {
             IntSupplier key = null;

@@ -122,12 +122,12 @@ public class BetweenTimestampFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class ConstFunc extends BooleanFunction implements UnaryFunction {
+    public static class ConstFunc extends BooleanFunction implements UnaryFunction {
         private final long from;
         private final Function left;
         private final long to;
 
-        public ConstFunc(Function left, long from, long to) {
+        private ConstFunc(Function left, long from, long to) {
             this.left = left;
             this.from = Math.min(from, to);
             this.to = Math.max(from, to);
@@ -144,6 +144,14 @@ public class BetweenTimestampFunctionFactory implements FunctionFactory {
             if (timestamp == Numbers.LONG_NULL) return false;
 
             return from <= timestamp && timestamp <= to;
+        }
+
+        public long getLowerBound() {
+            return from;
+        }
+
+        public long getUpperBound() {
+            return to;
         }
 
         @Override

@@ -32,6 +32,7 @@ import io.questdb.cairo.IndexType;
 import io.questdb.cairo.ListColumnFilter;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.griffin.FunctionParser;
 import io.questdb.griffin.SqlException;
@@ -95,7 +96,7 @@ public class GroupByUtils {
             SqlExecutionContext executionContext,
             RecordMetadata baseMetadata,
             int timestampIndex,
-            boolean isBaseTimestampAscending,
+            @Nullable RecordCursorFactory orderedBaseFactory,
             boolean timestampUnimportant,
             ObjList<GroupByFunction> outGroupByFunctions,
             IntList outGroupByFunctionPositions,
@@ -268,9 +269,9 @@ public class GroupByUtils {
                         outGroupByFunctions.add(groupByFunc);
                         outGroupByFunctionPositions.add(node.position);
                         if (groupByFunc instanceof TwapGroupByFunction twapFunc) {
-                            twapFunc.validateTimestampArg(timestampIndex, isBaseTimestampAscending, node.position);
+                            twapFunc.validateTimestampArg(timestampIndex, isBaseTimestampAscending(orderedBaseFactory, timestampIndex), node.position);
                         } else if (groupByFunc instanceof SparklineGroupByFunction sparklineFunc) {
-                            sparklineFunc.validateScanDirection(isBaseTimestampAscending, node.position);
+                            sparklineFunc.validateScanDirection(isBaseTimestampAscending(orderedBaseFactory, timestampIndex), node.position);
                         }
                         if (fillCount > 0) {
                             // 0-based index of the just-added aggregate. The Math.min clamp
@@ -836,5 +837,15 @@ public class GroupByUtils {
             return ((ColumnFunction) func).getColumnIndex();
         }
         return -1;
+    }
+
+    private static boolean isBaseTimestampAscending(@Nullable RecordCursorFactory factory, int timestampIndex) {
+        // Query scan direction only for aggregates that require it: on a hash join this pins the
+        // probe side. The metadata check rejects sorts that dropped the designated timestamp
+        // before an outer timestamp(col) clause reattached it. Sparkline also accepts forward
+        // scans with no designated timestamp, where both indexes are -1.
+        return factory != null
+                && factory.getMetadata().getTimestampIndex() == timestampIndex
+                && factory.getScanDirection() == RecordCursorFactory.SCAN_DIRECTION_FORWARD;
     }
 }

@@ -80,6 +80,12 @@ abstract class AbstractHashJoinProbe implements FrozenHashJoinBuild.Probe {
         probeGeneration = EXPIRED;
     }
 
+    @Override
+    public final long getNextRowLink() {
+        assert isCurrent();
+        return rowHeap.hasChainLengths() ? -1 : next;
+    }
+
     /**
      * The payload reader, positioned at the last match; null for a build without payload columns.
      */

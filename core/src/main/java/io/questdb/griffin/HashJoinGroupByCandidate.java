@@ -44,8 +44,10 @@ import io.questdb.griffin.model.IQueryModel;
 import io.questdb.griffin.model.JoinContext;
 import io.questdb.griffin.model.QueryColumn;
 import io.questdb.std.Chars;
+import io.questdb.std.IntHashSet;
 import io.questdb.std.IntList;
 import io.questdb.std.LowerCaseCharSequenceIntHashMap;
+import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
 import io.questdb.std.ObjList;
@@ -59,17 +61,18 @@ import org.jetbrains.annotations.Nullable;
  */
 public final class HashJoinGroupByCandidate {
     private final IntList baseColumnIndexes;
-    private final int buildIndex;
+    private final int probeIndex;
+    private final IntList buildIndexes;
+    private final ObjList<HashJoinGroupByKeys> buildKeys;
+    private final ObjList<IntList> requiredColumnsBySource;
     private final ExpressionNode buildOnFilter;
     private final IntList columnSources;
     private final LowerCaseCharSequenceIntHashMap[] inputColumns;
     private final boolean isInputSwapped;
     private final boolean isKeyCapacityPresized;
     private final IQueryModel joinModel;
-    private final HashJoinGroupByKeys keys;
     private final int logicalJoinType;
     private final ExpressionNode resolvedBuildOnFilter;
-    private final IntList requiredBuildColumns;
     private final ObjList<QueryColumn> resolvedColumns;
     private final RecordMetadata resolvedMetadata;
     private final ObjList<ExpressionNode> resolvedPostJoinFilters;
@@ -81,6 +84,15 @@ public final class HashJoinGroupByCandidate {
             boolean isInputSwapped,
             boolean isKeyCapacityPresized
     ) {
+        this(analyzer, singleton(analyzer.buildIndex), new ObjList<>(keys), isInputSwapped, isKeyCapacityPresized);
+    }
+
+    private HashJoinGroupByCandidate(Analyzer analyzer, IntList buildIndexes, ObjList<HashJoinGroupByKeys> buildKeys,
+                                    boolean isInputSwapped, boolean isKeyCapacityPresized) {
+        this.buildIndexes = buildIndexes;
+        this.buildKeys = buildKeys;
+        this.probeIndex = analyzer.probeIndex;
+        this.requiredColumnsBySource = analyzer.requiredColumnsBySource;
         this.inputColumns = analyzer.inputColumns;
         this.resolvedBuildOnFilter = analyzer.resolvedBuildOnFilter;
         this.baseColumnIndexes = analyzer.columnIndexes;
@@ -89,18 +101,15 @@ public final class HashJoinGroupByCandidate {
         this.resolvedMetadata = analyzer.metadata;
         this.resolvedPostJoinFilters = analyzer.resolvedPostJoinFilters;
         this.requiresCompiledPipeline = analyzer.requiresCompiledPipeline;
-        this.buildIndex = analyzer.buildIndex;
-        this.keys = keys;
         this.isInputSwapped = isInputSwapped;
         this.isKeyCapacityPresized = isKeyCapacityPresized;
         this.buildOnFilter = analyzer.buildOnFilter;
         this.joinModel = analyzer.join;
         this.logicalJoinType = analyzer.joinType;
-        this.requiredBuildColumns = analyzer.requiredBuildColumns;
     }
 
     public IQueryModel getBuildModel() {
-        return joinModel.getJoinModels().getQuick(buildIndex);
+        return getBuildModel(0);
     }
 
     /**
@@ -115,7 +124,7 @@ public final class HashJoinGroupByCandidate {
      * Reconciled equality keys in sink order, with base-table column indexes.
      */
     public HashJoinGroupByKeys getKeys() {
-        return keys;
+        return getKeys(0);
     }
 
     public int getLogicalJoinType() {
@@ -127,7 +136,7 @@ public final class HashJoinGroupByCandidate {
     }
 
     public IQueryModel getProbeModel() {
-        return joinModel.getJoinModels().getQuick(1 - buildIndex);
+        return joinModel.getJoinModels().getQuick(probeIndex);
     }
 
     /**
@@ -135,7 +144,7 @@ public final class HashJoinGroupByCandidate {
      * excluding columns used only by the build's own filters.
      */
     public IntList getRequiredBuildColumns() {
-        return requiredBuildColumns;
+        return getRequiredBuildColumns(0);
     }
 
     /**
@@ -312,11 +321,15 @@ public final class HashJoinGroupByCandidate {
             }
             join = join.getNestedModel();
         }
-        if (join == null || join.getJoinModels().size() != 2 || hasBarrier(join)
+        if (join == null || join.getJoinModels().size() < 2 || hasBarrier(join)
                 || join.getLatestBy().size() > 0 || join.getConstWhereClause() != null) {
             return null;
         }
         IntList order = join.getOrderedJoinModels();
+        if (join.getJoinModels().size() > 2) {
+            return isBuildFlipped || executionContext.getQueryCodeGenerator() == null ? null
+                    : analyseMultiway(groupBy, join, parser, executionContext);
+        }
         if (order.size() != 2) {
             return null;
         }
@@ -400,33 +413,8 @@ public final class HashJoinGroupByCandidate {
             if (!analyzer.checkBuildOnFilter(slave.getOuterJoinExpressionClause())) {
                 return null;
             }
-            boolean hasAggregate = false;
-            for (int i = 0; i < groupBy.getColumns().size(); i++) {
-                ExpressionNode expression = analyzer.resolve(groupBy.getColumns().getQuick(i).getAst(), groupBy.getNestedModel(), -1, 0);
-                if (expression == null) {
-                    return null;
-                }
-                analyzer.resolvedColumns.add(QueryColumn.FACTORY.newInstance().of(
-                        Chars.toString(groupBy.getColumns().getQuick(i).getName()), expression));
-                try (Function function = parser.parseFunction(expression, analyzer.metadata, executionContext)) {
-                    if (function instanceof GroupByFunction) {
-                        if (!isSupportedAggregate(function)) {
-                            return null;
-                        }
-                        hasAggregate = true;
-                    } else if (!HashJoinGroupByKeys.isSupportedKeyType(function.getType())
-                            || !function.supportsParallelism() || !function.isStableWithinExecution()) {
-                        return null;
-                    }
-                }
-            }
-            if (!hasAggregate || !analyzer.checkFilters(groupBy.getNestedModel(), -1)) {
+            if (!analyzer.resolveOutput(groupBy)) {
                 return null;
-            }
-            for (int i = 0; i < 2; i++) {
-                if (!analyzer.checkFilters(join.getJoinModels().getQuick(i), i)) {
-                    return null;
-                }
             }
             analyzer.captureInputColumns();
             // captureInputColumns() tolerates unresolvable input columns, so check the flag after it.
@@ -486,12 +474,139 @@ public final class HashJoinGroupByCandidate {
         }
     }
 
+    public int getBuildCount() {
+        return buildIndexes.size();
+    }
+
+    public IQueryModel getBuildModel(int build) {
+        return getInputModel(buildIndexes.getQuick(build));
+    }
+
+    public HashJoinGroupByKeys getKeys(int build) {
+        return buildKeys.getQuick(build);
+    }
+
+    public IntList getRequiredBuildColumns(int build) {
+        return requiredColumnsBySource.getQuick(buildIndexes.getQuick(build));
+    }
+
+    int getProbeIndex() {
+        return probeIndex;
+    }
+
+    int getBuildIndex(int build) {
+        return buildIndexes.getQuick(build);
+    }
+
+    IQueryModel getInputModel(int source) {
+        return joinModel.getJoinModels().getQuick(source);
+    }
+
+    IntList getInputOrder() {
+        return joinModel.getOrderedJoinModels();
+    }
+
+    int getColumnSource(int column) {
+        return columnSources.getQuick(column);
+    }
+
+    private static IntList singleton(int value) {
+        IntList result = new IntList();
+        result.add(value);
+        return result;
+    }
+
+    private static HashJoinGroupByCandidate analyseMultiway(IQueryModel groupBy, IQueryModel join,
+                                                           FunctionParser parser, SqlExecutionContext executionContext) {
+        final int count = join.getJoinModels().size();
+        final IntList order = join.getOrderedJoinModels();
+        if (order.size() != count) return null;
+        JoinContext first = join.getJoinModels().getQuick(order.getQuick(1)).getJoinContext();
+        if (first == null || first.aNames.size() == 0) return null;
+        ObjList<TableReader> readers = new ObjList<>();
+        try {
+            RecordMetadata[] metadata = new RecordMetadata[count];
+            for (int source = 0; source < count; source++) {
+                IQueryModel table = baseTable(join.getJoinModels().getQuick(source), join);
+                if (table == null) return null;
+                TableReader reader = executionContext.getReader(executionContext.getTableToken(table.getTableName()), table.getMetadataVersion());
+                readers.add(reader);
+                metadata[source] = reader.getMetadata();
+            }
+            // Keep the existing common-probe orientation when it fits. Otherwise follow the
+            // optimizer's left-deep order, binding each later key to an already produced input.
+            int probe = order.getQuick(0);
+            boolean commonProbe = false;
+            for (int endpoint = 0; endpoint < 2; endpoint++) {
+                int candidate = endpoint == 0 ? first.aIndexes.getQuick(0) : first.bIndexes.getQuick(0);
+                boolean common = true;
+                for (int i = 1; i < count && common; i++) {
+                    JoinContext edge = join.getJoinModels().getQuick(order.getQuick(i)).getJoinContext();
+                    if (edge == null || edge.aNames.size() == 0) { common = false; break; }
+                    for (int k = 0; k < edge.aIndexes.size(); k++) {
+                        int a = edge.aIndexes.getQuick(k), b = edge.bIndexes.getQuick(k);
+                        if (a == b || a != candidate && b != candidate
+                                || readers.getQuick(a == candidate ? b : a).size() > readers.getQuick(candidate).size()) {
+                            common = false;
+                            break;
+                        }
+                    }
+                }
+                if (common) { probe = candidate; commonProbe = true; break; }
+            }
+            IntList indexes = new IntList();
+            IntList available = new IntList();
+            available.add(probe);
+            ObjList<HashJoinGroupByKeys> builds = new ObjList<>();
+            int firstBuild = first.aIndexes.getQuick(0) == probe ? first.bIndexes.getQuick(0) : first.aIndexes.getQuick(0);
+            Analyzer analyzer = new Analyzer(join, IQueryModel.JOIN_INNER, firstBuild, probe, metadata, parser, executionContext);
+            for (int i = 1; i < count; i++) {
+                IQueryModel input = join.getJoinModels().getQuick(order.getQuick(i));
+                JoinContext edge = input.getJoinContext();
+                if (input.getJoinType() != IQueryModel.JOIN_INNER || input.getOuterJoinExpressionClause() != null
+                        || edge == null || edge.aNames.size() == 0) return null;
+                int build = commonProbe
+                        ? (edge.aIndexes.getQuick(0) == probe ? edge.bIndexes.getQuick(0) : edge.aIndexes.getQuick(0))
+                        : order.getQuick(i);
+                if (available.contains(build) || readers.getQuick(build).size() > readers.getQuick(probe).size()) return null;
+                for (int k = 0; k < edge.aIndexes.size(); k++) {
+                    int a = edge.aIndexes.getQuick(k), b = edge.bIndexes.getQuick(k);
+                    if (!((a == build && available.contains(b)) || (b == build && available.contains(a)))) return null;
+                }
+                HashJoinGroupByKeys keys = analyzer.resolveKeys(edge, build);
+                if (keys == null || keys.size() == 0) return null;
+                for (int k = 0; k < keys.size(); k++) {
+                    int type = keys.getProbeType(k);
+                    if (type != keys.getBuildType(k) || (type != ColumnType.INT && type != ColumnType.LONG
+                            && type != ColumnType.SYMBOL && type != ColumnType.DATE && !ColumnType.isTimestamp(type))) return null;
+                    int source = keys.getProbeSource(k);
+                    if (source != probe) {
+                        IntList required = analyzer.requiredColumnsBySource.getQuick(source);
+                        if (!required.contains(keys.getProbeColumn(k))) required.add(keys.getProbeColumn(k));
+                    }
+                }
+                indexes.add(build);
+                builds.add(keys);
+                available.add(build);
+            }
+            if (!analyzer.resolveOutput(groupBy)) return null;
+            analyzer.captureInputColumns();
+            if (analyzer.hasUndefinedBindVariable) return null;
+            analyzer.requiresCompiledPipeline = true;
+            return new HashJoinGroupByCandidate(analyzer, indexes, builds, probe != order.getQuick(0), true);
+        } catch (SqlException unsupported) {
+            return null;
+        } finally {
+            Misc.freeObjList(readers);
+        }
+    }
+
     int getBaseColumnIndex(int resolvedIndex) {
         return baseColumnIndexes.getQuick(resolvedIndex);
     }
 
-    IntList getInputColumns(RecordMetadata metadata, boolean isBuildInput) {
-        LowerCaseCharSequenceIntHashMap indexes = inputColumns[isBuildInput ? buildIndex : 1 - buildIndex];
+    IntList getInputColumns(RecordMetadata metadata, int source) {
+        LowerCaseCharSequenceIntHashMap indexes = inputColumns[source];
         IntList result = new IntList(metadata.getColumnCount());
         for (int i = 0; i < metadata.getColumnCount(); i++) {
             result.add(indexes.get(metadata.getColumnName(i)));
@@ -517,10 +632,6 @@ public final class HashJoinGroupByCandidate {
 
     ObjList<ExpressionNode> getResolvedPostJoinFilters() {
         return resolvedPostJoinFilters;
-    }
-
-    boolean isBuildColumn(int resolvedIndex) {
-        return columnSources.getQuick(resolvedIndex) == buildIndex;
     }
 
     private static IQueryModel baseTable(IQueryModel input, IQueryModel join) {
@@ -712,15 +823,18 @@ public final class HashJoinGroupByCandidate {
 
     private static final class Analyzer {
         private final int buildIndex;
+        private final int probeIndex;
+        private final int[] sourceOffsets;
+        private final ObjList<IntList> requiredColumnsBySource = new ObjList<>();
         private final IntList columnIndexes = new IntList();
         private final IntList columnSources = new IntList();
         private final SqlExecutionContext executionContext;
-        private final LowerCaseCharSequenceIntHashMap[] inputColumns = {new LowerCaseCharSequenceIntHashMap(), new LowerCaseCharSequenceIntHashMap()};
+        private final LowerCaseCharSequenceIntHashMap[] inputColumns;
         private final IQueryModel join;
         private final int joinType;
         private final GenericRecordMetadata metadata = new GenericRecordMetadata();
         private final FunctionParser parser;
-        private final IntList requiredBuildColumns = new IntList();
+        private final IntList requiredBuildColumns;
         private final ObjList<QueryColumn> resolvedColumns = new ObjList<>();
         private final ObjList<ExpressionNode> resolvedPostJoinFilters = new ObjList<>();
         private boolean requiresCompiledPipeline;
@@ -752,7 +866,7 @@ public final class HashJoinGroupByCandidate {
         // name every input column that an admitted expression can later reach.
         private boolean isResolvingInputColumn;
         private ExpressionNode resolvedBuildOnFilter;
-        private int usedSources;
+        private final IntHashSet usedSources = new IntHashSet();
 
         private Analyzer(
                 IQueryModel join,
@@ -763,13 +877,24 @@ public final class HashJoinGroupByCandidate {
                 FunctionParser parser,
                 SqlExecutionContext executionContext
         ) {
+            this(join, joinType, buildIndex, 1 - buildIndex, new RecordMetadata[]{left, right}, parser, executionContext);
+        }
+
+        private Analyzer(IQueryModel join, int joinType, int buildIndex, int probeIndex, RecordMetadata[] sources,
+                         FunctionParser parser, SqlExecutionContext executionContext) {
             this.join = join;
             this.joinType = joinType;
             this.buildIndex = buildIndex;
-            this.sources = new RecordMetadata[]{left, right};
+            this.probeIndex = probeIndex;
+            this.sources = sources;
+            this.sourceOffsets = new int[sources.length];
+            this.inputColumns = new LowerCaseCharSequenceIntHashMap[sources.length];
             this.parser = parser;
             this.executionContext = executionContext;
-            for (int source = 0; source < 2; source++) {
+            for (int source = 0; source < sources.length; source++) {
+                inputColumns[source] = new LowerCaseCharSequenceIntHashMap();
+                requiredColumnsBySource.add(new IntList());
+                sourceOffsets[source] = metadata.getColumnCount();
                 RecordMetadata sourceMetadata = sources[source];
                 for (int i = 0; i < sourceMetadata.getColumnCount(); i++) {
                     metadata.add(new TableColumnMetadata("c" + metadata.getColumnCount(), sourceMetadata.getColumnType(i), IndexType.NONE, 0, true, null));
@@ -777,13 +902,45 @@ public final class HashJoinGroupByCandidate {
                     columnSources.add(source);
                 }
             }
+            requiredBuildColumns = requiredColumnsBySource.getQuick(buildIndex);
+        }
+
+        private boolean resolveOutput(IQueryModel groupBy) throws SqlException {
+            boolean hasAggregate = false;
+            for (int i = 0; i < groupBy.getColumns().size(); i++) {
+                ExpressionNode expression = resolve(groupBy.getColumns().getQuick(i).getAst(), groupBy.getNestedModel(), -1, 0);
+                if (expression == null) {
+                    return false;
+                }
+                resolvedColumns.add(QueryColumn.FACTORY.newInstance().of(
+                        Chars.toString(groupBy.getColumns().getQuick(i).getName()), expression));
+                try (Function function = parser.parseFunction(expression, metadata, executionContext)) {
+                    if (function instanceof GroupByFunction) {
+                        if (!isSupportedAggregate(function)) {
+                            return false;
+                        }
+                        hasAggregate = true;
+                    } else if (!HashJoinGroupByKeys.isSupportedKeyType(function.getType())
+                            || !function.supportsParallelism() || !function.isStableWithinExecution()) {
+                        return false;
+                    }
+                }
+            }
+            if (!hasAggregate || !checkFilters(groupBy.getNestedModel(), -1)) {
+                return false;
+            }
+            for (int i = 0; i < sources.length; i++) {
+                if (!checkFilters(join.getJoinModels().getQuick(i), i)) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         private void captureInputColumns() {
-            int payloadSize = requiredBuildColumns.size();
             isResolvingInputColumn = true;
             try {
-                for (int source = 0; source < 2; source++) {
+                for (int source = 0; source < sources.length; source++) {
                     IQueryModel input = join.getJoinModels().getQuick(source);
                     ObjList<QueryColumn> columns = input.getColumns();
                     int count = columns.size() > 0 ? columns.size() : sources[source].getColumnCount();
@@ -798,7 +955,6 @@ public final class HashJoinGroupByCandidate {
             } finally {
                 isResolvingInputColumn = false;
             }
-            requiredBuildColumns.setPos(payloadSize);
         }
 
         private boolean checkBuildOnFilter(ExpressionNode node) throws SqlException {
@@ -806,7 +962,7 @@ public final class HashJoinGroupByCandidate {
                 return true;
             }
             hasVarSizeFrameFilterColumn = false;
-            if (!checkFilter(node, join, -1, false) || (usedSources != 0 && usedSources != (1 << buildIndex))) {
+            if (!checkFilter(node, join, -1, false) || (usedSources.size() != 0 && (usedSources.size() != 1 || !usedSources.contains(buildIndex)))) {
                 return false;
             }
             buildOnFilter = node;
@@ -844,7 +1000,7 @@ public final class HashJoinGroupByCandidate {
             if (isPostJoin && node.type == ExpressionNode.OPERATION && Chars.equalsIgnoreCase(node.token, "and")) {
                 return checkFilter(node.lhs, model, source, true) && checkFilter(node.rhs, model, source, true);
             }
-            usedSources = 0;
+            usedSources.clear();
             final int deferredCount = deferredBindVariableCount;
             // A post-join filter reads the joined record, whose build columns are payload columns.
             // Any other filter runs on an input's page frames.
@@ -863,7 +1019,7 @@ public final class HashJoinGroupByCandidate {
             if (expression == null) {
                 return false;
             }
-            if (isPostJoin && usedSources == 3) {
+            if (isPostJoin && usedSources.size() > 1) {
                 // Preserve the ordinary admission gate unless the optional compiler accepts the
                 // complete pipeline later. SqlCodeGenerator closes a rejected factory and restores
                 // the input models before producing the ordinary plan.
@@ -944,15 +1100,18 @@ public final class HashJoinGroupByCandidate {
             // A probe column of any type reaches the joined record straight off its page frame, and
             // a build filter reads a build column of any type straight off the build's page frame,
             // which the analysis notes for the ON condition; see analyse().
-            if (!isResolvingInputColumn && source == buildIndex && !isSupportedValueType(metadata.getColumnType(index))) {
+            if (!isResolvingInputColumn && source != probeIndex && !isSupportedValueType(metadata.getColumnType(index))) {
                 if (!isResolvingFrameFilter) {
                     return null;
                 }
                 hasVarSizeFrameFilterColumn = true;
             }
-            usedSources |= 1 << source;
-            if (source == buildIndex && !requiredBuildColumns.contains(columnIndexes.getQuick(index))) {
-                requiredBuildColumns.add(columnIndexes.getQuick(index));
+            usedSources.add(source);
+            if (source != probeIndex && !isResolvingInputColumn && !isResolvingFrameFilter) {
+                IntList required = requiredColumnsBySource.getQuick(source);
+                if (!required.contains(columnIndexes.getQuick(index))) {
+                    required.add(columnIndexes.getQuick(index));
+                }
             }
             return ExpressionNode.FACTORY.newInstance().of(ExpressionNode.LITERAL, metadata.getColumnName(index), 0, position);
         }
@@ -1036,7 +1195,7 @@ public final class HashJoinGroupByCandidate {
                 if (model == join && source == -1) {
                     int dot = Chars.lastIndexOf(node.token, 0, node.token.length(), '.');
                     int found = -1;
-                    for (int i = 0; i < 2; i++) {
+                    for (int i = 0; i < sources.length; i++) {
                         IQueryModel input = join.getJoinModels().getQuick(i);
                         if (dot >= 0 && !Chars.equalsIgnoreCase(node.token.subSequence(0, dot), input.getName())) {
                             continue;
@@ -1054,7 +1213,7 @@ public final class HashJoinGroupByCandidate {
                 if (model.getTableName() != null && source >= 0) {
                     int dot = Chars.lastIndexOf(node.token, 0, node.token.length(), '.');
                     int index = sources[source].getColumnIndexQuiet(node.token, dot + 1, node.token.length());
-                    return column(index < 0 ? -1 : index + (source == 0 ? 0 : sources[0].getColumnCount()), node.position);
+                    return column(index < 0 ? -1 : index + sourceOffsets[source], node.position);
                 }
                 if (model.getSelectModelType() == IQueryModel.SELECT_MODEL_NONE && model.getNestedModel() != null) {
                     return resolve(node, model.getNestedModel(), source, depth + 1);
@@ -1119,18 +1278,16 @@ public final class HashJoinGroupByCandidate {
          * table; see {@link HashJoinGroupByCandidate#isKeyCapacityPresized()}.
          */
         private ExpressionNode resolveFrameFilter(ExpressionNode node, IQueryModel model, int source) {
-            final int payloadSize = requiredBuildColumns.size();
             isResolvingFrameFilter = true;
             try {
                 return resolve(node, model, source, 0);
             } finally {
                 isResolvingFrameFilter = false;
-                requiredBuildColumns.setPos(payloadSize);
             }
         }
 
         private int resolveInput(int source, CharSequence name, int depth) {
-            if (source < 0 || source > 1) {
+            if (source < 0 || source >= sources.length) {
                 return -1;
             }
             ExpressionNode column = resolve(ExpressionNode.FACTORY.newInstance().of(ExpressionNode.LITERAL, name, 0, 0),
@@ -1144,6 +1301,10 @@ public final class HashJoinGroupByCandidate {
          * that the ordinary compile reports the mismatch itself.
          */
         private HashJoinGroupByKeys resolveKeys(JoinContext context) {
+            return resolveKeys(context, buildIndex);
+        }
+
+        private HashJoinGroupByKeys resolveKeys(JoinContext context, int buildIndex) {
             final HashJoinGroupByKeys keys = new HashJoinGroupByKeys();
             final int count = context.aNames.size();
             isResolvingInputColumn = true;
@@ -1156,7 +1317,7 @@ public final class HashJoinGroupByCandidate {
                     }
                     final int build = context.aIndexes.getQuick(i) == buildIndex ? a : b;
                     final int probe = build == a ? b : a;
-                    if (!keys.add(columnIndexes.getQuick(probe), metadata.getColumnType(probe),
+                    if (!keys.add(columnSources.getQuick(probe), columnIndexes.getQuick(probe), metadata.getColumnType(probe),
                             columnIndexes.getQuick(build), metadata.getColumnType(build))) {
                         return null;
                     }
