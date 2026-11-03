@@ -714,8 +714,12 @@ INT/LONG/SYMBOL/composites, preserving ordinary heaps and fallback. The forest p
 requires probe-only predicate/grouping inputs and one producer per dependent key.
 500M-row typed branches gain another 2.76-2.99x; deeper mixed-type controls gain
 3.83x. See `JOIN_GENERALIZATION_PLAN.md` and `target/join-subtrees.md`.
-Remaining root hash probes are latency-sensitive. Profile them alongside grouping
-before choosing the next representation. SUM/AVG, COUNT(value), DISTINCT, observed
-build values and mixed-source keys need separate semantic proofs. Include query
-memory and compile-plus-first latency: this slice adds ~9-24ms compilation in main/
-deep cases, and no-match first-request time loses 4.9% despite stable warm execution.
+Repeated-input consumption now supports SUM/AVG, COUNT(value), MIN/MAX and mixed
+lists. The first two retain ordered arithmetic; only unobserved consecutive runs
+are reduced. SUM gains 2.86-3.21x and AVG 2.52-2.67x on 500M-row typed branches.
+See `target/join-repeated-inputs.md`. Remaining work: distinguish root lookup from
+ordered arithmetic, then prove broader observed-payload placement, DISTINCT and
+mixed-source dependencies independently. Keep first-request/code-size costs visible:
+this extension adds ~56-73ms compilation in the primary cases, roughly doubles their
+generated code, and adds ~80ms to no-match compile-plus-first time. Warm no-match and
+ordinary AVG controls retain ~3-4% costs. Do not hide these behind duplicate-heavy wins.

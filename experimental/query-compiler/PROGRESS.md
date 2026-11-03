@@ -7321,3 +7321,125 @@ extra CPU cost; this refresh does not establish a new microarchitectural cause.
 All SSB queries use SUM: the recent closed-COUNT gains do not apply. Strict full
 coverage remains **0/13**; stock was not rerun. No production change or new dataset.
 Evidence: `target/ssb-current.md` -> `/run/media/jara/test/ssb-current-20261103/RESULTS.md`.
+
+## 2026-11-03 — Aggregate generality test: COUNT reduction remains narrow
+
+Matched 500M-row joins, 18 aggregate/type variants, frozen LLVM before the two COUNT
+steps versus current: COUNT(*) gains **5.00-6.35x** across INT/LONG/SYMBOL (LONG repeat
+**4.81x**). Only these **3/18** variants eliminate duplicate expansion. SUM, AVG,
+COUNT(value), MIN/MAX, mixed lists, grouped SUM and build-side SUM retain generated
+expansion. `countsRowsOnly()` excludes all of them, including COUNT(*) + SUM(value).
+Type/graph coverage did not establish aggregate generality; W3 remains incomplete.
+
+INT COUNT drops **454.6 -> 55.1 instructions/input**, **167.9 -> 25.5 cycles/input**;
+saved cycles predict ~1.65s versus 1.68s observed. Non-COUNT instruction costs remain
+near baseline. Apparent DOUBLE/SYMBOL AVG/mixed gains and the grouped SUM loss do not
+survive reversed-order checks. No new limiting-hardware-resource claim.
+
+**184 complete large outputs** and all **21 MultiJoinSqlTest tests** pass, including
+new mixed aggregate/NULL/all-NULL controls across typed joins, copied/uncopied payloads
+and serial/parallel builds. Warm I/O and major faults are zero; PMUs are unmultiplexed.
+No production change or new data copy. Prioritize aggregate generality before further
+COUNT-only tuning; preserve actual SUM sentinel and floating-rounding semantics.
+Evidence: `target/join-generality.md` ->
+`/run/media/jara/test/query-join-generality-20261103/RESULTS.md`.
+
+## 2026-11-03 — General aggregate consumption of join multiplicities
+
+Closed the COUNT-only gate. Existing weights now feed COUNT(value), MIN/MAX,
+SUM/AVG and mixed/grouped aggregates. Counts add weights, extrema update once,
+SUM/AVG replay actual ordered state updates with cancellation. Non-COUNT leaf
+folding requires an unobserved suffix; unrepresentable run lengths decline to the
+original joins. No new map, worker infrastructure, toggle or CPU-specific admission.
+
+Frozen `b0ade3ce2e` -> candidate, 500M probe rows/eight cores, three process pairs
+per primary case: SUM gains **2.86-3.21x**, AVG **2.52-2.67x** across INT/LONG/SYMBOL.
+Single-pair controls: COUNT(value) **4.39x**, extrema **5.36x**, mixed **3.06-3.28x**,
+grouped SUM **3.87x**, DOUBLE SUM **2.07x**. Observed build SUM gains only **1.10x**;
+unique/independent joins gain little. Eight process pairs retain **~3-4%** costs for
+no-match and ordinary AVG, below the repeated regression boundary.
+
+First-matrix LONG SUM drops **668 -> 201 instructions/input**, **233 -> 72 cycles**.
+Saved cycles predict ~1.91s against 1.87s observed. Separate hardware runs show
+**128 -> 39 load-wait cycles/input**, **13.05 -> 8.85GB controller traffic/query**.
+With unchanged lowering but multiplicities withheld, SUM returns to **2.74s** and
+**233 cycles/input**. Native samples still find root-map/state dependencies; ordered
+arithmetic remains. This is not a bandwidth-saturation win.
+
+Rejected the first replay variant: SUM improved but AVG regressed. Disassembly
+showed repeated initialization checks; peeling the first update gives ordinary
+computeNext additions in registers. Exact-state checks also found and fixed the
+pre-existing AVG NULL-prefix/negative-zero discrepancy, reproduced on old code.
+
+Primary compilation adds **~56-73ms**; representative generated code grows **~9 ->
+18KiB**. No-match compile-plus-first adds **~80ms (19%)**. A 4MiB root array replaces
+4MiB cached heads, with temporary construction overlap. **106 focused tests** and
+**548 complete benchmark outputs** pass; all warm reads/major faults are zero.
+Four source hashes and 60 installed classes verify. Existing data reused; no new
+stock/DuckDB score or strict coverage claim. SUM/AVG retain ordered arithmetic,
+and DISTINCT, broader payload placement and mixed-source dependencies remain open.
+Evidence: `target/join-repeated-inputs.md` ->
+`/run/media/jara/test/query-join-repeated-20261103/RESULTS.md`. No commit.
+
+## 2026-11-03 — Validate MIN and MAX as primary aggregate families
+
+Three process pairs per standalone MIN/MAX and INT/LONG/SYMBOL join key, 500M rows,
+eight cores: MIN gains **4.99-6.67x**, MAX **4.91-7.10x** over the same frozen
+COUNT-capable compiler. INT/DOUBLE values gain **6.08/5.30x**, grouped extrema
+**6.62x**, mixed COUNT/SUM/AVG/extrema **3.12x**. Observed build values gain **1.47x**;
+only their unobserved suffix collapses. SYMBOL coverage describes join keys.
+
+LONG MIN drops **682 -> 95 instructions/input**, **243 -> 45 cycles**, and separate
+load-event runs **131 -> 24 load-wait cycles**. With multiplicities withheld it
+returns to **2.91s / 247 cycles**. Remaining native latency samples locate root-map
+and row-head loads; controller traffic falls **14.40 -> 8.88GB/query**. Preparation
+still costs ~4% on the repeated no-match control, and primary compilation adds
+~43-53ms. The main gains include both duplicate traversal and repeated state updates.
+
+**23 focused tests / 312 complete outputs** pass. Strengthened existing state/SQL
+tests with INT extrema and crossed prior/current floating values, preserving NULLs,
+replaceable infinities and signed-zero ties. Warm reads/faults and scoped errors are
+zero. Four source / 60 installed class hashes verify the compiler is unchanged;
+this pass extends validation and the generality criteria. Evidence:
+`target/join-extrema.md` -> `/run/media/jara/test/query-join-extrema-20261103/RESULTS.md`.
+No commit.
+
+## 2026-11-03 — Describe aggregate state once; validate with KSUM
+
+Ordinary aggregates now declare typed state cells and whether their result is a
+direct slot, a finalized slot, or requires the original getter. Scalar promotion
+uses that description instead of an aggregate-class whitelist. KSUM supplies its
+three actual slots and QuestDB's first/next/merge operations once; existing scalar,
+grouped and typed fused-join paths consume them. No backend special case or toggle.
+KSUM's count-guarded getter remains authoritative; raw-result sort/TopK/nested
+consumers decline, and direct-column vector/Rosti KSUM is unchanged.
+
+500M input rows, eight physical cores: stock -> generated KSUM is **262.5 ->
+112.2ms** scalar, **242.2 -> 139.9ms** with seven groups and **3378.6 -> 641.8ms**
+with 262144 groups. Scalar/grouped use three process cohorts. INT/LONG/SYMBOL
+three-join controls drop **33.6-36.0s -> 0.53-0.73s** in one process per variant,
+three warm executions; final candidate process medians are **0.63-0.75s**.
+Join gains include admission to existing fusion, multiplicity reduction
+and parallel execution; the fallback was serial. They are not arithmetic-only wins.
+
+The first generated scalar still took ~255ms. Native profiles and disassembly
+found initialization tests on its feedback chain. Peeling the first update of each
+existing 1024-row chunk preserves operation order and lowers **22.37 -> 9.85
+cycles/input**, **35.72 -> 17.72 instructions/input**. Saved cycles predict ~142ms
+against ~143ms observed. The same change improves ordinary mixed SUM/AVG/MIN/MAX/
+COUNT **123.8 -> 97.3ms**. It uses the shared first/next contract, not KSUM identity.
+
+High-cardinality grouping activates existing input partitioning: load-wait cycles
+fall **277 -> 14.6/input**, controller traffic **102.9 -> 27.1GB/query**. Source and
+profiles support improved map locality; this is not a bandwidth-saturation claim.
+Partition buffers cost memory (whole-process RSS ~6.2 -> 12.7GiB). Primary compile
+time rises ~60-240ms versus stock. Existing mixed controls remain within 2% at the
+matrix median; one-core and 18-match stress checks retain correct results.
+
+**83 focused tests / 501 complete benchmark outputs** pass, including exact state
+merge, NULL prefixes, signed zero, nonfinite inputs, overflow, chunk boundaries,
+typed keys, payload ownership and getter fallback. Warm reads/major faults and
+scoped memory/throttle errors are zero. All measured classes are source-matched;
+existing data reused. No strict whole-query coverage claim: sorting/build
+preparation can remain Java. Evidence: `target/aggregate-ksum.md` ->
+`/run/media/jara/test/query-ksum-20261103/RESULTS.md`. No commit.

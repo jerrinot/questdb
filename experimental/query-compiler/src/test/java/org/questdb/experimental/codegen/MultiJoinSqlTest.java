@@ -409,6 +409,63 @@ public class MultiJoinSqlTest {
         }
     }
 
+    @Test public void aggregateFamiliesPreserveNullsAndDuplicateProductsAcrossTypedBranches() throws Exception {
+        engine.execute("create table gp as (select cast(x%64 as int) k,(x%64-32)*4294967297 l,"
+                + "cast('K'||cast(x%64 as string) as symbol) s,cast(x%4 as int) j,"
+                + "case when x%4=0 or x%7=0 then null else x%23-11 end v,"
+                + "case when x%4=0 or x%7=0 then null else (x%23-11)*0.25 end d from long_sequence(8192))", context);
+        engine.execute("create table ga as (select cast((128-x)%64 as int) k,((128-x)%64-32)*4294967297 l,"
+                + "cast('K'||cast((128-x)%64 as string) as symbol) s,cast(x%17 as int) nk,"
+                + "(x%17)*4294967297+4503599627370496 nl,cast('P'||cast(x%17 as string) as symbol) ns from long_sequence(128))", context);
+        engine.execute("create table gb as (select cast((51-x)%17 as int) k,((51-x)%17)*4294967297+4503599627370496 l,"
+                + "cast('P'||cast((51-x)%17 as string) as symbol) s,"
+                + "case when x%3=0 then null else x%11-5 end v from long_sequence(51))", context);
+        String probeAggregates = "count(),count(p.v),count(p.s),count(p.d),sum(p.k),min(p.k),max(p.k),sum(p.v),avg(p.v),min(p.v),max(p.v),"
+                + "sum(p.d),avg(p.d),min(p.d),max(p.d),ksum(p.d)";
+        shardThreshold = 4;
+        for (long copy : new long[]{0, 128L << 20}) {
+            payloadCopyLimit = copy;
+            buildThreshold = copy == 0 ? Long.MAX_VALUE : 1;
+            for (String key : new String[]{"k", "l", "s"}) {
+                String from = " from gp p join ga a on p." + key + "=a." + key
+                        + " join gb b on a.n" + key + "=b." + key
+                        + " join gb c on a.n" + key + "=c." + key;
+                // Exercise both a closed forest and an observed build followed by an unobserved leaf.
+                for (String aggregates : new String[]{probeAggregates, probeAggregates + ",sum(b.v),count(b.v),ksum(cast(b.v as double))"}) {
+                    matches("select " + aggregates + from, 0, true, compiler);
+                    // j=0 is an all-NULL group for both probe aggregate value columns.
+                    matches("select p.j," + aggregates + from + " group by p.j", 1, true, compiler);
+                }
+            }
+        }
+    }
+
+    @Test public void foldingUnobservedInputsPreservesObservedValueOrder() throws Exception {
+        pool.halt();
+        engine.execute("create table op as (select cast(0 as int) k,x id from long_sequence(512))", context);
+        engine.execute("create table oa as (select cast(0 as int) k from long_sequence(2))", context);
+        engine.execute("create table ob as (select cast(0 as int) k,"
+                + "case when x=1 then 1.0 when x=2 then -1e16 else 1e16 end d from long_sequence(3))", context);
+        for (String joins : new String[]{" join oa a on p.k=a.k join ob b on p.k=b.k",
+                " join ob b on p.k=b.k join oa a on p.k=a.k"}) {
+            String sql = "select p.id,count(),sum(b.d),avg(b.d) from op p" + joins + " group by p.id";
+            // The same frozen maps and join order, with the ordinary Java updater,
+            // provide the oracle for rounding-sensitive values.
+            context.setQueryCodeGenerator(intercepted(true, null));
+            java.util.List<CompiledGroupBy.ResultRow> expected;
+            try (var control = Demo.compileSql(engine, context, sql, true)) {
+                assertTrue(plan(control).contains("compiledJoinPipeline"));
+                expected = Demo.readSql(control, context, 1);
+            }
+            context.setQueryCodeGenerator(compiler);
+            try (var candidate = Demo.compileSql(engine, context, sql, true)) {
+                assertTrue(plan(candidate).contains("compiledJoinPipeline"));
+                assertEquals(sql, expected, Demo.readSql(candidate, context, 1));
+                assertEquals(sql, expected, Demo.readSql(candidate, context, 1));
+            }
+        }
+    }
+
     @Test public void independentBuildsBindPayloadsFiltersAndDuplicateProducts() throws Exception {
         for (long limit : new long[]{0, 128L << 20}) {
             payloadCopyLimit = limit;

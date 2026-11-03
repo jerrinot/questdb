@@ -449,6 +449,25 @@ public class MultiJoinKernelTest {
         }
     }
 
+    @Test public void repeatedUpdateLengthsRejectCrossRootOverflow() throws Exception {
+        try (var a = new Input("a", true); var b = new Input("b", true);
+             var left = new DirectLongList(a.frozen.getRowCount(), MemoryTag.NATIVE_JIT);
+             var right = new DirectLongList(b.frozen.getRowCount(), MemoryTag.NATIVE_JIT)) {
+            for (long i = 0; i < a.frozen.getRowCount(); i++) left.add(0);
+            for (long i = 0; i < b.frozen.getRowCount(); i++) right.add(0);
+            var builds = new FrozenHashJoinBuild[]{a.frozen, b.frozen};
+            var counts = new DirectLongList[]{left, right};
+            assertTrue(JoinDependencyFilter.repetitionsFit(builds, counts, context.getCircuitBreaker()));
+            left.set(0, Long.MAX_VALUE);
+            right.set(0, 1);
+            assertTrue(JoinDependencyFilter.repetitionsFit(builds, counts, context.getCircuitBreaker()));
+            right.set(0, 2);
+            assertFalse(JoinDependencyFilter.repetitionsFit(builds, counts, context.getCircuitBreaker()));
+            left.set(0, -1);
+            assertFalse(JoinDependencyFilter.repetitionsFit(builds, counts, context.getCircuitBreaker()));
+        }
+    }
+
     @Test public void countPreparationHonoursBudgetAndReleasesOnFailure() throws Exception {
         try (var p = new Input("p", false); var a = new Input("a", true); var b = new Input("b", true);
              var tracker = new MemoryTracker() {

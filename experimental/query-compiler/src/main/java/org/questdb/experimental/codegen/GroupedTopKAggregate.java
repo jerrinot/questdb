@@ -117,6 +117,7 @@ final class GroupedTopKAggregate extends LongFunction implements GroupByFunction
     static double decode(long key) { return Double.longBitsToDouble(key < 0 ? key ^ Long.MAX_VALUE : key); }
 
     record Update(Pipeline.Scalar argument, long offset, int limit, boolean ascending) implements AggregateUpdates.Update {
+        @Override public AggregateUpdates.ResultAccess resultAccess() { return AggregateUpdates.ResultAccess.DIRECT; }
         @Override public void initialize(Builder b, Expr destination) { b.store(at(destination, offset), i64(0)); }
 
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {

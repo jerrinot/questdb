@@ -122,7 +122,7 @@ final class JoinDependencyFilter {
     }
 
     /**
-     * Folds a closed COUNT forest through its cached heads. Old counts/links remain usable
+     * Folds a closed unobserved forest through its cached heads. Old counts/links remain usable
      * until every root succeeds; only then replace them with immutable root weights.
      */
     static boolean prepareSubtrees(FrozenHashJoinBuild[] builds, CompiledJoin.Build[] descriptions,
@@ -188,6 +188,27 @@ final class JoinDependencyFilter {
             return false;
         } finally {
             for (DirectLongList weight : weights) if (weight != null) weight.close();
+        }
+    }
+
+    /** Replaying aggregate updates requires a representable positive run length. */
+    static boolean repetitionsFit(FrozenHashJoinBuild[] builds, DirectLongList[] counts, SqlExecutionCircuitBreaker breaker) {
+        long product = 1;
+        try {
+            for (int i = 0; i < counts.length; i++) {
+                if (counts[i] == null) continue;
+                long maximum = 1;
+                for (long row = 0, n = builds[i].getRowCount(); row < n; row++) {
+                    if ((row & 1023) == 0) breaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    long count = counts[i].get(row);
+                    if (count < 0) return false;
+                    maximum = Math.max(maximum, count);
+                }
+                product = Math.multiplyExact(product, maximum);
+            }
+            return true;
+        } catch (ArithmeticException overflow) {
+            return false;
         }
     }
 

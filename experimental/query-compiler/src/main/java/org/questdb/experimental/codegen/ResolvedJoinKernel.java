@@ -130,7 +130,7 @@ final class ResolvedJoinKernel {
     }
 
     private record Layout(CompiledJoin.Build[] builds, Key[] keys, int[] sourceBuilds, int[] sourceColumns,
-                          boolean[] counts, boolean subtrees) {
+                          boolean[] counts, boolean subtrees, boolean rowCountsOnly) {
         int build(int index) {
             int offset = BUILDS;
             for (int i = 0; i < index; i++) offset += (keyStart(i) + keys[i].widths.length * KEY_BYTES + keys[i].bytes + 7) & ~7;
@@ -243,22 +243,27 @@ final class ResolvedJoinKernel {
             sourceColumns[i] = index;
         }
         boolean[] counts = new boolean[builds.length];
-        boolean subtrees = updates.countsRowsOnly();
+        boolean subtrees = true;
         boolean dependent = false;
-        if (updates.countsRowsOnly()) {
-            java.util.Arrays.fill(counts, true);
-            // Binding has collected every aggregate, predicate and grouping input.
-            // A later join key also observes its producer, even when COUNT itself does not.
-            for (int owner : sourceBuilds) if (owner >= 0) { counts[owner] = false; subtrees = false; }
-            for (Key key : keys) {
-                for (Source source : key.sources) if (source.build >= 0) counts[source.build] = false;
-                if (key.dependent()) {
-                    dependent = true;
-                    subtrees &= key.producer() >= 0;
-                }
+        int lastObserved = -1;
+        java.util.Arrays.fill(counts, true);
+        // Binding has collected every aggregate, predicate and grouping input.
+        for (int owner : sourceBuilds) if (owner >= 0) {
+            counts[owner] = false;
+            subtrees = false;
+            lastObserved = Math.max(lastObserved, owner);
+        }
+        // Folding an earlier unobserved join would turn a,b,a,b into a,a,b,b.
+        // SUM sentinel overflow and floating updates require consecutive identical inputs.
+        if (!updates.countsRowsOnly()) java.util.Arrays.fill(counts, 0, lastObserved + 1, false);
+        for (Key key : keys) {
+            for (Source source : key.sources) if (source.build >= 0) counts[source.build] = false;
+            if (key.dependent()) {
+                dependent = true;
+                subtrees &= key.producer() >= 0;
             }
         }
-        var descriptors = new Layout(builds, keys, sourceBuilds, sourceColumns, counts, subtrees && dependent);
+        var descriptors = new Layout(builds, keys, sourceBuilds, sourceColumns, counts, subtrees && dependent, updates.countsRowsOnly());
         var code = backend.compile(program(updates, predicate, target, descriptors, false), artifacts);
         CompiledKernel membership = null;
         try {
@@ -347,7 +352,7 @@ final class ResolvedJoinKernel {
                     filterAll(loaded, keys, sets, layout, 0, eligible ->
                             lookupAll(eligible, lookups, heads, keys, layout, 0, found -> {
                                 if (iteration == Iteration.SUBTREES) {
-                                    countSubtrees(found, updates, predicate, target, layout, lookups, heads, links, addresses,
+                                    consumeSubtrees(found, updates, predicate, target, layout, lookups, heads, links, addresses,
                                             row, destination, matched, position, i64(1), 0);
                                 } else expand(found, updates, predicate, target, layout, lookups, heads, links, resumes, sets, addresses,
                                         row, destination, matched, position, pairs, i64(1), 0, iteration == Iteration.UNIQUE);
@@ -357,7 +362,7 @@ final class ResolvedJoinKernel {
         b.store(at(COLUMNS, MATCHED), matched);
     }
 
-    private static void countSubtrees(Builder b, AggregateUpdates updates, Pipeline.Predicate predicate, Target target,
+    private static void consumeSubtrees(Builder b, AggregateUpdates updates, Pipeline.Predicate predicate, Target target,
                                       Layout layout, Lookup[] lookups, Var[] heads, Var[] links, ArrayList<Var> addresses,
                                       Var row, Var destination, Var matched, Var position, Expr repetitions, int index) {
         if (index == links.length) {
@@ -366,7 +371,7 @@ final class ResolvedJoinKernel {
             return;
         }
         if (layout.keys[index].dependent()) {
-            countSubtrees(b, updates, predicate, target, layout, lookups, heads, links, addresses,
+            consumeSubtrees(b, updates, predicate, target, layout, lookups, heads, links, addresses,
                     row, destination, matched, position, repetitions, index + 1);
             return;
         }
@@ -379,7 +384,7 @@ final class ResolvedJoinKernel {
             weighted.assign(count, load(new Offset(counts, offset)));
         });
         // Preparation rejects subtree overflow, so zero here really means no joined row.
-        b.when(ne(count, i64(0)), present -> countSubtrees(present, updates, predicate, target, layout,
+        b.when(ne(count, i64(0)), present -> consumeSubtrees(present, updates, predicate, target, layout,
                 lookups, heads, links, addresses, row, destination, matched, position,
                 present.let(binary(Op.MUL, repetitions, count)), index + 1));
     }
@@ -608,8 +613,7 @@ final class ResolvedJoinKernel {
             });
         }
         b.assign(matched, i64(1));
-        if (updates.countsRowsOnly()) updates.addCountedRows(b, destination, repetitions);
-        else updates.emit(b, row, destination, nil());
+        updates.emitRepeated(b, row, destination, repetitions);
     }
 
     private static Pipeline.Row loadRow(Builder b, AggregateUpdates updates, Layout layout,
@@ -717,6 +721,15 @@ final class ResolvedJoinKernel {
         @Override
         public CharSequence getName() { return name; }
 
+        private void checkRepetitions(FrozenHashJoinBuild[] builds, SqlExecutionCircuitBreaker breaker) {
+            if (!layout.rowCountsOnly && !JoinDependencyFilter.repetitionsFit(builds, chainCounts, breaker)) {
+                subtreesReady = false;
+                for (int i = 0; i < chainCounts.length; i++) {
+                    if (chainCounts[i] != null) { chainCounts[i].close(); chainCounts[i] = null; }
+                }
+            }
+        }
+
         @Override
         public CompiledJoin.Updater newUpdater(Runnable checkpoint) { return new Slot(this, checkpoint); }
 
@@ -804,6 +817,7 @@ final class ResolvedJoinKernel {
                         chainCounts[i] = null;
                     }
                 }
+                checkRepetitions(builds, breaker);
                 membershipReady = true;
             } catch (Throwable failure) {
                 clearExecution();
@@ -885,6 +899,7 @@ final class ResolvedJoinKernel {
                 prepared.subtreesReady = JoinDependencyFilter.prepareSubtrees(builds, layout.builds, parents,
                         prepared.chainCounts, prepared.dependencyLinks, tracker, breaker);
             }
+            prepared.checkRepetitions(builds, breaker);
         }
 
         private JoinDependencyFilter.Lookup dependencyLookup(FrozenHashJoinBuild build, int child) {

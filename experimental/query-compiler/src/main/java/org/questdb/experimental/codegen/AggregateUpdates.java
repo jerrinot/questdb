@@ -44,6 +44,7 @@ import io.questdb.griffin.engine.functions.groupby.CountLongConstGroupByFunction
 import io.questdb.griffin.engine.functions.groupby.CountLongGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountSymbolGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.CountVarcharGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.KSumDoubleGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxDoubleGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxIntGroupByFunction;
 import io.questdb.griffin.engine.functions.groupby.MaxLongGroupByFunction;
@@ -80,11 +81,50 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         return true;
     }
 
-    void addCountedRows(Builder builder, Expr destination, Expr rows) {
-        for (var update : updates) {
-            var scalar = (ScalarUpdate) update;
-            ((Pipeline.Count) scalar.operation).addRows(builder, at(destination, scalar.offset), rows);
+    /** Consume consecutive identical inputs. Only row counts permit a wrapped multiplicity. */
+    void emitRepeated(Builder b, Pipeline.Row row, Expr destination, Expr rows) {
+        if (rows.equals(i64(1))) {
+            emit(b, row, destination, nil());
+            return;
         }
+        if (countsRowsOnly()) {
+            for (var update : updates) {
+                var scalar = (ScalarUpdate) update;
+                ((Pipeline.Count) scalar.operation).addRows(b, at(destination, scalar.offset), rows);
+            }
+            return;
+        }
+        var frame = new ResolvedVarchar.Frame(row, i64(0), nil(), nil());
+        b.when(binary(Op.LT, i64(0), rows), present -> {
+            var repeated = new ArrayList<Update>();
+            for (var update : updates) {
+                if (update instanceof ScalarUpdate scalar && scalar.operation instanceof Pipeline.Count count) {
+                    count.addRows(present, at(destination, scalar.offset), rows);
+                } else if (update instanceof ScalarUpdate scalar && scalar.operation instanceof Pipeline.CountValue count) {
+                    count.addRows(present, row, at(destination, scalar.offset), rows);
+                } else if (update instanceof IntegerExtremum || update instanceof DoubleExtremum) {
+                    update.emit(present, frame, destination, nil());
+                } else {
+                    repeated.add(update);
+                }
+            }
+            if (repeated.isEmpty()) return;
+            for (var update : repeated) update.emit(present, frame, destination, nil());
+            // Keep the actual update order and sentinel/rounding rules. LLVM can keep
+            // state in registers inside a chunk. The first row has handled empty-state
+            // initialization; subsequent rows use the ordinary computeNext contract.
+            Var remaining = present.let(binary(Op.SUB, rows, i64(1)));
+            present.loop(binary(Op.LT, i64(0), remaining), chunk -> {
+                Var count = chunk.let(new Select(binary(Op.LT, remaining, i64(1024)), remaining, i64(1024)));
+                Var index = chunk.let(i64(0));
+                chunk.loop(binary(Op.LT, index, count), repeat -> {
+                    for (var update : repeated) update.emitNext(repeat, frame, destination, nil());
+                    repeat.assign(index, add(index, i64(1)));
+                });
+                chunk.assign(remaining, binary(Op.SUB, remaining, count));
+                chunk.when(binary(Op.LT, i64(0), remaining), Builder::poll);
+            });
+        });
     }
 
     /** Shared resolved-function binding; state offsets come from the owning engine value layout. */
@@ -131,8 +171,9 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             }
             int argumentType;
             boolean average = isAverage(implementation);
+            boolean compensated = implementation == KSumDoubleGroupByFunction.class;
             boolean floating = implementation == SumDoubleGroupByFunction.class || implementation == MinDoubleGroupByFunction.class
-                    || implementation == MaxDoubleGroupByFunction.class || implementation == AvgDoubleGroupByFunction.class;
+                    || implementation == MaxDoubleGroupByFunction.class || implementation == AvgDoubleGroupByFunction.class || compensated;
             int stateType = floating || average && implementation != AvgShortGroupByFunction.class ? ColumnType.DOUBLE : ColumnType.LONG;
             boolean sum;
             boolean minimum = implementation == MinLongGroupByFunction.class || implementation == MinIntGroupByFunction.class
@@ -193,6 +234,12 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
                     || (distinct && offsets.applyAsLong(valueIndex + 1) != offsets.applyAsLong(valueIndex) + 8))) {
                 throw new IllegalArgumentException("Resolved aggregate count or payload state does not match its assigned slots");
             }
+            if (compensated && (valueIndex + 2 >= valueTypes.getColumnCount()
+                    || valueTypes.getColumnType(valueIndex + 1) != ColumnType.DOUBLE
+                    || valueTypes.getColumnType(valueIndex + 2) != ColumnType.LONG
+                    || !assignedSlots.add(valueIndex + 1) || !assignedSlots.add(valueIndex + 2))) {
+                throw new IllegalArgumentException("Resolved compensated sum state does not match its assigned slots");
+            }
             Pipeline.RowAggregate operation;
             if (argumentType == ColumnType.UNDEFINED) {
                 operation = new Pipeline.Count();
@@ -208,6 +255,11 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
                 if (average) {
                     updates.add(new AverageUpdate(expression, offsets.applyAsLong(valueIndex), offsets.applyAsLong(valueIndex + 1),
                             stateType == ColumnType.DOUBLE ? MemoryType.F64 : MemoryType.I64));
+                    continue;
+                }
+                if (compensated) {
+                    updates.add(new KahanSum(expression, offsets.applyAsLong(valueIndex),
+                            offsets.applyAsLong(valueIndex + 1), offsets.applyAsLong(valueIndex + 2)));
                     continue;
                 }
                 if (floating) {
@@ -266,8 +318,19 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     }
 
     void emit(Builder b, ResolvedVarchar.Frame source, Expr destination, Expr cardinalityAddress) {
+        emit(b, source, destination, cardinalityAddress, false);
+    }
+
+    void emitNext(Builder b, ResolvedVarchar.Frame source, Expr destination, Expr cardinalityAddress) {
+        emit(b, source, destination, cardinalityAddress, true);
+    }
+
+    private void emit(Builder b, ResolvedVarchar.Frame source, Expr destination, Expr cardinalityAddress, boolean next) {
         var frame = new ResolvedVarchar.Frame(source.numeric(b), source.row(), source.columns(), source.literals(), source.helpers(), source.materialized());
-        for (var update : updates) update.emit(b, frame, destination, cardinalityAddress);
+        for (var update : updates) {
+            if (next) update.emitNext(b, frame, destination, cardinalityAddress);
+            else update.emit(b, frame, destination, cardinalityAddress);
+        }
     }
 
     void emitFrame(Builder b, Var row, List<Var> addresses, Expr destination, Expr cardinalityAddress) {
@@ -303,11 +366,23 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
         return isAverage(function.getClass())
                 ? DoubleColumn.newInstance(((GroupByFunction) function).getValueIndex()) : function;
     }
-    sealed interface Update permits ScalarUpdate, IntegerExtremum, DoubleSum, DoubleExtremum, DistinctUpdate, AverageUpdate, VarcharCount, VarcharExtremum, VectorSumUpdate, VectorLongAverageUpdate, VectorDoubleCount, VectorDoubleExtremum, GroupedTopKAggregate.Update {
+    record StateCell(MemoryType width, long offset) { }
+
+    enum ResultAccess { NONE, DIRECT, FINALIZED }
+
+    sealed interface Update permits ScalarUpdate, IntegerExtremum, DoubleSum, DoubleExtremum, KahanSum, DistinctUpdate, AverageUpdate, VarcharCount, VarcharExtremum, VectorSumUpdate, VectorLongAverageUpdate, VectorDoubleCount, VectorDoubleExtremum, GroupedTopKAggregate.Update {
         long offset();
+        /** Complete state for scalar register promotion/copy; empty declines that path. Effects are checked separately. */
+        default List<StateCell> scalarState() { return List.of(); }
+        /** Whether a numeric consumer may read the result directly at offset(), and when. */
+        default ResultAccess resultAccess() { return ResultAccess.NONE; }
         void initialize(Builder b, Expr destination);
         void merge(Builder b, Expr source, Expr destination);
         void emit(Builder builder, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress);
+        /** The caller has already consumed at least one input row for this state, possibly NULL. */
+        default void emitNext(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            emit(b, frame, destination, cardinalityAddress);
+        }
         default boolean allocates() { return false; }
         default boolean finalizesResult() { return false; }
         default boolean deferredMerge() { return false; }
@@ -316,6 +391,8 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     }
 
     record VarcharCount(ResolvedVarchar.Expression argument, long offset) implements Update {
+        @Override public List<StateCell> scalarState() { return List.of(new StateCell(MemoryType.I64, offset)); }
+        @Override public ResultAccess resultAccess() { return ResultAccess.DIRECT; }
         @Override public void initialize(Builder b, Expr destination) { b.store(at(destination, offset), i64(0)); }
         @Override public void merge(Builder b, Expr source, Expr destination) {
             b.store(at(destination, offset), add(load(at(destination, offset)), load(at(source, offset))));
@@ -328,6 +405,8 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
 
     /** SUM(DOUBLE) ignores NaN inputs and replaces a NaN accumulator on the next value. */
     record DoubleSum(Pipeline.Scalar argument, long offset) implements Update {
+        @Override public List<StateCell> scalarState() { return List.of(new StateCell(MemoryType.F64, offset)); }
+        @Override public ResultAccess resultAccess() { return ResultAccess.DIRECT; }
         @Override public void initialize(Builder b, Expr destination) { b.store(MemoryType.F64, at(destination, offset), f64(Double.NaN)); }
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
             combine(b, destination, argument.emit(frame.numeric(b)).data());
@@ -348,6 +427,8 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
 
     /** Preserve the ordinary extrema rule: a nonfinite current value is replaceable. */
     record DoubleExtremum(Pipeline.Scalar argument, long offset, boolean minimum) implements Update {
+        @Override public List<StateCell> scalarState() { return List.of(new StateCell(MemoryType.F64, offset)); }
+        @Override public ResultAccess resultAccess() { return ResultAccess.DIRECT; }
         @Override public void initialize(Builder b, Expr destination) { b.store(MemoryType.F64, at(destination, offset), f64(Double.NaN)); }
         @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
             combine(b, destination, argument.emit(frame.numeric(b)).data());
@@ -360,6 +441,74 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             Expr better = minimum ? binary(Op.FLT, incoming, current) : binary(Op.FLT, current, incoming);
             b.when(binary(Op.EITHER, better, Pipeline.doubleNull(current)), replace ->
                     replace.store(MemoryType.F64, at(destination, offset), incoming));
+        }
+    }
+
+    /** Ordinary KSUM: preserve the ordered compensation recurrence and finite-input count. */
+    record KahanSum(Pipeline.Scalar argument, long offset, long compensationOffset, long countOffset) implements Update {
+        @Override public List<StateCell> scalarState() {
+            return List.of(new StateCell(MemoryType.F64, offset), new StateCell(MemoryType.F64, compensationOffset),
+                    new StateCell(MemoryType.I64, countOffset));
+        }
+
+        @Override public void initialize(Builder b, Expr destination) {
+            b.store(MemoryType.F64, at(destination, offset), f64(Double.NaN));
+            b.store(MemoryType.F64, at(destination, compensationOffset), f64(0));
+            b.store(at(destination, countOffset), i64(0));
+        }
+
+        @Override public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            Var value = b.let(argument.emit(frame.numeric(b)).data());
+            Var sum = b.let(new Load(MemoryType.F64, at(destination, offset)));
+            Var count = b.let(load(at(destination, countOffset)));
+            // The empty etalon is (NaN,_,0); computeFirst(nonfinite) leaves (0,0,0).
+            // That distinction preserves signed zero on the next finite input.
+            Var first = b.let(binary(Op.BOTH, eq(count, i64(0)), binary(Op.FNE, sum, sum)));
+            Var finite = b.let(eq(Pipeline.doubleNull(value), bool(false)));
+            b.when(first, empty -> {
+                empty.store(MemoryType.F64, at(destination, offset), new Select(finite, value, f64(0)));
+                empty.store(MemoryType.F64, at(destination, compensationOffset), f64(0));
+                empty.store(at(destination, countOffset), new Select(finite, i64(1), i64(0)));
+            });
+            b.when(binary(Op.BOTH, eq(first, bool(false)), finite), next -> add(next, destination, value, sum, count));
+        }
+
+        @Override public void emitNext(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            Var value = b.let(argument.emit(frame.numeric(b)).data());
+            b.when(eq(Pipeline.doubleNull(value), bool(false)), next -> add(next, destination, value,
+                    next.let(new Load(MemoryType.F64, at(destination, offset))), next.let(load(at(destination, countOffset)))));
+        }
+
+        private void add(Builder b, Expr destination, Expr value, Expr sum, Expr count) {
+            Var y = b.let(binary(Op.FSUB, value, new Load(MemoryType.F64, at(destination, compensationOffset))));
+            Var total = b.let(binary(Op.FADD, sum, y));
+            b.store(MemoryType.F64, at(destination, offset), total);
+            b.store(MemoryType.F64, at(destination, compensationOffset), binary(Op.FSUB, binary(Op.FSUB, total, sum), y));
+            b.store(at(destination, countOffset), Ir.add(count, i64(1)));
+        }
+
+        @Override public void merge(Builder b, Expr source, Expr destination) {
+            Var count = b.let(load(at(source, countOffset)));
+            b.when(binary(Op.LT, i64(0), count), nonempty -> {
+                Var destinationCount = nonempty.let(load(at(destination, countOffset)));
+                Var sum = nonempty.let(new Load(MemoryType.F64, at(source, offset)));
+                Var compensation = nonempty.let(new Load(MemoryType.F64, at(source, compensationOffset)));
+                Var populated = nonempty.let(binary(Op.LT, i64(0), destinationCount));
+                nonempty.when(populated, existing -> {
+                    Var current = existing.let(new Load(MemoryType.F64, at(destination, offset)));
+                    // QuestDB merges the source's correction, not the destination's.
+                    Var y = existing.let(binary(Op.FSUB, sum, compensation));
+                    Var total = existing.let(binary(Op.FADD, current, y));
+                    existing.store(MemoryType.F64, at(destination, offset), total);
+                    existing.store(MemoryType.F64, at(destination, compensationOffset), binary(Op.FSUB, binary(Op.FSUB, total, current), y));
+                    existing.store(at(destination, countOffset), Ir.add(destinationCount, count));
+                });
+                nonempty.when(eq(populated, bool(false)), empty -> {
+                    empty.store(MemoryType.F64, at(destination, offset), sum);
+                    empty.store(MemoryType.F64, at(destination, compensationOffset), compensation);
+                    empty.store(at(destination, countOffset), count);
+                });
+            });
         }
     }
 
@@ -449,6 +598,8 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     }
 
     record ScalarUpdate(Pipeline.RowAggregate operation, long offset) implements Update {
+        @Override public List<StateCell> scalarState() { return List.of(new StateCell(MemoryType.I64, offset)); }
+        @Override public ResultAccess resultAccess() { return ResultAccess.DIRECT; }
         @Override public void initialize(Builder b, Expr destination) {
             b.store(at(destination, offset), i64(operation.initialValue()));
         }
@@ -463,6 +614,8 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
 
     /** Existing MIN/MAX state: LONG for LONG input, INT for INT/SHORT input. */
     record IntegerExtremum(Pipeline.Scalar argument, long offset, MemoryType width, boolean minimum) implements Update {
+        @Override public List<StateCell> scalarState() { return List.of(new StateCell(width, offset)); }
+        @Override public ResultAccess resultAccess() { return ResultAccess.DIRECT; }
         private long nullValue() { return width == MemoryType.I64 ? Long.MIN_VALUE : Integer.MIN_VALUE; }
 
         @Override public void initialize(Builder b, Expr destination) {
@@ -492,18 +645,31 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
 
     /** Ordinary averages: SHORT has a LONG sum; INT/LONG/DOUBLE accumulate in DOUBLE. */
     record AverageUpdate(Pipeline.Scalar argument, long offset, long countOffset, MemoryType sumType) implements Update {
+        @Override public List<StateCell> scalarState() {
+            return List.of(new StateCell(sumType, offset), new StateCell(MemoryType.I64, countOffset));
+        }
+        @Override public ResultAccess resultAccess() { return ResultAccess.FINALIZED; }
         @Override public boolean finalizesResult() { return true; }
         @Override public void initialize(Builder b, Expr destination) {
-            b.store(sumType, at(destination, offset), sumType == MemoryType.F64 ? f64(0) : i64(Long.MIN_VALUE));
+            b.store(sumType, at(destination, offset), sumType == MemoryType.F64 ? f64(Double.NaN) : i64(Long.MIN_VALUE));
             b.store(at(destination, countOffset), i64(0));
         }
         @Override
         public void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            emit(b, frame, destination, true);
+        }
+
+        @Override
+        public void emitNext(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr cardinalityAddress) {
+            emit(b, frame, destination, false);
+        }
+
+        private void emit(Builder b, ResolvedVarchar.Frame frame, Expr destination, boolean initialize) {
             Expr sumAddress = at(destination, offset), countAddress = at(destination, countOffset);
             Var count = b.let(load(countAddress));
             var input = argument.emit(frame.numeric(b));
             Expr missing = input.data().type() == Type.F64 ? binary(Op.FNE, input.data(), input.data()) : input.isNull();
-            if (sumType == MemoryType.F64) {
+            if (initialize && sumType == MemoryType.F64) {
                 // Ordinary computeFirst(NULL) stores (0,0). A later Java computeNext
                 // adds directly, so leaving the empty etalon's NaN here is unsafe.
                 b.when(binary(Op.BOTH, missing, eq(count, i64(0))), absent ->
@@ -511,8 +677,16 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             }
             b.when(eq(missing, bool(false)), present -> {
                 Expr value = sumType == MemoryType.F64 && input.data().type() == Type.I64 ? new ToDouble(input.data()) : input.data();
-                Expr sum = binary(sumType == MemoryType.F64 ? Op.FADD : Op.ADD, new Load(sumType, sumAddress), value);
-                present.store(sumType, sumAddress, new Select(eq(count, i64(0)), value, sum));
+                Var current = present.let(new Load(sumType, sumAddress));
+                Expr sum = binary(sumType == MemoryType.F64 ? Op.FADD : Op.ADD, current, value);
+                if (initialize) {
+                    Expr first = eq(count, i64(0));
+                    // A NULL prefix leaves (0,0), unlike the empty (NaN,0) etalon.
+                    // Adding -0.0 to that existing zero must retain ordinary rounding.
+                    if (sumType == MemoryType.F64) first = binary(Op.BOTH, first, binary(Op.FNE, current, current));
+                    sum = new Select(first, value, sum);
+                }
+                present.store(sumType, sumAddress, sum);
                 present.store(countAddress, add(count, i64(1)));
             });
         }
@@ -542,6 +716,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     }
 
     record DistinctUpdate(Pipeline.Scalar argument, long offset, NestedDistinct layout, int initialCapacity, double loadFactor) implements Update {
+        @Override public ResultAccess resultAccess() { return ResultAccess.DIRECT; }
         @Override public boolean allocates() { return true; }
         @Override public boolean deferredMerge() { return layout == NestedDistinct.LONG; }
         @Override public void initialize(Builder b, Expr destination) {

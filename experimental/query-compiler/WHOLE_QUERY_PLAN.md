@@ -26,7 +26,7 @@ Targets for this cycle, measured against a fresh, frozen current LLVM baseline B
 | --- | --- |
 | Broad new performance | Set an ambitious complete-query target for the selected join mechanism before implementation, based on measured recoverable work. Demonstrate gains on at least two independent 500M-row controls, varying the properties that explain the gain. Report SSB totals and per-family results as controls, without an SSB speedup quota. |
 | Complete generated execution | Make build, probe, filtering, aggregation, merge and ordering compose through reusable contracts where measurements justify the work. Report strict all-operator coverage separately from speedup; do not add operators solely to reach an SSB query-count target. Java scheduling/allocation is allowed; Java data-processing loops do not count as generated. |
-| Generality | Validate claimed support beyond SSB: independent and dependent join inputs, key types/dictionaries, sparse and wide domains, duplicates, skew and selectivity. Use relevant controls for each mechanism, with explicit rejection/fallback for unsupported properties. SYMBOL/LONG and dependent-chain composition remain architectural candidates; a multiway improvement need not also improve a single-table query. |
+| Generality | Validate claimed support beyond SSB: independent and dependent join inputs, key types/dictionaries, sparse and wide domains, duplicates, skew and selectivity. Aggregate placement must also cover SUM, AVG, MIN/MAX, COUNT(value), mixed aggregate lists and grouping, with NULL/overflow/rounding controls. MIN and MAX are primary aggregate families: validate each independently as well as in mixed lists. Type coverage alone does not establish aggregate generality; generated expansion and successful fallback do not establish work elimination. Use relevant controls for each mechanism, with explicit rejection/fallback for unsupported properties. SYMBOL/LONG and dependent-chain composition remain architectural candidates; a multiway improvement need not also improve a single-table query. |
 | Preserve previous gains | Refresh the original ClickBench combined gate: at least 22/43 queries both fully generated and robustly at least 1.5x faster than stock. Preserve the existing aggregation, dictionary and ranking controls. |
 | Economical execution | Measure complete first requests, compilation CPU, generated code size, peak live query memory and RSS separately. A repeatable control regression exceeding both 5% and 1ms requires correction, narrower semantic/property-based admission, or rejection. First-request tradeoffs are reported even when warm execution wins. |
 
@@ -325,10 +325,22 @@ compilation cost. Closed build forests are now retained too: producer multiplici
 are folded once and generated workers probe only roots. The six primary typed cases
 gain 1.84-2.99x over leaf folding; a deeper mixed-type forest gains 3.83x. Memory,
 overflow, unsupported heaps, cancellation/reopen and zero-group semantics are checked.
-Remaining root probes warrant profiling before another representation change.
-SUM/AVG, DISTINCT, outer joins and functional-dependency rewrites still need separate
-proofs. W3 is not complete; Java-owned build preparation does not increase strict
-whole-query generated coverage.
+Repeated-input consumption now closes the COUNT-only aggregate gate: COUNT(value)
+uses weights, extrema update once, and SUM/AVG replay actual ordered updates inside
+a generated loop, including mixed lists and grouping. Initialization is peeled from
+AVG's subsequent updates. Non-COUNT folding preserves the observed input order and
+requires representable run lengths; it does not substitute multiplication for SUM.
+Three 500M-row process pairs on each INT/LONG/SYMBOL branch give SUM 2.86-3.21x and
+AVG 2.52-2.67x over the frozen COUNT-capable compiler. Exact-state/SQL controls cover
+NULLs, sentinel overflow, signed zero, nonfinite values and rounding-sensitive order.
+Small no-match/ordinary-AVG costs and larger compilation/code size remain explicit;
+see [evidence](target/join-repeated-inputs.md).
+
+W3 is not complete. Observed build inputs retain ordinary expansion except for legal
+unobserved suffixes; DISTINCT, outer joins and functional-dependency rewrites still
+need separate proofs. Java-owned build preparation does not increase strict whole-
+query generated coverage. The next experiment must separate residual root lookup
+from ordered aggregate arithmetic rather than assume every remaining cost is hashing.
 
 ## W4 — Make whole-query specialization economical
 

@@ -69,11 +69,9 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
         long base = layout.getAddress(0);
         var updates = AggregateUpdates.bind(inputs, values, functions, index -> layout.getAddress(index) - base, false);
         if (updates == null) return null;
-        // Promote only the known fixed-width states; allocating aggregates need an allocator-aware path.
+        // Only explicitly described states are eligible; allocating aggregates need an allocator-aware path.
         for (var update : updates.updates()) {
-            if (!(update instanceof AggregateUpdates.ScalarUpdate || update instanceof AggregateUpdates.IntegerExtremum
-                    || update instanceof AggregateUpdates.AverageUpdate || update instanceof AggregateUpdates.DoubleSum
-                    || update instanceof AggregateUpdates.DoubleExtremum || update instanceof AggregateUpdates.VarcharCount)) return null;
+            if (update.allocates() || update.scalarState().isEmpty()) return null;
         }
         var filter = predicate == null ? null : ResolvedFilter.bind(inputs, predicate);
         CompiledKernel code = filter == null ? backend.compile(scan(updates), artifacts)
@@ -94,12 +92,7 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
     private static List<Load> stateLoads(AggregateUpdates updates, Expr base) {
         var result = new ArrayList<Load>();
         for (var update : updates.updates()) {
-            var width = update instanceof AggregateUpdates.IntegerExtremum extrema ? extrema.width()
-                    : update instanceof AggregateUpdates.AverageUpdate average ? average.sumType()
-                    : update instanceof AggregateUpdates.DoubleSum || update instanceof AggregateUpdates.DoubleExtremum ? MemoryType.F64 : MemoryType.I64;
-            result.add(new Load(width, at(base, update.offset())));
-            if (update instanceof AggregateUpdates.AverageUpdate average)
-                result.add(new Load(MemoryType.I64, at(base, average.countOffset())));
+            for (var cell : update.scalarState()) result.add(new Load(cell.width(), at(base, cell.offset())));
         }
         return result;
     }
@@ -126,16 +119,21 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
         b.loop(binary(Op.LT, index, ROWS), chunk -> {
             chunk.poll();
             Var end = chunk.let(new Select(binary(Op.LT, ROWS, add(index, i64(1024))), ROWS, add(index, i64(1024))));
+            // A chunk is nonempty. Its first update establishes ordinary state even after
+            // a NULL prefix; the remaining rows can use the same next-update contract as joins.
+            Var firstRow = rowIds == null ? index : chunk.let(load(new Offset(rowIds, binary(Op.MUL, index, i64(8)))));
+            updateRow(chunk, updates, addresses, registers, firstRow, false);
+            chunk.assign(index, add(index, i64(1)));
             chunk.loop(binary(Op.LT, index, end), loop -> {
                 Var row = rowIds == null ? index : loop.let(load(new Offset(rowIds, binary(Op.MUL, index, i64(8)))));
-                updateRow(loop, updates, addresses, registers, row);
+                updateRow(loop, updates, addresses, registers, row, true);
                 loop.assign(index, add(index, i64(1)));
             });
         });
     }
 
     private static void updateRow(Builder loop, AggregateUpdates updates, List<Var> addresses,
-                                  Map<Load, Var> registers, Var row) {
+                                  Map<Load, Var> registers, Var row, boolean next) {
         var values = updates.loadFrameRow(loop, row, addresses);
         var frame = updates.inputs().frame(values, row, at(COLUMNS, 8));
         var strings = new LinkedHashMap<ResolvedVarchar.Expression, Pipeline.Utf8Value>();
@@ -146,7 +144,9 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
             strings.put(count.argument(), new Pipeline.Utf8Value(nil(), i64(0), isNull, bool(false), bool(true)));
         }
         Builder emitted = loop.fork();
-        updates.emit(emitted, new ResolvedVarchar.Frame(frame.numeric(loop), row, nil(), nil(), strings), STATE, nil());
+        var source = new ResolvedVarchar.Frame(frame.numeric(loop), row, nil(), nil(), strings);
+        if (next) updates.emitNext(emitted, source, STATE, nil());
+        else updates.emit(emitted, source, STATE, nil());
         loop.append(promote(emitted.block(), registers));
     }
 
@@ -160,7 +160,7 @@ final class ResolvedScalarAggregate implements CompiledScalarAggregate {
         Var count = b.let(i64(0));
         ScanLowering.filteredRange(filter.plan(), filter.residual(), b, at(COLUMNS, 8 + updates.inputs().bytes()), i64(0),
                 (selected, row) -> {
-                    updateRow(selected, updates, addresses, registers, selected.let(row));
+                    updateRow(selected, updates, addresses, registers, selected.let(row), false);
                     selected.assign(count, add(count, i64(1)));
                 });
         for (var entry : registers.entrySet()) b.store(entry.getKey().width(), entry.getKey().address(), entry.getValue());

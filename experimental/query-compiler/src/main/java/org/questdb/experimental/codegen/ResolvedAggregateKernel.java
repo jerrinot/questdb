@@ -92,7 +92,8 @@ public final class ResolvedAggregateKernel {
         for (int i = 0; i < functions.size(); i++) {
             var function = functions.getQuick(i);
             // Capture the exact output slot and type while resolved functions are borrowed.
-            readers.add(new ResultRead(function.getClass(), AggregateUpdates.outputFunction(function).getClass(), function.getValueIndex(), layout.getOffset(function.getValueIndex()), function.getType()));
+            readers.add(new ResultRead(function.getClass(), AggregateUpdates.outputFunction(function).getClass(),
+                    function.getValueIndex(), layout.getOffset(function.getValueIndex()), function.getType(), updates.get(i).resultAccess()));
         }
         return new Binding(new Program(b.block()), allocates, probe, prefetchRows, countSumReference, resolved, layout.getSizeInBytes(), valueTypes.getColumnCount(), List.copyOf(readers));
     }
@@ -331,7 +332,8 @@ public final class ResolvedAggregateKernel {
         });
     }
 
-    private record ResultRead(Class<?> implementation, Class<?> outputImplementation, int index, long offset, int type) { }
+    private record ResultRead(Class<?> implementation, Class<?> outputImplementation, int index, long offset, int type,
+                              AggregateUpdates.ResultAccess access) { }
 
     public static final class Binding {
         private final Program program;
@@ -717,6 +719,8 @@ public final class ResolvedAggregateKernel {
             int index = function instanceof GroupByFunction aggregate ? aggregate.getValueIndex()
                     : function instanceof io.questdb.griffin.engine.functions.columns.ColumnFunction column ? column.getColumnIndex() : -1;
             for (var reader : binding.readers) {
+                if (reader.access() == AggregateUpdates.ResultAccess.NONE
+                        || reader.access() == AggregateUpdates.ResultAccess.FINALIZED && finalizeCode == null) continue;
                 if (reader.type() == function.getType() && reader.index() == index
                         && (reader.implementation() == function.getClass()
                         || finalizeCode != null && reader.outputImplementation() == function.getClass())) return reader.offset();

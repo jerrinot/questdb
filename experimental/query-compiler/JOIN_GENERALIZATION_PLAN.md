@@ -210,10 +210,37 @@ in diagnostics, with first preparation ~21-25ms. Build preparation remains Java.
 69 compiler / 155 core checks, 761 complete outputs and installed hashes pass.
 See [subtree evidence](target/join-subtrees.md).
 
-Next separate remaining root lookup cost from grouping/aggregate work. Closed
-subtrees remove repeated build work but do not remove irregular root probes.
-Broader aggregate placement requires null/overflow/rounding proofs; observed build
-values and mixed-source dependency keys retain ordinary processing. Choose the next
+Aggregate generality now extends beyond COUNT. Existing multiplicities feed weighted
+COUNT(value), idempotent MIN/MAX and ordered SUM/AVG replay, including mixed lists and
+grouping. `countsRowsOnly()` now distinguishes wrapping row-count arithmetic; it no
+longer gates reduction. SUM/AVG reuse actual state updates, not multiplication, and
+peel initialization from subsequent updates. Non-COUNT leaf reduction is restricted
+to the unobserved suffix after the last observed build, preserving input order.
+Cross-root run-length overflow declines publication and keeps ordinary expansion.
+
+Three process pairs on the same 500M-row typed branches give SUM **2.86-3.21x** and
+AVG **2.52-2.67x** over the frozen COUNT-capable compiler. COUNT(value), extrema,
+mixed/grouped aggregates and DOUBLE SUM also benefit. No-match preparation and
+ordinary AVG retain small costs; compilation and generated code grow. See
+[repeated-input evidence](target/join-repeated-inputs.md) for controls and limits.
+
+MIN and MAX also pass independent primary comparisons: three 500M-row process pairs
+per INT/LONG/SYMBOL join key give MIN **4.99-6.67x** and MAX **4.91-7.10x**. INT and
+DOUBLE aggregate values, grouped/mixed lists and observed build values are controls.
+Exact state checks cross prior/current floating values, including replaceable infinite
+states and signed-zero ties. SYMBOL here describes join keys, not extrema over symbol
+text. See [extrema evidence](target/join-extrema.md); the compiler is unchanged.
+
+Aggregate integration now has explicit typed scalar state and result-access contracts.
+Ordinary KSUM validates a new three-cell family across scalar, grouped and typed
+joins without adding a backend or scalar-promotion class case. Its original getter
+remains required; vector/Rosti KSUM and native derived-result expressions are separate
+work. Generic first-update peeling also improves the existing mixed scalar control.
+See [KSUM evidence](target/aggregate-ksum.md) for exact-state and 500M-row checks.
+
+Next distinguish remaining root lookup from ordered aggregate arithmetic. Observed
+build values permit only safe suffix folding; mixed-source dependencies, DISTINCT,
+outer joins and further aggregate pushdown need separate proofs. Choose the next
 mechanism from fresh fixed-work profiles, not an SSB query quota.
 
 ## Retention rules

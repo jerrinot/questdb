@@ -420,8 +420,11 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         public long initialValue() { return 0; }
         @Override
         public void emit(Builder builder, Row row, Expr address) {
+            addRows(builder, row, address, i64(1));
+        }
+        public void addRows(Builder builder, Row row, Expr address, Expr rows) {
             builder.when(eq(argument.emit(row).isNull(), bool(false)),
-                    b -> b.store(address, add(load(address), i64(1))));
+                    b -> b.store(address, add(load(address), rows)));
         }
         @Override
         public void merge(Builder builder, Expr source, Expr destination) {

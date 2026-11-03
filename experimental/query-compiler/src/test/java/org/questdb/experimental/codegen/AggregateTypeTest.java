@@ -311,6 +311,74 @@ public class AggregateTypeTest {
         try (var candidate = compile(sql)) { check(sql, candidate); }
     }
 
+    @Test public void compensatedSumsShareScalarAndTypedMapPipelinesButKeepTheirResultGetter() throws Exception {
+        engine.execute("create table compensated as (select cast(x%7 as int) k,(x%7)*4294967297 l,"
+                + "cast(x%7 as symbol) s,cast(x%7 as double) g,"
+                + "case when x%7=0 or x<31 then null else cast(x%101-50 as double) end d,"
+                + "x%37-18 v from long_sequence(2003))", context);
+        String aggregates = "ksum(d*1.0),sum(v),avg(v),min(d),max(d),count()";
+        for (String key : List.of("k", "l", "s", "g")) {
+            String sql = "select " + key + "," + aggregates + " from compensated group by " + key;
+            try (var candidate = compile(sql)) {
+                check(sql, candidate); check(sql, candidate);
+                assertTrue(sql, nativeRows(candidate) > 0);
+            }
+        }
+        for (String sql : List.of("select " + aggregates + " from compensated",
+                "select ksum(d*1.0) from compensated where k>0",
+                "select k,ksum(d) from compensated where k>=0 group by k")) {
+            try (var candidate = compile(sql)) {
+                check(sql, candidate); check(sql, candidate);
+                assertTrue(sql, nativeRows(candidate) > 0);
+            }
+        }
+        for (String suffix : List.of(" order by n", " order by n desc limit 3")) {
+            String sql = "select k,ksum(d*1.0) n from compensated group by k" + suffix;
+            try (var candidate = compile(sql)) {
+                checkRanked(sql, candidate);
+                assertTrue(nativeRows(candidate) > 0);
+                assertEquals("KSUM needs its count-guarded getter", 0, nativeRankedRows(candidate, !suffix.contains("limit")));
+            }
+        }
+        String nested = "select count(n),sum(n) from (select k,ksum(d*1.0) n from compensated group by k)";
+        try (var candidate = compile(nested)) { check(nested, candidate); check(nested, candidate); }
+        engine.execute("alter table compensated add column late double", context);
+        String sql = "select k,ksum(d*1.0),ksum(late*1.0) from compensated group by k";
+        try (var candidate = compile(sql)) {
+            check(sql, candidate);
+            engine.execute("insert into compensated values (1,4294967297,'1',1.0,0.25,1,1.25)", context);
+            check(sql, candidate);
+            assertTrue(nativeRows(candidate) > 0);
+        }
+        engine.execute("truncate table compensated", context);
+        try (var candidate = compile("select ksum(d*1.0) from compensated")) {
+            check("select ksum(d*1.0) from compensated", candidate);
+        }
+    }
+
+    @Test public void compensatedScalarChunksPreserveOrderedRoundingAndNullPrefixes() throws Exception {
+        pool.halt();
+        context.changePageFrameSizes(4096, 4096); // One ordered frame, crossing two native chunk boundaries.
+        engine.execute("create table rounding (d double)", context);
+        String sql = "select ksum(d*1.0),avg(d*1.0) from rounding";
+        try (var candidate = compile(sql)) {
+            for (double[] pattern : new double[][]{{Double.NaN, -0.0}, {-0.0, Double.NaN},
+                    {1e16, 1.0, 1.0, -1e16, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, 0.1}}) {
+                engine.execute("truncate table rounding", context);
+                try (var writer = engine.getWriter(engine.verifyTableName("rounding"), "test")) {
+                    for (int i = 0; i < 2051; i++) {
+                        var row = writer.newRow();
+                        row.putDouble(0, pattern[i % pattern.length]);
+                        row.append();
+                    }
+                    writer.commit();
+                }
+                check(sql, candidate); check(sql, candidate);
+                assertTrue(nativeRows(candidate) > 0);
+            }
+        }
+    }
+
     @Test public void unsupportedComputedKeyRetainsOrdinaryAverageFinalization() throws Exception {
         engine.execute("create table fallback as (select cast(x%17-8 as int) i,(x%31-15)*0.25 d from long_sequence(1003))", context);
         String sql = "select abs(i) k,avg(i),avg(d) from fallback group by k";
