@@ -61,6 +61,7 @@ import io.questdb.std.datetime.millitime.MillisecondClock;
 import io.questdb.std.str.StringSink;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.QueryAssertion;
+import io.questdb.test.QueryCodegenTestSupport;
 import io.questdb.test.tools.CountingSqlExecutionCircuitBreaker;
 import io.questdb.test.tools.TestUtils;
 import org.jetbrains.annotations.Nullable;
@@ -3673,7 +3674,7 @@ public class HashJoinGroupByPlannerTest extends AbstractCairoTest {
     }
 
     private SqlExecutionContextImpl context(int workers) {
-        return new SqlExecutionContextImpl(engine, workers).with(AllowAllSecurityContext.INSTANCE, null, null, -1, null);
+        return QueryCodegenTestSupport.configure(new SqlExecutionContextImpl(engine, workers)).with(AllowAllSecurityContext.INSTANCE, null, null, -1, null);
     }
 
     /**

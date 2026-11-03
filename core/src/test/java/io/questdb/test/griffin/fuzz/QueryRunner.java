@@ -38,7 +38,9 @@ import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.griffin.FunctionParser;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.griffin.TextPlanSink;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.test.TestFaultFunctionFactory;
 import io.questdb.griffin.engine.groupby.CountRecordCursorFactory;
 import io.questdb.griffin.engine.groupby.GroupByNotKeyedRecordCursorFactory;
@@ -54,6 +56,7 @@ import io.questdb.std.ObjList;
 import io.questdb.std.Rnd;
 import io.questdb.std.Unsafe;
 import io.questdb.std.str.StringSink;
+import io.questdb.test.QueryCodegenTestSupport;
 import io.questdb.test.cairo.fuzz.FailureFileFacade;
 import io.questdb.test.griffin.fuzz.FuzzTableFactory.ParquetMode;
 
@@ -183,6 +186,8 @@ public final class QueryRunner {
     // Successful runs, on any axis, whose plan picks the build of an INNER fused hash join GROUP BY
     // per execution. It shows that the generator's interval conjuncts reach that plan.
     private int buildChoiceRuns;
+    private int compilerAxisNativeRuns;
+    private int compilerAxisRuns;
     private int faultsFired;
     // Per-type count of faults that actually fired, indexed by FaultType.ordinal().
     private final int[] faultsFiredByType = new int[FaultType.values().length];
@@ -203,6 +208,7 @@ public final class QueryRunner {
     private final StringSink rowsC = new StringSink();
     private final StringSink rowsD = new StringSink();
     private final StringSink rowsE = new StringSink();
+    private final StringSink rowsCompiler = new StringSink();
     // Scratch sink for the toTop() re-iteration pass; compared against the
     // first pass to confirm the cursor reproduces its result set on rewind.
     private final StringSink rowsToTop = new StringSink();
@@ -266,6 +272,14 @@ public final class QueryRunner {
      */
     public FaultType chooseFaultType(Rnd rnd) {
         return faultTypes[rnd.nextInt(faultTypes.length)];
+    }
+
+    public int getCompilerAxisNativeRuns() {
+        return compilerAxisNativeRuns;
+    }
+
+    public int getCompilerAxisRuns() {
+        return compilerAxisRuns;
     }
 
     public int getFaultsArmed(FaultType type) {
@@ -1597,7 +1611,8 @@ public final class QueryRunner {
 
     private Result runQuery(GeneratedQuery query) {
         String sql = query.sql();
-        if (!diffJit && !diffShadow && !isFusedAxisApplicable(query) && !query.hasBind()) {
+        QueryCodeGenerator compiler = executionContext.getQueryCodeGenerator();
+        if (compiler == null && !diffJit && !diffShadow && !isFusedAxisApplicable(query) && !query.hasBind()) {
             Outcome outcome = runOnce(sql, rowsA, primaryHasAnyParquet, query.deterministic());
             return toResult(sql, outcome);
         }
@@ -1606,9 +1621,30 @@ public final class QueryRunner {
             // Pivot: primary at JIT-off. The pivot is the right-hand side of
             // the JIT comparison and the left-hand side of the storage,
             // fused and bind-variable comparisons, so it runs whenever any of
-            // the four diffs is on.
+            // any differential axis is on.
             executionContext.setJitMode(SqlJitMode.JIT_MODE_DISABLED);
+            long nativeBefore = QueryCodegenTestSupport.executions();
             Outcome bJ = runOnce(sql, rowsB, primaryHasAnyParquet, query.deterministic());
+            if (compiler != null) {
+                boolean executed = QueryCodegenTestSupport.executions() > nativeBefore;
+                Outcome stock;
+                var context = (SqlExecutionContextImpl) executionContext;
+                context.setQueryCodeGenerator(null);
+                long stockBefore = QueryCodegenTestSupport.executions();
+                try {
+                    stock = runOnce(sql, rowsCompiler, primaryHasAnyParquet, query.deterministic());
+                } finally {
+                    context.setQueryCodeGenerator(compiler);
+                }
+                if (QueryCodegenTestSupport.executions() != stockBefore) {
+                    throw new AssertionError("stock compiler oracle executed experimental native code");
+                }
+                compilerAxisRuns++;
+                if (executed && bJ.failure == null && stock.failure == null) compilerAxisNativeRuns++;
+                Result compilerResult = reconcilePair(sql, bJ, stock, rowsB, rowsCompiler, query.deterministic(),
+                        "compiler divergence", "compiled", "stock   ");
+                if (compilerResult.isFailed()) return compilerResult;
+            }
 
             Outcome aJ = null;
             Result jitResult = null;

@@ -7443,3 +7443,37 @@ scoped memory/throttle errors are zero. All measured classes are source-matched;
 existing data reused. No strict whole-query coverage claim: sorting/build
 preparation can remain Java. Evidence: `target/aggregate-ksum.md` ->
 `/run/media/jara/test/query-ksum-20261103/RESULTS.md`. No commit.
+
+## 2026-11-03 — Run existing Griffin correctness and fuzz tests through LLVM
+
+Added test-only compiler injection to shared node/TestUtils contexts, the query
+fuzzer and the join-suite context helpers. `run-griffin-tests.sh stock|llvm
+class[#method] ...` runs existing JUnit tests and reports compilations/native kernel
+invocations per method. Zero native execution fails an entire LLVM run; code-handle
+ownership is checked at the end. Production code and configuration are unchanged.
+
+The existing query fuzzer now adds an explicit compiler-on/off comparison whenever
+a compiler is installed. Both arms use the same filter-JIT mode, and the stock arm
+is checked for absence of experimental kernel calls. Existing result/exception,
+cursor-rewind/size, floating-comparison, storage/bind/fused and fault checks remain.
+No result or plan assertion was relaxed. A standalone KSUM case reuses the existing
+merge-fuzz fixture: the mixed KSUM/unsupported-NSUM case alone cannot prove admission.
+
+Seeds `(123456789,987654321)` and `(1,2)`, 1000 queries each, pass in stock and LLVM.
+LLVM executes in **88/848** and **118/857** compiler comparisons respectively;
+the other comparisons must not be reported as native coverage. Both modes fire
+**121/152** and **101/143** injected faults. Native call counts include kernels
+with different ABIs, not input rows or complete-query coverage.
+
+Focused checks also pass: all 14 CountColumn, ten HashJoinGroupByColumnTypes and
+four OrderByEncodeSortFuzz methods; the randomized join qualification matrix;
+two join planner methods; and KSUM, AVG and SHORT MIN/MAX merge-fuzz methods.
+The last two merge cases retain ordinary batching on the tested seed. The join
+matrix/type cases execute ~6900 native calls after wiring their separate context
+helper. Existing memory/cursor assertions and LLVM handle checks pass.
+
+Maven reactor packaging/install and the documented shell command pass. One early
+larger run was invalidated by rebuilding its classpath concurrently; its class-load
+failures are excluded, and the clean run was repeated. This is a bounded correctness
+pass, not a full Griffin-suite result or a performance experiment. Usage is in
+README; current test logs are under `target/griffin/`. No commit.

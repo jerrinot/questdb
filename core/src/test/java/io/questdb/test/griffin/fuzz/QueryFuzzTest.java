@@ -40,6 +40,7 @@ import io.questdb.std.ObjList;
 import io.questdb.std.Rnd;
 import io.questdb.std.str.StringSink;
 import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.QueryCodegenTestSupport;
 import io.questdb.test.cairo.fuzz.FailureFileFacade;
 import io.questdb.test.griffin.fuzz.expr.BindContext;
 import io.questdb.test.mp.TestWorkerPool;
@@ -74,7 +75,7 @@ import java.nio.file.Paths;
  * Budget knobs:
  * <ul>
  *     <li>{@code -Dquestdb.fuzz.queries=N} &mdash; number of queries per
- *         run (default 100). Crank up locally when hunting bugs.</li>
+ *         run (default 1000). Crank up locally when hunting bugs.</li>
  *     <li>{@code -Dquestdb.fuzz.diff.jit=true|false} &mdash; differential
  *         JIT-on/off mode (default true). When enabled, every query is run
  *         twice and the materializations are compared; any divergence is
@@ -156,7 +157,7 @@ import java.nio.file.Paths;
  *         the operator's own rule, which copies over the fuzz tables' equal
  *         row counts unless an interval leaves the probe under half the
  *         build).</li>
- *     <li>{@code -Dquestdb.fuzz.s0=L -Dquestdb.fuzz.s1=L} - replay a
+ *     <li>{@code -Dfuzz.s0=L -Dfuzz.s1=L} - replay a
  *         specific seed pair, as printed in the run's "random seeds: ..."
  *         line. Use to reproduce a failure deterministically.</li>
  * </ul>
@@ -664,7 +665,7 @@ public class QueryFuzzTest extends AbstractCairoTest {
             queryPool.start(LOG);
             writerPool.start(LOG);
             try (
-                    SqlExecutionContext parallelCtx = new SqlExecutionContextImpl(engine, workerCount)
+                    SqlExecutionContext parallelCtx = QueryCodegenTestSupport.configure(new SqlExecutionContextImpl(engine, workerCount))
                             .with(securityContext, bindVariableService, null, -1, circuitBreaker)
             ) {
                 parallelCtx.initNow();
@@ -1067,8 +1068,18 @@ public class QueryFuzzTest extends AbstractCairoTest {
                 .$(runner.getBuildChoiceRuns()).$(" runs picked the build per execution")
                 .$();
 
+        if (sqlExecutionContext.getQueryCodeGenerator() != null) {
+            LOG.info().$("fuzz compiler axis: ").$(runner.getCompilerAxisNativeRuns())
+                    .$(" comparisons executed native kernels, ").$(runner.getCompilerAxisRuns())
+                    .$(" comparisons attempted").$();
+        }
+
         if (failures.size() > 0) {
             throw buildFailure(failures);
+        }
+        if (sqlExecutionContext.getQueryCodeGenerator() != null) {
+            Assert.assertTrue("compiler differential run executed no native kernels",
+                    runner.getCompilerAxisNativeRuns() > 0);
         }
         // Guard each generator against emitting SQL the engine cannot compile, and against emitting
         // nothing at all. A shape whose generator drifts out of step with the engine's rules still

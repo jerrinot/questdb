@@ -121,6 +121,7 @@ import io.questdb.std.str.Utf8Sequence;
 import io.questdb.std.str.Utf8String;
 import io.questdb.std.str.Utf8StringSink;
 import io.questdb.std.str.Utf8s;
+import io.questdb.test.QueryCodegenTestSupport;
 import io.questdb.test.QuestDBTestNode;
 import io.questdb.test.TestTimestampType;
 import io.questdb.test.cairo.TableModel;
@@ -1596,7 +1597,7 @@ public final class TestUtils {
     }
 
     public static SqlExecutionContext createSqlExecutionCtx(CairoEngine engine) {
-        return new SqlExecutionContextImpl(engine, 1)
+        return QueryCodegenTestSupport.configure(new SqlExecutionContextImpl(engine, 1))
                 .with(
                         engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext(),
                         null
@@ -1604,7 +1605,7 @@ public final class TestUtils {
     }
 
     public static SqlExecutionContext createSqlExecutionCtx(CairoEngine engine, BindVariableService bindVariableService) {
-        SqlExecutionContextImpl ctx = new SqlExecutionContextImpl(engine, 1);
+        SqlExecutionContextImpl ctx = QueryCodegenTestSupport.configure(new SqlExecutionContextImpl(engine, 1));
         ctx.with(
                 engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext(),
                 bindVariableService
@@ -1613,14 +1614,14 @@ public final class TestUtils {
     }
 
     public static SqlExecutionContextImpl createSqlExecutionCtx(CairoEngine engine, int workerCount) {
-        return new SqlExecutionContextImpl(engine, workerCount)
+        return QueryCodegenTestSupport.configure(new SqlExecutionContextImpl(engine, workerCount))
                 .with(engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext());
     }
 
     public static SqlExecutionContextImpl createSqlExecutionCtx(
             CairoEngine engine, BindVariableService bindVariableService, int workerCount
     ) {
-        return new SqlExecutionContextImpl(engine, workerCount)
+        return QueryCodegenTestSupport.configure(new SqlExecutionContextImpl(engine, workerCount))
                 .with(
                         engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext(),
                         bindVariableService

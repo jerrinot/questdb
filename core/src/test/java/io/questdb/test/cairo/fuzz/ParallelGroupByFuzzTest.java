@@ -2145,6 +2145,18 @@ public class ParallelGroupByFuzzTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testParallelKSumMergeFuzz() throws Exception {
+        // An expression exercises ordinary KSUM, independently of NSUM and vector batching.
+        testParallelNonKeyedMergeFuzz(
+                "create table tab as (select rnd_double(2) adouble, " +
+                        "timestamp_sequence(0, 86400000000) ts from long_sequence(1)) " +
+                        "timestamp(ts) partition by day WAL",
+                "rnd_double(2)",
+                "SELECT round(ksum(adouble * 1.0), 6) ksum_d FROM tab"
+        );
+    }
+
+    @Test
     public void testParallelKSumNSumMergeFuzz() throws Exception {
         // Verifies KSumDoubleGroupByFunction and NSumDoubleGroupByFunction merge() correctness
         // by comparing single-threaded and parallel results across partitions of varying sizes.
@@ -5545,10 +5557,13 @@ public class ParallelGroupByFuzzTest extends AbstractCairoTest {
                         }
 
                         // Run single-threaded reference.
+                        var candidateCompiler = sqlExecutionContext.getQueryCodeGenerator();
+                        ((SqlExecutionContextImpl) sqlExecutionContext).setQueryCodeGenerator(null);
                         sqlExecutionContext.setParallelGroupByEnabled(false);
                         try {
                             TestUtils.printSql(engine, sqlExecutionContext, query, sink);
                         } finally {
+                            ((SqlExecutionContextImpl) sqlExecutionContext).setQueryCodeGenerator(candidateCompiler);
                             sqlExecutionContext.setParallelGroupByEnabled(engine.getConfiguration().isSqlParallelGroupByEnabled());
                         }
 

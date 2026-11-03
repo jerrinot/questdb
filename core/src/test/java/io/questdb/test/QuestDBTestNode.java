@@ -211,7 +211,7 @@ public class QuestDBTestNode {
 
         private Griffin(Cairo cairo, SqlExecutionCircuitBreaker circuitBreaker) {
             bindVariableService = new BindVariableServiceImpl(cairo.configuration);
-            sqlExecutionContext = new SqlExecutionContextImpl(cairo.engine, 1)
+            sqlExecutionContext = QueryCodegenTestSupport.configure(new SqlExecutionContextImpl(cairo.engine, 1))
                     .with(
                             cairo.configuration.getFactoryProvider().getSecurityContextFactory().getRootContext(),
                             bindVariableService,

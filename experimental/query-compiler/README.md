@@ -387,7 +387,7 @@ bridge lives beside the LLVM bridge; it adds no dependency to ordinary QuestDB.
 From the repository root:
 
 ```sh
-mvn -q -pl core -am -Dmaven.test.skip=true -Djacoco.skip=true install
+mvn -q -pl core -am -DskipTests -Djacoco.skip=true install
 mvn -f experimental/query-compiler/pom.xml test
 ```
 
@@ -401,6 +401,42 @@ mvn -Pquery-compiler-prototype -pl experimental/query-compiler -am \
 ```
 
 ## Runners and controls
+
+Run existing Griffin tests against stock execution or LLVM after building the core
+test JAR and the experimental runner:
+
+```sh
+mvn -Pquery-compiler-prototype -pl experimental/query-compiler -am \
+  -DskipTests -Djacoco.skip=true install
+JAVA_TOOL_OPTIONS='-Dfuzz.s0=1 -Dfuzz.s1=2' \
+  experimental/query-compiler/run-griffin-tests.sh llvm \
+  'io.questdb.test.cairo.fuzz.ParallelGroupByFuzzTest#testParallelKSumMergeFuzz'
+JAVA_TOOL_OPTIONS='-Dfuzz.s0=123456789 -Dfuzz.s1=987654321 -Dquestdb.fuzz.queries=1000' \
+  experimental/query-compiler/run-griffin-tests.sh llvm \
+  'io.questdb.test.griffin.fuzz.QueryFuzzTest#testQueryFuzz'
+```
+
+Use `stock` instead of `llvm` for the control. Class names run all their tests;
+`class#method` selects one. Finish builds before starting a run: rebuilding classes
+while a test JVM reads them invalidates the result. Seeds use the existing
+`TestUtils` properties, `fuzz.s0` and `fuzz.s1`.
+
+`QueryCodegenTestSupport` installs the backend only in test contexts. Shared node
+and `TestUtils` contexts, the query fuzzer and the hash-join context helpers use it;
+other tests with direct context construction need the same explicit wiring.
+The runner reports compilations and actual native kernel calls per test, fails if
+the entire LLVM run executes none, and checks that LLVM code handles are released.
+Kernel calls are not input-row counts or proof that every operator was generated.
+Empty input, unsupported functions and ordinary batch paths can legitimately report
+zero; direct Java aggregate/map unit tests remain Java tests.
+
+When the query fuzzer has a compiler installed, it also runs an explicit stock arm
+with that hook unset, at the same filter-JIT mode. It retains the existing result,
+exception, floating comparison and cursor checks. Existing JIT/storage/bind/fused
+axes and fault injection remain enabled. The compiler axis reports successful
+comparisons that actually invoked native code and fails on zero coverage. Exact
+plan assertions in other suites are retained; a changed plan is a failure to review,
+not a reason to discard result or lifecycle assertions.
 
 For integrated SQL, `run-scan.sh --resolved-sql` accepts repetitions, cases, rows,
 batch size, warmups, implementation, total execution slots, configuration and an

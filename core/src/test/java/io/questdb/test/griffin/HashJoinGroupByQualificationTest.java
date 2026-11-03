@@ -46,6 +46,7 @@ import io.questdb.std.ObjList;
 import io.questdb.std.Rnd;
 import io.questdb.std.str.StringSink;
 import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.QueryCodegenTestSupport;
 import io.questdb.test.tools.TestUtils;
 import org.jetbrains.annotations.Nullable;
 import org.junit.After;
@@ -628,7 +629,7 @@ public class HashJoinGroupByQualificationTest extends AbstractCairoTest {
     }
 
     static SqlExecutionContextImpl context(CairoEngine engine, int workers) {
-        SqlExecutionContextImpl context = new SqlExecutionContextImpl(engine, workers)
+        SqlExecutionContextImpl context = QueryCodegenTestSupport.configure(new SqlExecutionContextImpl(engine, workers))
                 .with(AllowAllSecurityContext.INSTANCE, null, null, -1, null);
         context.setParallelGroupByEnabled(true);
         context.setParallelHashJoinGroupByEnabled(true);
