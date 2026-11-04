@@ -403,20 +403,31 @@ mvn -Pquery-compiler-prototype -pl experimental/query-compiler -am \
 ## Runners and controls
 
 The ASOF experiment runs inside the ordinary adaptive join. Its filtered forward
-region can consume bounded master spans and update the existing unkeyed aggregate
-state through LLVM. A single same-type INT/LONG/SYMBOL key also admits generated
-descending lookup after the first Java candidate misses. The owner lends only
-the remaining current-frame span, bounded by memoized history and its work limit;
-frame navigation, indexed lookup and strategy transitions remain with the owner.
+and ordinary lookup regions can consume bounded master spans and update the
+existing unkeyed aggregate state through LLVM. Lookup fuses timestamp positioning,
+descending predicate/key search and aggregate updates across multiple probes,
+within the current master/RHS frames and the owner's 64-probe observation window.
+Frame crossing, indexed/memoized lookup and strategy transitions stay with Java;
+an unfinished native probe has no aggregate effect and resumes there. Both regions
+reuse the existing scalar aggregate lowering, including SUM/MIN/MAX/COUNT/AVG with
+supported INT/LONG/DOUBLE inputs, rather than a separate aggregate implementation.
+
+A single same-type INT/LONG/SYMBOL key admits these regions. Without a supported
+aggregate consumer, generated descending lookup still runs after the first Java
+candidate misses. The owner lends only the remaining current-frame span, bounded
+by memoized history and its work limit.
 SYMBOL probes use its existing dictionary translation. Unsupported predicates,
 keys and frame representations retain ordinary lookup. `lookup_rows` reports
-actual generated candidate checks, independently of the downstream consumer.
+candidate checks in the smaller backward kernel; it excludes the larger fused
+region, whose completed probes are counted by `aggregate_probes`.
 `aggregate region` in EXPLAIN indicates eligibility, while `aggregate_probes` in
 the runner reports actual use. The optional region compiles on first use, so
-inspect warmup/first-use latency as well as steady-state results. Backward lookup
-also compiles lazily: immediate matches avoid it, but a tiny nonlocal query may
-pay more compilation cost than it can recover. No machine-specific crossover
-threshold is assumed.
+inspect warmup/first-use latency as well as steady-state results. The smaller
+backward kernel also compiles lazily: immediate matches avoid that kernel, while
+eligible aggregate queries can compile the larger region even for immediate
+matches. Both retain code across cached factory reuse and release it on eviction.
+A tiny query may pay more compilation cost than it can recover. No machine-specific
+crossover threshold is assumed.
 
 The existing ASOF runner provides a reproducible 500M-row, six-aggregate control:
 

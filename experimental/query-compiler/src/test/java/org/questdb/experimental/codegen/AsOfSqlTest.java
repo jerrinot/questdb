@@ -30,6 +30,8 @@ import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.griffin.engine.join.FilteredAsOfJoinFastRecordCursorFactory;
+import io.questdb.std.ConcurrentAssociativeCache;
+import io.questdb.std.DefaultConcurrentCacheConfiguration;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
 import org.junit.After;
@@ -132,6 +134,54 @@ public class AsOfSqlTest {
                 }
             }
         } finally { context.setQueryCodeGenerator(null); }
+    }
+
+    @Test public void cachedFactoryRetainsLookupCode() throws Exception {
+        int[] compilations = {0};
+        Backend backend = new Backend() {
+            private final Backend delegate = new LlvmBackend();
+            @Override public String name() { return delegate.name(); }
+            @Override public CompiledKernel compile(Ir.Program program, java.nio.file.Path artifacts) throws java.io.IOException {
+                compilations[0]++;
+                return delegate.compile(program, artifacts);
+            }
+        };
+        var generator = new ResolvedQueryCompiler(backend, temporary.newFolder().toPath());
+        for (String key : new String[]{"k", "kl", "ks"}) {
+            String body = "a.ts,b.v from l a asof join (select * from r where v-v/3*3=0) b on (" + key + ")";
+            String sql = "select " + body;
+            List<String> expected;
+            try (var reference = Demo.compileSql(engine, context, "select /*+ asof_linear(a b) */ " + body, true);
+                 var cursor = reference.getCursor(context)) {
+                expected = read(cursor);
+            }
+            long handles = LlvmBackend.liveFunctions();
+            // Same factory cache and close-cursor/put/poll ownership used by HTTP SELECT.
+            try (var cache = new ConcurrentAssociativeCache<RecordCursorFactory>(DefaultConcurrentCacheConfiguration.DEFAULT)) {
+                context.setQueryCodeGenerator(generator);
+                var factory = Demo.compileSql(engine, context, sql, true);
+                cache.put(sql, factory);
+                int compiled = -1;
+                for (int execution = 0; execution < 3; execution++) {
+                    var cached = cache.poll(sql);
+                    assertSame(factory, cached);
+                    try {
+                        RecordCursorFactory base = cached;
+                        while (base != null && !(base instanceof FilteredAsOfJoinFastRecordCursorFactory)) base = base.getBaseFactory();
+                        assertNotNull(base);
+                        try (var cursor = cached.getCursor(context)) {
+                            assertEquals(expected, read(cursor));
+                            assertTrue(((FilteredAsOfJoinFastRecordCursorFactory) base).getNativeLookupRows() > 0);
+                        }
+                        if (execution == 0) compiled = compilations[0];
+                        else assertEquals("Cache hit must retain native code", compiled, compilations[0]);
+                    } finally { cache.put(sql, cached); }
+                }
+                assertTrue(LlvmBackend.liveFunctions() > handles);
+                cache.clear();
+                assertEquals("Eviction must release native code", handles, LlvmBackend.liveFunctions());
+            } finally { context.setQueryCodeGenerator(null); }
+        }
     }
 
     @Test public void varcharPredicateAndParquetFrames() throws Exception {
@@ -296,13 +346,15 @@ public class AsOfSqlTest {
     }
 
     @Test public void aggregateRegionMapRefusalPreservesCompletedPrefix() throws Exception {
-        mapLimit = 4096;
         engine.execute("create table mr as (select cast(x*1000000 as timestamp) ts,"
                 + "cast(case when x<15000 then x%8 else x%1000 end as int) k,x v from long_sequence(20000)) timestamp(ts)", context);
         engine.execute("create table ml as (select cast((14000+x)*1000000 as timestamp) ts,"
                 + "cast(case when x<1000 then (x+4)%8 else x%1000 end as int) k,x kl from long_sequence(5000)) timestamp(ts)", context);
-        aggregateMatches("sum(b.v),min(b.v),max(b.v),count(b.v),sum(b.v+a.kl),count(*) "
-                + "from ml a asof join (select * from mr where v>0) b on (k)", true);
+        for (int limit : new int[]{1, 4096}) {
+            mapLimit = limit;
+            aggregateMatches("sum(b.v),min(b.v),max(b.v),count(b.v),sum(b.v+a.kl),count(*) "
+                    + "from ml a asof join (select * from mr where v>0) b on (k)", true);
+        }
     }
 
     @Test public void aggregateRegionMissingSymbolsAndUnsupportedConsumer() throws Exception {
@@ -358,6 +410,42 @@ public class AsOfSqlTest {
                 }
             } finally { context.setMemoryTracker(null); }
         } finally { context.setQueryCodeGenerator(null); }
+    }
+
+    @Test public void backwardAggregateRegionCachesAndResumes() throws Exception {
+        engine.execute("create table short_l as (select * from l limit 48) timestamp(ts)", context);
+        for (String key : new String[]{"k", "kl", "ks"}) {
+            for (String tolerance : new String[]{"", " tolerance 20s"}) {
+                String body = "sum(b.v),min(b.v),max(b.v),count(b.v),sum(b.v+a.kl),count(*) "
+                        + "from short_l a asof join (select * from r where v-v/3*3=0) b on (" + key + ")" + tolerance;
+                context.setQueryCodeGenerator(null);
+                String expected;
+                try (var reference = Demo.compileSql(engine, context, "select /*+ asof_linear(a b) */ " + body, true);
+                     var cursor = reference.getCursor(context)) {
+                    expected = aggregateResult(cursor, reference);
+                }
+                context.setQueryCodeGenerator(compiler);
+                try (var tracker = new io.questdb.test.tools.LimitedMemoryTracker(32 * 1024);
+                     var candidate = Demo.compileSql(engine, context, "select " + body, true)) {
+                    RecordCursorFactory base = candidate;
+                    while (base != null && !(base instanceof FilteredAsOfJoinFastRecordCursorFactory)) base = base.getBaseFactory();
+                    assertNotNull(base);
+                    var asof = (FilteredAsOfJoinFastRecordCursorFactory) base;
+                    var owner = candidate instanceof io.questdb.griffin.engine.QueryProgress ? candidate.getBaseFactory() : candidate;
+                    context.setMemoryTracker(tracker);
+                    for (int reopen = 0; reopen < 3; reopen++) {
+                        try (var cursor = owner.getCursor(context)) {
+                            assertEquals(expected, aggregateResult(cursor, candidate));
+                            assertTrue("No fused backward probes " + body, asof.getNativeAggregateRows() > 0);
+                            assertEquals(0, asof.getNativeForwardRows());
+                            cursor.toTop();
+                            assertEquals(expected, aggregateResult(cursor, candidate));
+                        }
+                        assertEquals(0, tracker.getUsed());
+                    }
+                } finally { context.setMemoryTracker(null); context.setQueryCodeGenerator(null); }
+            }
+        }
     }
 
     private void aggregateMatches(String body, boolean requireNative) throws Exception {

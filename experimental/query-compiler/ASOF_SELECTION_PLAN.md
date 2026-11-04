@@ -1,6 +1,6 @@
 # Automatic ASOF selection and generated execution
 
-2026-11-04. Code baseline: `baf86ae4fc`. Status: bounded unfiltered selection, filter-aware scan/lookup, LLVM forward scan/aggregate fusion and bounded INT/LONG/SYMBOL backward lookup through ordinary SQL are implemented. First-use lookup compilation admission, broader consumer admission and parallel temporal execution remain open. Execute one milestone at a time and revise the next milestone when
+2026-11-04. Initial code baseline: `baf86ae4fc`; integrated ASOF baseline: `958842eb46`. Status: bounded unfiltered selection, filter-aware scan/lookup, LLVM forward scan/aggregate fusion and bounded INT/LONG/SYMBOL backward lookup through ordinary SQL are implemented. Broader generated regions, consumer admission and parallel temporal execution remain open. Compilation cost remains a measured property rather than the next optimization milestone. Execute one milestone at a time and revise the next milestone when
 measurements contradict its assumptions.
 
 The goal is for ordinary ASOF SQL to approach the performance of the best eligible
@@ -1056,12 +1056,28 @@ chooser, cursor hierarchy or configuration switch was added. Normal SQL, seeded
 fuzz, memory-failure and timestamp-boundary checks pass. See the latest PROGRESS
 entry for replicated controls and the material Java process variation.
 
-The next milestone is first-use compilation admission. A fresh one-probe query
-pays about 4.4ms in the backend even on a warm JVM/backend; immediate matches avoid
-lookup compilation altogether. Compare the existing backends/optimization tiers
-on the same typed search and include planning, compilation, execution and factory
-reuse. Choose an automatic policy only from measured preparation cost and useful
-search work, retaining the current Java span as the baseline. Do not hard-code a
-probe-count crossover, add a new toggle, or tune algorithm selection against the
-superseded Java candidate loop. Broader consumer fusion and parallel temporal
-production remain subsequent milestones.
+The user revised the priority: the measured 4.4ms compilation cost is acceptable
+for analytical queries and can be amortized by the existing query cache. HTTP
+caches cursor factories, and the generated code belongs to the factory. Cursor
+close clears execution state without closing code. A focused test now exercises
+the real concurrent factory cache's put/poll/clear lifecycle for INT/LONG/SYMBOL:
+cache hits perform native lookup without recompiling; eviction releases the code.
+This verifies factory/cache ownership, not a wire-protocol cache hit-rate claim.
+Keep reporting compilation cost, but do not add a compilation-admission policy
+without evidence that startup dominates the target workload.
+
+The larger bounded region is now integrated: timestamp navigation, backward
+matching and the existing aggregate consumer execute across multiple probes.
+It reuses the forward region's borrowed master spans, aggregate-state lowering
+and 64-probe observation windows. Frame/history/work boundaries and the existing
+strategy owner remain intact. A naive fused loop lost badly; generated address
+recurrences and branch shape had to be corrected before accepting the change.
+See PROGRESS for complete-query controls, counterfactuals and hardware evidence.
+
+Next, measure whether overlapping independent predecessor searches can hide the
+remaining demand-load latency inside the borrowed span. Keep master-order output,
+aggregate order and observation boundaries, and retain sequential execution as
+the control. This is an experiment to design, not an implemented scheduler or a
+claim that prefetch alone solves the bottleneck. Test nearby/distant probes,
+duplicate timestamps, mixed key types and phase changes before expanding scope.
+Broader consumer admission and parallel temporal production remain later milestones.

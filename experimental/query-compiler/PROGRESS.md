@@ -8564,3 +8564,104 @@ Next: address first-use compilation admission before expanding this region.
 Measure existing backend/tier compile costs and work savings; do not infer a
 portable threshold from this fixture. Larger navigation/consumer fusion remains
 the next execution experiment after that startup boundary is understood.
+
+
+### 2026-11-04 — Multi-probe ASOF lookup, navigation and aggregates fused
+
+Following the user discussion, compilation admission is not the next priority.
+A focused test of the actual ConcurrentAssociativeCache put/poll/clear lifecycle
+confirms cached INT/LONG/SYMBOL factories retain native lookup code across cursor
+reopens and release it on eviction. This checks ownership, not HTTP traffic or
+cache hit rates. The larger region is now integrated without a new toggle.
+
+It borrows the existing master span and remaining 64-probe observation window.
+Within one RHS frame it emits the existing linear/binary timestamp positioning,
+descending predicate/key matching and shared AggregateUpdates consumer. It uses
+INT/LONG/SYMBOL keys, existing symbol translation, fixed INT/LONG/DOUBLE aggregate
+inputs, tolerance and saturating timestamp conversion. SUM/MIN/MAX/COUNT/AVG keep
+their existing lowering. Java retains cross-frame/history work, indexed/memoized
+lookup and strategy transitions. Only completed probes change aggregate state;
+a failed native probe returns to ordinary matching and may repeat bounded work.
+This remains a serial ASOF operator, not a parallel temporal execution design.
+
+Controls use 500M RHS rows, 1M probes, six exact aggregate results checked against
+ordinary Light, CPU 4 on the 9950X, 32 warmups and five measured full executions
+per process. The baseline is the previously committed LLVM integration, not stock
+QuestDB. INT entries are medians of three fresh-process medians. LONG/SYMBOL have
+one process each. Final compact runs follow the balanced earlier region/control
+runs; they were not all pairwise interleaved.
+
+| Warm complete query | Previous LLVM | Larger lookup region |
+| --- | ---: | ---: |
+| INT, distant matches | 1048ms | **921ms** |
+| INT, immediate matches | 543ms | **342ms** |
+| LONG, distant matches | 1023ms | **924ms** |
+| SYMBOL, distant matches | 969ms | **900ms** |
+
+Distant INT process medians span 969–1054ms before and 908–931ms after; immediate
+matches span 480–551ms before and 338–343ms after. A normal-build A/B check gives
+1053 -> 903ms distant, 465 -> 342ms immediate, and 288 -> 287ms selective forward.
+After the final map-refusal fix, a fresh process per case gives 915ms, 343ms and
+288ms respectively, with zero timed physical reads or major faults.
+The immediate-match improvement is therefore 26–38% across these process groups,
+not a uniform 37% promise. There is no new forward algorithm or admission tuning.
+About 999K probes execute in the larger region. Its work is not included in the
+smaller kernel's lookup_rows counter; comparing those counters as saved candidate
+comparisons would be incorrect.
+
+Naive fusion lost badly: 2462ms. Native cycle samples placed 96% in that generated
+region, with the timestamp-search load the largest sampled instruction. Its
+candidate-loop row decrement depended on the key comparison, serializing the
+next address. An unconditional decrement reduced it to 1831ms despite more
+instructions. Branch-directed timestamp prefetch, invariant hoisting and removing
+unnecessary per-probe polls brought the region below the control. Compacting the
+candidate state then reached the final result. Both search branch shape and
+prefetch changed; this is not an isolated prefetch-speedup claim. The mechanism
+agrees with the branch/speculation tradeoff discussed in
+[Array Layouts for Comparison-Based Searching](https://arxiv.org/abs/1509.05053),
+but our generated code and complete-query controls decide the implementation.
+
+Fresh fixed-work PMU passes show dispatched loads/probe falling 2784 -> 2034 and
+load-not-complete cycles/probe 4084 -> 3724. A representative distant run falls
+from about 5972 to 5114 cycles/probe, with instructions 11.1K -> 10.8K. At roughly
+5.6GHz, saving ~700 cycles across 1M probes predicts about 0.125s, consistent with
+the replicated ~0.127s median reduction. These are separate passes, not an additive
+stall decomposition. Immediate matches remove much more per-probe bookkeeping;
+roughly 0.2 microseconds saved per probe accounts for the ~0.2s median reduction.
+
+The baseline has 76% backend-stalled dispatch slots. Fresh native IBS still
+identifies timestamp/key/predicate demand-load latency. Software prefetches also
+appear as IBS loads: their weights are excluded from demand-latency claims.
+Whole-host controller peaks stay below 27% of a fresh same-core streaming event
+rate; no bytes/event assumption is used. Timed queries have zero physical reads
+and major faults. Available RAM exceeds 74GiB, with no direct reclaim or new OOM;
+the SMT sibling averages 0.32% busy (9.1% 200ms peak). The USE/hardware study passes
+for the distant INT case. This is evidence of dependent-load cost on this host,
+not memory-bandwidth saturation or portable workload-wide coverage.
+
+Startup is a real tradeoff: fresh factories on a warmed backend compile the larger
+query's kernels in a median **31.9ms** (18.4–32.6ms), versus **4.4ms** (3.2–6.0ms)
+for the smaller-kernel control, one alternating five-round process after eight
+warmups. First use in fresh benchmark processes costs roughly 41–49ms. Cached
+measured executions perform no backend compilation. Keep that cost explicit;
+we have not solved tiny uncached-query economics by improving steady execution.
+
+Validation: normal reactor build, 17 focused SQL tests, the 270-case timestamp
+matrix, and 12 existing adaptive/seeded duplicate and nonduplicate fuzz/OOM tests
+pass. The final existing-test runner counts 3486 compilations and 8185 native calls; the
+focused suite separately asserts its native regions. Reopen/rewind, projections,
+nulls, independent symbols, mixed timestamp precision, Parquet/history/tops,
+LIMIT, cancellation and exact aggregates retain their checks. Two concrete red/
+green cases mattered: the lookup region initially allocated the unused forward
+selection buffer and exceeded a 32KiB query budget; allocating only its descriptors
+and work arrays fixes it. Refusing initial map allocation at a native window's
+strategy transition escaped the old hasNext() catch; reusing retryWithoutScanState
+now refreshes navigation without applying completed aggregates twice. Ordinary
+allocation failure and cancellation still propagate.
+
+Raw profiles, controls and identities are under ignored target/asof-evidence/
+lookup-region-*; scratch variants and the saved control are under target/
+asof-lookup-region/. Next experiment: test overlap of independent predecessor
+searches within the borrowed span, preserving master order and the existing
+strategy boundaries. Remaining load waiting is a hypothesis to attack, not a
+reason to add another chooser or specialize to this fixture.

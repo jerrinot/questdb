@@ -441,10 +441,15 @@ public final class FilteredAsOfJoinFastRecordCursorFactory extends AsOfJoinDense
         }
 
         @Override
-        protected void aggregateForwardRegion(PageFrameMemoryRecord master, MapValue value, CompiledAsOfJoin.State state) {
+        protected void aggregateLookupRegion(PageFrameMemoryRecord master, MapValue value, CompiledAsOfJoin.State state) {
             if (compiledJoin == null) {
                 return;
             }
+            translateRegionKeys(master, state);
+            compiledJoin.aggregateLookup(master, filterCursor, value, state, circuitBreaker);
+        }
+
+        private void translateRegionKeys(PageFrameMemoryRecord master, CompiledAsOfJoin.State state) {
             if (symbolTranslatingRecord != null) {
                 long row = Rows.toLocalRowID(master.getRowId());
                 try {
@@ -456,6 +461,14 @@ public final class FilteredAsOfJoinFastRecordCursorFactory extends AsOfJoinDense
                     master.setRowIndex(row);
                 }
             }
+        }
+
+        @Override
+        protected void aggregateForwardRegion(PageFrameMemoryRecord master, MapValue value, CompiledAsOfJoin.State state) {
+            if (compiledJoin == null) {
+                return;
+            }
+            translateRegionKeys(master, state);
             // Native navigation may borrow record B for history. Discard the Java selection
             // cache: its row offsets belong to the previous forward cursor position.
             batchFrame = -1;

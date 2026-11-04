@@ -245,6 +245,70 @@ public abstract class AsOfJoinDenseRecordCursorFactoryBase extends AbstractJoinR
                 } else {
                     updater.updateExisting(value, aggregateRecord, rows++);
                 }
+                while (adaptive && !forwardMode && !memoizedLookup && indexColumnIndex < 0
+                        && origHasSlave && origSlaveRowId >= 0 && previousLookupRowId >= 0
+                        && slaveFrameIndex == origSlaveFrameIndex
+                        && Rows.toPartitionIndex(previousLookupRowId) == origSlaveFrameIndex
+                        && slaveTimeFrame.isOpen() && slaveTimeFrame.getFrameIndex() == origSlaveFrameIndex
+                        && masterCursor instanceof PageFrameRecordCursor frames
+                        && masterRecord instanceof PageFrameMemoryRecord master) {
+                    circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+                    long hi = frames.getContiguousFrameRowHi();
+                    long lo = Rows.toLocalRowID(master.getRowId()) + 1;
+                    if (hi <= lo) {
+                        break;
+                    }
+                    if (!masterCursor.hasNext()) {
+                        throw new IllegalStateException("ASOF master span ended early");
+                    }
+                    state.masterLo = state.nextMaster = lo;
+                    state.masterHi = Math.min(hi, lo + WORK_WINDOW - windowProbes);
+                    state.lookupRow = origSlaveRowId;
+                    state.lookupFrameRow = slaveFrameRow;
+                    state.lookupTimestamp = lookaheadTimestamp;
+                    state.previousLookupRow = Rows.toLocalRowID(previousLookupRowId);
+                    state.lookupLo = slaveTimeFrame.getRowLo();
+                    state.lookupHi = slaveTimeFrame.getRowHi();
+                    state.lookupLimit = MAX_LOOKUP_ROWS - 1;
+                    state.lookahead = lookahead;
+                    aggregateLookupRegion(master, value, state);
+                    long completed = state.nextMaster - lo;
+                    frames.consumeFrameRows(completed);
+                    if (completed > 0) {
+                        origSlaveRowId = state.lookupRow;
+                        slaveFrameRow = state.lookupFrameRow;
+                        lookaheadTimestamp = state.lookupTimestamp;
+                        previousLookupRowId = Rows.toRowID(origSlaveFrameIndex, state.previousLookupRow);
+                        previousLookupFrameHi = state.lookupHi;
+                        try {
+                            for (int i = 0; i < completed; i++) {
+                                if (state.backwardWork[i] >= 0) {
+                                    observeWork(state.backwardWork[i], state.forwardWork[i], false);
+                                }
+                            }
+                        } catch (MapMemoryLimitException e) {
+                            // A transition can allocate only at the window's final probe.
+                            // Refresh its navigation without applying its aggregates again.
+                            retryWithoutScanState();
+                        }
+                    }
+                    rows += completed;
+                    if (state.nextMaster == state.masterHi) {
+                        continue;
+                    }
+                    if (completed > 0 && !masterCursor.hasNext()) {
+                        throw new IllegalStateException("ASOF partial master span ended early");
+                    }
+                    // The unfinished probe has no aggregate effects. Existing navigation and
+                    // matching handle frame crossing, history and the lookup-work boundary.
+                    try {
+                        findSlave(scaleTimestamp(masterRecord.getTimestamp(masterTimestampIndex), masterTimestampScale));
+                    } catch (MapMemoryLimitException e) {
+                        retryWithoutScanState();
+                    }
+                    updater.updateExisting(value, aggregateRecord, rows++);
+                    break;
+                }
                 while (forwardMode && !forwardScanExhausted && forwardRowId >= 0 && indexColumnIndex < 0
                         && masterCursor instanceof PageFrameRecordCursor frames
                         && masterRecord instanceof PageFrameMemoryRecord master) {
@@ -320,6 +384,9 @@ public abstract class AsOfJoinDenseRecordCursorFactoryBase extends AbstractJoinR
         }
 
         protected void aggregateForwardRegion(PageFrameMemoryRecord master, MapValue value, CompiledAsOfJoin.State state) {
+        }
+
+        protected void aggregateLookupRegion(PageFrameMemoryRecord master, MapValue value, CompiledAsOfJoin.State state) {
         }
 
         protected Map getForwardMap() {

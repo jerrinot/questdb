@@ -53,12 +53,13 @@ import java.util.ArrayList;
 import static org.questdb.experimental.codegen.Ir.*;
 import static org.questdb.experimental.codegen.MapKernelState.*;
 
-/** Fuses a bounded, already-selected forward strategy with ordinary aggregate updates. */
+/** Fuses bounded regions of the selected ASOF strategy with ordinary aggregate updates. */
 final class ResolvedAsOfJoin implements CompiledAsOfJoin {
     private static final int LEFT = 0, RIGHT = 8, RIGHT_HI = 16, PROBE_ROWS = 24, LIMIT = 32,
             LATEST = 40, AGG = 48, PREFIX = 56, LEFT_LO = 64, MISSING = 72,
             HISTORY_PREFIX = 80, HISTORY_ROW = 88, MASTER_TS = 96, SLAVE_TS = 104, HISTORY_TS = 112,
-            CACHE_LO = 120, CACHE_HI = 128, CACHE_POS = 136, CACHE_COUNT = 144;
+            CACHE_LO = 120, CACHE_HI = 128, CACHE_POS = 136, CACHE_COUNT = 144,
+            NAV_ROW = 160, NAV_TS = 168, PREVIOUS = 176, RIGHT_LO = 184, LOOKAHEAD = 192;
     private static final int FILTER_BATCH_ROWS = 32_768;
     private static final int STOP = 1, HISTORY = 7;
     private static final long STATE_BYTES = CONTROL_BYTES + QuestMapProbe.VIEW_BYTES;
@@ -66,7 +67,7 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
     private final AggregateUpdates updates;
     private final ResolvedFilter.Binding filter;
     private final QuestMapProbe probe;
-    private final CompiledKernel code;
+    private final CompiledKernel code, lookupCode;
     private final String name;
     private final int masterData, slaveData, historyData, filterData, symbolData, backwardWork, forwardWork, vectorData, selectedRows;
     private final long bytes;
@@ -86,7 +87,7 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
         this.probe = probe;
         this.keyType = input.master().getColumnType(input.masterKey());
         vectorFilter = filter.residual() == null && filter.parameters().isEmpty();
-        masterData = 160;
+        masterData = 224;
         slaveData = masterData + input.master().getColumnCount() * 8;
         historyData = slaveData + input.slave().getColumnCount() * 8;
         filterData = historyData + input.slave().getColumnCount() * 8;
@@ -99,6 +100,7 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
         name = backend.name();
         // The adaptive owner may stay in lookup mode for the entire execution.
         code = CompiledKernel.defer(backend, this::emit, artifacts);
+        lookupCode = CompiledKernel.defer(backend, this::emitLookup, artifacts);
     }
 
     static CompiledAsOfJoin compile(Input input, Map map, Function predicate, ColumnTypes values,
@@ -220,27 +222,163 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
                             same.assign(backward, add(binary(Op.SUB, latest, rowId), i64(1))));
                 });
             });
-            var inputs = new ArrayList<Pipeline.Value>();
-            int split = input.master().getColumnCount();
-            for (int i = 0; i < updates.sourceIndexes().length; i++) {
-                var column = updates.columns().get(i);
-                int source = joinedColumn(updates.sourceIndexes()[i]);
-                Var value;
-                if (source < split) value = loop.let(column(column.width(), at(COLUMNS, masterData), source, left));
-                else {
-                    value = loop.let(column.width() == MemoryType.F64 ? f64(Double.NaN) : i64(column.nullValue()));
-                    int rhs = slaveColumn(source - split);
-                    loop.when(match, present -> present.assign(value, column(column.width(), payload, rhs, matchedRow)));
-                }
-                inputs.add(column.value(value));
-            }
-            updates.emit(loop, new Pipeline.Row(updates.columns(), inputs), new Load(MemoryType.ADDRESS, at(COLUMNS, AGG)), nil());
+            emitUpdates(loop, left, match, matchedRow, payload);
             loop.store(new Offset(at(COLUMNS, backwardWork), offset), backward);
             loop.store(new Offset(at(COLUMNS, forwardWork), offset), work);
             loop.assign(left, add(left, i64(1)));
             loop.assign(work, i64(0));
         });
         save(b, left, right, work, latest); b.exit(0);
+        return new Program(b.block());
+    }
+
+    private void emitUpdates(Builder loop, Expr left, Expr match, Expr matchedRow, Expr payload) {
+        var inputs = new ArrayList<Pipeline.Value>();
+        int split = input.master().getColumnCount();
+        for (int i = 0; i < updates.sourceIndexes().length; i++) {
+            var column = updates.columns().get(i);
+            int source = joinedColumn(updates.sourceIndexes()[i]);
+            Var value;
+            if (source < split) value = loop.let(column(column.width(), at(COLUMNS, masterData), source, left));
+            else {
+                value = loop.let(column.width() == MemoryType.F64 ? f64(Double.NaN) : i64(column.nullValue()));
+                int rhs = slaveColumn(source - split);
+                loop.when(match, present -> present.assign(value, column(column.width(), payload, rhs, matchedRow)));
+            }
+            inputs.add(column.value(value));
+        }
+        updates.emit(loop, new Pipeline.Row(updates.columns(), inputs), new Load(MemoryType.ADDRESS, at(COLUMNS, AGG)), nil());
+    }
+
+    /** Mirrors AbstractAsOfJoinFastRecordCursor's bounded linear/binary timestamp search. */
+    private static void emitLookupPosition(Builder b, Expr ts, Var predecessor, Var navigation, Var lookahead, long scale) {
+        b.when(binary(Op.GE, ts, lookahead), seek -> {
+            Var first = seek.let(navigation);
+            Var scanHi = seek.let(new Select(binary(Op.LT, add(navigation, load(at(COLUMNS, LOOKAHEAD))), load(at(COLUMNS, RIGHT_HI))),
+                    add(navigation, load(at(COLUMNS, LOOKAHEAD))), load(at(COLUMNS, RIGHT_HI))));
+            Var searching = seek.let(bool(true));
+            Expr within = binary(Op.EITHER, binary(Op.LT, navigation, scanHi),
+                    binary(Op.BOTH, eq(lookahead, ts), binary(Op.LT, navigation, load(at(COLUMNS, RIGHT_HI)))));
+            seek.loop(binary(Op.BOTH, searching, within), scan -> {
+                scan.assign(lookahead, scaled(timestamp(SLAVE_TS, navigation), scale));
+                scan.when(binary(Op.LT, ts, lookahead), found -> found.assign(searching, bool(false)));
+                scan.when(searching, next -> next.assign(navigation, add(navigation, i64(1))));
+                scan.when(eq(binary(Op.AND, navigation, i64(1023)), i64(0)), Builder::poll);
+            });
+            seek.when(binary(Op.LT, first, navigation), found -> found.assign(predecessor, binary(Op.SUB, navigation, i64(1))));
+            seek.when(searching, binarySearch -> {
+                Var low = binarySearch.let(navigation), high = binarySearch.let(binary(Op.SUB, load(at(COLUMNS, RIGHT_HI)), i64(1)));
+                Var unresolved = binarySearch.let(bool(true));
+                binarySearch.loop(binary(Op.BOTH, unresolved, binary(Op.LT, i64(65), binary(Op.SUB, high, low))), search -> {
+                    Var mid = search.let(binary(Op.USHR, add(low, high), i64(1)));
+                    Var value = search.let(scaled(timestamp(SLAVE_TS, mid), scale));
+                    search.when(binary(Op.LT, value, ts), less -> {
+                        less.assign(low, mid);
+                        // Keep the next timestamp load on the selected search path. Both
+                        // the hint and branch shape matter for dependent memory accesses.
+                        less.prefetch(new Offset(new Load(MemoryType.ADDRESS, at(COLUMNS, SLAVE_TS)),
+                                binary(Op.MUL, binary(Op.USHR, add(mid, high), i64(1)), i64(8))), false);
+                    });
+                    search.when(binary(Op.LT, ts, value), more -> {
+                        more.assign(high, binary(Op.SUB, mid, i64(1)));
+                        more.prefetch(new Offset(new Load(MemoryType.ADDRESS, at(COLUMNS, SLAVE_TS)),
+                                binary(Op.MUL, binary(Op.USHR, binary(Op.SUB, add(low, mid), i64(1)), i64(1)), i64(8))), false);
+                    });
+                    search.when(eq(ts, value), equal -> {
+                        equal.assign(predecessor, mid);
+                        Var duplicates = equal.let(bool(true));
+                        equal.loop(binary(Op.BOTH, duplicates, binary(Op.LT, predecessor, high)), next -> {
+                            next.assign(duplicates, eq(scaled(timestamp(SLAVE_TS, add(predecessor, i64(1))), scale), ts));
+                            next.when(duplicates, advance -> advance.assign(predecessor, add(predecessor, i64(1))));
+                            next.when(eq(binary(Op.AND, predecessor, i64(1023)), i64(0)), Builder::poll);
+                        });
+                        equal.assign(unresolved, bool(false));
+                    });
+                });
+                binarySearch.when(unresolved, tail -> {
+                    Var row = tail.let(high);
+                    tail.loop(binary(Op.BOTH, unresolved, binary(Op.GE, row, low)), scan -> {
+                        scan.when(binary(Op.GE, ts, scaled(timestamp(SLAVE_TS, row), scale)), found -> {
+                            found.assign(predecessor, row); found.assign(unresolved, bool(false));
+                        });
+                        scan.assign(row, binary(Op.SUB, row, i64(1)));
+                    });
+                });
+                binarySearch.assign(navigation, predecessor);
+                binarySearch.assign(lookahead, scaled(timestamp(SLAVE_TS, add(predecessor, i64(1))), scale));
+            });
+        });
+    }
+
+    private Program emitLookup() {
+        Builder b = new Builder();
+        Var left = b.let(load(at(COLUMNS, LEFT))), predecessor = b.let(load(at(COLUMNS, RIGHT)));
+        Var navigation = b.let(load(at(COLUMNS, NAV_ROW))), lookahead = b.let(load(at(COLUMNS, NAV_TS)));
+        Var previous = b.let(load(at(COLUMNS, PREVIOUS)));
+        boolean scale = input.master().getTimestampType() != input.slave().getTimestampType();
+        long masterScale = scale ? ColumnType.getTimestampDriver(input.master().getTimestampType()).toNanosScale() : 1;
+        long slaveScale = scale ? ColumnType.getTimestampDriver(input.slave().getTimestampType()).toNanosScale() : 1;
+        MemoryType keyWidth = keyType == ColumnType.LONG ? MemoryType.I64 : MemoryType.I32;
+        Expr descriptors = at(COLUMNS, filterData);
+        var addresses = new ArrayList<Expr>();
+        for (int i = 0; i < filter.plan().input().size(); i++)
+            addresses.add(b.let(new Load(MemoryType.ADDRESS, at(descriptors, i * 8L))));
+        var parameters = new ArrayList<Expr>();
+        for (int i = 0; i < filter.parameters().size(); i++)
+            parameters.add(b.let(new Load(MemoryType.I32, at(descriptors, (filter.sourceIndexes().length + i) * 8L))));
+        Var keys = b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, slaveData + input.slaveKey() * 8L)));
+        Var lowerBound = b.let(load(at(COLUMNS, RIGHT_LO))), budget = b.let(load(at(COLUMNS, LIMIT)));
+        Var lastTimestamp = b.let(scaled(timestamp(SLAVE_TS, binary(Op.SUB, load(at(COLUMNS, RIGHT_HI)), i64(1))), slaveScale));
+        b.loop(binary(Op.LT, left, ROWS), loop -> {
+            Var ts = loop.let(scaled(timestamp(MASTER_TS, left), masterScale));
+            // The Java owner resolves equal timestamps spanning frame boundaries.
+            loop.when(binary(Op.GE, ts, lastTimestamp), stop -> stop.exit(STOP));
+            emitLookupPosition(loop, ts, predecessor, navigation, lookahead, slaveScale);
+            Expr offset = binary(Op.MUL, binary(Op.SUB, left, load(at(COLUMNS, LEFT_LO))), i64(8));
+            Var key = loop.let(keyType == ColumnType.SYMBOL ? load(new Offset(at(COLUMNS, symbolData), offset))
+                    : column(keyWidth, at(COLUMNS, masterData), input.masterKey(), left));
+            Var known = loop.let(keyType == ColumnType.SYMBOL ? ne(key, i64(SymbolTable.VALUE_NOT_FOUND)) : bool(true));
+            Var row = loop.let(predecessor), match = loop.let(bool(false));
+            Var budgetLo = loop.let(binary(Op.SUB, add(predecessor, i64(1)), budget));
+            Var searchLo = loop.let(new Select(binary(Op.LT, lowerBound, budgetLo), budgetLo, lowerBound));
+            Var min = loop.let(input.tolerance() == Numbers.LONG_NULL ? i64(Long.MIN_VALUE) : binary(Op.SUB, ts, i64(input.tolerance())));
+            loop.when(known, search -> {
+                Var searching = search.let(bool(true));
+                search.loop(searching, scan -> {
+                    scan.when(binary(Op.LT, row, searchLo), stop -> stop.exit(STOP));
+                    scan.assign(match, bool(false));
+                    if (input.tolerance() != Numbers.LONG_NULL) {
+                        scan.when(binary(Op.LT, scaled(timestamp(SLAVE_TS, row), slaveScale), min), expired -> expired.assign(searching, bool(false)));
+                    }
+                    scan.when(searching, candidate -> {
+                        var record = ScanLowering.row(filter.plan().input(), addresses, row, false, parameters);
+                        candidate.when(filter.plan().predicate().emit(record), selected -> {
+                            java.util.function.Consumer<Builder> compare = test -> test.assign(match,
+                                    eq(new Load(keyWidth, new Offset(keys, binary(Op.MUL, row, i64(keyWidth.bytes)))), key));
+                            if (filter.residual() == null) compare.accept(selected);
+                            else selected.when(filter.residual().emit(selected, descriptors, row), compare);
+                        });
+                    });
+                    scan.assign(searching, binary(Op.BOTH, searching, eq(match, bool(false))));
+                    // Advance independently of the match result. A conditional decrement
+                    // makes the next load address depend on this candidate's key load.
+                    scan.assign(row, binary(Op.SUB, row, i64(1)));
+                    scan.when(eq(binary(Op.AND, row, i64(1023)), i64(0)), Builder::poll);
+                });
+            });
+            emitUpdates(loop, left, match, add(row, i64(1)), at(COLUMNS, slaveData));
+            loop.store(new Offset(at(COLUMNS, backwardWork), offset), new Select(known, binary(Op.SUB, binary(Op.SUB, predecessor, row),
+                    new Select(match, i64(0), i64(1))), i64(-1)));
+            loop.store(new Offset(at(COLUMNS, forwardWork), offset), binary(Op.SUB, predecessor, previous));
+            loop.when(known, observed -> observed.assign(previous, predecessor));
+            loop.assign(left, add(left, i64(1)));
+            loop.store(at(COLUMNS, LEFT), left);
+            loop.store(at(COLUMNS, RIGHT), predecessor);
+            loop.store(at(COLUMNS, NAV_ROW), navigation);
+            loop.store(at(COLUMNS, NAV_TS), lookahead);
+            loop.store(at(COLUMNS, PREVIOUS), previous);
+        });
+        b.exit(0);
         return new Program(b.block());
     }
 
@@ -452,6 +590,51 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
         }
     }
 
+    @Override
+    public void aggregateLookup(PageFrameMemoryRecord master, TimeFrameCursor slave, MapValue value,
+                                State progress, SqlExecutionCircuitBreaker breaker) {
+        if (master instanceof PageFrameFilteredMemoryRecord || !(slave.getRecord() instanceof PageFrameMemoryRecord rhs)
+                || rhs instanceof PageFrameFilteredMemoryRecord) return;
+        buffer.clearAndEnsureCapacity((STATE_BYTES + vectorData + 7) / 8);
+        long state = buffer.getAddress(), args = state + STATE_BYTES;
+        slave.recordAt(rhs, Rows.toRowID(slave.getTimeFrame().getFrameIndex(), progress.lookupRow));
+        if (!prepare(master, rhs, args) || !filter.prepare(rhs, args + filterData)) return;
+        Unsafe.putLong(args + LEFT, progress.masterLo);
+        Unsafe.putLong(args + LEFT_LO, progress.masterLo);
+        Unsafe.putLong(args + RIGHT, progress.lookupRow);
+        Unsafe.putLong(args + RIGHT_LO, progress.lookupLo);
+        Unsafe.putLong(args + RIGHT_HI, progress.lookupHi);
+        Unsafe.putLong(args + NAV_ROW, progress.lookupFrameRow);
+        Unsafe.putLong(args + NAV_TS, progress.lookupTimestamp);
+        Unsafe.putLong(args + PREVIOUS, progress.previousLookupRow);
+        Unsafe.putLong(args + LOOKAHEAD, progress.lookahead);
+        Unsafe.putLong(args + LIMIT, progress.lookupLimit);
+        Unsafe.putLong(args + AGG, value.getAddress(0));
+        if (keyType == ColumnType.SYMBOL) {
+            for (int i = 0; i < progress.masterHi - progress.masterLo; i++)
+                Unsafe.putLong(args + symbolData + i * 8L, progress.symbolKeys[i]);
+        }
+        memory.enter(breaker);
+        try {
+            long status = lookupCode.run(args, progress.masterHi, state);
+            memory.throwIfFailed();
+            if (status != 0 && status != STOP) throw new IllegalStateException("Invalid ASOF lookup aggregate status: " + status);
+        } finally {
+            progress.nextMaster = Unsafe.getLong(args + LEFT);
+            progress.lookupRow = Unsafe.getLong(args + RIGHT);
+            progress.lookupFrameRow = Unsafe.getLong(args + NAV_ROW);
+            progress.lookupTimestamp = Unsafe.getLong(args + NAV_TS);
+            progress.previousLookupRow = Unsafe.getLong(args + PREVIOUS);
+            for (int i = 0; i < progress.nextMaster - progress.masterLo; i++) {
+                progress.backwardWork[i] = Unsafe.getLong(args + backwardWork + i * 8L);
+                progress.forwardWork[i] = Unsafe.getLong(args + forwardWork + i * 8L);
+            }
+            nativeRows += progress.nextMaster - progress.masterLo;
+            filterFrame = -1;
+            memory.close();
+        }
+    }
+
     private boolean prepare(PageFrameMemoryRecord master, PageFrameMemoryRecord rhs, long args) {
         long timestamp = master.getPageAddress(input.master().getTimestampIndex());
         if (timestamp == 0 || master.getPageAddress(input.masterKey()) == 0) return false;
@@ -486,6 +669,6 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
     @Override public CharSequence getName() { return name; }
     @Override public long getNativeRows() { return nativeRows; }
     @Override public void close() {
-        try { clearExecution(); } finally { code.close(); }
+        try { clearExecution(); } finally { try { code.close(); } finally { lookupCode.close(); } }
     }
 }

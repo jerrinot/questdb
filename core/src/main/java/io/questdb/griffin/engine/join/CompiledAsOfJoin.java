@@ -35,7 +35,7 @@ import io.questdb.std.IntList;
 import io.questdb.std.MemoryTracker;
 import io.questdb.std.QuietCloseable;
 
-/** A bounded forward ASOF region with an aggregate consumer. The cursor owns strategy changes. */
+/** Bounded ASOF regions with an aggregate consumer. The cursor owns strategy changes. */
 public interface CompiledAsOfJoin extends QuietCloseable {
     void clearExecution();
 
@@ -55,6 +55,15 @@ public interface CompiledAsOfJoin extends QuietCloseable {
     void aggregate(PageFrameMemoryRecord master, TimeFrameCursor slave, Map map, MapValue value,
                    State state, SqlExecutionCircuitBreaker breaker);
 
+    /**
+     * Consume a prefix within the current master and RHS frames, without maps or navigation
+     * across frames. Publish only completed probes. History, indexed/memoized lookup and
+     * the work-limit boundary remain with the cursor; an unfinished probe has no aggregate effects.
+     */
+    default void aggregateLookup(PageFrameMemoryRecord master, TimeFrameCursor slave, MapValue value,
+                                 State state, SqlExecutionCircuitBreaker breaker) {
+    }
+
     record Input(RecordMetadata master, RecordMetadata slave,
                  int masterKey, int slaveKey, IntList slaveProjection, long tolerance,
                  ColumnTypes aggregateInputs, IntList aggregateColumns) {
@@ -66,6 +75,15 @@ public interface CompiledAsOfJoin extends QuietCloseable {
         public final long[] backwardWork = new long[CAPACITY];
         public final long[] forwardWork = new long[CAPACITY];
         public final int[] symbolKeys = new int[CAPACITY];
+        // Local RHS row indexes and timestamp-navigation state for bounded lookup.
+        public long lookupRow;
+        public long lookupFrameRow;
+        public long lookupTimestamp;
+        public long previousLookupRow;
+        public long lookupLo;
+        public long lookupHi;
+        public long lookupLimit;
+        public int lookahead;
         public long masterLo;
         public long masterHi;
         public long nextMaster;
