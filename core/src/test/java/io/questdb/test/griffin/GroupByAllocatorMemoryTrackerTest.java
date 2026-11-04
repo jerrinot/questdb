@@ -25,6 +25,7 @@
 package io.questdb.test.griffin;
 
 import io.questdb.PropertyKey;
+import io.questdb.cairo.ArrayColumnTypes;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
@@ -247,7 +248,7 @@ public class GroupByAllocatorMemoryTrackerTest extends AbstractCairoTest {
                     new EmptyTableRecordCursorFactory(baseMetadata),
                     groupByMetadata,
                     groupByFunctions,
-                    1,
+                    new ArrayColumnTypes().add(ColumnType.LONG),
                     null
             )) {
                 Assert.assertFalse(factory.supportsSharedCursors());
@@ -296,7 +297,7 @@ public class GroupByAllocatorMemoryTrackerTest extends AbstractCairoTest {
                     new EmptyTableRecordCursorFactory(baseMetadata),
                     groupByMetadata,
                     groupByFunctions,
-                    1,
+                    new ArrayColumnTypes().add(ColumnType.LONG),
                     sharedRecordFunctions
             )) {
                 final long memBefore = Unsafe.getMemUsed();

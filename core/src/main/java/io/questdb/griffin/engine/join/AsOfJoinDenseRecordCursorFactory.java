@@ -30,7 +30,6 @@ import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.SingleRecordSink;
 import io.questdb.cairo.map.Map;
-import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
@@ -51,6 +50,7 @@ import org.jetbrains.annotations.Nullable;
 public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordCursorFactoryBase {
     private final RecordSink masterKeyCopier;
     private final RecordSink slaveKeyCopier;
+    private final SymbolShortCircuit symbolShortCircuit;
     private @Nullable SymbolTranslatingRecord symbolTranslatingRecord;
 
     public AsOfJoinDenseRecordCursorFactory(
@@ -65,9 +65,12 @@ public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordC
             JoinContext joinContext,
             long toleranceInterval,
             int @Nullable [] masterSymbolKeyColumnIndices,
-            int @Nullable [] slaveSymbolKeyColumnIndices
+            int @Nullable [] slaveSymbolKeyColumnIndices,
+            boolean adaptive,
+            SymbolShortCircuit symbolShortCircuit
     ) {
-        super(metadata, masterFactory, slaveFactory, joinContext, toleranceInterval);
+        super(configuration, metadata, masterFactory, slaveFactory, joinContext, toleranceInterval, adaptive, -1);
+        this.symbolShortCircuit = symbolShortCircuit;
         this.masterKeyCopier = masterKeyCopier;
         this.slaveKeyCopier = slaveKeyCopier;
         this.symbolTranslatingRecord = masterSymbolKeyColumnIndices != null
@@ -78,8 +81,8 @@ public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordC
         try {
             long maxSinkTargetHeapSize = (long)
                     configuration.getSqlHashJoinValuePageSize() * configuration.getSqlHashJoinValueMaxPages();
-            fwdScanKeyToRowId = MapFactory.createUnorderedMap(configuration, keyTypes, TYPES_VALUE, false, false);
-            bwdScanKeyToRowId = MapFactory.createUnorderedMap(configuration, keyTypes, TYPES_VALUE, false, false);
+            fwdScanKeyToRowId = createScanMap(configuration, keyTypes);
+            bwdScanKeyToRowId = createScanMap(configuration, keyTypes);
             this.cursor = new AsOfJoinDenseRecordCursor(
                     columnSplit,
                     fwdScanKeyToRowId,
@@ -113,6 +116,7 @@ public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordC
             failure = th;
         }
         failure = Misc.freeBestEffort(failure, symbolTranslatingRecord);
+        failure = Misc.freeBestEffort(failure, symbolShortCircuit);
         CairoException.rethrowCleanupFailure(failure);
     }
 
@@ -126,7 +130,7 @@ public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordC
 
     @Override
     protected void putFactoryType(PlanSink sink) {
-        sink.type("AsOf Join Dense");
+        sink.type(adaptive ? "AsOf Join Adaptive" : "AsOf Join Dense");
     }
 
     private class AsOfJoinDenseRecordCursor extends AsOfJoinDenseRecordCursorBase {
@@ -168,6 +172,7 @@ public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordC
             Misc.free(slaveSinkTarget);
             Misc.free(masterSinkTarget);
             Misc.free(symbolTranslatingRecord);
+            symbolShortCircuit.close();
             super.close();
         }
 
@@ -177,6 +182,7 @@ public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordC
             // so an open-time breach frees each exactly once.
             masterSinkTarget.reopen();
             slaveSinkTarget.reopen();
+            symbolShortCircuit.reopen();
             if (symbolTranslatingRecord != null) {
                 symbolTranslatingRecord.initSources(masterCursor, slaveCursor);
             }
@@ -185,6 +191,8 @@ public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordC
             if (symbolTranslatingRecord != null) {
                 symbolTranslatingRecord.of(masterRecord);
                 masterKeyRecord = symbolTranslatingRecord;
+            } else {
+                symbolShortCircuit.of(slaveCursor);
             }
         }
 
@@ -194,6 +202,7 @@ public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordC
             super.setMemoryTracker(tracker);
             masterSinkTarget.setMemoryTracker(tracker);
             slaveSinkTarget.setMemoryTracker(tracker);
+            symbolShortCircuit.setMemoryTracker(tracker);
             if (symbolTranslatingRecord != null) {
                 symbolTranslatingRecord.setMemoryTracker(tracker);
             }
@@ -225,6 +234,8 @@ public final class AsOfJoinDenseRecordCursorFactory extends AsOfJoinDenseRecordC
         protected int setupSymbolKeyToFind() {
             if (symbolTranslatingRecord != null) {
                 symbolTranslatingRecord.resetNonExistentKeyFlag();
+            } else if (symbolShortCircuit.isShortCircuit(masterRecord)) {
+                return SymbolTable.VALUE_NOT_FOUND;
             }
             masterSinkTarget.clear();
             masterKeyCopier.copy(masterKeyRecord, masterSinkTarget);

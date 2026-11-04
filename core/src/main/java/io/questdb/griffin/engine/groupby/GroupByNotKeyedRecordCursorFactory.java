@@ -27,6 +27,7 @@ package io.questdb.griffin.engine.groupby;
 import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
@@ -42,7 +43,10 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.SymbolFunction;
+import io.questdb.griffin.engine.join.FilteredAsOfJoinFastRecordCursorFactory;
+import io.questdb.griffin.engine.table.SelectedRecordCursorFactory;
 import io.questdb.std.BytecodeAssembler;
+import io.questdb.std.IntList;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
 import io.questdb.std.Transient;
@@ -51,6 +55,7 @@ import org.jetbrains.annotations.Nullable;
 
 public class GroupByNotKeyedRecordCursorFactory extends AbstractRecordCursorFactory {
     private RecordCursorFactory base;
+    private FilteredAsOfJoinFastRecordCursorFactory compiledAsOfAggregate;
     private GroupByNotKeyedRecordCursor cursor;
     private ObjList<GroupByFunction> groupByFunctions;
     private @Nullable ObjList<ObjList<Function>> sharedRecordFunctions;
@@ -64,12 +69,12 @@ public class GroupByNotKeyedRecordCursorFactory extends AbstractRecordCursorFact
             RecordCursorFactory base,
             RecordMetadata groupByMetadata,
             ObjList<GroupByFunction> groupByFunctions,
-            int valueCount,
+            ColumnTypes valueTypes,
             @Nullable ObjList<ObjList<Function>> sharedRecordFunctions
     ) {
         super(groupByMetadata);
         try {
-            this.value = new SimpleMapValue(valueCount);
+            this.value = new SimpleMapValue(valueTypes.getColumnCount());
             this.base = base;
             this.groupByFunctions = groupByFunctions;
             this.sharedRecordFunctions = sharedRecordFunctions;
@@ -78,6 +83,25 @@ public class GroupByNotKeyedRecordCursorFactory extends AbstractRecordCursorFact
 
             final GroupByFunctionsUpdater updater = GroupByFunctionsUpdaterFactory.getInstance(asm, groupByFunctions);
             boolean earlyExitSupported = GroupByUtils.isEarlyExitSupported(groupByFunctions);
+            if (!earlyExitSupported) {
+                RecordCursorFactory source = base;
+                IntList columns = null;
+                while (source instanceof SelectedRecordCursorFactory) {
+                    IntList selection = source.getColumnCrossIndex();
+                    if (columns == null) {
+                        columns = new IntList(selection);
+                    } else {
+                        for (int i = 0; i < columns.size(); i++) {
+                            columns.setQuick(i, selection.getQuick(columns.getQuick(i)));
+                        }
+                    }
+                    source = source.getBaseFactory();
+                }
+                if (source instanceof FilteredAsOfJoinFastRecordCursorFactory asof
+                        && asof.bindAggregate(base.getMetadata(), columns, valueTypes, groupByFunctions, value)) {
+                    compiledAsOfAggregate = asof;
+                }
+            }
 
             if (earlyExitSupported) {
                 this.cursor = new EarlyExitGroupByNotKeyedRecordCursor(configuration, groupByFunctions, updater);
@@ -466,6 +490,11 @@ public class GroupByNotKeyedRecordCursorFactory extends AbstractRecordCursorFact
                 // Consult the breaker before aggregating, so an empty base scan (which only calls
                 // updateEmpty below, never the row loop) still observes cancellation.
                 circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottledOrYield();
+                if (compiledAsOfAggregate != null) {
+                    compiledAsOfAggregate.aggregate(value, groupByFunctionsUpdater, baseCursor.getRecord());
+                    isValueBuilt = true;
+                    return;
+                }
                 final Record baseRecord = baseCursor.getRecord();
                 if (baseCursor.hasNext()) {
                     long rowId = 0;

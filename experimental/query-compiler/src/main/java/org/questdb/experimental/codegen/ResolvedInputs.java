@@ -402,6 +402,14 @@ final class ResolvedInputs {
             return new Pipeline.Constant(value);
         }
         if (Boolean.parseBoolean(System.getProperty("query.codegen.expressions", "true"))) {
+            if (implementation == io.questdb.griffin.engine.functions.math.DivIntFunctionFactory.Func.class
+                    || implementation == io.questdb.griffin.engine.functions.math.DivLongFunctionFactory.Func.class) {
+                var division = (BinaryFunction) function;
+                var left = scalar(division.getLeft(), type, depth + 1);
+                var right = scalar(division.getRight(), type, depth + 1);
+                return left != null && right instanceof Pipeline.Constant constant && constant.value() > 0
+                        ? new Pipeline.Divide(left, right, type) : null;
+            }
             if (implementation == HourOfDayFunctionFactory.HourOfDayFunction.class
                     || implementation == MinuteOfHourFunctionFactory.MinuteFunction.class
                     || implementation == SecondOfMinuteFunctionFactory.SecondOfMinuteFunc.class) {

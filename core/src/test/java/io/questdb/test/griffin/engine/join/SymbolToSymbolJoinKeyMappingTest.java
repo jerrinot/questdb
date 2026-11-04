@@ -32,7 +32,7 @@ import io.questdb.cairo.sql.StaticSymbolTable;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.SqlCompiler;
 import io.questdb.griffin.engine.join.AsOfJoinDenseSingleSymbolRecordCursorFactory;
-import io.questdb.griffin.engine.join.AsOfJoinFastRecordCursorFactory;
+import io.questdb.griffin.engine.join.AsOfJoinDenseRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinIndexedRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinLightRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinMemoizedRecordCursorFactory;
@@ -109,7 +109,7 @@ public class SymbolToSymbolJoinKeyMappingTest extends AbstractCairoTest {
             assertQuery(query).noLeakCheck().assertsPlanNotContaining("symbolKeyJoin");
             assertCachesReleased(
                     query,
-                    AsOfJoinFastRecordCursorFactory.class,
+                    AsOfJoinDenseRecordCursorFactory.class,
                     """
                             count\tcount1\tsum
                             2000\t1000\t499500.0
@@ -185,7 +185,7 @@ public class SymbolToSymbolJoinKeyMappingTest extends AbstractCairoTest {
                     """;
             final String query = "SELECT %s count(), count(s.price), sum(s.price) FROM master m ASOF JOIN slave s ON (sym)";
 
-            assertCachesReleased(query.formatted(""), AsOfJoinFastRecordCursorFactory.class, expected, 1);
+            assertCachesReleased(query.formatted(""), AsOfJoinDenseSingleSymbolRecordCursorFactory.class, expected, 1);
             assertCachesReleased(query.formatted("/*+ asof_linear(m s) */"), AsOfJoinLightRecordCursorFactory.class, expected, 1);
             assertCachesReleased(query.formatted("/*+ asof_dense(m s) */"), AsOfJoinDenseSingleSymbolRecordCursorFactory.class, expected, 1);
             assertCachesReleased(query.formatted("/*+ asof_index(m s) */"), AsOfJoinIndexedRecordCursorFactory.class, expected, 1);

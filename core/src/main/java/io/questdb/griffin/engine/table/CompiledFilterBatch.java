@@ -49,7 +49,8 @@ import io.questdb.std.ObjList;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 
-public class LatestByCompiledFilter extends BooleanFunction implements UnaryFunction {
+/** A scalar predicate with a bounded compiled path over borrowed page frames. */
+public class CompiledFilterBatch extends BooleanFunction implements UnaryFunction {
     public static final int BATCH_SIZE = 2048;
     private static final ThreadLocal<BatchObserver> TEST_BATCH_OBSERVER = new ThreadLocal<>();
     private final DirectLongList auxAddresses;
@@ -61,10 +62,12 @@ public class LatestByCompiledFilter extends BooleanFunction implements UnaryFunc
     private ObjList<Function> bindVarFunctions;
     private CompiledFilter compiledFilter;
     private Function filter;
+    private boolean executionPrepared;
+    private long inputRows;
     private boolean isFrameCompiled;
     private int preparedFrameIndex = -1;
 
-    public LatestByCompiledFilter(
+    public CompiledFilterBatch(
             CairoConfiguration configuration,
             Function filter,
             CompiledFilter compiledFilter,
@@ -91,28 +94,63 @@ public class LatestByCompiledFilter extends BooleanFunction implements UnaryFunc
             long rowHi
     ) {
         assert rowHi > rowLo && rowHi - rowLo <= BATCH_SIZE;
-        if (filter instanceof LatestByCompiledFilter jit) {
+        if (filter instanceof CompiledFilterBatch jit) {
             try {
                 PageFrameMemory memory = memoryPool.navigateTo(frameIndex);
-                if (frameIndex != jit.preparedFrameIndex) {
-                    jit.prepareFrame(memory, addressCache.getColumnCount());
-                    jit.preparedFrameIndex = frameIndex;
-                }
-                if (jit.isFrameCompiled) {
-                    if (jit.batchObserver != null) {
-                        jit.batchObserver.onJitBatch();
-                    }
-                    jit.applyBatch(memory, addressCache, rowLo, rowHi - rowLo);
-                    return jit.filteredRows;
-                }
-                if (jit.batchObserver != null) {
-                    jit.batchObserver.onJavaFallbackFrame();
-                }
+                return jit.apply(memory, addressCache.getColumnTypes(), rowLo, rowHi);
             } finally {
                 memoryPool.releaseFrameMemory();
             }
         }
         return null;
+    }
+
+    public @Nullable DirectLongList apply(PageFrameMemory memory, IntList columnTypes, long rowLo, long rowHi) {
+        assert rowHi > rowLo && rowHi - rowLo <= BATCH_SIZE;
+        if (memory.getFrameIndex() != preparedFrameIndex) {
+            prepareFrame(memory, columnTypes.size());
+            preparedFrameIndex = memory.getFrameIndex();
+        }
+        if (isFrameCompiled) {
+            if (batchObserver != null) {
+                batchObserver.onJitBatch();
+            }
+            applyBatch(memory, columnTypes, rowLo, rowHi - rowLo);
+            inputRows += rowHi - rowLo;
+            return filteredRows;
+        }
+        if (batchObserver != null) {
+            batchObserver.onJavaFallbackFrame();
+        }
+        return null;
+    }
+
+    public void clearExecution() {
+        Throwable failure = null;
+        if (executionPrepared) {
+            executionPrepared = false;
+            try {
+                compiledFilter.clearExecution();
+            } catch (Throwable th) {
+                failure = th;
+            }
+        }
+        failure = closeBuffers(failure);
+        filteredRows.setMemoryTracker(null);
+        dataAddresses.setMemoryTracker(null);
+        auxAddresses.setMemoryTracker(null);
+        bindVarMemory.setMemoryTracker(null);
+        preparedFrameIndex = -1;
+        CairoException.rethrowCleanupFailure(failure);
+    }
+
+    public CharSequence getBackendName() {
+        CharSequence name = compiledFilter.getBackendName();
+        return name == null ? "asmjit" : name;
+    }
+
+    public long getInputRows() {
+        return inputRows;
     }
 
     @TestOnly
@@ -127,13 +165,18 @@ public class LatestByCompiledFilter extends BooleanFunction implements UnaryFunc
 
     @Override
     public void close() {
+        Throwable failure = null;
+        try {
+            clearExecution();
+        } catch (Throwable th) {
+            failure = th;
+        }
         final Function filter = this.filter;
         this.filter = null;
         final CompiledFilter compiledFilter = this.compiledFilter;
         this.compiledFilter = null;
         final ObjList<Function> bindVarFunctions = this.bindVarFunctions;
         this.bindVarFunctions = null;
-        Throwable failure = closeBuffers(null);
         failure = Misc.freeBestEffort(failure, compiledFilter);
         failure = Misc.freeObjListBestEffort(failure, bindVarFunctions);
         failure = Misc.freeBestEffort(failure, filter);
@@ -142,8 +185,12 @@ public class LatestByCompiledFilter extends BooleanFunction implements UnaryFunc
 
     @Override
     public void cursorClosed() {
-        if (filter != null) {
-            filter.cursorClosed();
+        try {
+            if (filter != null) {
+                filter.cursorClosed();
+            }
+        } finally {
+            clearExecution();
         }
     }
 
@@ -159,14 +206,24 @@ public class LatestByCompiledFilter extends BooleanFunction implements UnaryFunc
 
     @Override
     public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+        clearExecution();
         batchObserver = TEST_BATCH_OBSERVER.get();
         preparedFrameIndex = -1;
+        inputRows = 0;
+        final var tracker = executionContext == null ? null : executionContext.getMemoryTracker();
+        filteredRows.setMemoryTracker(tracker);
+        dataAddresses.setMemoryTracker(tracker);
+        auxAddresses.setMemoryTracker(tracker);
+        bindVarMemory.setMemoryTracker(tracker);
         filteredRows.reopen();
         dataAddresses.reopen();
         auxAddresses.reopen();
         filter.init(symbolTableSource, executionContext);
         Function.init(bindVarFunctions, symbolTableSource, executionContext, null);
         AsyncFilterUtils.prepareBindVarMemory(executionContext, symbolTableSource, bindVarFunctions, bindVarMemory);
+        executionPrepared = true;
+        compiledFilter.prepareExecution(tracker);
+        compiledFilter.prepareForDispatch();
     }
 
     @Override
@@ -179,8 +236,7 @@ public class LatestByCompiledFilter extends BooleanFunction implements UnaryFunc
         filter.toPlan(sink);
     }
 
-    private void applyBatch(PageFrameMemory memory, PageFrameAddressCache addressCache, long rowLo, long rowCount) {
-        final IntList columnTypes = addressCache.getColumnTypes();
+    private void applyBatch(PageFrameMemory memory, IntList columnTypes, long rowLo, long rowCount) {
         for (int i = 0, n = filterColumnIndexes.size(); i < n; i++) {
             final int columnIndex = filterColumnIndexes.getQuick(i);
             final int columnType = columnTypes.getQuick(columnIndex);
@@ -239,7 +295,7 @@ public class LatestByCompiledFilter extends BooleanFunction implements UnaryFunc
     }
 
     static void addJitAttr(PlanSink sink, Function filter) {
-        if (filter instanceof LatestByCompiledFilter) {
+        if (filter instanceof CompiledFilterBatch) {
             sink.attr("jit").val(true);
         }
     }

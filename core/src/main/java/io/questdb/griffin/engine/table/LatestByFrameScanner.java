@@ -45,7 +45,7 @@ final class LatestByFrameScanner {
 
     LatestByFrameScanner(@NotNull Function filter, @NotNull PageFrameMemoryPool memoryPool, @NotNull PageFrameAddressCache addressCache) {
         this.filter = filter;
-        this.javaFilter = filter instanceof LatestByCompiledFilter jit ? jit.getArg() : filter;
+        this.javaFilter = filter instanceof CompiledFilterBatch jit ? jit.getArg() : filter;
         this.memoryPool = memoryPool;
         this.addressCache = addressCache;
     }
@@ -73,8 +73,8 @@ final class LatestByFrameScanner {
         if (batchHi < frameRowCount) {
             circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
         }
-        batchLo = Math.max(0, batchHi - LatestByCompiledFilter.BATCH_SIZE);
-        matches = LatestByCompiledFilter.apply(filter, memoryPool, addressCache, frameIndex, batchLo, batchHi);
+        batchLo = Math.max(0, batchHi - CompiledFilterBatch.BATCH_SIZE);
+        matches = CompiledFilterBatch.apply(filter, memoryPool, addressCache, frameIndex, batchLo, batchHi);
         if (matches != null) {
             rowCount = matches.size();
         } else {

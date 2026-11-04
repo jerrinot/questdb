@@ -107,7 +107,7 @@ public class LatestByDeferredListValuesFilteredRecordCursorFactory extends Abstr
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("LatestByDeferredListValuesFiltered");
-        LatestByCompiledFilter.addJitAttr(sink, filter);
+        CompiledFilterBatch.addJitAttr(sink, filter);
         sink.optAttr("filter", filter);
         sink.optAttr("includedSymbols", includedSymbolFuncs);
         sink.optAttr("excludedSymbols", excludedSymbolFuncs);
@@ -116,7 +116,7 @@ public class LatestByDeferredListValuesFilteredRecordCursorFactory extends Abstr
 
     @Override
     public boolean usesCompiledFilter() {
-        return filter instanceof LatestByCompiledFilter;
+        return filter instanceof CompiledFilterBatch;
     }
 
     private static @Nullable IntList newSymbolKeyCache(@Nullable ObjList<Function> functions) {

@@ -46,7 +46,6 @@ import io.questdb.griffin.engine.PerWorkerLocks;
 import io.questdb.griffin.engine.join.AbstractJoinRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinDenseRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinDenseSingleSymbolRecordCursorFactory;
-import io.questdb.griffin.engine.join.AsOfJoinFastRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinIndexedRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinLightRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinMemoizedRecordCursorFactory;
@@ -348,7 +347,7 @@ public class SymbolTranslationCacheMemoryTrackerTest extends AbstractCairoTest {
                 assertOpenFailuresFreeChildCursorsOnce(
                         compiler,
                         "SELECT om.k1, os.price FROM om ASOF JOIN os ON (k1, k2)",
-                        AsOfJoinFastRecordCursorFactory.class,
+                        AsOfJoinDenseRecordCursorFactory.class,
                         false
                 );
                 assertOpenFailuresFreeChildCursorsOnce(
@@ -380,7 +379,7 @@ public class SymbolTranslationCacheMemoryTrackerTest extends AbstractCairoTest {
                 assertOpenFailuresFreeChildCursorsOnce(
                         compiler,
                         "SELECT om.k1, os.price FROM om ASOF JOIN os ON (k1)",
-                        AsOfJoinFastRecordCursorFactory.class,
+                        AsOfJoinDenseSingleSymbolRecordCursorFactory.class,
                         false
                 );
                 assertOpenFailuresFreeChildCursorsOnce(
@@ -414,7 +413,7 @@ public class SymbolTranslationCacheMemoryTrackerTest extends AbstractCairoTest {
                         compiler,
                         sqlExecutionContext,
                         "SELECT m.k1 FROM m ASOF JOIN s ON (k1, k2)",
-                        AsOfJoinFastRecordCursorFactory.class
+                        AsOfJoinDenseRecordCursorFactory.class
                 );
                 assertCachesChargeTracker(
                         compiler,

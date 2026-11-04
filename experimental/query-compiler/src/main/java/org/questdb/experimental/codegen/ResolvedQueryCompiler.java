@@ -112,6 +112,37 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     }
 
     @Override
+    public io.questdb.griffin.engine.join.CompiledAsOfLookup compileAsOfLookup(
+            ColumnTypes inputs, Function filter, int keyColumn, int timestampColumn,
+            long timestampScale, boolean finiteTolerance) {
+        return ResolvedAsOfLookup.compile(inputs, filter, keyColumn, timestampColumn,
+                timestampScale, finiteTolerance, backend, artifacts);
+    }
+
+    @Override
+    public io.questdb.griffin.engine.join.CompiledAsOfJoin compileAsOfJoin(
+            io.questdb.griffin.engine.join.CompiledAsOfJoin.Input input, Map layout, Function filter,
+            ColumnTypes values, ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue value) {
+        try {
+            return ResolvedAsOfJoin.compile(input, layout, filter, values, functions, value, backend, artifacts);
+        } catch (IOException failure) {
+            throw CairoException.nonCritical().put("ASOF aggregate compilation failed: ").put(failure.getMessage());
+        }
+    }
+
+    @Override
+    public io.questdb.griffin.engine.join.CompiledAsOfScan compileAsOfScan(
+            ColumnTypes inputs, ColumnTypes keyTypes, io.questdb.cairo.ListColumnFilter columns,
+            Map layout, Function filter, int timestampColumn, long timestampScale) {
+        try {
+            return ResolvedAsOfScan.compile(inputs, keyTypes, columns, layout, filter,
+                    timestampColumn, timestampScale, backend, artifacts);
+        } catch (IOException failure) {
+            throw CairoException.nonCritical().put("ASOF scan compilation failed: ").put(failure.getMessage());
+        }
+    }
+
+    @Override
     public java.util.function.UnaryOperator<RecordCursorFactory> prepareGroupedTopK(
             RecordCursorFactory input, GroupedTopK plan, io.questdb.griffin.SqlExecutionContext context) {
         return ResolvedGroupedTopK.prepare(input, plan, context, this);

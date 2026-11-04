@@ -227,7 +227,6 @@ import io.questdb.griffin.engine.groupby.vect.VectorAggregateFunctionConstructor
 import io.questdb.griffin.engine.join.ArrayUnnestSource;
 import io.questdb.griffin.engine.join.AsOfJoinDenseRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinDenseSingleSymbolRecordCursorFactory;
-import io.questdb.griffin.engine.join.AsOfJoinFastRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinIndexedRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinLightNoKeyRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinLightRecordCursorFactory;
@@ -315,7 +314,7 @@ import io.questdb.griffin.engine.table.HorizonJoinSlaveState;
 import io.questdb.griffin.engine.table.LatestByAllFilteredRecordCursorFactory;
 import io.questdb.griffin.engine.table.LatestByAllIndexedRecordCursorFactory;
 import io.questdb.griffin.engine.table.LatestByAllSymbolsFilteredRecordCursorFactory;
-import io.questdb.griffin.engine.table.LatestByCompiledFilter;
+import io.questdb.griffin.engine.table.CompiledFilterBatch;
 import io.questdb.griffin.engine.table.LatestByDeferredListValuesFilteredRecordCursorFactory;
 import io.questdb.griffin.engine.table.LatestByLightRecordCursorFactory;
 import io.questdb.griffin.engine.table.LatestByRecordCursorFactory;
@@ -2479,7 +2478,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
     }
 
     /**
-     * Wraps {@code filter} into a {@link LatestByCompiledFilter} when the JIT can serialize it.
+     * Wraps {@code filter} into a {@link CompiledFilterBatch} when the JIT can serialize it.
      * Accepted generic JIT limitation: f32 comparisons use {@code FLOAT_EPSILON}, slightly wider
      * than the Java filter's {@link Numbers#DOUBLE_TOLERANCE}. All compiled-filter query paths
      * share this discrepancy; it is not specific to LATEST ON. The maintainer accepts boundary-row
@@ -2535,7 +2534,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
             for (int i = 0, n = usedColumns.size(); i < n; i++) {
                 filterColumnIndexes.add(usedColumns.get(i));
             }
-            return new LatestByCompiledFilter(configuration, filter, compiled, bindVariables, filterColumnIndexes);
+            return new CompiledFilterBatch(configuration, filter, compiled, bindVariables, filterColumnIndexes);
         } catch (SqlException | LimitOverflowException e) {
             Throwable failure = Misc.freeBestEffort(null, compiled);
             failure = Misc.freeObjListBestEffort(failure, bindVariables);
@@ -6472,7 +6471,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
             final RecordMetadata masterMetadata,
             final CharSequence masterAlias,
             final RecordCursorFactory slave,
-            final RecordMetadata slaveMetadata
+            final RecordMetadata slaveMetadata,
+            final SqlExecutionContext executionContext
     ) throws SqlException {
         long toleranceInterval = tolerance(slaveModel, masterMetadata.getTimestampType(), slaveMetadata.getTimestampType());
         CharSequence slaveAlias = slaveModel.getName();
@@ -6515,7 +6515,8 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                         slaveSymbolColumnIndex,
                                         (SymbolJoinKeyMapping) symbolShortCircuit,
                                         slaveContext,
-                                        toleranceInterval
+                                        toleranceInterval,
+                                        false
                                 );
                             }
                             int[][] denseSymbolKeyIndices = convertSymbolJoinKeysToInt(masterMetadata, slaveMetadata);
@@ -6531,7 +6532,9 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                     slaveContext,
                                     toleranceInterval,
                                     denseSymbolKeyIndices != null ? denseSymbolKeyIndices[0] : null,
-                                    denseSymbolKeyIndices != null ? denseSymbolKeyIndices[1] : null
+                                    denseSymbolKeyIndices != null ? denseSymbolKeyIndices[1] : null,
+                                    false,
+                                    NoopSymbolShortCircuit.INSTANCE
                             );
                         }
                         if (isSingleSymbolJoin) {
@@ -6568,27 +6571,21 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                 );
                             }
 
-                            // We're falling back to the default Fast scan. We can still optimize one thing:
-                            // join key equality check. Instead of comparing symbols as strings, compare symbol keys.
-                            // For that to work, we need code that maps master symbol key to slave symbol key.
-                            writeSymbolAsStringA.unset(slaveSymbolColumnIndex);
-                            return new AsOfJoinFastRecordCursorFactory(
+                            return new AsOfJoinDenseSingleSymbolRecordCursorFactory(
                                     configuration,
                                     joinMetadata,
                                     master,
-                                    new SymbolKeyMappingRecordCopier((SymbolJoinKeyMapping) symbolShortCircuit),
                                     slave,
-                                    createRecordCopierSlave(slaveMetadata),
                                     joinColumnSplit,
-                                    symbolShortCircuit,
+                                    slaveSymbolColumnIndex,
+                                    symbolJoinKeyMapping,
                                     slaveContext,
                                     toleranceInterval,
-                                    null,
-                                    null
+                                    true
                             );
                         } else {
-                            int[][] fastSymbolKeyIndices = convertSymbolJoinKeysToInt(masterMetadata, slaveMetadata);
-                            return new AsOfJoinFastRecordCursorFactory(
+                            int[][] symbolKeyIndices = convertSymbolJoinKeysToInt(masterMetadata, slaveMetadata);
+                            return new AsOfJoinDenseRecordCursorFactory(
                                     configuration,
                                     joinMetadata,
                                     master,
@@ -6596,24 +6593,20 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                     slave,
                                     createRecordCopierSlave(slaveMetadata),
                                     joinColumnSplit,
-                                    fastSymbolKeyIndices != null ? NoopSymbolShortCircuit.INSTANCE : symbolShortCircuit,
+                                    keyTypes,
                                     slaveContext,
                                     toleranceInterval,
-                                    fastSymbolKeyIndices != null ? fastSymbolKeyIndices[0] : null,
-                                    fastSymbolKeyIndices != null ? fastSymbolKeyIndices[1] : null
+                                    symbolKeyIndices != null ? symbolKeyIndices[0] : null,
+                                    symbolKeyIndices != null ? symbolKeyIndices[1] : null,
+                                    true,
+                                    symbolKeyIndices != null ? NoopSymbolShortCircuit.INSTANCE : symbolShortCircuit
                             );
                         }
                     } else if (slave.supportsFilterStealing() && slave.getBaseFactory().supportsTimeFrameCursor()) {
                         RecordCursorFactory slaveBase = slave.getBaseFactory();
                         int slaveTimestampIndex = validateAndGetSlaveTimestampIndex(slaveMetadata, slaveBase);
 
-                        Function stolenFilter = slave.getFilter();
-                        assert stolenFilter != null;
-
-                        Misc.free(slave.getCompiledFilter());
-                        Misc.free(slave.getBindVarMemory());
-                        Misc.freeObjList(slave.getBindVarFunctions());
-                        slave.halfClose();
+                        Function stolenFilter = stealAsOfFilter(slave);
 
                         int[][] filteredSymbolKeyIndices = convertSymbolJoinKeysToInt(masterMetadata, slaveMetadata);
                         return new FilteredAsOfJoinFastRecordCursorFactory(
@@ -6623,7 +6616,11 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                 createRecordCopierMaster(masterMetadata),
                                 slaveBase,
                                 createRecordCopierSlave(slaveMetadata),
+                                keyTypes,
                                 stolenFilter,
+                                executionContext.getQueryCodeGenerator(),
+                                listColumnFilterA,
+                                listColumnFilterB,
                                 masterMetadata.getColumnCount(),
                                 NullRecordFactory.getInstance(slaveMetadata),
                                 null,
@@ -6645,17 +6642,10 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                             if (filterStealingBase.supportsTimeFrameCursor()) {
                                 IntList stolenCrossIndex = slave.getColumnCrossIndex();
                                 assert stolenCrossIndex != null;
-                                Function stolenFilter = projectionBase.getFilter();
-                                assert stolenFilter != null;
-
-                                // index *after* applying the projection
+                                // Index after applying the projection; filtering retains the raw layout.
                                 int slaveTimestampIndex = slaveMetadata.getTimestampIndex();
                                 assert stolenCrossIndex.get(slaveTimestampIndex) == filterStealingBase.getMetadata().getTimestampIndex();
-
-                                Misc.free(projectionBase.getCompiledFilter());
-                                Misc.free(projectionBase.getBindVarMemory());
-                                Misc.freeObjList(projectionBase.getBindVarFunctions());
-                                projectionBase.halfClose();
+                                Function stolenFilter = stealAsOfFilter(projectionBase);
 
                                 int[][] projFilteredSymbolKeyIndices = convertSymbolJoinKeysToInt(masterMetadata, slaveMetadata);
                                 return new FilteredAsOfJoinFastRecordCursorFactory(
@@ -6665,7 +6655,11 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                         createRecordCopierMaster(masterMetadata),
                                         filterStealingBase,
                                         createRecordCopierSlave(slaveMetadata),
+                                        keyTypes,
                                         stolenFilter,
+                                        executionContext.getQueryCodeGenerator(),
+                                        listColumnFilterA,
+                                        listColumnFilterB,
                                         masterMetadata.getColumnCount(),
                                         NullRecordFactory.getInstance(slaveMetadata),
                                         stolenCrossIndex,
@@ -7140,7 +7134,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                 processJoinContext(index == 1, isSelfJoin, slaveModel.getJoinContext(), masterMetadata, slaveMetadata);
                                 validateTimestampNotInJoinKeys(slaveModel, masterMetadata, slaveMetadata);
                                 master = joinType == IQueryModel.JOIN_ASOF
-                                        ? generateJoinAsof(isSelfJoin, model, slaveModel, master, masterMetadata, masterAlias, slaveToFree, slaveMetadata)
+                                        ? generateJoinAsof(isSelfJoin, model, slaveModel, master, masterMetadata, masterAlias, slaveToFree, slaveMetadata, executionContext)
                                         : generateJoinLt(model, slaveModel, master, masterMetadata, masterAlias, slaveToFree, slaveMetadata);
                                 masterAlias = null;
                                 // from now on, master owns slave, so we don't have to close it
@@ -11486,7 +11480,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                         factory,
                         outerProjectionMetadata,
                         groupByFunctions0,
-                        valueTypes.getColumnCount(),
+                        valueTypes,
                         sharedOuterProjectionFunctions0
                 );
             }
@@ -15229,6 +15223,22 @@ public class SqlCodeGenerator implements Mutable, Closeable {
         }
     }
 
+    private Function stealAsOfFilter(RecordCursorFactory factory) {
+        if (factory instanceof AsyncJitFilteredRecordCursorFactory jit && factory.getFilter().isStableWithinExecution()) {
+            CompiledFilterBatch batch = jit.takeCompiledFilter(configuration);
+            if (batch != null) {
+                return batch;
+            }
+        }
+        Function filter = factory.getFilter();
+        assert filter != null;
+        Misc.free(factory.getCompiledFilter());
+        Misc.free(factory.getBindVarMemory());
+        Misc.freeObjList(factory.getBindVarFunctions());
+        factory.halfClose();
+        return filter;
+    }
+
     private Function toLimitFunction(
             SqlExecutionContext executionContext,
             ExpressionNode limit,
@@ -15785,6 +15795,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
             this.vectorized = true;
         }
     }
+
 
     private static class WindowJoinColCheckVisitor implements PostOrderTreeTraversalAlgo.Visitor {
         boolean hasIncludeCol;

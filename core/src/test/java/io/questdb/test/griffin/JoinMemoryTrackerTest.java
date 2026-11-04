@@ -32,7 +32,6 @@ import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlCompiler;
 import io.questdb.griffin.engine.join.AsOfJoinDenseRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinDenseSingleSymbolRecordCursorFactory;
-import io.questdb.griffin.engine.join.AsOfJoinFastRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinIndexedRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinLightRecordCursorFactory;
 import io.questdb.griffin.engine.join.AsOfJoinMemoizedRecordCursorFactory;
@@ -74,6 +73,29 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
     public void setUp() {
         super.setUp();
         setProperty(PropertyKey.CAIRO_QUERY_MEMORY_LIMIT_BYTES, 512 * 1024L);
+    }
+
+    @Test
+    public void testAsOfJoinAdaptiveLookupUnderTightLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table s as (select x k,cast(x as timestamp) ts from long_sequence(100000)) timestamp(ts)");
+            execute("create table m as (select -1L k,cast(90000 as timestamp) ts from long_sequence(1)) timestamp(ts)");
+            drainWalQueue();
+            setProperty(PropertyKey.CAIRO_QUERY_MEMORY_LIMIT_BYTES, 32 * 1024L);
+            // The old lookup needs only its key sinks. Optional scan state must not turn
+            // this successful bounded-memory query into an allocation failure.
+            String sql = "select m.k,s.k from m asof join s on k";
+            assertUsesFactory(sql, AsOfJoinDenseRecordCursorFactory.class);
+            for (int i = 0; i < 3; i++) {
+                try (RecordCursorFactory factory = select(sql);
+                     RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Assert.assertTrue(cursor.hasNext());
+                    Assert.assertEquals(-1, cursor.getRecord().getLong(0));
+                    Assert.assertEquals(Long.MIN_VALUE, cursor.getRecord().getLong(1));
+                    Assert.assertFalse(cursor.hasNext());
+                }
+            }
+        });
     }
 
     @Test
@@ -191,9 +213,9 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testAsOfJoinFastOpenFailureReleasesAllocations() throws Exception {
-        // A keyed ASOF join over a time-frame slave routes to AsOfJoinFastRecordCursorFactory, whose of()
-        // reopens two tracker-bound SingleRecordSinks; a tiny limit breaches that reopen. The reuse loop
+    public void testAsOfJoinAdaptiveOpenFailureReleasesAllocations() throws Exception {
+        // The adaptive single-symbol cursor reopens its tracker-bound translation cache.
+        // A tiny limit breaches that reopen. The reuse loop
         // asserts the open-error path frees each cursor once and leaves the factory reusable.
         assertMemoryLeak(() -> {
             execute("CREATE TABLE m AS (SELECT x::SYMBOL k, (x * 1_000_000L)::timestamp ts FROM long_sequence(4)) TIMESTAMP(ts) PARTITION BY DAY");
@@ -203,21 +225,20 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
             setProperty(PropertyKey.CAIRO_QUERY_MEMORY_LIMIT_BYTES, 4L);
             assertOpenFailureReleasesAllocations(
                     "SELECT m.k FROM m ASOF JOIN s ON k",
-                    AsOfJoinFastRecordCursorFactory.class
+                    AsOfJoinDenseSingleSymbolRecordCursorFactory.class
             );
         });
     }
 
     @Test
-    public void testAsOfJoinFastRepeatedCursorRunsReleaseAllocations() throws Exception {
-        // The reuse loop cycles the fast cursor's sinks; assertMemoryLeak is the load-bearing check that
-        // their malloc/free stays symmetric on the per-query counter after the of() reorder.
+    public void testAsOfJoinAdaptiveRepeatedCursorRunsReleaseAllocations() throws Exception {
+        // Repeated sparse executions must release the adaptive cursor's translation cache.
         assertMemoryLeak(() -> {
             execute("CREATE TABLE m AS (SELECT x::SYMBOL k, (x * 1_000_000L)::timestamp ts FROM long_sequence(50)) TIMESTAMP(ts) PARTITION BY DAY");
             execute("CREATE TABLE s AS (SELECT x::SYMBOL k, (x * 1_000_000L)::timestamp ts FROM long_sequence(50)) TIMESTAMP(ts) PARTITION BY DAY");
             drainWalQueue();
             final String sql = "SELECT m.k FROM m ASOF JOIN s ON k";
-            assertUsesFactory(sql, AsOfJoinFastRecordCursorFactory.class);
+            assertUsesFactory(sql, AsOfJoinDenseSingleSymbolRecordCursorFactory.class);
             try (SqlCompiler compiler = engine.getSqlCompiler();
                  RecordCursorFactory factory = compiler.compile(sql, sqlExecutionContext).getRecordCursorFactory()) {
                 for (int i = 0; i < 20; i++) {
@@ -234,8 +255,8 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testAsOfJoinFastSymbolKeyMappingCacheCapacityKeepsQueryUnderLimit() throws Exception {
-        // Same master table and 128 KiB limit as testAsOfJoinFastSymbolKeyMappingCacheFailsOnLargeInput, but the
+    public void testAsOfJoinAdaptiveSymbolKeyMappingCacheCapacityKeepsQueryUnderLimit() throws Exception {
+        // Same master table and 128 KiB limit as testAsOfJoinAdaptiveSymbolKeyMappingCacheFailsOnLargeInput, but the
         // cache capacity limits the symbol key cache to 1,000 entries (4 pages of 1 KiB), so 40K distinct symbols
         // no longer breach the limit. The master rows past the first 1,000 get translated via the symbol strings.
         // The slave table starts with an extra symbol "0", so each slave key is one more than the master key of
@@ -250,7 +271,7 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
             execute("CREATE TABLE s AS (SELECT (x - 1)::SYMBOL k, ((x - 1) * 1_000_000L)::timestamp ts FROM long_sequence(40_001)) TIMESTAMP(ts) PARTITION BY DAY");
             drainWalQueue();
             final String sql = "SELECT count(), count(s.k), count(CASE WHEN s.k::STRING = m.k::STRING THEN 1 END) FROM m ASOF JOIN s ON k";
-            assertUsesFactory(sql, AsOfJoinFastRecordCursorFactory.class);
+            assertUsesFactory(sql, AsOfJoinDenseSingleSymbolRecordCursorFactory.class);
             assertQuery(sql).noLeakCheck().noRandomAccess().expectSize().returns("""
                     count\tcount1\tcount2
                     40000\t40000\t40000
@@ -259,11 +280,11 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testAsOfJoinFastSymbolKeyMappingCacheFailsOnLargeInput() throws Exception {
-        // A single-key SYMBOL ASOF join over a time-frame slave routes to AsOfJoinFastRecordCursorFactory with
+    public void testAsOfJoinAdaptiveSymbolKeyMappingCacheFailsOnLargeInput() throws Exception {
+        // A single-key SYMBOL ASOF join over a time-frame slave routes to AsOfJoinDenseSingleSymbolRecordCursorFactory with
         // a SymbolToSymbolJoinKeyMapping, which caches one master-to-slave key translation per distinct master
         // symbol that the slave holds. Each master row finds its key in the slave row with the same timestamp,
-        // so the backward slave scan stays short and the fixed-size key sinks stay tiny, while 40K distinct
+        // so backward scans stay short and no scan maps are opened, while 40K distinct
         // symbols with dense keys would fill 157 pages of the cache (NATIVE_JOIN_MAP), about 157 KiB, so the
         // cache growth is the first allocation to breach the 128 KiB limit. Without the tracker binding the cache
         // escapes the limit and the query completes, tripping Assert.fail. Reusing one factory checks that each
@@ -274,7 +295,7 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
             execute("CREATE TABLE s AS (SELECT x::SYMBOL k, (x * 1_000_000L)::timestamp ts FROM long_sequence(40_000)) TIMESTAMP(ts) PARTITION BY DAY");
             drainWalQueue();
             final String sql = "SELECT m.k FROM m ASOF JOIN s ON k";
-            assertUsesFactory(sql, AsOfJoinFastRecordCursorFactory.class);
+            assertUsesFactory(sql, AsOfJoinDenseSingleSymbolRecordCursorFactory.class);
             try (SqlCompiler compiler = engine.getSqlCompiler();
                  RecordCursorFactory factory = compiler.compile(sql, sqlExecutionContext).getRecordCursorFactory()) {
                 for (int i = 0; i < 5; i++) {
@@ -296,8 +317,8 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testAsOfJoinFastSymbolTranslationCacheCapacityKeepsQueryUnderLimit() throws Exception {
-        // Same shape and 128 KiB limit as testAsOfJoinFastSymbolTranslationCacheFailsOnLargeInput, but the cache
+    public void testAsOfJoinAdaptiveSymbolTranslationCacheCapacityKeepsQueryUnderLimit() throws Exception {
+        // Same shape and 128 KiB limit as testAsOfJoinAdaptiveSymbolTranslationCacheFailsOnLargeInput, but the cache
         // capacity stops each translation cache from allocating at 1,000 entries (4 pages of 1 KiB), so 40K
         // distinct master symbols no longer breach the limit. The only slave row matches the last master row,
         // whose symbols lie outside the allocated pages, so count(s.k1) = 1 checks the uncached translation via
@@ -309,7 +330,7 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
             execute("CREATE TABLE s AS (SELECT (x + 39_999)::SYMBOL k1, (x + 39_999)::SYMBOL k2, (x * 1_000_000L)::timestamp ts FROM long_sequence(1)) TIMESTAMP(ts) PARTITION BY DAY");
             drainWalQueue();
             final String sql = "SELECT count(), count(s.k1) FROM m ASOF JOIN s ON (m.k1 = s.k1 AND m.k2 = s.k2)";
-            assertUsesFactory(sql, AsOfJoinFastRecordCursorFactory.class);
+            assertUsesFactory(sql, AsOfJoinDenseRecordCursorFactory.class);
             assertQuery(sql).noLeakCheck().noRandomAccess().expectSize().returns("""
                     count\tcount1
                     40000\t1
@@ -318,8 +339,8 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testAsOfJoinFastSymbolTranslationCacheFailsOnLargeInput() throws Exception {
-        // A multi-key SYMBOL ASOF join over a time-frame slave routes to AsOfJoinFastRecordCursorFactory with
+    public void testAsOfJoinAdaptiveSymbolTranslationCacheFailsOnLargeInput() throws Exception {
+        // A multi-key SYMBOL ASOF join over a time-frame slave routes to AsOfJoinDenseRecordCursorFactory with
         // a SymbolTranslatingRecord (a single SYMBOL key takes the SymbolKeyMappingRecordCopier path instead),
         // which caches one master-to-slave key translation per distinct master symbol and key column. The
         // one-row slave keeps the backward slave scan and the fixed-size key sinks tiny, while 40K distinct
@@ -334,7 +355,7 @@ public class JoinMemoryTrackerTest extends AbstractCairoTest {
             execute("CREATE TABLE s AS (SELECT x::SYMBOL k1, x::SYMBOL k2, (x * 1_000_000L)::timestamp ts FROM long_sequence(1)) TIMESTAMP(ts) PARTITION BY DAY");
             drainWalQueue();
             final String sql = "SELECT m.k1 FROM m ASOF JOIN s ON (m.k1 = s.k1 AND m.k2 = s.k2)";
-            assertUsesFactory(sql, AsOfJoinFastRecordCursorFactory.class);
+            assertUsesFactory(sql, AsOfJoinDenseRecordCursorFactory.class);
             assertQuery(sql).noLeakCheck().assertsPlanContaining("symbolKeyJoin: true");
             try (SqlCompiler compiler = engine.getSqlCompiler();
                  RecordCursorFactory factory = compiler.compile(sql, sqlExecutionContext).getRecordCursorFactory()) {

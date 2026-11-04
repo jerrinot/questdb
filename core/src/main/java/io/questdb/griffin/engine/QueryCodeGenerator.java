@@ -25,6 +25,7 @@
 package io.questdb.griffin.engine;
 
 import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.ListColumnFilter;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
@@ -34,12 +35,36 @@ import io.questdb.griffin.engine.CompiledProjection;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.groupby.GroupByKernel;
 import io.questdb.griffin.engine.join.CompiledJoin;
+import io.questdb.griffin.engine.join.CompiledAsOfJoin;
+import io.questdb.griffin.engine.join.CompiledAsOfLookup;
+import io.questdb.griffin.engine.join.CompiledAsOfScan;
 import io.questdb.std.ObjList;
 import io.questdb.std.Transient;
 import org.jetbrains.annotations.Nullable;
 
 /** Optional compilation of resolved operators. Core has no dependency on a backend. */
 public interface QueryCodeGenerator {
+    /** Stable RHS predicate and one raw INT/LONG/SYMBOL key; SYMBOL probes use the RHS dictionary. */
+    default @Nullable CompiledAsOfLookup compileAsOfLookup(
+            ColumnTypes inputs, Function filter, int keyColumn, int timestampColumn,
+            long timestampScale, boolean finiteTolerance) {
+        return null;
+    }
+
+    /** Borrows resolved ASOF inputs and the ordinary map and aggregate layouts during binding. */
+    default @Nullable CompiledAsOfJoin compileAsOfJoin(
+            CompiledAsOfJoin.Input input, Map layout, Function filter,
+            ColumnTypes values, ObjList<GroupByFunction> functions, MapValue value) {
+        return null;
+    }
+
+    /** Stable RHS predicate and raw column indexes in the existing ASOF map's key order. */
+    default @Nullable CompiledAsOfScan compileAsOfScan(
+            ColumnTypes inputs, ColumnTypes keyTypes, ListColumnFilter keyColumns,
+            Map layout, Function filter, int timestampColumn, long timestampScale) {
+        return null;
+    }
+
     /** Planning-only preparation. A successful builder adopts its input, including on failure. */
     default @Nullable java.util.function.UnaryOperator<RecordCursorFactory> prepareGroupedTopK(
             RecordCursorFactory input, GroupedTopK plan, io.questdb.griffin.SqlExecutionContext context) { return null; }

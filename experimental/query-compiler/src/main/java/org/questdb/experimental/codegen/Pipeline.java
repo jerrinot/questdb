@@ -237,9 +237,19 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    /** SQL division returns NaN for any nonfinite result. */
-    public record Divide(Scalar left, Scalar right) implements Scalar {
+    /** Floating division normalizes nonfinite results; integral divisors use the existing positive-constant IR. */
+    public record Divide(Scalar left, Scalar right, int columnType) implements Scalar {
+        public Divide(Scalar left, Scalar right) { this(left, right, ColumnType.DOUBLE); }
+        public Divide {
+            checkArithmeticType(columnType);
+            if (columnType != ColumnType.DOUBLE && (!(right instanceof Constant constant) || constant.value() <= 0))
+                throw new IllegalArgumentException("Positive constant integral divisor required");
+        }
         @Override public Value emit(Row row) {
+            if (columnType != ColumnType.DOUBLE) {
+                Value value = left.emit(row);
+                return new Value(binary(Op.SDIV, value.data(), i64(((Constant) right).value())), value.isNull());
+            }
             Expr result = binary(Op.FDIV, left.emit(row).data(), right.emit(row).data());
             Expr absent = doubleNull(result);
             return new Value(new Select(absent, f64(Double.NaN), result), absent);

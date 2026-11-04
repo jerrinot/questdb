@@ -26,7 +26,6 @@ package io.questdb.griffin.engine.join;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.map.Map;
-import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
@@ -53,16 +52,18 @@ public final class AsOfJoinDenseSingleSymbolRecordCursorFactory extends AsOfJoin
             int slaveSymbolColumnIndex,
             SymbolJoinKeyMapping joinKeyMapping,
             JoinContext joinContext,
-            long toleranceInterval
+            long toleranceInterval,
+            boolean adaptive
     ) {
-        super(metadata, masterFactory, slaveFactory, joinContext, toleranceInterval);
+        super(configuration, metadata, masterFactory, slaveFactory, joinContext, toleranceInterval, adaptive,
+                adaptive && slaveFactory.getMetadata().isColumnIndexed(slaveSymbolColumnIndex) ? slaveSymbolColumnIndex : -1);
         this.joinKeyMapping = joinKeyMapping;
         this.slaveSymbolColumnIndex = slaveSymbolColumnIndex;
         Map fwdScanKeyToRowId = null;
         Map bwdScanKeyToRowId = null;
         try {
-            fwdScanKeyToRowId = MapFactory.createUnorderedMap(configuration, TYPES_KEY, TYPES_VALUE, false, false);
-            bwdScanKeyToRowId = MapFactory.createUnorderedMap(configuration, TYPES_KEY, TYPES_VALUE, false, false);
+            fwdScanKeyToRowId = createScanMap(configuration, TYPES_KEY);
+            bwdScanKeyToRowId = createScanMap(configuration, TYPES_KEY);
             this.cursor = new AsOfJoinDenseSingleSymbolRecordCursor(
                     columnSplit,
                     fwdScanKeyToRowId,
@@ -84,7 +85,7 @@ public final class AsOfJoinDenseSingleSymbolRecordCursorFactory extends AsOfJoin
 
     @Override
     protected void putFactoryType(PlanSink sink) {
-        sink.type("AsOf Join Dense Single Symbol");
+        sink.type(adaptive ? "AsOf Join Adaptive Single Symbol" : "AsOf Join Dense Single Symbol");
     }
 
     private class AsOfJoinDenseSingleSymbolRecordCursor extends AsOfJoinDenseRecordCursorBase {

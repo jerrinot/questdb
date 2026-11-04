@@ -24,8 +24,10 @@
 
 package io.questdb.griffin.engine.join;
 
+import io.questdb.cairo.idx.IndexReader;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RowCursor;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.TimeFrame;
 import io.questdb.cairo.sql.TimeFrameCursor;
@@ -62,43 +64,7 @@ public abstract class AbstractKeyedAsOfJoinRecordCursor extends AbstractAsOfJoin
             return false;
         }
 
-        // Common slave cursor state restoration logic
-        if (origSlaveRowId != -1) {
-            slaveTimeFrameCursor.jumpTo(origSlaveFrameIndex);
-            slaveTimeFrameCursor.open();
-            slaveTimeFrameCursor.recordAt(slaveRecB, Rows.toRowID(origSlaveFrameIndex, origSlaveRowId));
-        }
-        record.hasSlave(origHasSlave);
-
-        final long masterTimestamp = scaleTimestamp(masterRecord.getTimestamp(masterTimestampIndex), masterTimestampScale);
-        if (masterTimestamp >= lookaheadTimestamp) {
-            nextSlave(masterTimestamp);
-        }
-
-        boolean hasSlave = record.hasSlave();
-        origHasSlave = hasSlave;
-        if (!hasSlave) {
-            // The non-keyed algo did not find a matching record in the slave table.
-            // This means the slave table does not have a single record with a timestamp that is less than or equal
-            // to the master record's timestamp.
-            // Thus, it cannot possibly have a record with a matching key, since matching timestamps is a prerequisite
-            // before we even try to match keys -> we can safely skip the key matching part and report no match.
-            return true;
-        }
-
-        // Common row ID backup logic
-        long rowId = slaveRecB.getRowId();
-        origSlaveFrameIndex = Rows.toPartitionIndex(rowId);
-        origSlaveRowId = Rows.toLocalRowID(rowId);
-
-        // Reset slave cursor to the current timeframe (nextSlave() call might have moved it)
-        TimeFrame timeFrame = slaveTimeFrameCursor.getTimeFrame();
-        slaveTimeFrameCursor.jumpTo(timeFrame.getFrameIndex());
-        slaveTimeFrameCursor.open();
-
-        // subclasses implement their specific key matching strategy
-        performKeyMatching(masterTimestamp);
-
+        findSlave(scaleTimestamp(masterRecord.getTimestamp(masterTimestampIndex), masterTimestampScale));
         return true;
     }
 
@@ -118,6 +84,74 @@ public abstract class AbstractKeyedAsOfJoinRecordCursor extends AbstractAsOfJoin
         origSlaveFrameIndex = -1;
         origSlaveRowId = -1;
         origHasSlave = false;
+    }
+
+    // Shared by the explicit Indexed factory and adaptive single-symbol lookup. The
+    // timestamp frontier must be in slaveRecB and its frame must be open on entry.
+    protected boolean findIndexedMatch(int symbolColumnIndex, int indexKey, long masterTimestamp, long minTimestamp) {
+        long rowMax = Rows.toLocalRowID(slaveRecB.getRowId());
+        int frameIndex = slaveTimeFrame.getFrameIndex();
+        for (;;) {
+            IndexReader indexReader = slaveTimeFrameCursor.getIndexReaderForCurrentFrame(symbolColumnIndex, IndexReader.DIR_BACKWARD);
+            // Index bounds use partition/piece coordinates; RowCursor.next() returns a row
+            // relative to this lower bound, matching TimeFrameCursor's frame coordinates.
+            final long rowLo = slaveTimeFrameCursor.getIndexRowLoForCurrentFrame();
+            try (RowCursor rowCursor = indexReader.getCursor(indexKey, rowLo, rowMax + rowLo)) {
+                if (rowCursor.hasNext()) {
+                    long rowId = rowCursor.next();
+                    slaveTimeFrameCursor.recordAt(slaveRecB, Rows.toRowID(frameIndex, rowId));
+                    long slaveTimestamp = scaleTimestamp(slaveRecB.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
+                    if (slaveTimestamp <= masterTimestamp) {
+                        return slaveTimestamp >= minTimestamp;
+                    }
+                }
+            }
+            if (!slaveTimeFrameCursor.prev()) {
+                return false;
+            }
+            slaveTimeFrameCursor.open();
+            frameIndex = slaveTimeFrame.getFrameIndex();
+            rowMax = slaveTimeFrame.getRowHi() - 1;
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+        }
+    }
+
+    protected void findSlave(long masterTimestamp) {
+        // Common slave cursor state restoration logic
+        if (origSlaveRowId != -1) {
+            slaveTimeFrameCursor.jumpTo(origSlaveFrameIndex);
+            slaveTimeFrameCursor.open();
+            slaveTimeFrameCursor.recordAt(slaveRecB, Rows.toRowID(origSlaveFrameIndex, origSlaveRowId));
+        }
+        record.hasSlave(origHasSlave);
+
+        if (masterTimestamp >= lookaheadTimestamp) {
+            nextSlave(masterTimestamp);
+        }
+
+        boolean hasSlave = record.hasSlave();
+        origHasSlave = hasSlave;
+        if (!hasSlave) {
+            // The non-keyed algo did not find a matching record in the slave table.
+            // This means the slave table does not have a single record with a timestamp that is less than or equal
+            // to the master record's timestamp.
+            // Thus, it cannot possibly have a record with a matching key, since matching timestamps is a prerequisite
+            // before we even try to match keys -> we can safely skip the key matching part and report no match.
+            return;
+        }
+
+        // Common row ID backup logic
+        long rowId = slaveRecB.getRowId();
+        origSlaveFrameIndex = Rows.toPartitionIndex(rowId);
+        origSlaveRowId = Rows.toLocalRowID(rowId);
+
+        // Reset slave cursor to the current timeframe (nextSlave() call might have moved it)
+        TimeFrame timeFrame = slaveTimeFrameCursor.getTimeFrame();
+        slaveTimeFrameCursor.jumpTo(timeFrame.getFrameIndex());
+        slaveTimeFrameCursor.open();
+
+        // subclasses implement their specific key matching strategy
+        performKeyMatching(masterTimestamp);
     }
 
     /**

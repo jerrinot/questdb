@@ -25,14 +25,14 @@
 package io.questdb.test.griffin.engine.join;
 
 import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.griffin.engine.join.AsOfJoinFastRecordCursorFactory;
+import io.questdb.griffin.engine.join.AsOfJoinDenseRecordCursorFactory;
 import io.questdb.griffin.engine.join.FilteredAsOfJoinFastRecordCursorFactory;
 import io.questdb.test.AbstractOomSweepTest;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Test;
 
 /**
- * Verifies that a keyed ASOF JOIN backed by {@code AsOfJoinFastRecordCursorFactory}
+ * Verifies that a keyed ASOF JOIN backed by {@code AsOfJoinDenseRecordCursorFactory}
  * (and its filtered variant) releases its resources when a native allocation fails
  * while the cursor is being opened.
  * <p>
@@ -62,7 +62,7 @@ public class AsOfJoinFastOomTest extends AbstractOomSweepTest {
     public void testKeyedAsOfJoinCleansUpWhenCursorRunsOutOfMemory() throws Exception {
         assertNoLeakOnCursorOom(
                 "SELECT m.k1, m.v, s.v FROM master m ASOF JOIN slave s ON (k1, k2)",
-                AsOfJoinFastRecordCursorFactory.class
+                AsOfJoinDenseRecordCursorFactory.class
         );
     }
 

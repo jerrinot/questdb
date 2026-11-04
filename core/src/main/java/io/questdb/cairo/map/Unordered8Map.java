@@ -112,6 +112,7 @@ public class Unordered8Map implements Map, Reopenable {
     private long mask;
     private long memLimit; // Hash table memory limit pointer.
     private long memStart; // Hash table memory start pointer.
+    private long memoryLimit = Long.MAX_VALUE;
     // Per-query native memory tracker bound by the owning factory at cursor start.
     // Null when no per-query limit applies; all Unsafe.{malloc,realloc,free} calls
     // degrade to the global-only overloads in that case.
@@ -521,6 +522,8 @@ public class Unordered8Map implements Map, Reopenable {
         if (memStart == 0 || keyCapacity != initialKeyCapacity) {
             // Allocate one extra slot at the end for the zero key entry.
             final long sizeBytes = entrySize * (initialKeyCapacity + 1);
+            long oldSize = memStart == 0 ? 0 : memLimit - memStart + entrySize;
+            Map.checkMemoryLimit(memoryLimit, sizeBytes + (batchEmptyValueStart == 0 ? 0 : valueSize), Math.max(0, sizeBytes - oldSize), memoryTracker);
             long newMemStart;
             if (memStart == 0) {
                 newMemStart = Unsafe.malloc(sizeBytes, memoryTag, memoryTracker);
@@ -547,6 +550,7 @@ public class Unordered8Map implements Map, Reopenable {
         if (updater == null || valueSize == 0) {
             return;
         }
+        Map.checkMemoryLimit(memoryLimit, memLimit - memStart + entrySize + valueSize, valueSize, memoryTracker);
         final long buf = Unsafe.malloc(valueSize, memoryTag, memoryTracker);
         try {
             Vect.memset(buf, valueSize, 0);
@@ -584,6 +588,14 @@ public class Unordered8Map implements Map, Reopenable {
             throw CairoException.nonCritical().put("map capacity overflow");
         }
         rehash(Numbers.ceilPow2((int) requiredCapacity));
+    }
+
+    @Override
+    public void setMemoryLimit(long bytes) {
+        if (isOpen() || bytes < 0) {
+            throw new IllegalArgumentException("memory limit requires a closed map and nonnegative size");
+        }
+        memoryLimit = bytes;
     }
 
     @Override
@@ -811,6 +823,7 @@ public class Unordered8Map implements Map, Reopenable {
         // Allocate one extra slot at the end for the zero key entry.
         final long newSizeBytes = entrySize * (newKeyCapacity + 1);
         validateBatchAddressable(newSizeBytes);
+        Map.checkMemoryLimit(memoryLimit, memLimit - memStart + entrySize + newSizeBytes + (batchEmptyValueStart == 0 ? 0 : valueSize), newSizeBytes, memoryTracker);
         final long newMemStart = Unsafe.malloc(newSizeBytes, memoryTag, memoryTracker);
         final long newMemLimit = newMemStart + entrySize * newKeyCapacity;
         Vect.memset(newMemStart, newSizeBytes, 0);

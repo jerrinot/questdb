@@ -138,6 +138,12 @@ public final class TimeFrameCursorImpl implements TimeFrameCursor {
     }
 
     @Override
+    public PageFrameMemory getFrameMemory() {
+        assert timeFrame.isOpen();
+        return frameMemoryPool.navigateTo(timeFrame.getFrameIndex());
+    }
+
+    @Override
     public IndexReader getIndexReaderForCurrentFrame(int logicalColumnIndex, int direction) {
         int physicalColumnIndex = frameCursor.getColumnMapping().getColumnIndex(logicalColumnIndex);
         int frameIndex = timeFrame.getFrameIndex();

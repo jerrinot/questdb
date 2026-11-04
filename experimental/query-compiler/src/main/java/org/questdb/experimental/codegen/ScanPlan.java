@@ -149,7 +149,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case Constant c -> c;
             case FloatingConstant c -> c;
             case ToFloating a -> new ToFloating(rewrite(a.argument(), schema, bindings));
-            case Divide a -> new Divide(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings));
+            case Divide a -> new Divide(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
             case Parameter p -> p;
             case TimestampPart a -> new TimestampPart(rewrite(a.argument(), schema, bindings), a.unitTicks(), a.period());
             case DictionaryLookup a -> new DictionaryLookup(rewrite(a.symbol(), schema, bindings), a.table());

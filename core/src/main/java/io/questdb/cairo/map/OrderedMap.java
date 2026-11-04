@@ -143,6 +143,7 @@ public class OrderedMap implements Map, Reopenable {
     private long kPos;      // Current key-value memory pointer (contains searched key / pending key-value pair).
     private int keyCapacity;
     private int mask;
+    private long memoryLimit = Long.MAX_VALUE;
     // Per-query native memory tracker bound by the owning factory at cursor start.
     // Null when no per-query limit applies; all Unsafe.{malloc,realloc,free} calls
     // degrade to the global-only overloads in that case.
@@ -521,13 +522,15 @@ public class OrderedMap implements Map, Reopenable {
     public void restoreInitialCapacity() {
         final long heapSize = heapLimit - heapAddr;
         if (heapSize != initialHeapSize || keyCapacity != initialKeyCapacity) {
+            int newKeyCapacity = initialKeyCapacity < MIN_KEY_CAPACITY ? MIN_KEY_CAPACITY : Numbers.ceilPow2(initialKeyCapacity);
+            Map.checkMemoryLimit(memoryLimit, initialHeapSize + ((long) newKeyCapacity << 3) + getAuxiliaryMemorySize(),
+                    Math.max(0, initialHeapSize - heapSize) + Math.max(0, (long) (newKeyCapacity - keyCapacity) << 3), memoryTracker);
             try {
                 // Commit both pointers only once the realloc has returned, so a breach leaves the
                 // map still describing the block it continues to own and close() frees it whole.
                 long newHeapAddr = Unsafe.realloc(heapAddr, heapSize, initialHeapSize, heapMemoryTag, memoryTracker);
                 heapAddr = kPos = newHeapAddr;
                 heapLimit = newHeapAddr + initialHeapSize;
-                int newKeyCapacity = initialKeyCapacity < MIN_KEY_CAPACITY ? MIN_KEY_CAPACITY : Numbers.ceilPow2(initialKeyCapacity);
                 offsetsAddr = Unsafe.realloc(offsetsAddr, (long) keyCapacity << 3, (long) newKeyCapacity << 3, listMemoryTag, memoryTracker);
                 keyCapacity = newKeyCapacity;
                 mask = keyCapacity - 1;
@@ -550,6 +553,7 @@ public class OrderedMap implements Map, Reopenable {
         // OrderedMap.clear() only resets kPos and the offsets array - it does NOT zero
         // the heap. probeBatch therefore cannot rely on fresh slots being zeroed, so
         // we always keep the scratch buffer and memcpy it into every new entry.
+        Map.checkMemoryLimit(memoryLimit, heapLimit - heapAddr + ((long) keyCapacity << 3) + getAuxiliaryMemorySize() + valueSize, valueSize, memoryTracker);
         final long buf = Unsafe.malloc(valueSize, heapMemoryTag, memoryTracker);
         try {
             Vect.memset(buf, valueSize, 0);
@@ -572,6 +576,14 @@ public class OrderedMap implements Map, Reopenable {
             throw CairoException.nonCritical().put("map capacity overflow");
         }
         rehash(Numbers.ceilPow2((int) requiredCapacity));
+    }
+
+    @Override
+    public void setMemoryLimit(long bytes) {
+        if (isOpen() || bytes < 0) {
+            throw new IllegalArgumentException("memory limit requires a closed map and nonnegative size");
+        }
+        memoryLimit = bytes;
     }
 
     @Override
@@ -1037,6 +1049,11 @@ public class OrderedMap implements Map, Reopenable {
         rehash((long) keyCapacity << 1);
     }
 
+    private long getAuxiliaryMemorySize() {
+        return (batchEmptyValueStart == 0 ? 0 : valueSize)
+                + (nativeKeyStaging == null ? 0 : nativeKeyStaging.getSizeInBytes());
+    }
+
     private void rehash(long newKeyCapacity) {
         rehash(newKeyCapacity, null);
     }
@@ -1049,6 +1066,7 @@ public class OrderedMap implements Map, Reopenable {
             return;
         }
 
+        Map.checkMemoryLimit(memoryLimit, heapLimit - heapAddr + ((keyCapacity + newKeyCapacity) << 3) + getAuxiliaryMemorySize(), newKeyCapacity << 3, memoryTracker);
         final long newOffsetsAddr = Unsafe.malloc(newKeyCapacity << 3, listMemoryTag, memoryTracker);
         Vect.memset(newOffsetsAddr, newKeyCapacity << 3, 0);
         final int newMask = (int) newKeyCapacity - 1;
@@ -1119,6 +1137,7 @@ public class OrderedMap implements Map, Reopenable {
             kCapacity = maxHeapSize;
         }
         validateHeapAddressable(kCapacity);
+        Map.checkMemoryLimit(memoryLimit, kCapacity + ((long) keyCapacity << 3) + getAuxiliaryMemorySize(), kCapacity - (heapLimit - heapAddr), memoryTracker);
         final long oldHeapAddr = heapAddr;
         long kAddr = Unsafe.realloc(oldHeapAddr, heapLimit - oldHeapAddr, kCapacity, heapMemoryTag, memoryTracker);
 
@@ -1259,6 +1278,13 @@ public class OrderedMap implements Map, Reopenable {
             if (requiredBytes < 0 || requiredBytes > Integer.MAX_VALUE) {
                 throw LimitOverflowException.instance().put("native key staging size exceeds integer range");
             }
+            // Unlike independent probe views, this buffer belongs to the map and
+            // must fit its optional storage bound along with the heap and index.
+            long capacity = requiredBytes > stagingCapacity
+                    ? Math.max(Numbers.ceilPow2(requiredBytes), MIN_STAGING_CAPACITY) : stagingCapacity;
+            long growth = capacity - stagingCapacity;
+            Map.checkMemoryLimit(map.memoryLimit, map.heapLimit - map.heapAddr + ((long) map.keyCapacity << 3)
+                    + map.getAuxiliaryMemorySize() + growth, growth, map.memoryTracker);
             setMemoryTracker(map.memoryTracker);
             ofLayout(map);
             ensureStagingCapacity(requiredBytes);

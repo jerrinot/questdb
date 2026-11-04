@@ -24,6 +24,7 @@
 
 package org.questdb.experimental.codegen;
 
+import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
@@ -57,6 +58,8 @@ final class LlvmVectorEmitter {
                         + memoryType + " " + loaded + " to " + vector(l.type()));
             }
             case Binary b -> {
+                if (b.op() == Op.SDIV && Long.bitCount(((Literal) b.right()).value()) != 1)
+                    yield value(divide(b.left(), ((Literal) b.right()).value()));
                 String left = value(b.left()), right = value(b.right());
                 if (b.op() == Op.USHR) right = temp.apply("and " + vector(Type.I64) + " " + right + ", " + value(i64(63)));
                 yield temp.apply(op(b.op()) + " " + vector(b.left().type()) + " " + left + ", " + right);
@@ -68,6 +71,38 @@ final class LlvmVectorEmitter {
             default -> throw new IllegalArgumentException("Not a lane expression: " + e);
         };
         values.put(e, result); return result;
+    }
+
+    /** Avoid scalar lane extraction when the target has no vector 64-bit high multiply. */
+    private static Expr divide(Expr numerator, long divisor) {
+        // A sign-extended INT load proves |n| <= 2^31, without profiling or a guard.
+        // Expressions over INT columns may exceed that range and retain the wide path.
+        int bits = numerator instanceof Load load && load.width() == MemoryType.I32 ? 32 : 64;
+        if (bits == 32 && divisor > (1L << 31)) return i64(0);
+        int shift = 64 - Long.numberOfLeadingZeros(divisor - 1);
+        // M = ceil(2^(bits+shift)/d) has bits+1 bits. For |n| <= 2^(bits-1), adding |n|
+        // to high(|n| * lowBits(M)) cannot overflow, including the signed minimum.
+        // The reciprocal's rounding error is < 1/2^(shift+1) < 1/d, so truncating
+        // the scaled product gives the exact quotient. Restore the sign last.
+        long multiplier = BigInteger.ONE.shiftLeft(bits + shift).add(BigInteger.valueOf(divisor - 1))
+                .divide(BigInteger.valueOf(divisor)).longValue();
+        Expr negative = binary(Op.LT, numerator, i64(0));
+        Expr magnitude = new Select(negative, binary(Op.SUB, i64(0), numerator), numerator);
+        Expr low = binary(Op.AND, magnitude, i64(0xffff_ffffL));
+        Expr productHigh;
+        if (bits == 32) {
+            productHigh = binary(Op.USHR, binary(Op.MUL, low, i64(multiplier & 0xffff_ffffL)), i64(32));
+        } else {
+            Expr high = binary(Op.USHR, magnitude, i64(32));
+            Expr lowMultiplier = i64(multiplier & 0xffff_ffffL), highMultiplier = i64(multiplier >>> 32);
+            Expr middle = add(binary(Op.MUL, high, lowMultiplier),
+                    binary(Op.USHR, binary(Op.MUL, low, lowMultiplier), i64(32)));
+            Expr carry = add(binary(Op.MUL, low, highMultiplier), binary(Op.AND, middle, i64(0xffff_ffffL)));
+            productHigh = add(binary(Op.MUL, high, highMultiplier),
+                    add(binary(Op.USHR, middle, i64(32)), binary(Op.USHR, carry, i64(32))));
+        }
+        Expr quotient = binary(Op.USHR, add(magnitude, productHigh), i64(shift));
+        return new Select(negative, binary(Op.SUB, i64(0), quotient), quotient);
     }
     private String splat(Expr e) {
         String type = vector(e.type());

@@ -74,7 +74,7 @@ public class LatestByAllSymbolsFilteredRecordCursorFactory extends AbstractTreeS
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("LatestByAllSymbolsFiltered");
-        LatestByCompiledFilter.addJitAttr(sink, filter);
+        CompiledFilterBatch.addJitAttr(sink, filter);
         sink.optAttr("filter", ((LatestByAllSymbolsFilteredRecordCursor) cursor).getFilter());
         sink.child(cursor);
         sink.child(partitionFrameCursorFactory);
@@ -82,7 +82,7 @@ public class LatestByAllSymbolsFilteredRecordCursorFactory extends AbstractTreeS
 
     @Override
     public boolean usesCompiledFilter() {
-        return filter instanceof LatestByCompiledFilter;
+        return filter instanceof CompiledFilterBatch;
     }
 
     @Override

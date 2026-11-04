@@ -98,6 +98,22 @@ public class PipelineTest {
     }
 
     @Test
+    public void integralDivisionPreservesNullsAndTruncation() throws Exception {
+        engine.execute("create table t (k int, i int, l long)", context);
+        engine.execute("insert into t values (0,null,null),(1,-2147483647,-9223372036854775807),"
+                + "(2,-101,-101),(3,-1,-1),(4,0,0),(5,1,1),(6,101,101),(7,2147483647,9223372036854775807)", context);
+        Column key = new Column(0, "k", ColumnType.INT);
+        Column integer = new Column(1, "i", ColumnType.INT);
+        Column longer = new Column(2, "l", ColumnType.LONG);
+        for (long divisor : new long[]{1, 2, 3, 97, Integer.MAX_VALUE}) {
+            var pipeline = new Pipeline(List.of(key, integer, longer), new All(), List.of(key),
+                    List.of(new Sum(new Divide(integer, new Constant(divisor), ColumnType.INT)),
+                            new Sum(new Divide(longer, new Constant(divisor), ColumnType.LONG))));
+            assertMatches("t", pipeline, "select k,sum(i/" + divisor + "),sum(l/" + divisor + ") from t group by k", 16);
+        }
+    }
+
+    @Test
     public void nullsMultipleKeysExpressionsAndAggregates() throws Exception {
         engine.execute("create table t (a int, b long, v long)", context);
         engine.execute("""

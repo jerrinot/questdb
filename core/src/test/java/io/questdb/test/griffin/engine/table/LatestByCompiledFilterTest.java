@@ -32,7 +32,7 @@ import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.PageFrameMemoryPool;
 import io.questdb.cairo.sql.PartitionFormat;
 import io.questdb.griffin.engine.functions.constants.BooleanConstant;
-import io.questdb.griffin.engine.table.LatestByCompiledFilter;
+import io.questdb.griffin.engine.table.CompiledFilterBatch;
 import io.questdb.jit.CompiledFilter;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.IntHashSet;
@@ -58,19 +58,19 @@ public class LatestByCompiledFilterTest extends AbstractTest {
             try (
                     TestCache cache = new TestCache(17);
                     TestPool pool = new TestPool(configuration, memory);
-                    LatestByCompiledFilter filter = new LatestByCompiledFilter(configuration, BooleanConstant.TRUE,
+                    CompiledFilterBatch filter = new CompiledFilterBatch(configuration, BooleanConstant.TRUE,
                             compiled, new ObjList<>(), IntList.createWithValues(16))
             ) {
                 filter.init(null, null);
                 memory.isThrowOnCastCheck = true;
                 try {
-                    LatestByCompiledFilter.apply(filter, pool, cache, 0, 0, 1);
+                    CompiledFilterBatch.apply(filter, pool, cache, 0, 0, 1);
                     Assert.fail("expected eligibility failure");
                 } catch (CairoException e) {
                     TestUtils.assertContains(e.getFlyweightMessage(), "injected eligibility failure");
                 }
                 compiled.expectedData.setQuick(16, dataBase(16));
-                Assert.assertNotNull(LatestByCompiledFilter.apply(filter, pool, cache, 0, 0, 1));
+                Assert.assertNotNull(CompiledFilterBatch.apply(filter, pool, cache, 0, 0, 1));
                 Assert.assertEquals(2, memory.castChecks);
                 Assert.assertEquals(1, compiled.calls);
                 for (int state = 0; state < 3; state++) {
@@ -79,9 +79,9 @@ public class LatestByCompiledFilterTest extends AbstractTest {
                     memory.topIndex = state == 1 ? 16 : -1;
                     filter.init(null, null);
                     if (state < 2) {
-                        Assert.assertNull(LatestByCompiledFilter.apply(filter, pool, cache, 0, 0, 1));
+                        Assert.assertNull(CompiledFilterBatch.apply(filter, pool, cache, 0, 0, 1));
                     } else {
-                        Assert.assertNotNull(LatestByCompiledFilter.apply(filter, pool, cache, 0, 0, 1));
+                        Assert.assertNotNull(CompiledFilterBatch.apply(filter, pool, cache, 0, 0, 1));
                     }
                 }
                 Assert.assertEquals(5, memory.castChecks);
@@ -104,7 +104,7 @@ public class LatestByCompiledFilterTest extends AbstractTest {
                 try (
                         TestCache cache = new TestCache(columnCount);
                         TestPool pool = new TestPool(configuration, memory);
-                        LatestByCompiledFilter filter = new LatestByCompiledFilter(configuration, BooleanConstant.TRUE,
+                        CompiledFilterBatch filter = new CompiledFilterBatch(configuration, BooleanConstant.TRUE,
                                 compiled, new ObjList<>(), IntList.createWithValues(last, 0))
                 ) {
                     cache.types.setQuick(last, ColumnType.VARCHAR);
@@ -113,7 +113,7 @@ public class LatestByCompiledFilterTest extends AbstractTest {
                         long rowLo = batch * 2048L;
                         compiled.expectedData.setQuick(0, dataBase(0) + rowLo * 8);
                         compiled.expectedAux.setQuick(last, auxBase(last) + rowLo * 16);
-                        Assert.assertNotNull(LatestByCompiledFilter.apply(filter, pool, cache, 0, rowLo, rowLo + 2048));
+                        Assert.assertNotNull(CompiledFilterBatch.apply(filter, pool, cache, 0, rowLo, rowLo + 2048));
                     }
                     Assert.assertEquals(66, memory.dataReads);
                     Assert.assertEquals(33, memory.auxReads);
@@ -155,7 +155,7 @@ public class LatestByCompiledFilterTest extends AbstractTest {
             try (
                     TestCache cache = new TestCache(40);
                     TestPool pool = new TestPool(configuration, memory);
-                    LatestByCompiledFilter filter = new LatestByCompiledFilter(configuration, BooleanConstant.TRUE,
+                    CompiledFilterBatch filter = new CompiledFilterBatch(configuration, BooleanConstant.TRUE,
                             compiled, new ObjList<>(), IntList.createWithValues(33, 3, 18, 5, 16, 7, 11, 9))
             ) {
                 cache.types.setQuick(3, ColumnType.BYTE);
@@ -179,7 +179,7 @@ public class LatestByCompiledFilterTest extends AbstractTest {
                     compiled.expectedAux.setQuick(16, auxBase(16) + rowLo * 8);
                     compiled.expectedAux.setQuick(18, auxBase(18) + rowLo * 8);
                     compiled.expectedAux.setQuick(33, auxBase(33) + rowLo * 16);
-                    DirectLongList rows = LatestByCompiledFilter.apply(filter, pool, cache, 0, rowLo, rowLo + 1);
+                    DirectLongList rows = CompiledFilterBatch.apply(filter, pool, cache, 0, rowLo, rowLo + 1);
                     Assert.assertNotNull(rows);
                     Assert.assertEquals(1, rows.size());
                     Assert.assertEquals(0, rows.get(0));
@@ -200,7 +200,7 @@ public class LatestByCompiledFilterTest extends AbstractTest {
             try (
                     TestCache cache = new TestCache(columnCount);
                     TestPool pool = new TestPool(configuration, memory);
-                    LatestByCompiledFilter filter = new LatestByCompiledFilter(configuration, BooleanConstant.TRUE,
+                    CompiledFilterBatch filter = new CompiledFilterBatch(configuration, BooleanConstant.TRUE,
                             compiled, new ObjList<>(), IntList.createWithValues(columnCount - 1))
             ) {
                 cache.types.setQuick(columnCount - 1, ColumnType.VARCHAR);
@@ -208,7 +208,7 @@ public class LatestByCompiledFilterTest extends AbstractTest {
                 final long savedLimit = Unsafe.getRssMemLimit();
                 Unsafe.setRssMemLimit(Unsafe.getRssMemUsed() + headroom);
                 try {
-                    LatestByCompiledFilter.apply(filter, pool, cache, 0, 0, 1);
+                    CompiledFilterBatch.apply(filter, pool, cache, 0, 0, 1);
                     Assert.fail("expected global RSS breach during pointer table growth");
                 } catch (CairoException e) {
                     Assert.assertTrue(e.isOutOfMemory());
@@ -230,7 +230,7 @@ public class LatestByCompiledFilterTest extends AbstractTest {
                 }
                 compiled.expectedData.setQuick(columnCount - 1, dataBase(columnCount - 1));
                 compiled.expectedAux.setQuick(columnCount - 1, auxBase(columnCount - 1));
-                Assert.assertNotNull(LatestByCompiledFilter.apply(filter, pool, cache, 0, 0, 1));
+                Assert.assertNotNull(CompiledFilterBatch.apply(filter, pool, cache, 0, 0, 1));
                 Assert.assertEquals(columnCount, data.size());
                 Assert.assertEquals(columnCount, aux.size());
                 Assert.assertEquals(1, compiled.calls);
@@ -247,8 +247,8 @@ public class LatestByCompiledFilterTest extends AbstractTest {
         return 1_000_777L + columnIndex * 65_536L;
     }
 
-    private static DirectLongList pointerList(LatestByCompiledFilter filter, String name) throws Exception {
-        Field field = LatestByCompiledFilter.class.getDeclaredField(name);
+    private static DirectLongList pointerList(CompiledFilterBatch filter, String name) throws Exception {
+        Field field = CompiledFilterBatch.class.getDeclaredField(name);
         field.setAccessible(true);
         return (DirectLongList) field.get(filter);
     }

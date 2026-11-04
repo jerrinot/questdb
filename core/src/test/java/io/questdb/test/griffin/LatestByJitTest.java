@@ -32,7 +32,7 @@ import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.SqlExecutionContextImpl;
-import io.questdb.griffin.engine.table.LatestByCompiledFilter;
+import io.questdb.griffin.engine.table.CompiledFilterBatch;
 import io.questdb.jit.JitUtil;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.MemoryTracker;
@@ -52,7 +52,7 @@ public class LatestByJitTest extends AbstractCairoTest {
     @Override
     @Before
     public void setUp() {
-        LatestByCompiledFilter.setBatchObserverForTesting(batchCounter);
+        CompiledFilterBatch.setBatchObserverForTesting(batchCounter);
         batchCounter.reset();
         super.setUp();
     }
@@ -60,7 +60,7 @@ public class LatestByJitTest extends AbstractCairoTest {
     @Override
     @After
     public void tearDown() throws Exception {
-        LatestByCompiledFilter.clearBatchObserverForTesting();
+        CompiledFilterBatch.clearBatchObserverForTesting();
         super.tearDown();
     }
 
@@ -138,7 +138,7 @@ public class LatestByJitTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testBindVarMemoryFollowsFactoryLifetime() throws Exception {
+    public void testBindVarMemoryFollowsCursorLifetime() throws Exception {
         Assume.assumeTrue(JitUtil.isJitSupported());
         assertMemoryLeak(() -> {
             setProperty(PropertyKey.CAIRO_SQL_JIT_BIND_VARS_MEMORY_PAGE_SIZE, 256 * 1024);
@@ -168,8 +168,12 @@ public class LatestByJitTest extends AbstractCairoTest {
                     for (int i = 0; i < mins.length; i++) {
                         bindVariableService.setLong("min", mins[i]);
                         bindVariableService.setStr("key", keys[i]);
+                        try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                            Assert.assertNotNull(cursor);
+                            Assert.assertTrue(Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT) >= before + 256 * 1024L);
+                        }
                         assertFactory(factory).withContext(sqlExecutionContext).sizeMayVary().returns(expected[clause][i]);
-                        Assert.assertTrue(Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT) >= before + 256 * 1024L);
+                        Assert.assertTrue(Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT) < before + 256 * 1024L);
                         Assert.assertNull(sqlExecutionContext.getMemoryTracker());
                         assertCompiledFilterRan(SqlJitMode.JIT_MODE_ENABLED);
                     }
@@ -203,12 +207,11 @@ public class LatestByJitTest extends AbstractCairoTest {
                             Assert.assertNotNull(cursor);
                             Assert.assertTrue(Unsafe.getMemUsedByTag(MemoryTag.NATIVE_OFFLOAD) > before);
                         }
-                        final long allocated = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_OFFLOAD);
-                        Assert.assertTrue(allocated > before);
+                        Assert.assertEquals(before, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_OFFLOAD));
                         for (int attempt = 0; attempt < 3; attempt++) {
                             assertFactory(factory).withContext(sqlExecutionContext).sizeMayVary()
                                     .returns(predicate.equals("v > 0") ? "v\n98\n99\n100\n" : "v\n47\n48\n49\n");
-                            Assert.assertEquals(allocated, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_OFFLOAD));
+                            Assert.assertEquals(before, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_OFFLOAD));
                             Assert.assertNull(sqlExecutionContext.getMemoryTracker());
                             assertCompiledFilterRan(SqlJitMode.JIT_MODE_ENABLED);
                         }
@@ -402,7 +405,7 @@ public class LatestByJitTest extends AbstractCairoTest {
                                 cursor.toTop();
                                 Assert.assertTrue(cursor.hasNext());
                             }
-                            Assert.assertTrue(Unsafe.getMemUsedByTag(MemoryTag.NATIVE_OFFLOAD) > before);
+                            Assert.assertEquals(before, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_OFFLOAD));
                             Assert.assertNull(sqlExecutionContext.getMemoryTracker());
                         }
                     }
@@ -587,7 +590,7 @@ public class LatestByJitTest extends AbstractCairoTest {
         });
     }
 
-    private static class BatchCounter implements LatestByCompiledFilter.BatchObserver {
+    private static class BatchCounter implements CompiledFilterBatch.BatchObserver {
         private long javaFallbackFrames;
         private long jitBatches;
 

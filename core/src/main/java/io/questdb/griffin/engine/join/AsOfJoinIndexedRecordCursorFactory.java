@@ -27,13 +27,11 @@ package io.questdb.griffin.engine.join;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.TableUtils;
-import io.questdb.cairo.idx.IndexReader;
 import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
-import io.questdb.cairo.sql.RowCursor;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.TimeFrameCursor;
 import io.questdb.griffin.PlanSink;
@@ -43,7 +41,6 @@ import io.questdb.griffin.model.JoinContext;
 import io.questdb.std.MemoryTracker;
 import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
-import io.questdb.std.Rows;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -177,44 +174,12 @@ public final class AsOfJoinIndexedRecordCursorFactory extends AbstractJoinRecord
                 return;
             }
 
-            // go backwards through per-frame symbol indexes, until we find a match or exhaust the search space
-            long rowMax = Rows.toLocalRowID(slaveRecB.getRowId());
-            int frameIndex = slaveTimeFrame.getFrameIndex();
-            for (; ; ) {
-                IndexReader indexReader = slaveTimeFrameCursor.getIndexReaderForCurrentFrame(
-                        slaveSymbolColumnIndex,
-                        IndexReader.DIR_BACKWARD
-                );
-                // indexReader.getCursor() takes the index's own row ids, but TimeFrameCursor numbers rows relative to
-                // the first row of the frame.
-                final long rowLo = slaveTimeFrameCursor.getIndexRowLoForCurrentFrame();
-                try (RowCursor rowCursor = indexReader.getCursor(symbolKey, rowLo, rowMax + rowLo)) {
-                    // Check the first entry only. They are sorted descending by timestamp,
-                    // so there aren't any entries more recent than the first one.
-                    if (rowCursor.hasNext()) {
-                        long rowId = rowCursor.next();
-                        slaveTimeFrameCursor.recordAt(slaveRecB, Rows.toRowID(frameIndex, rowId));
-                        long slaveTimestamp = scaleTimestamp(slaveRecB.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
-                        if (slaveTimestamp <= masterTimestamp) {
-                            // Enforce tolerance limit if specified
-                            boolean hasSlave = toleranceInterval == Numbers.LONG_NULL ||
-                                    slaveTimestamp >= masterTimestamp - toleranceInterval;
-                            record.hasSlave(hasSlave);
-                            return;
-                        }
-                    }
-                }
-
-                // no match in this frame, try the previous frame
-                if (!slaveTimeFrameCursor.prev()) {
-                    record.hasSlave(false);
-                    return;
-                }
-                slaveTimeFrameCursor.open();
-                frameIndex = slaveTimeFrame.getFrameIndex();
-                rowMax = slaveTimeFrame.getRowHi() - 1;
-                circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
-            }
+            record.hasSlave(findIndexedMatch(
+                    slaveSymbolColumnIndex,
+                    symbolKey,
+                    masterTimestamp,
+                    toleranceInterval == Numbers.LONG_NULL ? Long.MIN_VALUE : masterTimestamp - toleranceInterval
+            ));
         }
     }
 }

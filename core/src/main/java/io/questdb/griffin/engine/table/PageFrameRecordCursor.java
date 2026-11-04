@@ -33,6 +33,26 @@ import io.questdb.griffin.SqlExecutionContext;
 
 public interface PageFrameRecordCursor extends RecordCursor, Plannable {
 
+    /**
+     * Exclusive row bound of a contiguous span beginning at the record positioned by
+     * hasNext(), or -1 when borrowing is unsupported. Coordinates are relative to that
+     * record's frame. The span respects the current decode and LIMIT budget; borrowing
+     * does not advance the cursor. No cursor navigation is allowed while it is borrowed.
+     */
+    default long getContiguousFrameRowHi() {
+        return -1;
+    }
+
+    /**
+     * Commits rows from a borrowed span, including the currently positioned record.
+     * Zero preserves the current record for a fallback. Otherwise the record is left
+     * on the last consumed row and the next hasNext() advances past it. Call hasNext()
+     * before consuming another span. This does not change the post-skip LIMIT budget.
+     */
+    default void consumeFrameRows(long rowCount) {
+        throw new UnsupportedOperationException();
+    }
+
     PageFrameCursor getPageFrameCursor();
 
     @Override

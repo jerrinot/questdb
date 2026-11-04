@@ -77,6 +77,11 @@ public class CompositeIndexedAsOfJoinTest extends AbstractCairoTest {
                     .noRandomAccess()
                     .withPlanContaining("AsOf Join Indexed")
                     .returns(expected);
+            assertQuery("SELECT sum(q.v), count() FROM m ASOF JOIN indexed q ON (s)")
+                    .expectSize()
+                    .noRandomAccess()
+                    .withPlanContaining("AsOf Join Adaptive Single Symbol", "indexed: true")
+                    .returns(expected);
         });
     }
 

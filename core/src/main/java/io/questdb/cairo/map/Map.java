@@ -51,6 +51,24 @@ public interface Map extends Mutable, Closeable, Reopenable {
      */
     int BATCH_ROW_INDEX_SHIFT = 39;
 
+    /** Checks an optional storage bound before malloc/realloc, including explicit rehash overlap. */
+    static void checkMemoryLimit(long limit, long requiredBytes, long allocationDelta, @Nullable MemoryTracker tracker) {
+        if (limit == Long.MAX_VALUE) {
+            return;
+        }
+        if (requiredBytes > limit) {
+            throw MapMemoryLimitException.INSTANCE;
+        }
+        if (tracker != null) {
+            long queryLimit = tracker.getLimit();
+            // Leave headroom for other operators. This snapshot is only an admission hint:
+            // the following tracked allocation still reserves and may fail normally.
+            if (queryLimit > 0 && allocationDelta > Math.max(0, queryLimit - tracker.getUsed()) / 2) {
+                throw MapMemoryLimitException.INSTANCE;
+            }
+        }
+    }
+
     /**
      * Decodes the value-region byte offset from an encoded batch entry. Combine
      * with {@link #probeBatch}'s result to obtain the absolute start address of the
@@ -254,6 +272,16 @@ public interface Map extends Mutable, Closeable, Reopenable {
     }
 
     void setKeyCapacity(int keyCapacity);
+
+    /**
+     * Sets an optional bound on this map's owned native storage, including old/new
+     * arrays coexisting during rehash. Must be set while closed. Unsupported maps
+     * reject it. On refusal the owner must discard state; real allocation errors
+     * retain their usual exception and accounting contracts.
+     */
+    default void setMemoryLimit(long bytes) {
+        throw new UnsupportedOperationException();
+    }
 
     /**
      * Binds a per-query native memory tracker to this map. All subsequent

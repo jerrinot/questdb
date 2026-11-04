@@ -35,6 +35,15 @@ import io.questdb.std.QuietCloseable;
  */
 public interface TimeFrameCursor extends SymbolTableSource, QuietCloseable {
 
+    /**
+     * Borrows the open frame in this cursor's column layout, or returns null when
+     * raw access is unavailable. The view and its addresses are valid only until
+     * the next cursor navigation or close. Callers must not retain them.
+     */
+    default PageFrameMemory getFrameMemory() {
+        return null;
+    }
+
     static void findSeekEstimate(
             long timestamp,
             int frameCount,

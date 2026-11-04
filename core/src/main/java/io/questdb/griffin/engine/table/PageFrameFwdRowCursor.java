@@ -31,6 +31,14 @@ class PageFrameFwdRowCursor implements RowCursor {
     private long current;
     private long hi;
 
+    long getNextRowIndex() {
+        return current;
+    }
+
+    long getRowHi() {
+        return hi;
+    }
+
     @Override
     public boolean hasNext() {
         return current < hi;

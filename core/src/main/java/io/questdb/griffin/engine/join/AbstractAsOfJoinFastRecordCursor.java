@@ -255,18 +255,31 @@ public abstract class AbstractAsOfJoinFastRecordCursor implements NoRandomAccess
      * @return true if the slave cursor has been advanced to a row with timestamp greater than the master timestamp, false otherwise
      */
     private boolean linearScan(long masterTimestamp) {
-        final long scanHi = Math.min(slaveFrameRow + lookahead, slaveTimeFrame.getRowHi());
-        while (slaveFrameRow < scanHi || (lookaheadTimestamp == masterTimestamp && slaveFrameRow < slaveTimeFrame.getRowHi())) {
-            slaveTimeFrameCursor.recordAt(slaveRecA, Rows.toRowID(slaveFrameIndex, slaveFrameRow));
+        final long rowHi = slaveTimeFrame.getRowHi();
+        final long scanHi = Math.min(slaveFrameRow + lookahead, rowHi);
+        if (!(slaveFrameRow < scanHi || (lookaheadTimestamp == masterTimestamp && slaveFrameRow < rowHi))) {
+            return false;
+        }
+        final long firstRow = slaveFrameRow;
+        // Pin this frame once. No navigation occurs while inspecting its timestamps,
+        // so advancing within it does not need partition or frame-cache resolution.
+        slaveTimeFrameCursor.recordAt(slaveRecA, Rows.toRowID(slaveFrameIndex, slaveFrameRow));
+        boolean foundLookahead = false;
+        do {
+            slaveTimeFrameCursor.recordAtRowIndex(slaveRecA, slaveFrameRow);
             lookaheadTimestamp = scaleTimestamp(slaveRecA.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
             if (lookaheadTimestamp > masterTimestamp) {
-                return true;
+                foundLookahead = true;
+                break;
             }
-            record.hasSlave(true);
-            slaveTimeFrameCursor.recordAt(slaveRecB, Rows.toRowID(slaveFrameIndex, slaveFrameRow));
             slaveFrameRow++;
+        } while (slaveFrameRow < scanHi || (lookaheadTimestamp == masterTimestamp && slaveFrameRow < rowHi));
+        // Only the final predecessor is visible to key matching or the consumer.
+        if (slaveFrameRow > firstRow) {
+            slaveTimeFrameCursor.recordAt(slaveRecB, Rows.toRowID(slaveFrameIndex, slaveFrameRow - 1));
+            record.hasSlave(true);
         }
-        return false;
+        return foundLookahead;
     }
 
     private boolean openSlaveFrame(long masterTimestamp) {

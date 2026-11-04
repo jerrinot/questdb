@@ -109,6 +109,24 @@ public class MapFactory {
     }
 
     /**
+     * Creates lazy optional state with a byte bound. Variable-width keys use the
+     * existing OrderedMap so their key storage participates in the same bound;
+     * UnorderedVarcharMap's separate arena does not yet offer this contract.
+     */
+    public static Map createUnorderedMap(
+            CairoConfiguration configuration,
+            @Transient @NotNull ColumnTypes keyTypes,
+            @Transient @Nullable ColumnTypes valueTypes,
+            long memoryLimit
+    ) {
+        Map map = selectUnorderedMapImplementation(keyTypes, ColumnTypes.sizeInBytes(valueTypes), configuration.getSqlUnorderedMapMaxEntrySize()) == MAP_IMPL_UNORDERED_VARCHAR
+                ? createOrderedMap(configuration, keyTypes, valueTypes, false)
+                : createUnorderedMap(configuration, keyTypes, valueTypes, false, false);
+        map.setMemoryLimit(memoryLimit);
+        return map;
+    }
+
+    /**
      * Creates an unordered Map pre-allocated to a small capacity to be used in GROUP BY queries, but not only.
      * <p>
      * The returned map may actually preserve insertion order, i.e. it may be ordered, depending on the types

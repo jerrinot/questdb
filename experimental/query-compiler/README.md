@@ -402,6 +402,37 @@ mvn -Pquery-compiler-prototype -pl experimental/query-compiler -am \
 
 ## Runners and controls
 
+The ASOF experiment runs inside the ordinary adaptive join. Its filtered forward
+region can consume bounded master spans and update the existing unkeyed aggregate
+state through LLVM. A single same-type INT/LONG/SYMBOL key also admits generated
+descending lookup after the first Java candidate misses. The owner lends only
+the remaining current-frame span, bounded by memoized history and its work limit;
+frame navigation, indexed lookup and strategy transitions remain with the owner.
+SYMBOL probes use its existing dictionary translation. Unsupported predicates,
+keys and frame representations retain ordinary lookup. `lookup_rows` reports
+actual generated candidate checks, independently of the downstream consumer.
+`aggregate region` in EXPLAIN indicates eligibility, while `aggregate_probes` in
+the runner reports actual use. The optional region compiles on first use, so
+inspect warmup/first-use latency as well as steady-state results. Backward lookup
+also compiles lazily: immediate matches avoid it, but a tiny nonlocal query may
+pay more compilation cost than it can recover. No machine-specific crossover
+threshold is assumed.
+
+The existing ASOF runner provides a reproducible 500M-row, six-aggregate control:
+
+```sh
+taskset -c 4 experimental/query-compiler/run-asof.sh \
+  experimental/query-compiler/target/asof-db 500000000 1024 1000000 \
+  filtered int adaptive,linear 5 32 keep 0 arith16 1 jit 0 llvm aggregates
+```
+
+Use `stock` instead of `llvm` for the baseline. `long`/`symbol`, `arith256` and
+`arith_all` vary key representation and selectivity; no compiler admission depends
+on these workload names. The runner checks the complete aggregate result, includes
+cursor open/close in elapsed time, and reports compilation, CPU time, I/O and faults.
+See [ASOF_SELECTION_PLAN.md](ASOF_SELECTION_PLAN.md) for ownership and remaining
+admission boundaries, and [PROGRESS.md](PROGRESS.md) for measured evidence.
+
 Run existing Griffin tests against stock execution or LLVM after building the core
 test JAR and the experimental runner:
 

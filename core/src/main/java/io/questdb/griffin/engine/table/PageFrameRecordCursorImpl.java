@@ -38,6 +38,7 @@ import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.Misc;
+import io.questdb.std.Rows;
 import io.questdb.std.Transient;
 import org.jetbrains.annotations.Nullable;
 
@@ -109,6 +110,36 @@ public class PageFrameRecordCursorImpl extends AbstractPageFrameRecordCursor {
     public void close() {
         rowCursor = Misc.free(rowCursor);
         super.close();
+    }
+
+    @Override
+    public void consumeFrameRows(long rowCount) {
+        final long hi = getContiguousFrameRowHi();
+        final long lo = Rows.toLocalRowID(recordA.getRowId());
+        if (hi < 0 || rowCount < 0 || rowCount > hi - lo) {
+            throw new IllegalArgumentException("Invalid contiguous frame consumption");
+        }
+        if (rowCount > 0) {
+            rowCursor.jumpTo(lo + rowCount);
+            recordA.setRowIndex(lo + rowCount - 1);
+            // hasNext() already charged the first row of this span.
+            rowsProducedSinceSkip += rowCount - 1;
+        }
+    }
+
+    @Override
+    public long getContiguousFrameRowHi() {
+        if (isExhausted || filter != null || rowsProducedSinceSkip == 0
+                || !(rowCursor instanceof PageFrameFwdRowCursor rows)
+                || recordA.getFrameIndex() != frameCount - 1) {
+            return -1;
+        }
+        final long lo = Rows.toLocalRowID(recordA.getRowId());
+        // recordAt() can reposition record A without advancing the row cursor.
+        if (rows.getNextRowIndex() != lo + 1) {
+            return -1;
+        }
+        return lo + Math.min(rows.getRowHi() - lo, maxRowsAfterSkip - rowsProducedSinceSkip + 1);
     }
 
     public RowCursorFactory getRowCursorFactory() {

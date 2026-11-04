@@ -106,7 +106,7 @@ public class LatestBySubQueryRecordCursorFactory extends AbstractTreeSetRecordCu
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("LatestBySubQuery");
-        LatestByCompiledFilter.addJitAttr(sink, filter);
+        CompiledFilterBatch.addJitAttr(sink, filter);
         sink.child("Subquery", recordCursorFactory);
         sink.child(cursor);
         sink.child(partitionFrameCursorFactory);
@@ -114,7 +114,7 @@ public class LatestBySubQueryRecordCursorFactory extends AbstractTreeSetRecordCu
 
     @Override
     public boolean usesCompiledFilter() {
-        return filter instanceof LatestByCompiledFilter;
+        return filter instanceof CompiledFilterBatch;
     }
 
     // Holds the LATEST BY key sub-query in a private field and does not expose it through

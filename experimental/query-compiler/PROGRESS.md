@@ -7477,3 +7477,1090 @@ larger run was invalidated by rebuilding its classpath concurrently; its class-l
 failures are excluded, and the clean run was repeated. This is a bounded correctness
 pass, not a full Griffin-suite result or a performance experiment. Usage is in
 README; current test logs are under `target/griffin/`. No commit.
+
+
+## 2026-11-03 — Automatic ASOF selection
+
+Ordinary unhinted keyed time-frame ASOF now combines Fast timestamp navigation,
+Dense's existing maps, indexed predecessor lookup where available, and typed
+memoized lookup after sparse gaps. INT, LONG, SYMBOL and composite keys share the
+scan/lookup policy. Hints remain fixed controls. No new production flag or LLVM
+dependency. This implements the unfiltered part of ASOF_SELECTION_PLAN.md; it does
+not finish filtered selection or the wider acceptance matrix.
+
+500M-row RHS, warm payload-consuming queries, one pinned core on Ryzen 9950X:
+
+| Control | Original default | Automatic | Paired hinted reference |
+| --- | ---: | ---: | ---: |
+| Dense INT, 5M probes | 15.35s | 4.09s | Dense 4.04s |
+| Dense LONG, 5M probes | — | 4.25s | Dense 4.06s |
+| Dense composite, 5M probes | — | 5.06s | Dense 5.63s |
+| Dense indexed SYMBOL, 5M probes | — | 3.48s | Dense 3.39s |
+| Rare unindexed SYMBOL, 1K probes | 2.70s | 2.37s | Memoized 2.06s |
+| Rare indexed SYMBOL, 1K probes | 2.56s | 7.55ms | Indexed 6.62ms |
+
+Sparse/local INT has no demonstrated regression: final main-thread CPU medians
+are roughly 108ms automatic / 110ms original. Wall medians were 120ms / 135ms,
+but their 110–142ms and 109–144ms ranges overlap; do not sell that as a speedup.
+Both temporal phase orders were checked. Independent count/sum/ordered-hash
+oracles matched; measured warm queries reported zero major faults/physical reads.
+These are mechanism controls, not server-wide or hardware-general results.
+
+Hardware gate passed. Original dense lookup performed 2.56B key comparisons per
+query: 512/probe versus about 99 forward updates after switching. Final normalized
+PMU results are 17,170 -> 3,933 cycles/probe and 104,734 -> 25,204 instructions/probe.
+Retiring is about 61–62%, with original DF read traffic below 2% of calibrated
+single-core streaming traffic. This is less repeated CPU work, not a bandwidth
+breakthrough. Use only the nonmultiplexed raw-event groups; discarded the original
+unschedulable groups and a compiler-hoisted streaming control.
+
+Rejected/changed hypotheses:
+- HORIZON's existing adaptation took 18.80s on the dense case; its forced forward
+  path took 4.55s versus Dense's 3.80s in that process. Reused the narrower proven
+  navigation/state pieces instead of importing the full helper.
+- An adjacency-only index policy fixed rare probes but lost 24% to Dense at wider
+  spacing. Sparse operator-call timing samples now arbitrate bounded trials;
+  timings exclude caller consumption and include actual operator work.
+- Adding a validity LONG widened the backward map beyond MapFactory's default
+  16-byte entry threshold, selecting OrderedMap and producing a 30% dense INT
+  regression. A layout control removed it. Reusing the two original-width maps
+  for result/validity in memoized mode restored dense performance. Exact JIT/cache
+  contributions to that regression were not separately isolated.
+- The first scan-only candidate took 5.04s on rare SYMBOL versus stock's 2.70s.
+  Generic validity caching closes that regression; an index closes the larger
+  available gap. Do not present 5.04s as the original stock baseline.
+
+Bounded optional state now closes the finite-budget gap. With the same 8 MiB
+query limit, 500M RHS rows and 5M INT probes, the prior candidate disabled scanning
+and took 18.30s; bounded maps take 3.50s (paired cycle/instruction PMU passes,
+three timed runs each). Cycles/probe fall from 20,276 to 3,848 and instructions/probe
+from 113,399 to 22,633. A separate nonmultiplexed retiring/backend pass moves from
+about 58% to 63% retiring. Warm requests have zero physical reads/major faults;
+baseline DF read-event rate is below 4.7% of the prior same-host streaming control.
+The improvement is reduced repeated CPU work. This comparison is against the prior
+adaptive candidate with its finite-budget restriction, not a new stock baseline.
+
+In unprofiled, alternating adaptive/forced-Dense runs under that same 8 MiB limit,
+medians are INT 4.19s/4.02s, LONG 4.07s/4.02s, indexed SYMBOL 3.80s/3.62s and
+composite 7.07s/6.89s; worst ratio 1.050. Separate-process and mixed-factory JIT
+profiles differ, so compare within each control rather than mixing table entries.
+All ordered checksums match. These controls establish key generality on this host,
+not a claim about all ASOF inputs or machines.
+
+Unlimited-budget ABBA controls keep dense INT at 3.58s versus the prior candidate's
+3.70s pooled median; indexed rare probes remain comparable (10.61ms versus
+11.34ms, main-thread CPU 4.69ms versus 4.84ms). Sparse local probes were sensitive
+to process/JIT state: one 20-warmup sequence showed 116.7ms -> 122.6ms, a borderline
+5% loss. A separate four-process ABBA PMU run with normal JVM flags gave process
+medians of 111–117ms before and 106–121ms after. Mean normalized costs were
+6,433 -> 6,416 cycles/probe and 19,099 -> 19,181 instructions/probe. This does not
+establish a repeatable regression or a small local-query speedup. Retain the
+uncertainty rather than patching a variable result. No production config changed
+between paired controls.
+
+Each optional map is capped at the existing configured join-value page size
+(default 16 MiB), further limited to one eighth of a finite query limit. Existing
+maps check only allocation/growth boundaries, including explicit old/new rehash
+storage, variable-width keys and map-owned staging. Bounded VARCHAR uses the
+existing OrderedMap to include key bytes in the bound. Query headroom is an
+admission hint, not a reservation; genuine tracker/global allocation failures and
+cancellation still propagate. A dedicated optional-storage refusal releases state
+and retries the same left row without advancing it. When useful, a smaller typed
+per-probe cache replaces full history. Forward scans remain disabled until
+rewind/reopen after a refusal, avoiding allocation retry storms but potentially
+losing a later dense phase. This is a bounded policy, not a best-plan guarantee.
+
+Bounded-state coverage includes all five key forms, native/Parquet frames, mixed
+timestamp precision, NULLs, future/absent keys, positive/negative memoization,
+tolerance, reopen/toTop, high-cardinality eviction, oversized VARCHAR keys,
+transient rehash overlap, map-owned staging and genuine allocation failure.
+The new map fixtures explicitly set their small page size: Griffin's server
+configuration defaults to 32 KiB, unlike the embedded benchmark's 4 KiB. The
+original 16 KiB test bound rejected initial OrderedMap allocation before reaching
+the intended growth checks; that fixture assumption was corrected.
+
+The filtered scalar path now uses the same bounded scan/lookup algorithm. Stable
+predicates run on the raw RHS record before projection; only qualifying rows enter
+state. `Function.isStableWithinExecution()` keeps random/stateful predicates in
+lookup-only mode. Bind changes, rewind and reopen reset execution state. This is
+ordinary QuestDB execution, without LLVM or another enable flag.
+
+The ownership audit changed the plan: PageFrameRecordCursorFactory reuses its
+underlying cursor, so opening a second filtered path is not an independent pilot
+or a proven snapshot-preserving handoff. This step operates on the scalar predicate
+already stolen by the old default. Compiled/parallel filtered-stream selection
+remains open; `asof_linear` preserves that existing alternative.
+
+On the 500M RHS / 1M INT-probe repeated-search control, matched query-only PMU
+passes give 6.523s -> 2.261s, 36,218 -> 12,513 cycles/probe and 219,655 -> 77,432
+instructions/probe. All event groups ran without multiplexing. The independent
+pipeline pass is about 64% retiring before and 65% after; baseline DF read-event
+rate is below 5.4% of the earlier single-core streaming control. Warm timed queries
+have zero major faults/physical reads and nearly all wall time on the query thread.
+This is reduced repeated CPU work, with no claim about a specific execution port.
+The input arithmetic predicts 1.536B predicate-row visits for repeated backward
+searches versus roughly 499M rows for a forward scan; these are derived counts,
+not instrumented counters. Fewer row visits explain the order of the gain.
+
+The initial filtered candidate still took 3.33s versus Light 2.11s. JFR attributed
+substantial work to full frame navigation per row. Shared sequential loops now
+use the existing `recordAtRowIndex()` within a frame and full `recordAt()` on entry
+and frame crossings. Entry must restore the frame because output materialization
+can navigate record B to a historical match. This also benefits unfiltered scans.
+
+Final alternating scalar controls, three warmups and three measured executions:
+
+| Filtered key | Automatic | Forced Light |
+| --- | ---: | ---: |
+| INT | 2.278s | 2.232s |
+| LONG | 2.445s | 2.161s |
+| SYMBOL | 2.281s | 2.096s |
+| Composite INT/LONG | 3.354s | 3.099s |
+
+Worst ratio is 1.131. Payload sums and ordered hashes match. The finite 8 MiB
+query-budget INT control takes 2.249s. Separate-process controls also improve
+filtered local matching (0.822s -> 0.685s) and unfiltered dense INT (3.775s ->
+2.612s). Do not combine these separate-process results with paired Light timings
+to claim one precise overall ratio.
+
+Mixed-query JVM profiles remain a material limitation: filtered INT takes 2.36s
+first, then 3.17s after dense INT and SYMBOL queries warm in the same JVM.
+PrintInlining shows failed inlining of shared callbacks and generated RecordSink
+calls. A refactor sharing one concrete cursor removed duplicate key code but
+increased the isolated filtered INT instruction count by 8.4% and elapsed time by
+10.9%. It reduced whole mixed-process retired ops by 6.5%, but cycles by only 0.8%
+(including warmup/engine-open work); its final filtered phase still took 3.03s.
+Rejected that refactor. The isolated 2.26s result is not representative of every
+server compilation history. No query-specific dispatch or JVM flag was added.
+
+Sparse controls are still noisy: local INT wall medians were 130ms -> 129ms but
+CPU medians 108ms -> 119ms in one sequence. Longer rare indexed-SYMBOL ABBA runs
+show wall ranges 3.3–15.7ms; process CPU medians were 3.14/3.30ms before and
+3.42/3.38ms after. This does not establish a universal no-regression result; keep
+the small-query/JIT uncertainty open instead of tuning to these samples.
+
+Reactor packaging/install passes. The rebuilt regression run executes 232 tests
+with zero failures and one existing assumption skip (`AsOfJoinNoKeyTest.testSelfJoin`
+requires a microsecond RHS). It covers ASOF/fuzz/OOM, composite indexed storage,
+join/symbol/record-chain memory ownership and bounded maps. Filtered checks include
+INT, LONG, SYMBOL, DOUBLE, VARCHAR, STRING and composite keys, projection, bind
+changes, stateful predicates, mixed timestamp precision, native/Parquet frames,
+tolerance, rewind/reopen and bounded-state refusal. No LLVM kernel is involved.
+
+Follow-up filter-placement controls expose a larger remaining gap. Extended the
+same runner with predicate/selectivity, real query workers, JIT/Java and LIMIT
+controls; it asserts the actual filter plan and reports process CPU/first-row time.
+The original modulo predicate was not compiled. New controls use the same 500M
+RHS, 1M probes, embedded configuration and three warm/measured rounds per case.
+Four slots mean three query workers plus the caller, on physical CPUs 4–7.
+
+| Control | Scalar adaptive | Existing forced Light |
+| --- | ---: | ---: |
+| Arithmetic, 33% pass, one slot | 3.065s | 2.679s |
+| Arithmetic, 6.24% pass, one slot | 2.701s | 1.641s |
+| Same 6.24%, JIT disabled, one slot | 2.774s | 1.914s |
+| Arithmetic, 33% pass, four slots | 3.037s | 1.167s |
+| Arithmetic, 6.24% pass, four slots | 2.629s | 0.456s |
+| Same, LONG key | 2.702s | 0.474s |
+| Same, SYMBOL key | 2.757s | 0.455s |
+| Same, composite INT/LONG key | 2.892s | 0.535s |
+| Arithmetic, 0.40% pass, four slots | 2.554s | 0.376s |
+| Scalar SIN predicate, four slots | 35.806s | 11.924s |
+| Local matches, arithmetic 33%, four slots | 0.698s | 0.899s |
+| LIMIT 100, arithmetic 6.24%, four slots | 2.50ms | 29.46ms |
+
+All count/sum/order-sensitive hashes match, with zero timed major faults/physical
+reads. These are existing-algorithm controls, not newly implemented speedups.
+The full arithmetic case's first row is roughly 0.4–1.2ms adaptive versus 3–4ms
+Light. LIMIT timings include cursor close and worker drain. DefaultCairoConfiguration
+uses unlimited limited-filter dispatch, whereas PropServerConfiguration uses a
+worker-dependent cap; the LIMIT result is not a server measurement.
+
+The detailed hardware study scopes the 6.24%-selective INT case. Query-only,
+nonmultiplexed PMU passes: scalar adaptive 2.680s, 94,696 instructions and 15,114
+cycles/probe; compiled Light 0.468s, 17,523 instructions and 9,485 cycles/probe.
+Counts include all participating threads. Reference CPU time is about 1.71s per
+query: ~3.65 effective CPUs, not 0.47 CPU-seconds. Its one-slot 1.64s versus
+four-slot 0.456s suggests ~3.6x scaling; the total gain is not all compilation.
+Even Java Light avoids much rejected-row ASOF bookkeeping (1.91s), with native
+filtering adding another improvement (1.64s). Preserve both effects in the design.
+
+Baseline retiring fraction is 62.5%; the faster reference is 22.5% with more backend
+stalls. Its integer-division lowering performs scalar lane divisions; we have not
+isolated its exact limiting execution resource. Do not infer cycles saved directly
+from the 5.4x instruction reduction: measured total cycles fall only 1.59x.
+JFR locates baseline work in scalar arithmetic Function calls and scanForward.
+Baseline DF traffic peaks below 12.1%, reference below 35.2%, of the preceding
+same-host achieved single-core streaming event rate. No invented bytes/event.
+USE shows >81GB available, no direct reclaim/OOM/throttling, and baseline main-thread
+CPU/wall >99.9%. Host IO PSI is high but no timed physical reads/major faults occur.
+Two host swap-ins appear during the reference profile, without query major faults.
+No resource classification is claimed for the whole matrix or other machines.
+
+Decision: reject 'compiled filter exists => choose Light'. Local matches and early
+LIMIT contradict it. Next, preserve compiled resources and reuse bounded batch
+filtering (existing LatestByCompiledFilter) inside the ASOF snapshot; process
+qualifying rows with the existing maps. Then reuse query jobs for a bounded forward
+window. Current TimeFrameCursor has no production borrowed-frame contract, and
+PageFrameSequence.of() opens/owns its base cursor; opening a second path would not
+prove snapshot/frame-ID safety. The revised steps and lifecycle/type requirements
+are in ASOF_SELECTION_PLAN.md. No production selection policy changed in this
+follow-up. The batch path and bounded parallel window are still implementation work.
+
+The expanded harness passes every oracle/plan check above and reactor install.
+Detailed current evidence is in ignored `target/asof-evidence/placement-*`; the
+hardware/USE study validates. No extra correctness suite was run for this harness-
+and-documentation-only increment. Mixed-JVM inlining, server LIMIT behavior and
+second-machine validation remain open alongside the implementation work.
+
+Runner: `run-asof.sh`; current disposable data/counters live under `target/asof-*`.
+Keep this one progress entry, not an archive of every exploratory run. No commit.
+
+
+## 2026-11-03 — First generated ASOF forward region, preserving strategy selection
+
+The existing experimental compiler now supplies a `CompiledAsOfScan` region for
+eligible filtered ASOF forward scans. Timestamp bounds, predicate evaluation,
+typed key encoding, map probing and latest-row updates execute together in LLVM.
+INT, full-width LONG, translated SYMBOL and composite keys use existing typed map
+layouts. Ordinary insertion/growth owns misses and optional-memory refusal. The
+positioned raw frame record is borrowed only during a call; no second reader or
+stored Parquet pointer. Lookup, indexed predecessor, memoized lookup, historical
+search, transitions and output remain in the existing Java implementation. No new
+production toggle or algorithm admission policy.
+
+One-core, warm 500M RHS / 1M INT probes, 6.24%-selective arithmetic predicate:
+
+| Existing same-branch execution / candidate | Median |
+| --- | ---: |
+| Java adaptive, experimental compiler off | 2.683s |
+| Forced Light with stock AsmJIT filter | 1.609s |
+| Generated adaptive forward region | 0.656s |
+| Forced Light with LLVM filter | about 0.636s |
+
+The native region examines **498,967,566** RHS rows/query; output count, sum and
+order-sensitive hash match. This is about **4.1x** over Java adaptive and **2.45x**
+over the stock-filter Light control. It is not full generated ASOF or parallelism.
+The compiler previously could not bind integer division; it now binds INT/LONG
+positive constant divisors through existing SDIV IR, with Java truncation and NULL
+semantics. Variable/nonpositive divisors retain fallback. That shared expression
+improvement also accelerates LLVM Light; do not attribute the full gain to fusion.
+
+Selectivity ablation, both paths using LLVM, same 500M dataset and one core:
+
+| RHS pass rate | Fused forward | Filter-first Light |
+| --- | ---: | ---: |
+| 33% | 0.692s | 1.181s |
+| 6.24% | 0.647s | 0.636s |
+| 0.40% | 0.572s | 0.408s |
+
+The 33% case has a second, interleaved mixed-JVM cohort at 0.686/1.384s: **1.7–2x**
+fusion benefit, with material JVM-history variation. Its all-thread cycles fall
+6,563 -> 3,879/probe and instructions 31,605 -> 17,206/probe. Sparse survival favors
+filter-first vector execution; this disproves a universal scalar fused loop.
+
+Detailed primary-case PMUs: **94,366 -> 16,482 instructions/probe** and
+**14,929 -> 3,692 cycles/probe**. At the measured ~5.6GHz effective clock, the saved
+11.24G cycles/query predict roughly 2.0s saved, matching 2.683 -> 0.656s. All event
+groups are unmultiplexed. Baseline retiring fraction is 62.1%; query-only native
+samples place **82.1%** in the final generated forward kernel. Object disassembly
+shows constant division lowered to multiply/shift but a scalar predicate/map loop.
+Binding immutable predicate addresses once gives only a small (~1%) change, not
+another established win. Exact remaining execution-port/latency limits are unknown.
+
+USE: >81.2GB available, zero swap/direct-reclaim/global OOM-kill deltas in the primary
+cohorts, zero timed physical reads/major faults and no CPU quota/throttling. Current
+scope OOM counters are zero; parent counters contain historical events. Maximum
+system-wide DF interval is 36.1% of the earlier achieved one-core streaming event
+rate, without assuming bytes/event. Baseline main CPU/wall >98.8%, candidate >95.9%;
+small elapsed differences against LLVM Light are not a meaningful win. Study scope
+is this one selective INT case on this host, not every acceptance input.
+
+500M-row native controls also pass for LONG (0.721s), SYMBOL (0.671s) and composite
+keys (0.793s); these are coverage/timing observations, not independent speedup claims.
+Local matches retain lookup and **zero native forward rows**: one cohort is
+0.791s Java / 0.807s LLVM. LIMIT 100 processes only 17,466 native forward rows and
+returns correct payloads, but its 8–13ms timings are JVM-startup sensitive. Fresh
+process SQL compilation costs roughly 0.32–0.39s with LLVM versus 0.13–0.15s without;
+unused forward code still adds planning cost. No universal sparse/startup win.
+Ordinary Java before/after the hook is 2.684/2.683s, cycles +0.23%, instructions +1.9%.
+
+Reactor install passes. Four focused SQL tests exercise native execution across
+key types/projection, NULLs, duplicate timestamps and mixed precision/tolerance,
+reopen/rewind, VARCHAR/SYMBOL predicates, Parquet, column-top fallback and bounded
+map refusal after native work. Three backend variants validate integral division
+at signed extremes/NULLs. Another **26 existing ASOF/fuzz/OOM/symbol-mapping tests**
+pass under the LLVM test runner; code handles and tracked native buffers close.
+
+Next: bounded vector predicate masks with ordered updates inside forward mode,
+then generated lookup/probe/consumer regions and separately parallel execution.
+Keep the existing multiple strategies and revalidate their crossover costs. The
+current source/PMU/USE/code artifacts are disposable `target/asof-evidence/llvm-forward-*`;
+the bottleneck study validates. Baseline class copies are removed after verification.
+No commit.
+
+
+## 2026-11-03 — Reject universal ASOF batching; retain shared vector division improvement
+
+The bounded-mask forward experiment reused existing IR, frame/map ownership and
+strategy selection. It passed the SQL controls, but the held-out workload rejected
+it. Final unrolled batches: 6.24% survival 0.663 -> 0.460s; 0.40% 0.569 -> 0.384s;
+33% 0.677/0.683s. Wrapping LONG multiplication with about 50% survival regressed
+**1.011 -> 1.514s**. AVX2-only code generation also erased the selective win
+(0.644/0.653s). The all-pass control kept lookup with zero native forward rows,
+3.200/3.211s. INT/LONG/SYMBOL/composite controls were correct, but correctness and
+selected wins were insufficient. **ASOF batching is reverted exactly.** No chooser
+change, magic selectivity threshold or production toggle remains.
+
+The failed experiment exposed a shared compiler issue. LLVM scalarized vector
+LONG division by positive constants into lane extraction, scalar multiply/shift,
+and repacking. The retained change in `LlvmVectorEmitter` expresses the reciprocal
+high product using four 32-bit partial products, preserving signed truncation,
+full-width values and existing SQL NULL propagation. Power-of-two divisors retain
+LLVM's ordinary lowering. This is a small expression-lowering change used by every
+LLVM numeric mask, independent of ASOF or any query shape.
+
+Matched **filter-first Light**, identical 500M RHS / 1M INT probes, one caller on
+CPU 4, warm caches, eight warmups and five measured requests, compilation excluded:
+
+| Predicate survival | Before | After | Elapsed reduction |
+| --- | ---: | ---: | ---: |
+| 33% | 1.152s | 1.043s | 9% |
+| 6.24% | 0.617s | 0.458s | 26% |
+| 0.40% | 0.404s | 0.214s | 47% |
+
+6.24% ranges: 0.611–0.658s / 0.448–0.494s. Instructions fall **12,546 -> 7,512 per
+probe**, cycles **3,514 -> 2,598**. Saving 0.915G cycles/query at roughly 5.6GHz
+predicts 163ms, consistent with the observed 159ms. Separate unmultiplexed pipeline
+counters show retired ops falling 41.29G -> 20.25G over 3M probes; backend-stall
+slots remain 36.50G -> 37.34G. We removed arithmetic work without removing the
+remaining backend stalls. Disassembly of the filter itself confirms zero lane
+extraction and four vector partial products. Exact remaining memory/port limits
+are not established.
+
+AVX2-only function attributes, on this same CPU, yield much smaller improvements:
+33% 1.202 -> 1.154s; 6.24% 0.660 -> 0.610s; 0.40% 0.401 -> 0.386s. Small timing
+ranges overlap; cycles also fall. Object inspection finds no ZMM operands. This
+is an ISA control, not proof on another machine or ARM. No workload-wide or
+universal 2x claim. Fresh-process compilation in the normal controls was roughly
+0.25–0.29s after, versus 0.27–0.32s before; startup remains substantial.
+
+All output counts and payload hashes match. Timed runs have zero physical reads
+and major faults; primary intervals have no swap, direct reclaim or OOM-kill
+deltas. Current cgroup limits and prior same-host DF calibration remain the USE
+controls. `target/asof-evidence/division-bottleneck-study.json` validates; raw
+commands, PMUs, current source hashes and per-query CPU/I/O are disposable evidence.
+
+This outcome is consistent with the caveat in [Kersten et al., compiled versus
+vectorized queries](https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf): fewer SIMD
+instructions need not improve complete-query execution. The [libdivide SIMD
+implementation](https://github.com/ridiculousfish/libdivide/blob/master/libdivide.h)
+also uses 32-bit partial products to implement vector 64-bit high multiplication.
+Here the retained lowering is portable LLVM arithmetic, with no ISA-specific
+intrinsic or benchmark recognition.
+
+Reactor install and **12 focused test cases** pass (four ASOF lifecycle/semantic
+cases, five LLVM backend cases, three SQL integer-division backend variants).
+The new vector oracle checks INT/LONG inputs, signed extrema and quotient
+boundaries, 12 divisors, 2/8/64 lanes and deterministic random inputs. Two existing
+Griffin arithmetic/NULL regressions also pass with 34 compilations and 57 native
+calls. Temporary override classes/source copies removed. Changes uncommitted.
+
+## 2026-11-03: ASOF architecture comparison exposes repeated frame resolution
+
+The committee experiment now uses SQL `SUM`, `MIN`, `MAX`, `COUNT(v)`,
+`SUM(v + left_key)` and `COUNT(*)`, not just row consumption. All controls retain
+500M RHS rows. The local-probe case increases the left side from 1M to 25M rows.
+The harness independently validates aggregate values through result checksums,
+reports compilation/first execution separately, and prints JVM compilation time
+per execution. Disposable run manifests now include class overrides and JVM flags.
+
+The initial dense control favored Light with LLVM filtering over adaptive ASOF.
+Profiling identified the reason: 69% of main-stack samples were in timestamp
+lookahead, including 42% in `recordAt`. The loop resolved the same frame for every
+timestamp and repositioned the matched record at every intermediate predecessor.
+The shared cursor now binds record A once, advances with the existing
+`recordAtRowIndex`, and binds B only to the final predecessor. Record A keeps the
+frame pinned, including decoded Parquet memory; no navigation/allocation occurs
+inside the region. Matching strategies, tie order, key handling and consumers
+retain their existing semantics. There is no new toggle, scheduler or LLVM operator.
+
+Matched fresh-process A/B, CPU 4 on the Ryzen 9950X, eight warmups and three
+measured executions, same LLVM compiler and six SQL consumers (milliseconds):
+
+| Control | Probes | Before median (range) | After median (range) | Speedup |
+|---|---:|---:|---:|---:|
+| Local filtered INT | 25M | 4613 (4600–4631) | 1775 (1755–1789) | 2.60x |
+| Local filtered LONG | 25M | 5254 (5251–5264) | 2539 (2538–2560) | 2.07x |
+| Sparse local SYMBOL | 1M | 736 (734–759) | 485 (464–488) | 1.52x |
+| Adjacent INT | 1M | 43 (42–66) | 41 (40–42) | 1.05x |
+| Phase-changing composite | 5M | 4124 (4115–4136) | 3332 (3330–3336) | 1.24x |
+| Selective forward INT | 1M | 625 (622–627) | 637 (626–639) | 0.98x |
+| 33%-survival forward INT | 1M | 744 (740–767) | 748 (734–756) | 0.99x |
+
+The mechanism is supported by fixed-work counters: local INT instructions/probe
+fall **6033 -> 1875**, cycles/probe **1017 -> 395**. At the observed ~5.5GHz,
+the cycle reduction predicts about **2.8s saved**, matching the measured 2.84s.
+The source implies roughly 925M fewer full record-position operations in this
+25M-probe case; that operation count is an estimate, not an instrumented counter.
+Independent pipeline passes show retired ops falling **363.1B -> 119.1B** across
+75M probes. The baseline retires 60.7% of dispatch slots; backend stalls account
+for 36.1%. This establishes excess retiring work, not a specific execution-port
+bottleneck. Afterward, lookahead is 24% of samples and `recordAt` 11%; scalar
+predicate evaluation and aggregate updates become larger relative costs.
+
+The hardware gate passed before the production edit. Minimum available RAM was
+81.1GB, with no swap, direct reclaim or OOM activity in the detailed interval.
+Peak DF read-event rate was 13.1% of a freshly measured one-core streaming rate
+(55.7GB/s useful throughput); no DF bytes/event conversion is assumed. Timed
+queries had zero physical reads/major faults. Unschedulable five-event PMU groups
+were discarded; the retained two-/three-event groups ran 100%. CPU profiles include
+warmups and identify software locations; hardware counters cover measured queries.
+
+The architecture decision remains conditional on the workload. After the fix,
+local INT is about **1.78s** with one or four cores; Light is **1.77s / 1.91s**.
+For selective 1M probes, a longer-warmup check gives adaptive **0.604s / 0.589s**
+versus Light **0.217s / 0.169s**. The short controls use 32 warmups and five measured
+queries; small JVM compilation deltas remain visible. Earlier shorter warmups and
+different JVM processes changed absolute times, but not this selective ordering.
+Four-core filtering spends more total CPU for modest elapsed improvement; do not
+extrapolate the earlier 3.6x scaling result to this compiler. Spreading the four
+survivors per 1009 values also preserves Light's advantage (0.737s vs 0.340s before
+the cursor edit); its extra arithmetic prevents treating it as a pure selectivity
+ablation.
+
+This is a general shared-cursor improvement, benefiting ordinary and LLVM-enabled
+execution. It closes the dense INT gap but does **not** beat the best eligible
+plan by 1.5x or add generated coverage. The next architecture milestone is to
+preserve the compiled filtered-stream alternative currently destroyed by filter
+stealing, with a sound snapshot/ownership boundary. Full strategy-specific
+matcher-to-consumer fusion and parallel matching remain open. Do not substitute
+a fixed selectivity threshold or a native predicate call per probe.
+
+Reactor build and **148 existing tests** pass: 129 ASOF, eight adaptive, six fuzz,
+one Parquet eviction and four LLVM ASOF tests. Additional harness controls validate
+all-unmatched and mixed matched/unmatched SYMBOL aggregates. The data domains remain
+narrow and composite components dependent; these are control cases, not workload-
+wide or cross-machine proof. Source, study and measurements are under disposable
+`target/asof-evidence/architecture-*`; the study validator passes. Changes uncommitted.
+
+## 2026-11-03 — retain compiled RHS filtering within adaptive ASOF
+
+Filtered ASOF now retains the existing compiled predicate instead of destroying
+it during filter extraction. It reuses LATEST BY's batch implementation (renamed
+`CompiledFilterBatch`) over a borrowed frame from its already-open RHS cursor.
+Lookup and filtering therefore share one snapshot, reader and frame owner. Only
+row offsets survive navigation; raw page addresses do not. The existing map,
+key sinks, timestamp conversion, tolerance and lookup/scan state remain in use.
+
+Within admitted forward execution, bounded trials choose between fused LLVM
+predicate/map updates and compiled filtering followed by ordinary map updates.
+Trials process real input, time at most 256 calls or 64K rows per alternative,
+require a 20% advantage to change the incumbent, and repeat after about 4M rows.
+There is no selectivity cutoff, query recognition, new flag or scheduler. Stable
+predicates alone qualify. Rejected future rows can be skipped, but the first
+qualifying future row stops the scan. Duplicate timestamps keep their input order.
+
+Matched process comparisons: 500M RHS rows, 1M probes, 1024-key domain, CPU 4 on
+the Ryzen 9950X, one execution slot, 32 warmups and three measured executions.
+Every execution runs and independently checks six SQL aggregates (SUM, MIN, MAX,
+COUNT, a left-dependent SUM and COUNT(*)). The control retains the previous
+planner's scalar/fused filter extraction; it uses the same current ASOF cursor.
+These are warm embedded-engine controls, not ClickBench protocol results.
+
+| Case | Before median ms | Retained version ms | Ratio before/after |
+|---|---:|---:|---:|
+| 0.4% survival, INT | 619.8 | 398.9 | 1.55x |
+| 0.4% survival, LONG | 634.5 | 412.4 | 1.54x |
+| 0.4% survival, SYMBOL | 616.8 | 389.4 | 1.58x |
+| 6.24% survival, INT | 673.7 | 626.9 | 1.07x |
+| 33% survival, INT | 735.3 | 755.0 | 0.97x |
+| Mixed multiplication, ~50% survival | 1015.0 | 1031.8 | 0.98x |
+| Local filtered lookup, INT | 472.4 | 463.6 | 1.02x |
+
+Selective INT ranges were 619.2–622.2 / 398.1–403.0ms. LONG/SYMBOL had wider
+ranges and occasional 20–25ms off-CPU outliers; raw distributions are retained
+only under disposable `target/asof-evidence/buffered-*`. Low survival selected
+batches for about 98% of forward rows; higher survival retained fused execution
+for about 98%. The 2–3% high-survival regressions are the observed trial/dispatch
+tradeoff, not hidden by an average. At 33% survival, about 1.57% of rows run
+through the slower batch trial; multiplying that fraction by the 825ms gap to
+unconditional batching predicts ~13ms of the observed 20ms regression. The
+remaining difference is not separately attributed. Local lookup consumes neither
+forward path.
+A wrapper-induced 15% lookup regression was removed by retaining direct scalar
+function access; the wrapper owns lifecycle, not the scalar hot call.
+
+The selective INT fixed-work counters move together: **16,256 -> 4,760
+instructions/probe; 3,474 -> 2,256 cycles/probe**. At ~5.6GHz, the saved 1.22B
+cycles predict ~0.22s per 1M probes, matching the measured 0.221s. An independent
+final source/pipeline pass gives 392.2ms, retiring 24.6% of dispatch slots and
+backend stalls 68.1%, versus 49.0% / 41.9% before. Less work wins despite lower
+IPC; these data do not identify a particular execution port or prove a memory
+latency bottleneck. Remaining samples concentrate in Java map/record loads.
+Profiles include warmup/lifecycle and do not resolve every generated native leaf.
+The pre-edit hardware/USE study passed; PMU groups were 100% scheduled, timed
+queries had no physical reads/major faults, and no swap/reclaim/OOM activity was
+observed. Peak baseline DF event rate was below 40% of the calibrated streaming
+ceiling; no bytes/event conversion is assumed.
+
+Two rejected alternatives matter. Maintaining the exact unfiltered timestamp
+frontier with a binary search reduced instructions but slowed the selective case
+to 716ms; consuming the filtered stream removes that work. Unconditional batching
+slowed 33%-survival execution to 1561ms, so retaining the fused alternative is
+necessary. Enlarging the existing 2048-row batch gave only a small gain and was
+not retained.
+
+Lifecycle now prepares/clears LLVM bindings, accounts buffers to the query, and
+releases them on cursor close. **207 core + 8 LLVM ASOF tests pass**, including
+fuzz, Parquet eviction, column tops, projection, mixed timestamp units, duplicate
+timestamps, changed binds, LIMIT, memory failure, cancellation and reopen. Key
+controls include INT, LONG, SYMBOL, DOUBLE, VARCHAR and composites. A boundary
+test exposed legacy AsmJIT FLOAT epsilon rounding differing from scalar widening;
+FLOAT predicates conservatively retain the prior ASOF path. DOUBLE predicates
+pass against a JIT-disabled scalar oracle. Fixing that pre-existing FLOAT backend
+contract is separate from this strategy change.
+
+This is a useful general strategy extension, not a full generated ASOF operator
+or an end-to-end breakthrough over the best eligible plan. Light with LLVM
+filtering remains ~217ms on one core / ~169ms on four in the earlier same-input
+control, versus ~392–399ms here. Consumer fusion and parallel matching remain
+open. Profile the remaining map/probe/consumer region against that control before
+adding another helper; preserve multiple matching strategies. Changes uncommitted.
+
+## 2026-11-03 — Bounded ASOF matching/consumer experiment: useful gains, admission bar not met
+
+Built an exploratory forward-region harness outside SQL admission, in
+`target/asof-region-src/AsOfRegionExperiment.java`. It reuses QuestDB's map probing,
+symbol translator, resolved vector filtering and `AggregateUpdates`; six ordinary
+SUM/MIN/MAX/COUNT aggregates include an expression using both join inputs. The
+map copies required fixed-width RHS payloads, so matches remain valid after their
+source frame closes. Native calls consume at most 64 left probes and yield after
+64K raw RHS rows. This is not an integrated adaptive ASOF implementation: it starts
+from the RHS prefix, has no historical-lookup fallback, and must not replace the
+existing strategies for sparse/late probes.
+
+500M RHS rows, 1M left probes, 1024 keys, one pinned CPU (Ryzen 9950X, CPU 4).
+Five measured executions per strategy, interleaved order; 32 warmups for the final
+INT selective run, 16 for the other controls. All SQL result vectors agree.
+Medians in milliseconds:
+
+| Key / predicate survival | Light + LLVM filter | Existing adaptive + LLVM | Bounded native region |
+| --- | ---: | ---: | ---: |
+| INT / 0.4% | 229.7 | 351.5 | 241.3 |
+| LONG / 0.4% | 237.9 | 348.6 | 251.0 |
+| SYMBOL / 0.4% | 248.2 | 360.6 | 248.9 |
+| INT / 6.24% | 456.6 | 561.9 | 352.9 |
+| INT / 33.3% | 1058.2 | 761.9 | 614.6 |
+
+Compare against the fastest eligible control in each row: the strongest gains
+are 1.29x and 1.24x, not the larger ratios against Light alone or the former
+adaptive path. Selective INT/LONG regress about 5%; SYMBOL is effectively tied.
+The 6.24% native range was 348.6–401.1ms, including one slow measured run; the
+33.3% range was 604.3–626.7ms. No workload-wide or cross-machine speedup claim.
+
+The first version retained separate 2048-row filter calls and took 296ms on the
+selective INT input. Calling the same vector filter as a native helper reduced
+matching invocations from 256,772 to 17,241 but still took about 288ms. Its cycle
+profile exposed cancellation upcalls: `UpcallLinker::on_entry` alone was 6.4% of
+samples. Bounded returns to Java instead of one cancellation upcall per filter
+batch reduced this to 268ms. Prefetching selected RHS timestamps/keys before their
+dependent consumption reduced it to 244ms in a separate-process PMU run, then
+241ms in the final interleaved comparison. No cancellation checks were removed:
+the raw-row budget forces a return and check even for an entirely rejected prefix.
+
+Fixed-work counters per completed left probe (five complete queries each):
+native helper 2581 instructions / 1626 cycles; bounded returns 2502 / 1522;
+prefetch variant 2518 / 1374; Light control 3482 / 1278. Fewer instructions alone
+did not win. Object-address attribution puts 67.5% of the pre-yield profile in
+the vector-filter helper and 22.3% in generated matching. The predicate's separate
+selection-only control takes 137.5ms for all 500M rows, before any ASOF work;
+its assembly contains the same multi-instruction signed division lowering.
+The old 1.5x selective target (about 153ms against the final Light control) leaves
+only about 15ms beyond that isolated filter cost. This is a budgeting argument,
+not a proof of a universal lower bound.
+
+Hardware limits remain explicit. Native-helper dispatch slots were 19.6% retiring
+and 71.8% backend-stalled; this does not identify a port or memory bottleneck.
+The prefetch counterfactual saves cycles with slightly more instructions, but IBS
+load samples did not show a clean reduction in reported miss latency. Do not
+claim a proven latency mechanism. Runs have zero measured physical reads/major
+faults, about 81GB available RAM, no direct reclaim/OOM or CPU quota throttling.
+Small host swap-ins occurred outside this fault-free measured query path. Broad
+hardware classification remains unclosed, so no production optimization gate is
+claimed for this exploratory harness.
+
+49 result comparisons pass, including signed/null INT and LONG keys, independent
+SYMBOL dictionaries, missing symbols, null payloads, duplicate timestamps,
+partition boundaries, probes before/after RHS, no qualifying rows, map growth,
+reopen and repeated raw-budget yield/resume. Reader, JIT-buffer and generated-code
+lifetimes return to baseline. This harness requires raw fixed-width pages, equal
+timestamp units and the stated consumer; it does not establish tolerance,
+projection, Parquet, column-top or adaptive-state integration correctness.
+
+Decision: retain the experiment and findings outside the planner; do not add a
+production toggle or a second execution framework for a missed target. Next,
+isolate shared predicate throughput and selected-input scheduling across varied
+arithmetic/type/selectivity controls. Full ASOF integration still needs the
+existing strategy's exact history exits, memory refusal and work observations.
+Evidence: `target/asof-evidence/region-*.{log,perf,json}`, generated objects in
+`region-native-symbols`, and `region-check-final.log`. No production code changed
+in this milestone; earlier uncommitted ASOF changes remain intact.
+
+## 2026-11-04 — Predicate experiments: keep static INT range, reject runtime complexity
+
+The shared vector emitter now uses a 32-bit reciprocal for division of a direct
+INT load by a positive literal. Its type proves the magnitude bound, including
+INT_MIN; no sampled statistics, runtime guard, SQL-shape check, CPU-specific rule
+or toggle is needed. LONG and arithmetic expressions over INT keep the existing
+64-bit lowering. On this host the INT vector loop falls from two unsigned partial
+multiplies to one per eight input rows. This is a small compiler improvement, not
+an ASOF breakthrough or an admission of the scratch native matching operator.
+
+500M-row RHS dataset, CPU 4 on Ryzen 9950X, five measured executions after warmup.
+Filter controls scan every row. Final complete-query control uses 24 warmups, 1M probes, 1024 keys and six ordinary
+aggregates. Medians in ms (each row compares the same path before/after):
+
+| Work | Before | After |
+| --- | ---: | ---: |
+| INT predicate, count only (`k-k/97*97<4`) | 85.7 | 76.7 |
+| Same predicate, materialize selected row IDs | 101.3 | 92.9 |
+| Held-out predicate, count only (`k/7>60`) | 80.1 | 70.9 |
+| Complete Light + LLVM ASOF | 440.3 | 428.8 |
+| Complete adaptive + LLVM ASOF | 539.4 | 518.6 |
+| Scratch bounded native region | 383.2 | 373.4 |
+
+Count-only results across repeated processes span roughly 8–14% improvement;
+complete-query savings are much smaller. One earlier candidate process took 650ms
+adaptive, versus 504ms on repetition. Subsequent instrumented comparisons logged
+both paths and JVM compilation: baseline/candidate each sometimes scanned about
+7.6M rows fused and sometimes about 49.6M, with the remainder filtered in batches.
+Do not explain that unreproduced process outlier as a compiler regression, or
+hide it behind the final median. Strategy/warmup sensitivity remains a limitation.
+
+The pre-edit USE/hardware study passed for the isolated INT filter. Fixed work
+(2.5B rows over five scans) reduced retired ops 2.513 -> 2.150 per row, SIMD
+scheduler-token stall cycles 0.503 -> 0.463, and cycles 0.981 -> 0.849 in the paired
+PMU run. This supports reduced execution pressure, not a claim about one multiply
+port or a purely core-limited whole join. Peak whole-host DF event rate was 62.6%
+of the fresh same-host single-core streaming event rate (56.8 useful GB/s);
+no bytes/event conversion is assumed. Baseline had no physical reads, major
+faults, swap or direct reclaim, about 81GB available RAM, and zero CPU quota
+throttling. Minor mmap faults remain measured and approximately equal.
+
+Rejected: 16/32-lane selection masks slowed the LONG filter from 138ms to 153/150ms,
+despite fewer instructions at width 16. Compile-time carry simplification saved
+only about 4%; guarded narrow LONG division saved about 3% and added a branch and
+helper machinery. Neither complexity was retained. Counting instructions alone
+would have picked the wrong vector-width experiment.
+
+15 focused LLVM/ASOF tests pass. Expanded controls cover quotient boundaries,
+signed extrema, divisors around 2^31, 2/8/64 lanes, wide arithmetic over INT loads,
+NULL-preserving selection/count masks and tails, plus scalar-oracle SQL ASOF
+comparisons across INT/LONG/SYMBOL/composite keys. Independent dataset arithmetic
+confirms both 500M-row filter counts. No new datasets or production switches.
+Evidence remains temporary under `target/asof-evidence/selection-*`; the gate is
+`selection-int-study.json`. Earlier ASOF changes remain uncommitted.
+
+The main selective ASOF control divides a LONG column and does not benefit from
+this type proof. Next, isolate selected-row gathering and matching costs across
+key/payload types and survival rates. Keep the best eligible SQL strategy as the
+control and require exact adaptive history/cancellation/memory contracts before
+promoting full matching fusion. Wider masks are no longer the leading hypothesis.
+
+## 2026-11-04 — Coarser native batches clear the ASOF experiment's performance bar
+
+The scratch matching/consumer region benefits from longer uninterrupted filter
+runs. Changing its raw filter batches from 2K to 8K/32K/64K rows gives selective
+INT medians of 242 -> 206/186/190ms. Matching, map updates, shared aggregate IR,
+probe count and results are unchanged. The 32K variant passes all 49 scratch
+correctness/lifetime comparisons. This is an experiment outside SQL admission;
+32K is a measured candidate on one host, not a portable optimum.
+
+500M RHS rows, 1M probes, 1024 keys, six aggregates, CPU 4 on Ryzen 9950X. Five
+complete measured queries after warmup; compilation/startup are separate. Best
+eligible SQL controls use LLVM filtering and retain Light/adaptive alternatives.
+Medians in ms:
+
+| Key and predicate regime | Best SQL control | Native 2K | Native 32K | SQL / native 32K |
+| --- | ---: | ---: | ---: | ---: |
+| INT, clustered 0.4% | 220 (Light) | 243 | 187 | 1.18x |
+| LONG, clustered 0.4% | 231 (Light) | 252 | 202 | 1.14x |
+| SYMBOL, clustered 0.4% | 229 (Light) | 247 | 190 | 1.21x |
+| INT, scattered 0.4% | 330 (Light) | 286 | 208 | 1.59x |
+| INT, 6.24% | 441 (Light) | 354 | 269 | 1.64x |
+| INT, 33.3% | 751 (adaptive) | 612 | 602 | 1.25x |
+| INT, cheap predicate, about 50% | 1036 (adaptive) | 870 | 854 | 1.21x |
+
+The four-path rotating matrix was followed by separate JVMs for SQL controls:
+mixed execution inflated the moderate-selectivity Light median to 524ms, falsely
+suggesting 1.9x. Use the isolated 441ms control above. Native 32K moderate timings
+were 271ms in the matrix and 269ms separately. SQL compilation still occasionally
+interrupts measured executions; keep ranges and compilation counters in the raw
+logs, not just this table. This establishes a narrow win, not broad ASOF coverage.
+
+For five complete selective native queries, cycles/probe fall 1362 -> 1050 and
+load-not-complete cycles/probe 611 -> 381; instructions fall only 0.8%. The exact
+generated predicate helper accounts for 9840 -> 6963 cycle samples; matching
+samples stay approximately flat. IBS at its vector demand load changes from
+467/888 L1 samples to 524/641, with reported mean weight 81 -> 35. This supports
+reduced demand-load waiting, not a particular prefetcher or DRAM-row explanation.
+Exclude `prefetcht0` from demand-load latency summaries: IBS labels it a load too.
+Resolve reused native addresses against the last allocation and object-relative
+helper symbols; the append-only map contains stale allocations at the same address.
+
+Napkin check: the predicate alone reads about 4GB/query, about 17 -> 21 useful
+GB/s, versus a fresh 57.4GB/s single-core streaming control. Peak whole-host DF
+event rate is 52% -> 70% of the same streaming event rate; no bytes/event conversion
+or bandwidth-saturation claim. PMU groups are fully scheduled. Timed queries have
+zero physical reads/major faults; minor mmap faults remain charged, about 81GB RAM
+is available, and the SMT sibling is idle in the stall runs. One host swap-in page
+occurred during the candidate process, without query I/O or major faults.
+
+Rejected: copying selected payloads into a compact intermediate buffer (251ms),
+prefetching the next batch (249–255ms), and blindly increasing the SQL helper's
+global batch size. The last initially appeared to improve adaptive 405 -> 280ms;
+longer warmup gave 328 -> 322ms, with load-wait cycles slightly higher. It does not
+reproduce the native region's mechanism and is not retained in production.
+Filter-only batching costs about 142ms versus 138ms for a whole-frame filter, so
+eliminating helper calls alone cannot explain the native region's roughly 55ms
+saving. The useful change concerns scheduling filtering together with its consumer,
+consistent with [Relaxed Operator Fusion](https://www.vldb.org/pvldb/vol11/p1-menon.pdf).
+
+Keep the bounded native experiment for integration work; no new production switch
+or batch-size change. Its copied RHS payload map is not the adaptive cursor's
+authoritative row-ID history. Next, preserve that history and existing strategy
+ownership when attaching a generated consumer; account for all lookahead and
+memory/cancellation work. The 32K run scans 499,029,375 raw rows versus 499,002,751
+at 2K; that extra lookahead stays inside elapsed time. Evidence is temporary under
+`target/asof-evidence/gather-*`; source identities are in `gather-source-hashes.json`.
+
+## 2026-11-04 — Fused ASOF can retain the ordinary row-ID map
+
+The consumer experiment now stores one LONG row ID per key and reads aggregate
+inputs from borrowed RHS frames. Historical matches return to the existing
+`TimeFrameCursor.recordAt(recordB, rowId)` before consuming the probe, then resume
+generated aggregation. No copied-payload cache or widened map is needed. This
+validates the first integration decision; the harness still scans a prefix and
+does not yet execute inside the adaptive cursor.
+
+500M RHS rows, 1M probes, 1024 keys, six aggregates, CPU 4, five measurements after
+32 warmups. Final complete-query medians and ranges in ms:
+
+| Regime | Best SQL control | Row-ID native region | Speedup |
+| --- | ---: | ---: | ---: |
+| 6.24% survival | Light 446 (445–482) | 270 (267–271) | 1.65x |
+| Clustered 0.4% survival | Light 223 (220–259) | 197 (196–198) | 1.13x |
+| Per-key aging history | Adaptive 819 (808–859) | 549 (548–551) | 1.49x |
+
+The aging control uses `v<(k+1)*400000`, making keys stop receiving updates at
+different times; it changes data access, not compiler admission. It forces 588,569
+historical-frame returns per million probes, versus 554 in the ordinary controls.
+Light takes 1206ms. Copied payloads take 542ms; using row IDs retains almost all of
+the benefit even with frequent historical access. Selective LONG/SYMBOL key
+controls finish in 207/197ms; their six-result vectors match the SQL oracle.
+SQL controls still occasionally include JVM compilation, so retain their ranges.
+
+The compatibility cost is modest but real. A selective comparison gives
+copied-payload versus row-ID medians of 189/196ms. For five complete queries,
+cycles/probe rise 1061 -> 1103 and load-not-complete cycles/probe 391 -> 423;
+instruction counts in the generic runs differ by less than 0.5%. A row ID adds a
+dependent payload read after map lookup. The extra load waiting is consistent with
+that cost; these counters do not identify a cache level or prove a new whole-query
+bottleneck. This is not a measured speedup from changing the state representation.
+
+85 correctness/lifetime comparisons pass: the prior 49 plus alternating old
+partitions across INT/LONG/SYMBOL keys and INT/LONG/DOUBLE payloads, both filter
+entry paths and reopen. Tests seed LONG_NULL history entries and verify NULL
+consumer inputs rather than treating the sentinel as a frame ID. Existing checks
+retain signed/null inputs, missing symbols, independent dictionaries, duplicate
+timestamps, map growth and bounded raw-yield/resume. Reader/JIT/buffer counts return
+to baseline. Performance queries check all six aggregate outputs, not just counts.
+
+The source audit found the next integration boundary. Adaptive ASOF reuses its two
+maps as result/validity maps in memoized lookup; missing forward keys can require
+backward history, and optional-map refusal retries the same master row. Native
+progress must preserve those facts and the chooser's work-window observations.
+On the input side, `recordAt()` does not advance the master row cursor, while
+`skipRows()` changes LIMIT/decode accounting. Define a bounded borrow/commit span
+on the existing cursor before attaching the consumer; do not introduce a second
+reader, payload side cache or independent chooser. The exact code-grounded
+contract and staged implementation are in ASOF_SELECTION_PLAN.
+
+No production API, planner gate or default execution changed in this milestone.
+The revised prototype is `target/asof-rowid/AsOfRegionExperiment.java`; measurements,
+USE samples, exact commands and source hashes are under `target/asof-evidence/rowid-*`.
+The failed-test temporary databases were removed. SQL admission, bounded master
+handoff, partial-progress map-limit retry, projected/tolerance/storage integration
+and parallel matching remain open; the new checks do not establish those contracts.
+
+
+## 2026-11-04 — ASOF matching and aggregation now fuse through ordinary SQL
+
+The generated forward region now runs inside the real adaptive ASOF cursor and
+unkeyed group-by owner. It borrows bounded master spans, updates the existing
+row-ID map and aggregate state, and returns work observations to the chooser.
+History, symbol translation, frame navigation, initialization and fallback retain
+their existing owners. Optional-map refusal preserves completed contributions and
+retries only the unfinished probe. No new execution toggle or payload cache.
+
+500M RHS rows, 1024 keys, six payload-consuming aggregates, CPU 4 on Ryzen 9950X;
+1M probes except the dense 5M control. Five complete measurements after 32 warmups,
+including cursor open/close, with all six outputs checked. Medians in ms:
+
+| Regime | Previous LLVM adaptive | LLVM Light | Integrated fusion |
+| --- | ---: | ---: | ---: |
+| INT, 6.24% survival | 679 | 475 | **291** |
+| INT, clustered 0.4% | 388 | 232 | **218** |
+| LONG, 6.24% | 645 | 561 | **311** |
+| SYMBOL, 6.24% | 578 | 478 | **297** |
+| INT, keys aging out at different times | 832 | 1437 | **716** |
+| INT, all rows qualify, 5M probes | **1159** | 3448 | 1171 |
+
+The moderate case is 2.33x faster than previous LLVM adaptive and 1.63x faster than
+the stronger LLVM Light control. Stock adaptive takes 1751ms with its normal JIT
+filter configuration; much of that larger gap predates this milestone and belongs
+to LLVM predicate execution. Dense execution is effectively tied with previous
+LLVM: retained 1164–1204ms versus prior 1130–1207ms. This is a selective-workload
+breakthrough, not a universal ASOF win or a multicore result.
+
+The decisive algorithm correction was to follow Java's filtered-stream frontier:
+predicate-rejected rows are permanently irrelevant, including future timestamps.
+Searching for a raw timestamp boundary per probe added unnecessary dependent
+loads; those variants were removed. The retained selection/consumer schedule
+prefetches selected key/timestamp addresses, skips hints for full selections, and
+uses an identity-row loop for full batches. Sparse and full loops share one update
+emitter; there is no query-specific admission or CPU-specific threshold.
+
+Same-source prefetch ablation on the moderate case: 375 -> 291ms; five-query cycles
+10.78 -> 8.38 billion and load-not-complete cycles 5.34 -> 2.69 billion. Generated
+symbols, assembly and IBS support reduced demand-load waiting. Dense loop versioning
+removes the selected-offset load and reduces cycles by about 6% versus the earlier
+full-selection loop; it does not beat the prior LLVM dense control. Exclude IBS
+samples at prefetch instructions when describing demand loads.
+
+Napkin check: the predicate reads about 4GB/query, or 13.7 useful GB/s at 291ms,
+versus a fresh 56.7GB/s single-core streaming control. The query's peak whole-host
+memory-controller event rate is about 57% of that achieved control; no bytes/event
+conversion or bandwidth-saturation claim. PMU groups are fully scheduled. Timed
+queries have zero physical reads and major faults, no direct reclaim, and an idle
+SMT sibling. Two host swap-in pages occurred during the sparse process; they are
+not query I/O evidence. Minor mmap faults remain charged.
+Ambient host I/O pressure is recorded but is not query I/O evidence.
+
+The normal reactor build passes. Final focused checks: 24 tests, no failures,
+covering INT/LONG/SYMBOL keys, INT/LONG/DOUBLE payloads, SUM/MIN/MAX/COUNT/AVG,
+expressions, independent symbol dictionaries, NULLs, history, mixed timestamp
+units, tolerance, projections, LIMIT, column tops, Parquet, map refusal, cancellation,
+query-memory release and reopen. Existing adaptive plus seeded fuzz controls also
+pass: 9 tests, 241 compiled kernels and 9468 calls in the fuzz run. The focused SQL
+tests assert their own native-row counters; the external runner's zero counts do
+not mean those explicitly installed compilers were bypassed.
+
+Compilation remains material. The optional region is deferred until forward use;
+a fresh moderate run reports 217ms plan compilation and 623ms first execution,
+including deferred LLVM and JVM warmup. These are separate from the steady-state
+table, not a cold-latency speedup. Indexed/backward matching, composite keys,
+grouped consumers and parallel temporal production remain open. The permanent
+ASOF runner now exposes aggregate-probe counts and reproduces the moderate result
+with an independently checked arithmetic checksum. Details and commands remain
+in temporary `target/asof-evidence/sql-retained-*`; the next experiment is in
+ASOF_SELECTION_PLAN.
+
+
+The follow-up counterfactual changes the next priority. On the all-match, 1M-probe
+case, automatic execution remains in Java lookup: INT/LONG/SYMBOL take
+3354/3617/3117ms. Forcing the existing forward mode only in the scratch harness
+gives 1034/1099/1038ms, with all six outputs equal. For INT, five-query cycles fall
+93.57 -> 28.92 billion and load-not-complete cycles 24.59 -> 4.60 billion. The
+fixture entails about 512 backward comparisons versus 499 forward rows/probe;
+the row-count rule never admits a trial, despite very different costs per row.
+This is an existing selection gap: prior LLVM forced forward takes 978ms, slightly
+faster than fusion at this spacing. Conversely, immediate local matches take
+473ms automatic versus 1025ms forced forward. No production chooser rule changed.
+The next experiment must measure actual implementation cost on bounded real work,
+including native spans and transitions, with the existing history/map owner.
+
+A 5M-probe phase reversal (distant matches, then immediately local matches) returns
+the same six results and processes 2,499,551 probes natively before lookup takes
+over: 1280ms versus 1303ms prior LLVM, effectively parity. Counterfactual runs retain
+at least 74.4GiB available memory, at most 0.16% whole-run SMT-sibling activity and
+no direct reclaim. Some process windows contain 1–5 host swap-in pages; timed query
+physical reads and major faults remain zero. A separate first-factory-use diagnostic
+confirms no aggregate-region compilation on lookup-only execution and 54.6ms in
+the backend compilation path on first selective use. Its backend is already loaded;
+this is not disk-cold or process-start latency, and excludes IR construction before
+the backend call.
+
+### 2026-11-04 — ASOF admission isolated; lookup attribution experiment
+
+The earlier reflective `adaptive=false` control changed more than admission:
+optional-map caps, forward budget, selection-refill size and subsequent policy
+also changed. Its 3.24x difference was not an admission-only result. A scratch
+overlay now changes exactly one admission decision while keeping normal adaptive
+execution, caps and work observations. No production policy changed.
+
+On the 500M-RHS/1M-probe all-match INT fixture, three balanced independent JVMs
+give baseline medians 2634/2889/3339ms versus 1139/1141/1138ms after admission.
+Each process has 32 warmups and five measured full queries; all six aggregates
+match the ordinary Light oracle. Median-of-process-medians improves 2.54x, with
+material Java process variation explicitly retained. Cycles/probe fall from
+14.7–18.7K to 6.35–6.39K, instructions/probe from 82.3–85.5K to 32.44K.
+
+The unchanged-work diagnostics explain the algorithm transition: baseline examines
+511,998,464 candidates; admitted execution examines 31,631 lookup and 426 historical
+candidates, then consumes 498,967,566 forward rows. It enters once, never exits,
+and keeps `adaptive=true`; native per-probe limits range 1885–2200. Maximum retained
+map capacity is 3072 slots (not a byte or transient-allocation high-water measure).
+All timed runs have zero physical reads and major faults. This proves a narrow
+admission loss, not an exclusive hardware bottleneck or a portable crossover.
+
+Single-process holdouts: LONG 1219ms, SYMBOL 1155ms, local matches 467ms versus
+475ms baseline. The local trial consumes 64 rows and exits without completing a
+native aggregate probe. First execution is 774ms versus 673ms baseline, including
+JVM warmup and optional LLVM work; do not call this trial free. Phase reversal
+enters/exits once and takes 1326ms, with 2,499,551 native aggregate probes.
+The previous LLVM scan, admitted under the same normal contract, takes 1004ms
+(962–1028): faster than the fused region at this spacing. Its scan counter reports
+only scan work; it must not be compared with fused execution as total RHS work.
+
+The completed attribution control keeps admission unchanged and compares serialized
+Java keys, typed Java equality, and a generated scalar backward search. It preserves
+the first-candidate Java check and existing memo/frame/budget boundaries.
+Scratch sources, source/class hashes, commands, counters and existing-test logs:
+`target/asof-admission/` and `target/asof-evidence/{admission,lookup}-*`.
+
+| Warm query, 500M RHS / 1M probes | Current Java lookup | Typed Java control | LLVM scalar lookup |
+| --- | ---: | ---: | ---: |
+| INT, distant matches | 3087ms | 3171ms | **1003ms** |
+| LONG, distant matches | 3178ms | 2711ms | **939ms** |
+| SYMBOL, distant matches | 3127ms | 3556ms | **1019ms** |
+| INT, immediate matches | 461ms | 459ms | 463ms |
+| INT, selective forward execution | 299ms | 303ms | 294ms |
+
+INT distant, immediate and selective columns for original/native are medians of
+three fresh-process medians; LONG/SYMBOL and the other typed holdouts have one
+process each. Five full executions follow 32 warmups per process, pinned to CPU 4
+on the 9950X. INT distant process medians span 2645–3294ms original, 2716–3179ms
+typed, 962–1042ms native. Typed equality alone is not a reliable improvement in
+these controls; the generated loop is 3.08x faster at the process median. This is
+the current LLVM-enabled integration's Java lookup path, not a new stock-server
+benchmark. All six aggregates match the independent ordinary Light oracle.
+
+Both lookup implementations examine exactly 511,998,464 candidates and make zero
+forward admissions. The native path examines 510,997,882 candidates in 998,625
+borrowed-frame calls. It generates the ordinary descending predicate/key search;
+Java still owns timestamp navigation, memo boundaries, transitions and consumers.
+No candidate record repositioning or key serialization occurs inside the native
+loop. Unlimited tolerance also removes the unnecessary candidate timestamp load.
+Local matches make zero native calls and incur zero lookup compilation.
+
+Instructions/probe fall from a median 88.0K to 10.9K, cycles from 17.2K to 5.72K.
+Separate fully scheduled PMU passes give 39,041 -> 2,952 dispatched loads/probe,
+but 4,746 -> 4,609 load-not-complete cycles/probe: nearly the same expensive waiting
+remains after removing bookkeeping. Native execution has 76% load-wait cycles;
+its pipeline pass reports 18% retiring and 75% backend-stalled dispatch slots.
+The original pass reports 55% retiring. These are separate counter passes, not
+an additive decomposition. At the measured frequency, remaining load waits alone
+represent roughly 0.8s/query, a diagnostic estimate rather than an immutable floor.
+
+Native symbols and object disassembly attribute 43.5% of user-cycle samples to the
+153-byte generated kernel. IBS places essentially all its reported load weight
+at the predicate and key loads (offsets 0x4d and 0x53); RAM-sourced samples are
+prominent. Sample proportions are not cache-miss rates. The monitored whole-host
+controller peak is 53.3% of the freshly achieved streaming-control event rate
+(55.95 useful GB/s); no bytes/event conversion is assumed. Timed requests have
+zero physical reads and major faults. This supports remaining data-load latency
+in the generated fragment; more than half the user-cycle samples remain outside
+it. It does not establish an exclusive limiter for every ASOF strategy or machine.
+
+A review caught plain multiplication where QuestDB saturates timestamp scaling.
+The new boundary check failed before the fix and now passes 270 cases across all
+three key types. The corrected prototype also passes 22 LLVM-enabled existing
+tests, including seeded ASOF fuzz (281 counted compilations, 2068 counted calls;
+the scratch lookup backend is outside those runner counters). The benchmark's
+unlimited-tolerance machine code is byte-identical before/after the correction,
+and its six results were rechecked on the full fixture. An earlier harness that
+added hook checks to every Java candidate was rejected; final Java controls use
+the original loop. Its superseded measurement artifacts were removed.
+
+Decision: the generated scalar lookup already reaches the best forward control
+(1004ms) on the motivating case without constructing maps. Do not tune admission
+against the old Java cost. Integrate the bounded lookup contract before a new
+cost chooser, with first-use compilation as an explicit remaining issue: this
+prototype compiles on the first eligible miss, costing about 10–13ms, which can
+hurt tiny nonlocal queries. No production algorithm/configuration/toggle changed
+in these experiments. The portable next question is how much remaining navigation,
+call-boundary and load-wait cost a larger generated region can remove while
+retaining the existing strategy family.
+
+### 2026-11-04 — Bounded ASOF lookup integrated; Java and LLVM share frame boundaries
+
+`CompiledAsOfLookup` / `ResolvedAsOfLookup` now connect the descending search to
+ordinary filtered ASOF through `QueryCodeGenerator`. Admission requires one
+same-type INT/LONG/SYMBOL key with matching sink encoding and a supported stable
+predicate. SYMBOL probes reuse the existing translation. Java owns the first
+candidate, frame navigation, memo/work boundaries, strategy selection and output.
+Native calls borrow one frame; unsupported frames decline into the Java span.
+Code and descriptors follow the existing factory/cursor lifecycle. No new toggle.
+The ordinary runner now reports `lookup_rows`; EXPLAIN reports binding separately.
+
+An initial integration regressed the Java-only lookup control: three process
+medians were 3543–3622ms, versus 3044–3050ms using saved pre-change classes. It
+increased instructions/probe from about 87K to 99K. Outlining bounds or making the
+capability hook constant did not remove the regression; neither workaround was
+kept. Instead, the owner now gives both Java and LLVM the same bounded frame
+span. The Java helper retains the original predicate/key/timestamp checks and
+per-row cancellation, with history and strategy checks outside its candidate
+loop. This keeps one algorithm and removes the per-candidate optional-codegen
+branch. The first-candidate shortcut remains unchanged.
+
+Final complete-query controls: 500M RHS rows, 1M probes, six aggregate results
+checked against ordinary Light, CPU 4 on the 9950X; 32 warmups and five measured
+executions per fresh process. Only the lookup compiler hook is disabled for the
+Java control; the other compiler bindings and adaptive policy are identical.
+
+| Workload | Java frame search | LLVM frame search |
+| --- | ---: | ---: |
+| INT, distant matches | 2610ms | **1035ms** |
+| LONG, distant matches | 2575ms | **1050ms** |
+| SYMBOL, distant matches | 2651ms | **1023ms** |
+| INT, immediate matches | 461ms | 468ms |
+| INT, selective forward execution | 290ms | 287ms |
+
+INT distant and immediate results are medians of three independent process
+medians; LONG/SYMBOL/selective holdouts have one process each. Distant INT Java
+process medians span 2585–3262ms and LLVM 962–1046ms. Java process variation remains
+material; do not present its median improvement as a uniform regression-free
+result. Local process medians span 455–552ms Java and 455–538ms LLVM, with zero
+native lookup rows: their timing differences are not a native-search gain.
+
+Distant INT instructions/probe fall from 74.3K to 11.0K and cycles from 14.6K to
+5.93K. LLVM still checks exactly 510,997,882 candidates inside borrowed frames.
+The generated loop removes candidate record positioning, sink serialization and
+unneeded timestamp loads for unlimited tolerance. All measured large queries have
+zero physical reads and major faults. Available RAM stays above 74.57GiB, with no
+direct reclaim or new host OOM; the SMT sibling averages 0.09% busy, peaking at
+9.1% over 200ms. Host swap-ins are not attributed to the query. This validates the
+integration on this host, not a portable crossover or a workload-wide breakthrough.
+
+The startup control deliberately creates fresh factories on a warm JVM/backend.
+Across three processes, one nonlocal probe takes 0.74ms Java versus 5.47ms LLVM
+for cursor execution, including 4.41ms of deferred backend compilation. Including
+planning, medians are 33.42ms versus 40.75ms. At 1024 probes execution is 7.08ms
+versus 7.87ms, including 3.10ms compilation. Keep startup separate from warm reuse;
+compiling on the first eligible miss remains an explicit limitation. Immediate
+matches neither execute nor compile the lookup kernel.
+
+Validation: the normal reactor build and focused module tests pass, including 270
+timestamp saturation checks. The final normal-classpath LLVM runner passes 27
+SQL/adaptive/fuzz/OOM tests (3627 counted compilations, 13502 calls), including
+both seeded duplicate/no-duplicate ASOF fuzz variants. Native code handles,
+readers and tracked memory are checked by the existing tests. Raw controls and
+source/class identities remain under ignored `target/asof-evidence/lookup-final-integrated-*`;
+small experiment harnesses are under `target/asof-integration/`.
+
+Next: address first-use compilation admission before expanding this region.
+Measure existing backend/tier compile costs and work savings; do not infer a
+portable threshold from this fixture. Larger navigation/consumer fusion remains
+the next execution experiment after that startup boundary is understood.

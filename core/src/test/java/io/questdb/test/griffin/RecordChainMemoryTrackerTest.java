@@ -98,7 +98,7 @@ public class RecordChainMemoryTrackerTest extends AbstractCairoTest {
 
     @Test
     public void testAsOfJoinFailsOnLargeKey() throws Exception {
-        // AsOfJoinFastRecordCursorFactory owns master/slave SingleRecordSink
+        // AsOfJoinDenseRecordCursorFactory owns master/slave SingleRecordSink
         // pairs. The sinks grow to fit the LARGEST key seen during the join
         // (clear() resets the append pointer but does not shrink the heap).
         // A single varchar key wider than half the per-query limit forces the

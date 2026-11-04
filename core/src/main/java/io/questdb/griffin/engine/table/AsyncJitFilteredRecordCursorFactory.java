@@ -29,6 +29,7 @@ import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameMemory;
@@ -313,10 +314,43 @@ public class AsyncJitFilteredRecordCursorFactory extends AbstractRecordCursorFac
 
     @Override
     public void halfClose() {
-        Misc.free(frameSequence);
-        Misc.free(compiledCountOnlyFilter);
-        cursor.freeRecords();
-        negativeLimitCursor.freeRecords();
+        final PageFrameSequence<AsyncJitFilterAtom> frameSequence = this.frameSequence;
+        this.frameSequence = null;
+        final CompiledCountOnlyFilter compiledCountOnlyFilter = this.compiledCountOnlyFilter;
+        this.compiledCountOnlyFilter = null;
+        Throwable failure = Misc.freeBestEffort(null, frameSequence);
+        failure = Misc.freeBestEffort(failure, compiledCountOnlyFilter);
+        failure = freeRecordsBestEffort(failure, cursor);
+        failure = freeRecordsBestEffort(failure, negativeLimitCursor);
+        CairoException.rethrowCleanupFailure(failure);
+    }
+
+    /** Transfers a scalar-compatible predicate, or leaves ownership unchanged and returns null. */
+    public @Nullable CompiledFilterBatch takeCompiledFilter(CairoConfiguration configuration) {
+        IntHashSet usedColumns = getAtom().getFilterUsedColumnIndexes();
+        IntList columns = new IntList(usedColumns.size());
+        for (int i = 0; i < usedColumns.size(); i++) {
+            int column = usedColumns.get(i);
+            // ASOF mixes scalar lookup with batch evaluation. Legacy JIT rounds the FLOAT
+            // comparison epsilon to FLOAT, while scalar functions widen operands to DOUBLE.
+            // Keep the existing path until those boundary semantics agree.
+            if (ColumnType.tagOf(base.getMetadata().getColumnType(column)) == ColumnType.FLOAT) {
+                return null;
+            }
+            columns.add(column);
+        }
+        CompiledFilterBatch result = new CompiledFilterBatch(configuration, filter, compiledFilter, bindVarFunctions, columns);
+        filter = null;
+        compiledFilter = null;
+        bindVarFunctions = null;
+        try {
+            halfClose();
+            bindVarMemory = Misc.free(bindVarMemory);
+            return result;
+        } catch (Throwable th) {
+            Misc.free(result, th);
+            throw th;
+        }
     }
 
     @Override
