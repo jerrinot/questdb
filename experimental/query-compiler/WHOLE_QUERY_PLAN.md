@@ -1,6 +1,6 @@
 # Whole-query compiler experiments
 
-2026-11-03. Active targets and experiments; the measured checkpoint is below.
+2026-11-05. Active targets and experiments; the measured checkpoint is below.
 This sequence supersedes the remaining local-loop sequence in TODO.md and the dated
 execution order in FOUNDATIONS_PLAN.md. Retain their evidence and semantic contracts.
 Run one mechanism at a time. Keep targets separate from achieved results.
@@ -40,6 +40,56 @@ settings pinned. Report geometric-mean ratio, absolute gaps and per-family losse
 beating a historical stock plan is not sufficient evidence of competitive execution.
 
 ## Current facts that constrain the design
+
+Preparation-choice experiment, 2026-11-05: a bounded build-key selectivity trial
+was rejected. On independent 500M-row INT/LONG/SYMBOL controls, avoiding redundant
+membership preparation saved 10-14ms of setup without a repeatable substantial
+whole-query gain. A correlated control regressed **52.0 -> 93.5ms**: 99.8% of build
+keys survived, but none of the actual probe keys did. Generated objects were identical;
+instructions/input rose **17.6 -> 53.6**, with nearly unchanged controller traffic.
+This is a failed preparation policy, not a new optimizer or a refreshed benchmark score.
+See the November 5 entry in [PROGRESS.md](PROGRESS.md) and the current experiment's
+[measurements](target/preparation-choice/analysis.json).
+
+Conditional probe sampling was subsequently prototyped at the pinned-frame boundary.
+It correctly distinguishes the correlated cases across typed keys and mixed aggregates.
+Stopping on the first rejection reduces selective-case sampling to 32-42us; a complete
+4096-row sample costs 1-1.6ms for numeric keys and about 5ms for SYMBOL. This policy also
+remains experimental: a 4096-key build spends ~1ms sampling to save ~0.4ms preparation.
+Its initial automatic-execution comparison (271.6 -> 312.4ms) was confounded by
+allocator-dependent false sharing between scalar aggregate states; it does not establish
+a sampler or chooser policy regression of that size. No production sampling API,
+setting or optimizer was added.
+
+The subsequent chooser audit found and fixed cache-line isolation in `SimpleMapValue`,
+shared by ordinary and generated execution. In a fixed-kernel 500M-row control, deliberately
+sharing neighboring states takes 628ms versus 267ms when isolated on eight cores; both
+take ~2s on one core with the same worker count. Instructions/input are unchanged while
+L2 ownership requests fall 0.348 -> 0.00065/input. This is a coherence counterfactual,
+not a 2.35x default-engine speedup. With ordinary allocation, two reversed passes show
+SYMBOL all-match 768 -> 704ms; other controls improve less or remain unchanged. The fix
+uses the existing cache-line constant, preserves value offsets, and adds no policy flag.
+50 focused tests and 726 complete outputs pass. Only one CPU architecture was measured.
+
+Wall/thread CPU traces confirm preemption affects observations, but a join-only CPU-clock
+trial did not improve execution repeatably. Other `runBatch` callers include parallel
+dispatch/wait, so a global thread-CPU replacement would measure the wrong work. Keep the
+chooser unchanged. With isolated state, a new small-build sampler comparison is
+269.0 -> 274.3ms, including its ~1ms sampling cost; unconditional sampling is still unpriced.
+
+The next experiment must evaluate preparation and execution together: retain/skip
+membership transfer crossed with exact/membership kernels, with cached links held
+constant, using the isolated scalar state as the new baseline. `AdaptiveKernel` still
+measures frame wall time with `System.nanoTime()`, keeps per-thread choices across
+executions, and uses a 10% switching margin. The clock audit does not justify changing
+these rules. Measure the cost of acquiring evidence against the optional work it avoids.
+Require the combined decision to beat the current chooser and fixed alternatives after
+sampling/preparation/compilation costs, including small builds, rare rejection, clustered
+inputs, duplicate fan-out, typed keys and worker-count changes. Samples guide optional
+work; they never establish SQL truth. Do not add a statistics framework on these results.
+See the conditional-sampling and state-isolation entries in [PROGRESS.md](PROGRESS.md),
+[sampling measurements](target/preparation-choice/probe-analysis.json), and
+[chooser audit](target/preparation-choice/choice-analysis.json).
 
 Latest SSB control, 2026-11-03: installed LLVM sums **2.690s** against freshly rerun
 uncompressed DuckDB **2.252s** across all 13 queries, 600M rows/eight physical cores,

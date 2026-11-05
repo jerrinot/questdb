@@ -33,6 +33,7 @@ import io.questdb.std.Long256;
 import io.questdb.std.Long256Impl;
 import io.questdb.std.Long256Util;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
 import io.questdb.std.Mutable;
 import io.questdb.std.Numbers;
 import io.questdb.std.QuietCloseable;
@@ -45,16 +46,22 @@ import io.questdb.std.Unsafe;
  * To speed up column index-based access, each slot takes 32 bytes.
  */
 public class SimpleMapValue implements MapValue, Mutable, QuietCloseable {
+    private final long allocationSize;
     private final int columnCount;
     private final Decimal128 decimal128 = new Decimal128();
     private final Decimal256 decimal256 = new Decimal256();
     private final Long256Impl long256 = new Long256Impl();
+    private long allocationAddress;
     private boolean isNew;
     private long ptr;
 
     public SimpleMapValue(int columnCount) {
         this.columnCount = columnCount;
-        this.ptr = Unsafe.malloc(32L * columnCount, MemoryTag.NATIVE_FAST_MAP);
+        // Worker-local values must not share their first or last cache line.
+        final long cacheLineSize = Misc.CACHE_LINE_SIZE;
+        allocationSize = ((32L * columnCount + cacheLineSize - 1) & -cacheLineSize) + cacheLineSize - 1;
+        allocationAddress = Unsafe.malloc(allocationSize, MemoryTag.NATIVE_FAST_MAP);
+        ptr = (allocationAddress + cacheLineSize - 1) & -cacheLineSize;
     }
 
     @Override
@@ -111,7 +118,8 @@ public class SimpleMapValue implements MapValue, Mutable, QuietCloseable {
 
     @Override
     public void close() {
-        this.ptr = Unsafe.free(ptr, 32L * columnCount, MemoryTag.NATIVE_FAST_MAP);
+        allocationAddress = Unsafe.free(allocationAddress, allocationSize, MemoryTag.NATIVE_FAST_MAP);
+        ptr = 0;
     }
 
     public void copy(SimpleMapValue srcValue) {

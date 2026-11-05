@@ -8665,3 +8665,226 @@ asof-lookup-region/. Next experiment: test overlap of independent predecessor
 searches within the borrowed span, preserving master order and the existing
 strategy boundaries. Remaining load waiting is a hypothesis to attack, not a
 reason to add another chooser or specialize to this fixture.
+
+## 2026-11-05 — Preparation costing needs the probe distribution
+
+Executed the first preparation-choice experiment at `70abe12427`. **Candidate
+rejected; production execution and defaults unchanged.** Reused the existing 500M-row
+fixture and workers. INT, full-width LONG and independent SYMBOL dictionaries execute
+mixed COUNT/SUM/MIN/MAX/AVG lists. Forced alternatives isolate membership transfer,
+cached child links and exact/membership kernels. Removing transfer makes the selective
+controls 2.3-2.7x slower; removing cached links also loses substantial existing gains.
+These are ablations of current LLVM, not new stock/DuckDB wins.
+
+The scratch candidate checks the first 4,096 producer keys and abandons optional
+membership reduction if at least 95% survive. Incomplete filters are discarded; exact
+joins and cached links still execute. This tests one build-side selectivity heuristic,
+not a reproduction of RPT+ or its guarantees. Two balanced process pairs, five warmups
+and six measured full executions per process, eight physical cores:
+
+| Control | Current ms | Trial ms |
+| --- | ---: | ---: |
+| INT, all match | 650.2 | 647.6 |
+| LONG, all match | 819.6 | 828.5 |
+| SYMBOL, all match | 703.4 | 724.9 |
+| INT, selective | 166.8 | 166.5 |
+| LONG, selective | 293.4 | 300.3 |
+| SYMBOL, selective | 196.9 | 193.6 |
+| Correlated rejection | 52.0 | 93.5 |
+| Correlated matching | 289.6 | 289.6 |
+
+All-match setup drops by 10-14ms, but process variance and execution effects preclude a
+substantial general gain. The rejection control is decisive: 261,696/262,144 producer
+keys survive (99.8%), while the probe uses only seven keys and every one is rejected.
+It saves 9.4ms preparation but adds 50.8ms elsewhere. The reverse correlation preserves
+all probe matches despite almost all build keys being rejected. A build reduction rate
+cannot stand in for conditional probe selectivity. The failing control remains slower
+at one core (250.3 -> 663.3ms) and sixteen cores (49.7 -> 56.6ms), one process pair each.
+
+Eight-core evidence per input row: instructions **17.60 -> 53.57**, dispatched loads
+**5.04 -> 15.69**, cycles **3.27 -> 7.29**. Branch misses and absolute load-wait cycles
+fall, so neither metric alone explains the slowdown. Separate UMC runs read
+**2.092 -> 2.116GB/query** (system-wide, perf's 64-byte transaction formula). Native
+objects are byte-identical; symbols attribute 84.0%/95.4% of sampled cycle weight to
+join kernels. This supports extra cache-resident lookup execution, not an increase in
+DRAM traffic or a claim of bandwidth saturation. Napkin check: roughly two billion
+extra cycles/query at eight cores near 5.36GHz cost about 47ms; subtracting 9.4ms saved
+serial preparation predicts about 38ms added latency, versus 41ms observed. Parallel
+occupancy and phase-specific frequency make this approximate.
+
+968 complete outputs match an independent arithmetic oracle, including SQL NULLs on
+empty aggregation; 38 existing multiway kernel/SQL correctness tests pass with the
+scratch candidate. Timed final executions each process 500M rows natively with zero
+physical reads/major faults. Ryzen 9950X/JDK25; affinity 0-7, existing eight workers plus
+owner, 64GiB cgroup limit/no swap. Sampled peak RSS 7.81GiB, available RAM >=74.83GiB;
+no observed swap or cgroup memory-limit/OOM events. Parent CPU quotas are unlimited;
+child throttling counters are unavailable. Host IO PSI remains anomalously high, but
+query-scope IO PSI is zero at 100ms resolution and timed reads/faults are zero. No
+cross-microarchitecture or complete memory-accounting claim. Compilation remains
+separate (about 0.2s for these mixed-aggregate queries); first-request measurements
+include it and do not establish a general startup win.
+
+Next: test bounded conditional sampling of actual probe rows at the existing frame/
+preparation boundary, with sample and transition cost included. Reusing preparation
+work is another hypothesis: membership and link construction repeat child lookups,
+but their iteration/duplicate contracts must be preserved. Do not promote the rejected
+build-selectivity rule or replace it with query/core-count thresholds. Current scratch
+sources, SQL, counters, native symbols and summary are in `target/preparation-choice/`;
+no dataset copy, new production setting, statistics framework or commit was made.
+
+### 2026-11-05: actual probe sampling works; preparation policy remains experimental
+
+Prototyped conditional sampling before worker publication, after `prepareForDispatch`
+pins the existing snapshot frames. It uses the owner's `PageFrameMemoryPool`, typed
+`Slot.find`, dictionary translators and the existing dependent-join duplicate traversal.
+No aggregation state is changed. Positions are stratified with jitter across the input;
+4096 rows and 65536 traversal steps bound the trial. Residual filters, Parquet and
+inconclusive/budget-exhausted samples retain current preparation. Transitive descendants
+are checked, not just immediate children. Exact joins remain authoritative throughout.
+
+The initial full sample cost 1-1.6ms for INT/LONG and ~5ms for SYMBOL. A refinement stops
+at the first rejection: the policy already retains current preparation in that case.
+This brings selective-case sampling to 32-42us, without adding a product toggle.
+Both variants are scratch classpath overlays; production execution is unchanged.
+
+500M probe rows per execution, eight physical cores, five warmups and six measurements
+per process, with reversed process order. These are current-LLVM/candidate comparisons,
+not a new Stock/DuckDB/SSB score. Values below average the two process medians; they are
+not confidence intervals, and several gains reverse between individual processes.
+
+| Control | Current ms | Early-exit sampler ms |
+| --- | ---: | ---: |
+| INT all-match | 676.0 | 652.9 |
+| LONG all-match | 887.7 | 878.2 |
+| SYMBOL all-match | 742.4 | 723.0 |
+| INT selective | 171.3 | 172.2 |
+| LONG selective | 291.1 | 299.6 |
+| SYMBOL selective | 199.0 | 196.8 |
+| Correlated reject | 53.0 | 53.0 |
+| Correlated match | 306.8 | 282.5 |
+| Small build, 4096 keys | 271.6 | 312.4 |
+
+No general breakthrough or default-policy promotion. The correlated rejection failure
+of the build-only trial is avoided, but small builds invalidate unconditional sampling:
+~1ms sampling buys only ~0.4ms less preparation. Fixed exact execution is 265.8 -> 267.5ms;
+automatic execution regresses much more. Separate traces show exact-kernel share moving
+from 96.3% to 53.5%. This establishes changed selection, not a complete explanation of
+the regression. One-core correlated rejection averages 261.8 -> 261.0ms with reversed
+order; at 16 cores it is 48.18 -> 48.19ms, while INT all-match regresses 397.6 -> 409.3ms.
+
+A forced-membership counterfactual explains why preparation and execution cannot be
+costed independently. In correlated match, transfer constructs a 3584-byte split-block
+Bloom filter (448 surviving build keys, bounds 0..258054); all actual probe keys pass.
+Retaining this filter takes 511.8ms versus 292.2ms without transfer in paired forced runs.
+Instructions/input fall 216.2 -> 146.6, cycles/input 42.42 -> 23.65, dispatched loads/input
+42.78 -> 36.82, and retired ops/input 195.91 -> 128.87. Separate UMC measurements show
+~6.31 -> 6.23GB read/query, not a comparable reduction in DRAM traffic. Generated objects
+are byte-identical; native symbols attribute 98.8%/98.0% of weighted cycles to the same
+membership kernel. The representation selects additional Bloom hash/mask/load work.
+Napkin check: 18.77 extra cycles/input * 500M / (8 * 5.35GHz) is ~219ms, close to the
+~220ms measured delta. This does not identify a particular execution port or exclusive
+stall class. The ordinary chooser already avoids most of this penalty; **1.75x is a
+forced-kernel counterfactual, not a speedup over current default execution**.
+
+Generality checks: 1617 complete outputs match independent arithmetic, including mixed
+COUNT/SUM/MIN/MAX/AVG and empty SQL aggregates. Both variants pass the 38 existing
+multiway tests plus a clustered INT -> LONG -> SYMBOL chain with rejection only at the
+last join and changed bind values on the same cached query. Duplicate-heavy tests hit
+the work cap and fall back. Rare rejection removes 122070 real rows, yet two deterministic
+4096-row samples see zero misses; seed (1,2), selected to exercise the opposite decision,
+sees a rejection on draw 76 and retains preparation. All three preserve the full result.
+Sampling is evidence with uncertainty, never a proof of universal membership.
+
+Ryzen 9950X/JDK25, unchanged worker/owner configuration and affinity, 64GiB/no-swap scope.
+All measured queries process 500M rows natively with zero physical reads/major faults.
+100ms resource samples show peak RSS 7.81GiB, available memory >=74.37GiB, no swap or
+memory-limit/OOM events, and zero query-scope IO PSI. Host IO PSI remains anomalous;
+parent CPU quotas are unlimited and child throttling counters unavailable. No cold-I/O
+or cross-microarchitecture claim. Compilation and first-request costs are recorded;
+the table reports warmed complete execution including sampling, preparation and merge.
+
+Next: audit the chooser's cost observations, then compare coupled preparation/kernel
+choices. Wall-time sampling, per-thread history and scheduling are hypotheses to test,
+not reasons to patch thresholds. Bound the cost of gathering evidence relative to the
+optional work, and require an advantage over fixed alternatives before adding an API.
+Reproduction and raw counters remain in `target/preparation-choice/`; the current summary
+is `probe-analysis.json`, with native attribution in `probe-native-profile.json` and USE
+samples summarized in `probe-resources.json`. No dataset copy or production edit.
+
+### 2026-11-05: chooser audit exposes false sharing in scalar aggregation
+
+**Implemented cache-line isolation in `SimpleMapValue`; chooser and sampling policies
+remain unchanged.** The earlier 271.6 -> 312.4ms automatic sampler comparison was
+confounded by allocator placement. It is not evidence for a 15% policy regression.
+
+Frame wall/thread CPU traces confirm scheduling distortion, but join-only CPU-clock
+selection did not improve execution repeatably in reversed runs. Native objects are
+byte-identical across the clock/sampling variants, and native kernels dominate profiles.
+Other `AdaptiveKernel.runBatch` callers dispatch and await parallel work: replacing their
+wall clock with caller-thread CPU time would measure the wrong work. No clock patch.
+
+The productive clue was the scalar-state addresses: separate workers could update words
+on the same cache line. Naturally overlapping state took 300.9ms versus 268.2ms after
+isolation. L2 store/ownership requests/input fell 0.02050 -> 0.00068, local-CCX demand
+fills 0.02826 -> 0.00287, and load-not-complete cycles 4.340 -> 2.754.
+
+A controlled intervention uses the same SQL, exact native kernel, allocated bytes and
+eight workers plus owner, placing their states in either shared or isolated cache lines.
+Pointers are restored before factory close. Every execution processes 500M input rows.
+
+| Controlled state placement | Shared ms | Isolated ms |
+| --- | ---: | ---: |
+| Eight physical cores | 628.0 | 267.5 |
+| One physical core, same worker count | 2000.0 | 1998.5 |
+
+Instructions/input stay 143.68 -> 143.78, while cycles/input fall 53.55 -> 21.90.
+A separate PMU cohort reproduces 627.7 -> 266.6ms: L2 store/ownership requests/input
+fall 0.34782 -> 0.00065, local-CCX fills 0.45355 -> 0.00286, and load-not-complete
+cycles 21.644 -> 2.662. Counters ran without multiplexing. Removing the penalty on one
+core falsifies an instruction-count explanation and supports cache-coherence contention.
+Napkin check: 31.65 extra cycles/input * 500M / (8 * ~5.35GHz) is ~370ms, close to the
+~361ms measured delta. **The 2.35x ratio is an intentionally adverse placement control,
+not a default-engine speedup.** No exclusive execution-port or DRAM-bandwidth claim.
+
+Final production-source A/B, ordinary allocator, unchanged automatic chooser: five
+warmups and six measurements per process; table averages two reversed process medians.
+Compilation is recorded separately; times include preparation, probing, merge and output.
+
+| 500M-row control, eight cores | Original ms | Isolated ms |
+| --- | ---: | ---: |
+| Small build, INT -> LONG | 268.1 | 268.6 |
+| INT all-match | 659.9 | 635.1 |
+| LONG all-match | 851.3 | 820.7 |
+| SYMBOL all-match | 768.1 | 703.9 |
+| LONG selective | 298.0 | 292.5 |
+
+Gains depend on placement and work: already isolated runs remain at their previous
+floor. INT/LONG gains are concentrated in one process pair; SYMBOL improves in both.
+One 16-core small-build pair is 185.3 -> 166.9ms, supporting the mechanism rather than
+establishing a cross-machine result. With isolated state, a fresh small-build sampler
+pair is 269.0 -> 274.3ms. Sampling still spends ~1ms to avoid ~0.4ms preparation and
+remains experimental; the earlier large apparent regression is not a sound policy input.
+
+The fix reserves complete cache lines at both ends of each value using QuestDB's existing
+`Misc.CACHE_LINE_SIZE`, retaining the original pointer/size for freeing and accounting.
+All 32-byte value slots and generated offsets are unchanged. Extra native allocation is
+63 bytes for even column counts, 95 for odd, per scalar value rather than per row.
+Ordinary async aggregation, generated joins and other users of this class receive the
+same layout. This does not claim new type coverage or stock-path benchmark gains.
+
+The isolation test fails before the fix and passes after it. Wide-value copy/clear,
+zero/odd/even column counts and leak checks pass; 50 focused tests pass in total,
+including the existing adaptive-kernel and typed multiway SQL suites. All 726 outputs
+from 66 processes match independent arithmetic, covering COUNT/SUM/MIN/MAX/AVG and
+INT/LONG/SYMBOL keys. Every measured query processes 500M native rows with zero physical
+reads/major faults. Ryzen 9950X/JDK25, unchanged affinity/configuration, 64GiB/no-swap
+scopes; peak RSS 7.80GiB, available memory >=74.55GiB, zero swap/limit events/query IO PSI.
+Parent CPU quotas are unlimited; child throttling counters remain unavailable. Host IO
+PSI is unexplained; MCA/ECC health and other CPU architectures were not measured.
+
+Next: retain/skip membership preparation crossed with exact/membership execution on
+the isolated baseline, pricing the evidence-gathering cost. Do not patch chooser
+thresholds to compensate for physical-layout noise. The hardware evidence gate passed
+before the source edit. Raw evidence, scripts, profiles and summaries remain under
+`target/preparation-choice/choice-*`; repeated result files are removed after validation,
+retaining one output per process and a validation manifest. No dataset copy or new flag.
