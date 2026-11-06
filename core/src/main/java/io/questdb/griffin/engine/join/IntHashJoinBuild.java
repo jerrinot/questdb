@@ -110,6 +110,7 @@ public final class IntHashJoinBuild implements Closeable {
     private static final int ROWS_PER_CHECK = 64 * 1024;
     private final HashJoinBuffer directory = new HashJoinBuffer(MAX_BUFFER_SIZE);
     private final HashJoinRowHeap heap;
+    private final HashJoinIntegralIndex integralIndex = new HashJoinIntegralIndex();
     private final int initialSlots;
     // The serial build's table, and a parallel build's first partition.
     private final IntHashJoinKeyTable keys = new IntHashJoinKeyTable();
@@ -351,6 +352,7 @@ public final class IntHashJoinBuild implements Closeable {
             frozen = null;
         }
         isOpen = false;
+        integralIndex.close();
         partitions.close();
         directory.close();
         for (int i = 0, n = tables.size(); i < n; i++) {
@@ -514,7 +516,7 @@ public final class IntHashJoinBuild implements Closeable {
     }
 
     public long getSizeInBytes() {
-        long size = heap.getSizeInBytes() + partitions.getSizeInBytes() + directory.capacity;
+        long size = heap.getSizeInBytes() + partitions.getSizeInBytes() + directory.capacity + integralIndex.getSizeInBytes();
         for (int i = 0, n = tables.size(); i < n; i++) {
             size += tables.getQuick(i).getSizeInBytes();
         }
@@ -597,6 +599,39 @@ public final class IntHashJoinBuild implements Closeable {
             close();
             throw th;
         }
+    }
+
+    /**
+     * Replaces bounded key tables before probe publication. All existing probes
+     * must reopen afterwards; row handles, duplicate order and payloads stay valid.
+     * Temporary allocation respects the limit; retained bytes never exceed the
+     * released lookup. Unknown probe work and unsuitable ranges retain hashing.
+     */
+    public boolean prepareIntegralLookup(long probeRows, int nullKey, SqlExecutionCircuitBreaker breaker) {
+        if (frozen == null) {
+            throw new IllegalStateException("hash join build is not frozen");
+        }
+        if (integralIndex.isReady() || heap.hasChainLengths()) {
+            return false;
+        }
+        long replacedBytes = directory.capacity;
+        for (int i = 0, n = tables.size(); i < n; i++) {
+            replacedBytes += tables.getQuick(i).getSizeInBytes();
+        }
+        try (var probe = frozen.newProbe()) {
+            if (!integralIndex.prepare(frozen, probeRows, nullKey, replacedBytes, memoryTracker, breaker, key -> {
+                probe.findUnchecked((int) key);
+                return probe.getNextRowLink();
+            })) {
+                return false;
+            }
+        }
+        for (int i = 0, n = tables.size(); i < n; i++) {
+            tables.getQuick(i).close();
+        }
+        directory.close();
+        frozen.size = getSizeInBytes();
+        return true;
     }
 
     /**
@@ -739,6 +774,14 @@ public final class IntHashJoinBuild implements Closeable {
         long size;
 
         @Override
+        public boolean writeIntegralLookup(long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            return !heap.hasChainLengths() && integralIndex.write(address, rowsAddress);
+        }
+
+        @Override
         public void countKeyRows() {
             if (frozen != this) {
                 throw new IllegalStateException("hash join build has expired");
@@ -799,9 +842,32 @@ public final class IntHashJoinBuild implements Closeable {
         }
 
         @Override
+        public int getRowStride() {
+            return heap.getRowStride();
+        }
+
+        @Override
+        public long getRowAddress(long ordinal) {
+            assert ordinal >= 0 && ordinal < rowsCount && generation == heap.getGeneration();
+            return rowsAddress + ordinal * heap.getRowStride();
+        }
+
+        @Override
+        public void relocateRows(long address, int stride) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            long released = heap.getSizeInBytes();
+            heap.relocateRows(address, stride);
+            rowsAddress = heap.getAddress();
+            generation = heap.getGeneration();
+            size -= released;
+        }
+
+        @Override
         public long getRowId(long ordinal) {
             assert heap.hasRowId() && ordinal >= 0 && ordinal < rowsCount && generation == heap.getGeneration();
-            return HashJoinRowHeap.getRowIdAt(rowsAddress, ordinal);
+            return HashJoinRowHeap.getRowId(rowsAddress + ordinal * heap.getRowStride());
         }
 
         @Override
@@ -840,7 +906,11 @@ public final class IntHashJoinBuild implements Closeable {
             if (frozen != this || generation != heap.getGeneration()) {
                 throw new IllegalStateException("hash join build has expired");
             }
-            keys.forEachKey(visitor, circuitBreaker);
+            if (integralIndex.isReady()) {
+                integralIndex.forEachKey(key -> visitor.accept((int) key), circuitBreaker);
+            } else {
+                keys.forEachKey(visitor, circuitBreaker);
+            }
             return true;
         }
 
@@ -849,7 +919,7 @@ public final class IntHashJoinBuild implements Closeable {
             if (frozen != this || generation != heap.getGeneration()) {
                 throw new IllegalStateException("hash join build has expired");
             }
-            if (heap.hasChainLengths()) {
+            if (heap.hasChainLengths() || integralIndex.isReady()) {
                 return false;
             }
             Unsafe.putLong(address, keysAddress);
@@ -890,9 +960,7 @@ public final class IntHashJoinBuild implements Closeable {
 
             @Override
             public void find(int key) {
-                assert isCurrent();
-                long slot = IntHashJoinKeyTable.findSlot(keysAddress, slots, key);
-                next = toRowLink(Unsafe.getInt(slot + 4));
+                next = toRowLink(findHead(key));
             }
 
             @Override
@@ -949,6 +1017,9 @@ public final class IntHashJoinBuild implements Closeable {
 
             private int findHead(int key) {
                 assert isCurrent();
+                if (integralIndex.isReady()) {
+                    return integralIndex.find(key);
+                }
                 final int mask = lookupMask;
                 final long base = lookupKeysAddress;
                 long address = base + ((long) ((int) Hash.hashInt64(key) & mask)) * SLOT_SIZE;
@@ -975,8 +1046,12 @@ public final class IntHashJoinBuild implements Closeable {
             if (frozen != this || generation != heap.getGeneration()) {
                 throw new IllegalStateException("hash join build has expired");
             }
-            for (int i = 0, n = partitions.getPartitionCount(); i < n; i++) {
-                tables.getQuick(i).forEachKey(visitor, circuitBreaker);
+            if (integralIndex.isReady()) {
+                integralIndex.forEachKey(key -> visitor.accept((int) key), circuitBreaker);
+            } else {
+                for (int i = 0, n = partitions.getPartitionCount(); i < n; i++) {
+                    tables.getQuick(i).forEachKey(visitor, circuitBreaker);
+                }
             }
             return true;
         }
@@ -986,7 +1061,7 @@ public final class IntHashJoinBuild implements Closeable {
             if (frozen != this || generation != heap.getGeneration()) {
                 throw new IllegalStateException("hash join build has expired");
             }
-            if (heap.hasChainLengths()) {
+            if (heap.hasChainLengths() || integralIndex.isReady()) {
                 return false;
             }
             Unsafe.putLong(address, 0);
@@ -1069,6 +1144,9 @@ public final class IntHashJoinBuild implements Closeable {
 
             private int findHead(int key) {
                 assert isCurrent();
+                if (integralIndex.isReady()) {
+                    return integralIndex.find(key);
+                }
                 final long hash = Hash.hashInt64(key);
                 final long entry = lookupDirectory + ((hash >>> 32) >>> lookupShift) * DIRECTORY_ENTRY_SIZE;
                 final long base = Unsafe.getLong(entry);

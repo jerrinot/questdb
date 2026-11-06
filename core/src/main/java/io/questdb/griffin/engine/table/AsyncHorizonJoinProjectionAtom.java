@@ -163,6 +163,13 @@ public class AsyncHorizonJoinProjectionAtom implements StatefulAtom, PerWorkerLo
         for (int s = 0; s < count; s++) {
             failure = slaveStates.getQuick(s).cursorClosed(failure);
         }
+        if (compiledFilter != null) {
+            try {
+                compiledFilter.clearExecution();
+            } catch (Throwable th) {
+                failure = Misc.foldCleanupFailure(failure, th);
+            }
+        }
         memoryTracker = null;
         CairoException.rethrowCleanupFailure(failure);
     }
@@ -264,6 +271,16 @@ public class AsyncHorizonJoinProjectionAtom implements StatefulAtom, PerWorkerLo
         if (bindVarFunctions != null) {
             Function.init(bindVarFunctions, symbolTableSource, executionContext, null);
             prepareBindVarMemory(executionContext, symbolTableSource, bindVarFunctions, bindVarMemory);
+        }
+        if (compiledFilter != null) {
+            compiledFilter.prepareExecution(memoryTracker);
+        }
+    }
+
+    @Override
+    public void prepareForDispatch() {
+        if (compiledFilter != null) {
+            compiledFilter.prepareForDispatch();
         }
     }
 

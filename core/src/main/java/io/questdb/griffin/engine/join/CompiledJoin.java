@@ -59,6 +59,11 @@ public interface CompiledJoin extends QuietCloseable {
         }
     }
 
+    /** Final preparation over ready payload copies, before worker publication. */
+    default void preparePayloads(FrozenHashJoinBuild[] builds, long probeRows, MemoryTracker tracker,
+                                 SqlExecutionCircuitBreaker breaker) {
+    }
+
     CharSequence getName();
 
     /** A cached slot-local check of the existing sequence's cancellation and breaker state. */

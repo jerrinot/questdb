@@ -393,6 +393,13 @@ public class AsyncWindowJoinAtom implements StatefulAtom, PerWorkerLockOwner, Re
         } catch (Throwable th) {
             cleanupFailure = Misc.foldCleanupFailure(cleanupFailure, th);
         }
+        if (compiledMasterFilter != null) {
+            try {
+                compiledMasterFilter.clearExecution();
+            } catch (Throwable th) {
+                cleanupFailure = Misc.foldCleanupFailure(cleanupFailure, th);
+            }
+        }
         memoryTracker = null;
         CairoException.rethrowCleanupFailure(cleanupFailure);
     }
@@ -675,6 +682,16 @@ public class AsyncWindowJoinAtom implements StatefulAtom, PerWorkerLockOwner, Re
         if (bindVarFunctions != null) {
             Function.init(bindVarFunctions, symbolTableSource, executionContext, null);
             prepareBindVarMemory(executionContext, symbolTableSource, bindVarFunctions, bindVarMemory);
+        }
+        if (compiledMasterFilter != null) {
+            compiledMasterFilter.prepareExecution(memoryTracker);
+        }
+    }
+
+    @Override
+    public void prepareForDispatch() {
+        if (compiledMasterFilter != null) {
+            compiledMasterFilter.prepareForDispatch();
         }
     }
 

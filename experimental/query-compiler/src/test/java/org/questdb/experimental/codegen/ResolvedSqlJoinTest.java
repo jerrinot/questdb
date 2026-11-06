@@ -59,6 +59,7 @@ public class ResolvedSqlJoinTest {
     private ResolvedQueryCompiler compiler;
     private long buildThreshold = Long.MAX_VALUE;
     private long payloadCopyLimit = 128L << 20;
+    private long queryMemoryLimit;
     private int shardThreshold = Integer.MAX_VALUE;
 
     public ResolvedSqlJoinTest(String name, Backend backend, WorkerPoolMode mode) {
@@ -82,6 +83,7 @@ public class ResolvedSqlJoinTest {
             @Override public long getSqlParallelHashJoinGroupByBuildParallelMinRows() { return buildThreshold; }
             @Override public long getSqlParallelHashJoinGroupByBuildRowsPerPartition() { return 64; }
             @Override public long getSqlParallelHashJoinGroupByPayloadCopyMaxSize() { return payloadCopyLimit; }
+            @Override public long getQueryMemoryLimitBytes() { return queryMemoryLimit; }
             @Override public int getGroupByShardingThreshold() { return shardThreshold; }
             @Override public int getSqlSmallMapKeyCapacity() { return 4; }
         };
@@ -107,6 +109,16 @@ public class ResolvedSqlJoinTest {
         if (pool != null) pool.halt();
         if (context != null) context.close();
         if (engine != null) engine.close();
+    }
+
+    @Test
+    public void lookupReplacementPreservesBaselineMemoryBudget() throws Exception {
+        engine.execute("create table budget_p as (select cast(x%1024 as int) k,x v from long_sequence(65539))", context);
+        engine.execute("create table budget_a as (select cast(x-1 as int) k,x v from long_sequence(1024))", context);
+        // The original lookup, row heap and copied LONG payload fit in 40KiB.
+        // Replacing the lookup must preserve completion under that same limit.
+        queryMemoryLimit = 40 * 1024;
+        matches("select count(),sum(p.v),sum(a.v) from budget_p p join budget_a a on p.k=a.k", true);
     }
 
     @Test
@@ -237,6 +249,15 @@ public class ResolvedSqlJoinTest {
                 if (code == null) return null;
                 return new CompiledJoin() {
                     @Override public CharSequence getName() { return code.getName(); }
+                    @Override public void clearExecution() { code.clearExecution(); }
+                    @Override public void prepareBuilds(io.questdb.griffin.engine.join.FrozenHashJoinBuild[] builds, long rows,
+                            io.questdb.std.MemoryTracker tracker, io.questdb.cairo.sql.SqlExecutionCircuitBreaker breaker) {
+                        code.prepareBuilds(builds, rows, tracker, breaker);
+                    }
+                    @Override public void preparePayloads(io.questdb.griffin.engine.join.FrozenHashJoinBuild[] builds, long rows,
+                            io.questdb.std.MemoryTracker tracker, io.questdb.cairo.sql.SqlExecutionCircuitBreaker breaker) {
+                        code.preparePayloads(builds, rows, tracker, breaker);
+                    }
                     @Override public void close() { code.close(); }
                     @Override public CompiledJoin.Updater newUpdater(Runnable checkpoint) {
                         return code.newUpdater(() -> {

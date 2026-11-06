@@ -58,6 +58,8 @@ abstract class AbstractHashJoinProbe implements FrozenHashJoinBuild.Probe {
     @Nullable
     protected HashJoinPayloadSource.Reader payload;
     protected long heapAddress;
+    private int rowStride;
+    private final int rowShift;
     private long handleBase;
     // The source that handed out the reader, so that a snapshot of another source replaces it.
     @Nullable
@@ -67,6 +69,7 @@ abstract class AbstractHashJoinProbe implements FrozenHashJoinBuild.Probe {
 
     AbstractHashJoinProbe(HashJoinRowHeap rowHeap) {
         this.rowHeap = rowHeap;
+        this.rowShift = rowHeap.hasRowId() ? 4 : 3;
     }
 
     @Override
@@ -119,7 +122,7 @@ abstract class AbstractHashJoinProbe implements FrozenHashJoinBuild.Probe {
             throw new IllegalStateException("hash join probe is exhausted");
         }
         final long offset = next - 8;
-        final long row = heapAddress + offset;
+        final long row = heapAddress + (offset >>> rowShift) * rowStride;
         if (payload != null) {
             payload.position(HashJoinRowHeap.getRowIdAddress(row), HashJoinRowHeap.getOrdinal(offset));
         }
@@ -146,7 +149,7 @@ abstract class AbstractHashJoinProbe implements FrozenHashJoinBuild.Probe {
      * frame, and only for a build whose count pass has returned.
      */
     protected final long getKeyRowCount(int head) {
-        return head != 0 ? Unsafe.getLong(heapAddress + CompressedOffsets.uncompressBiased8(head)) : 0;
+        return head != 0 ? Unsafe.getLong(heapAddress + (CompressedOffsets.uncompressBiased8(head) >>> rowShift) * rowStride) : 0;
     }
 
     /**
@@ -171,6 +174,7 @@ abstract class AbstractHashJoinProbe implements FrozenHashJoinBuild.Probe {
         }
         this.handleBase = handleBase;
         this.heapAddress = rowsAddress;
+        this.rowStride = rowHeap.getRowStride();
         this.rowsCount = rowsCount;
         this.probeGeneration = generation;
         next = 0;
@@ -184,7 +188,7 @@ abstract class AbstractHashJoinProbe implements FrozenHashJoinBuild.Probe {
      */
     protected final void positionAt(long offset) {
         if (payload != null) {
-            payload.position(HashJoinRowHeap.getRowIdAddress(heapAddress + offset), HashJoinRowHeap.getOrdinal(offset));
+            payload.position(HashJoinRowHeap.getRowIdAddress(heapAddress + (offset >>> rowShift) * rowStride), HashJoinRowHeap.getOrdinal(offset));
         }
     }
 }

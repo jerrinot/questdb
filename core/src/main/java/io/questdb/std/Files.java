@@ -94,6 +94,20 @@ public final class Files {
         // Prevent construction.
     }
 
+    /** Best-effort Linux hint for fully owned pages of a large anonymous allocation. */
+    public static void adviseLargePages(long address, long bytes) {
+        if (Os.isLinux() && bytes >= (1L << 21)) {
+            long mask = PAGE_SIZE - 1;
+            long start = (address + mask) & ~mask;
+            long end = (address + bytes) & ~mask;
+            // MADV_HUGEPAGE=14. Exclude malloc metadata and neighboring allocations.
+            // No MADV_COLLAPSE: kernel policy controls page size and compaction.
+            if (end > start) {
+                madvise0(start, end - start, 14);
+            }
+        }
+    }
+
     public static boolean allocate(long fd, long size) {
         return allocate(toOsFd(fd), size);
     }

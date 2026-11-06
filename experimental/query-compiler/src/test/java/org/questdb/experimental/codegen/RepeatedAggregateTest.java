@@ -49,6 +49,14 @@ public class RepeatedAggregateTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
     @Test public void repeatedInputsPreserveOrdinaryStatesAndCancellation() throws Exception {
+        repeatedInputs(false);
+    }
+
+    @Test public void promotedInputsPreserveOrdinaryStatesAndCancellation() throws Exception {
+        repeatedInputs(true);
+    }
+
+    private void repeatedInputs(boolean promote) throws Exception {
         long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
         var functions = new ObjList<GroupByFunction>();
         functions.add(new CountLongConstGroupByFunction());
@@ -71,14 +79,21 @@ public class RepeatedAggregateTest {
             var updates = AggregateUpdates.bind(inputs, types, functions, index -> actual.getAddress(index) - actual.getAddress(0), false);
             assertNotNull(updates);
             Builder b = new Builder();
+            var registers = promote ? ScalarAggregateState.bind(b, updates) : null;
+            if (promote) assertNotNull(registers);
             var values = new ArrayList<Pipeline.Value>();
             for (int i = 0; i < updates.columns().size(); i++) {
                 var column = updates.columns().get(i);
                 values.add(column.value(b.let(new Load(column.width(), at(COLUMNS, updates.sourceIndexes()[i] * 8L)))));
             }
-            updates.emitRepeated(b, new Pipeline.Row(updates.columns(), values), STATE, ROWS);
+            if (promote) {
+                Builder emitted = b.fork();
+                updates.emitRepeated(emitted, new Pipeline.Row(updates.columns(), values), STATE, ROWS);
+                b.append(registers.promote(emitted.block()));
+            } else updates.emitRepeated(b, new Pipeline.Row(updates.columns(), values), STATE, ROWS);
             b.exit(0);
-            try (var code = new LlvmBackend().compile(new Program(b.block()), temporary.newFolder().toPath());
+            var program = new Program(registers == null ? b.block() : registers.publishExits(b.block()));
+            try (var code = new LlvmBackend().compile(program, temporary.newFolder().toPath());
                  var expected = new SimpleMapValue(types.getColumnCount());
                  var input = new DirectLongList(3, MemoryTag.NATIVE_JIT)) {
                 // setEmpty need not touch unobservable state, e.g. KSUM's compensation.

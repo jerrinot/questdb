@@ -50,6 +50,19 @@ import java.util.function.LongConsumer;
  */
 public interface FrozenHashJoinBuild {
     int LOOKUP_BYTES = 40;
+    int INTEGRAL_LOOKUP_BYTES = 40;
+
+    /**
+     * Optional bounded integral lookup: head-array address, non-null min/max key,
+     * null's biased byte link, and row-heap address. Array entries are unsigned
+     * compressed logical heads (multiply by eight for a biased row link), zero for absent
+     * keys. The snapshot owns the array until consumer drain. The ordinary hash
+     * descriptor is unavailable when this representation replaced its tables. Physical row
+     * addresses use the logical ordinal and {@link #getRowStride()}.
+     */
+    default boolean writeIntegralLookup(long address) {
+        return false;
+    }
 
     /** Conservative integral bounds; min > max means unavailable. */
     default long getMinIntegralKey() {
@@ -140,6 +153,25 @@ public interface FrozenHashJoinBuild {
      */
     long getRowId(long ordinal);
 
+    /** Physical bytes per row header, or zero when the build does not expose relocatable rows. */
+    default int getRowStride() {
+        return 0;
+    }
+
+    /** Header of one frozen row. Only valid when getRowStride() is positive. */
+    default long getRowAddress(long ordinal) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Borrows a completed copy of all headers, preserving logical links and row handles.
+     * The caller owns the copy until every probe is drained and this build is closed.
+     * Existing probes must reopen before use.
+     */
+    default void relocateRows(long address, int stride) {
+        throw new UnsupportedOperationException();
+    }
+
     /**
      * Allocated native bytes, including unused capacity.
      */
@@ -197,7 +229,8 @@ public interface FrozenHashJoinBuild {
          * address, slot mask, partition directory address (zero for serial), partition shift and
          * row-heap address. Directory entries hold table address and mask. Table slots are an INT
          * key and an unsigned compressed head (head * 8 is the biased row link). A row begins with
-         * its next biased byte link; zero ends the chain. Hashing is Hash.hashInt64, as in the Java
+         * its next biased logical link; zero ends the chain. Convert a logical row offset to an
+         * ordinal before multiplying by {@link #getRowStride()}. Hashing is Hash.hashInt64, as in the Java
          * probe. All backing is immutable and borrowed until this execution drains, before close.
          * Returns false for an unsupported/chain-counted snapshot, before the consumer mutates state.
          */
@@ -207,8 +240,9 @@ public interface FrozenHashJoinBuild {
 
         /**
          * Borrows the payload view described by {@link HashJoinPayloadSource#writeNativeColumn}.
-         * A supported heap has 16-byte rows: next link followed by row id. The ordinal is
-         * the unbiased byte offset divided by 16. This view has the lookup snapshot's lifetime.
+         * Payload-bearing rows have logical 16-byte headers: next link followed by row id.
+         * The ordinal is the unbiased logical offset divided by 16; the physical stride may
+         * also include copied payload. This view has the lookup snapshot's lifetime.
          */
         default boolean writeNativePayload(int column, long address) {
             return false;

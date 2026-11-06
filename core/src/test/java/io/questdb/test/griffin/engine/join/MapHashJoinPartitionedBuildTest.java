@@ -283,6 +283,9 @@ public class MapHashJoinPartitionedBuildTest extends AbstractCairoTest {
                                 }
                                 assertChains(frozen, frames, layout, factory.getMetadata(), expected, hasPayload);
                                 assertSegmentsCoverTheHeap(build, frozen, frames, hasPayload);
+                                Assert.assertEquals(layout == KeyLayout.LONG, build.prepareIntegralLookup(10_000, NOOP));
+                                assertChains(frozen, frames, layout, factory.getMetadata(), expected, hasPayload);
+                                assertSegmentsCoverTheHeap(build, frozen, frames, hasPayload);
                                 try (FrozenHashJoinBuild.RecordProbe probe = frozen.newProbe(layout.newSink(factory.getMetadata()))) {
                                     if (partitionCount == 1) {
                                         serialProbeClass = probe.getClass();

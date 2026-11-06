@@ -388,18 +388,25 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
     }
 
     void prepareProbe(long probeRows, SqlExecutionCircuitBreaker breaker) {
+        long knownProbeRows = filterContext.getFilter(-1) == null ? probeRows : -1;
+        for (int i = 0, n = builds.size(); i < n; i++) {
+            builds.getQuick(i).prepareLookup(knownProbeRows, breaker);
+        }
         if (compiledJoin != null) {
             // Frame counts are exact only before a residual probe filter.
-            compiledJoin.prepareBuilds(nativeBuilds, filterContext.getFilter(-1) == null ? probeRows : -1,
+            compiledJoin.prepareBuilds(nativeBuilds, knownProbeRows,
                     frameSequence.getMemoryTracker(), breaker);
             CompiledJoin.Updater owner = getSlot(-1).compiledUpdater;
             if (owner != null && hasDependentJoins) {
-                owner.prepareDependencies(nativeBuilds, filterContext.getFilter(-1) == null ? probeRows : -1,
+                owner.prepareDependencies(nativeBuilds, knownProbeRows,
                         frameSequence.getMemoryTracker(), breaker);
             }
         }
         for (int i = 0; i < builds.size(); i++) {
             builds.getQuick(i).maybeCopyPayload(probeRows, breaker);
+        }
+        if (compiledJoin != null) {
+            compiledJoin.preparePayloads(nativeBuilds, knownProbeRows, frameSequence.getMemoryTracker(), breaker);
         }
     }
 

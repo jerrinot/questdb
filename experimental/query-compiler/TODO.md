@@ -1,5 +1,23 @@
 # Deferred aggregation performance work
 
+Current checkpoint (2026-11-06): frozen integral lookups, compact duplicate payloads,
+physical specialization and coordinated kernel sampling are retained. See the latest
+entry in [PROGRESS.md](PROGRESS.md). The next measured target is composite root lookup:
+DuckDB remains 2.46x faster on the independent random control, and forced alternatives
+recover only about 8%. Test staged lookup using existing QuestMapProbe operations,
+preserving probe/aggregate order and typed key semantics. Contiguous duplicate groups
+would require finalizing row order before dependency-head caches and worker publication;
+do not bolt another permanent old-to-new handle map onto the retained layout.
+Code constraint: `QuestMapProbe.prepare`/`prefetchOffset` currently bind aggregate STATE
+and sharding, and their prefetches request write ownership. They cannot be called
+unchanged for a frozen join. Share their mechanics through borrowed-view, read-only
+operations alongside `findExisting`; preserve exact collision handling and return NULL
+on misses. Staging must fit existing ownership/budget contracts and consume completed
+lookups in probe order. Price staging against the already-fast direct-array path.
+First-request compilation is the other demonstrated cost: price IR/SSA, LLVM and
+code reuse before adding background compilation infrastructure. No new ClickBench/SSB
+score or second-machine performance claim accompanies this checkpoint.
+
 Active experiment order (2026-11-03): [whole-query plan](WHOLE_QUERY_PLAN.md).
 Join and multiway-join acceleration remain goals through a general architecture.
 SSB supplies controls and opportunities, not query-count targets or distribution

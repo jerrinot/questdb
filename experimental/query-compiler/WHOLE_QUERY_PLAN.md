@@ -41,6 +41,40 @@ beating a historical stock plan is not sufficient evidence of competitive execut
 
 ## Current facts that constrain the design
 
+Latest checkpoint, 2026-11-06: bounded integral lookups replace frozen hash tables
+when known probe work, observed range and memory bounds justify conversion. Java and
+LLVM share them. Duplicate fixed-width payload copies can co-locate their row headers
+and release the old heap without changing logical handles or duplicate order. The
+compiler then specializes on the prepared physical representation and compares
+memory/register scalar state and cached/direct child lookup in shared sampling periods.
+The unconditional promotion and alternate polling-ABI experiments were rejected;
+the retained register path reuses existing aggregate updates and publishes at polls.
+
+Fresh 500M-row controls improve across INT, dense high-bit LONG, independently encoded
+SYMBOL, mixed COUNT/SUM/MIN/MAX/AVG, grouping and observed duplicates. Sparse/composite
+keys retain hashing. One/sixteen-core controls test different worker/cache placements;
+they do not establish a second-machine result. Temporary copies must fit the query
+budget, displaced storage is released, and Parquet retains the existing layout.
+See the November 6 entry in [PROGRESS.md](PROGRESS.md) for current numbers and limits.
+No ClickBench/SSB score or strict generated-operator coverage was refreshed.
+
+The strongest remaining external-control gap is the random composite-key root join.
+On the same 500M inputs, it retires fewer instructions than DuckDB but consumes far
+more cycles. A page-size counterfactual recovers only part of that gap. Next separate
+translation, lookup/duplicate dependencies, cache capacity and memory-level parallelism
+with fixed-work counters and source-matched load samples. Consider batched probing or
+contiguous duplicate groups only after that evidence. Do not change hash semantics,
+logical handles, symbol domains or aggregate order to simplify one benchmark shape.
+Compilation and adaptive-choice quality remain measured costs, not reasons to add a
+background compiler or another policy framework before a counterfactual shows payoff.
+Forced alternatives recover about 8%, so selection alone does not explain the gap.
+The retained Linux large-page hint substantially reduces measured translation cost;
+it does not remove the directory/key/duplicate-load dependency chain. Reuse the staged
+lookup operations already in QuestMapProbe before designing another probing engine.
+W4 now has a concrete counterexample: fresh-process compile plus first no-match query
+regresses about 0.51 -> 0.63s, even though the warmed query improves. Additional IR/SSA
+and LLVM work, rather than native binding, explains much of the extra compiler CPU.
+
 Preparation-choice experiment, 2026-11-05: a bounded build-key selectivity trial
 was rejected. On independent 500M-row INT/LONG/SYMBOL controls, avoiding redundant
 membership preparation saved 10-14ms of setup without a repeatable substantial
@@ -70,6 +104,17 @@ not a 2.35x default-engine speedup. With ordinary allocation, two reversed passe
 SYMBOL all-match 768 -> 704ms; other controls improve less or remain unchanged. The fix
 uses the existing cache-line constant, preserves value offsets, and adds no policy flag.
 50 focused tests and 726 complete outputs pass. Only one CPU architecture was measured.
+
+A subsequent join-free 500M-row control confirms the mechanism: deliberately shared
+ordinary scalar state takes 388ms versus 208ms when isolated on eight cores; both take
+~1.30s on one core. LLVM scalar reduction stays ~74ms with either layout because it
+already keeps aggregate state local to the frame, confirmed in optimized IR and machine
+code. All 463 outputs pass independent arithmetic. Natural-allocation benefits depend
+on actual overlap; this is not a blanket padding gain. Before adding a coupled chooser,
+test reuse of existing scalar-state promotion for eligible join reductions, preserving
+mixed aggregates, duplicate traversal and cancellation. Inspect actual stores and price
+register pressure; grouped or allocating states are outside that initial experiment.
+See [the control measurements](target/scalar-state-control/analysis.json).
 
 Wall/thread CPU traces confirm preemption affects observations, but a join-only CPU-clock
 trial did not improve execution repeatably. Other `runBatch` callers include parallel

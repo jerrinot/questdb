@@ -76,6 +76,59 @@ public class MapHashJoinBuildTest extends AbstractCairoTest {
     private static final RowIdPayloadSource PAYLOADS = new RowIdPayloadSource();
 
     @Test
+    public void testIntegralReplacementPreservesFullWidthDomainsAndSparseFallback() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int type : new int[]{ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP}) {
+                for (long first : new long[]{Long.MIN_VALUE + 1, -17, 1L << 53, Long.MAX_VALUE - 30}) {
+                    try (LimitedMemoryTracker tracker = new LimitedMemoryTracker(0);
+                         MapHashJoinBuild build = new MapHashJoinBuild(configuration, new SingleColumnType(type), true, 4, 1024, 64, true)) {
+                        build.open(tracker, NOOP);
+                        LongKeySink sink = new LongKeySink();
+                        for (int key = 0; key < 31; key++) {
+                            build.append(source(first + key, key), sink);
+                            build.append(source(first + key, 100 + key), sink);
+                        }
+                        build.append(source(Long.MIN_VALUE, 42), sink);
+                        FrozenHashJoinBuild.RecordKeyed frozen = build.freeze(PAYLOADS);
+                        long before = tracker.getUsed();
+                        try (FrozenHashJoinBuild.RecordProbe probe = frozen.newProbe(sink)) {
+                            tracker.setLimit(before + 127);
+                            Assert.assertFalse(build.prepareIntegralLookup(5000, NOOP));
+                            tracker.setLimit(before + 128);
+                            Assert.assertTrue(build.prepareIntegralLookup(5000, NOOP));
+                            Assert.assertTrue(tracker.getUsed() < before);
+                            Assert.assertEquals(tracker.getUsed(), frozen.getSizeInBytes());
+                            Assert.assertEquals(0, frozen.getNativeMapCount());
+                            probe.reopen();
+                            for (int key = 0; key < 31; key++) {
+                                TestUtils.assertEquals((100 + key) + " " + key, chainOf(probe, first + key));
+                            }
+                            TestUtils.assertEquals("42", chainOf(probe, Long.MIN_VALUE));
+                            TestUtils.assertEquals("", chainOf(probe, first == Long.MIN_VALUE + 1 ? Long.MAX_VALUE : first - 1));
+                            LongList keys = new LongList();
+                            Assert.assertTrue(frozen.forEachIntegralKey(keys::add, NOOP));
+                            Assert.assertEquals(32, keys.size());
+                            frozen.countKeyRows();
+                            Assert.assertEquals(2, probe.findRowCountUnchecked(source(first + 7, 0)));
+                            Assert.assertEquals(1, probe.findRowCountUnchecked(source(Long.MIN_VALUE, 0)));
+                            build.close();
+                            Assert.assertEquals(0, tracker.getUsed());
+                            build.open(tracker, NOOP);
+                            build.append(source(Long.MIN_VALUE + 1, 11), sink);
+                            build.append(source(Long.MAX_VALUE, 22), sink);
+                            build.freeze(PAYLOADS);
+                            Assert.assertFalse(build.prepareIntegralLookup(5000, NOOP));
+                            probe.reopen();
+                            TestUtils.assertEquals("11", chainOf(probe, Long.MIN_VALUE + 1));
+                            TestUtils.assertEquals("22", chainOf(probe, Long.MAX_VALUE));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testAgreesWithTheIntKeyedBuild() throws Exception {
         assertMemoryLeak(() -> {
             final Rnd rnd = new Rnd();

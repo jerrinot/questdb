@@ -80,6 +80,97 @@ public class IntHashJoinBuildTest extends AbstractCairoTest {
     );
 
     @Test
+    public void testIntegralReplacementBudgetFailureAndReopen() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int nullKey : new int[]{Numbers.INT_NULL, SymbolTable.VALUE_IS_NULL}) {
+                try (LimitedMemoryTracker tracker = new LimitedMemoryTracker(0);
+                     IntHashJoinBuild build = new IntHashJoinBuild(true, 4, 64, true)) {
+                    build.open(tracker, NOOP);
+                    for (int key = 0; key < 32; key++) {
+                        if (key == 13) {
+                            continue;
+                        }
+                        build.append(key, key);
+                        build.append(key, 100 + key);
+                    }
+                    build.append(nullKey, 42);
+                    FrozenHashJoinBuild.IntKeyed frozen = build.freeze(new RowIdPayloadSource());
+                    long before = tracker.getUsed();
+                    long descriptor = Unsafe.malloc(FrozenHashJoinBuild.INTEGRAL_LOOKUP_BYTES, MemoryTag.NATIVE_DEFAULT);
+                    try (FrozenHashJoinBuild.IntProbe probe = frozen.newProbe()) {
+                        Assert.assertFalse(build.prepareIntegralLookup(-1, nullKey, NOOP));
+                        Assert.assertFalse(build.prepareIntegralLookup(64, nullKey, NOOP));
+                        tracker.setLimit(before + 127);
+                        Assert.assertFalse(build.prepareIntegralLookup(5000, nullKey, NOOP));
+                        Assert.assertFalse(frozen.writeIntegralLookup(descriptor));
+                        Assert.assertEquals(before, tracker.getUsed());
+                        tracker.setLimit(before + 128);
+                        AtomicBoolean cancelled = new AtomicBoolean();
+                        var breaker = new CountingSqlExecutionCircuitBreaker(NOOP) {
+                            @Override public void statefulThrowExceptionIfTrippedTimeThrottled() {
+                                if (tracker.getUsed() > before) {
+                                    cancelled.set(true);
+                                    throw new IllegalStateException("index cancelled");
+                                }
+                            }
+                        };
+                        Assert.assertEquals("index cancelled", Assert.assertThrows(IllegalStateException.class,
+                                () -> build.prepareIntegralLookup(5000, nullKey, breaker)).getMessage());
+                        Assert.assertTrue(cancelled.get());
+                        Assert.assertEquals(before, tracker.getUsed());
+                        Assert.assertTrue(frozen.writeLookup(descriptor));
+                        probe.find(7);
+                        probe.next();
+                        Assert.assertEquals(107, probe.getRecord().getInt(0));
+                        Assert.assertTrue(build.prepareIntegralLookup(5000, nullKey, NOOP));
+                        Assert.assertTrue(tracker.getUsed() < before);
+                        Assert.assertEquals(tracker.getUsed(), frozen.getSizeInBytes());
+                        Assert.assertFalse(frozen.writeLookup(descriptor));
+                        Assert.assertTrue(frozen.writeIntegralLookup(descriptor));
+                        probe.reopen();
+                        try (FrozenHashJoinBuild.IntProbe fresh = frozen.newProbe()) {
+                            for (FrozenHashJoinBuild.IntProbe p : new FrozenHashJoinBuild.IntProbe[]{probe, fresh}) {
+                                for (int key = 0; key < 32; key++) {
+                                    if (key == 13) {
+                                        p.findUnchecked(key);
+                                        Assert.assertFalse(p.hasNext());
+                                        continue;
+                                    }
+                                    p.findUnchecked(key);
+                                    p.next(); Assert.assertEquals(100 + key, p.getRecord().getInt(0));
+                                    p.next(); Assert.assertEquals(key, p.getRecord().getInt(0));
+                                    Assert.assertFalse(p.hasNext());
+                                }
+                                p.find(nullKey); p.next(); Assert.assertEquals(42, p.getRecord().getInt(0));
+                                Assert.assertFalse(p.hasNext());
+                                p.find(Integer.MAX_VALUE); Assert.assertFalse(p.hasNext());
+                            }
+                        }
+                        IntList keys = new IntList();
+                        Assert.assertTrue(frozen.forEachKey(keys::add, NOOP));
+                        Assert.assertEquals(32, keys.size());
+                        frozen.countKeyRows();
+                        Assert.assertEquals(2, probe.findRowCountUnchecked(7));
+                        Assert.assertEquals(1, probe.findRowCountUnchecked(nullKey));
+                        Assert.assertFalse(frozen.writeIntegralLookup(descriptor));
+                        build.close();
+                        Assert.assertEquals(0, tracker.getUsed());
+                        Assert.assertThrows(IllegalStateException.class, () -> frozen.writeIntegralLookup(descriptor));
+                        build.open(tracker, NOOP);
+                        build.append(7, 77);
+                        build.freeze(new RowIdPayloadSource());
+                        probe.reopen();
+                        Assert.assertFalse(frozen.writeIntegralLookup(descriptor));
+                        probe.find(7); probe.next(); Assert.assertEquals(77, probe.getRecord().getInt(0));
+                    } finally {
+                        Unsafe.free(descriptor, FrozenHashJoinBuild.INTEGRAL_LOOKUP_BYTES, MemoryTag.NATIVE_DEFAULT);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testCompressedIncrementalHeapBoundAndGrowthCap() throws Exception {
         assertMemoryLeak(() -> {
             final long limit = CompressedOffsets.MAX_ALIGNED8_HEAP_SIZE;

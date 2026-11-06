@@ -47,6 +47,9 @@ import java.io.Closeable;
  * {@link CompressedOffsets#MAX_ALIGNED8_HEAP_SIZE} before allocation or encoding, so every row
  * offset round trips through {@link CompressedOffsets#compressBiased8(long)}. Duplicate iteration
  * follows the links in reverse input order, as the light join's LongChain does.
+ * A completed payload copy may borrow these headers into wider rows. Links and handles keep
+ * their original logical offsets; physical addresses then use the row ordinal and stride.
+ * The payload source owns that storage and outlives all probes and this heap.
  * <p>
  * The heap is owner-built, or, in a parallel build, sized by the owner and written by the
  * partition tasks, one partition's rows each; either way it is frozen for the execution. A
@@ -79,6 +82,8 @@ final class HashJoinRowHeap implements Closeable {
     private final int rowSize;
     private SqlExecutionCircuitBreaker circuitBreaker;
     private long generation;
+    private long borrowedAddress;
+    private int physicalStride;
     // True once countChains() replaced this execution's links with chain lengths.
     private boolean hasChainLengths;
     private long nextHandleBase;
@@ -94,6 +99,7 @@ final class HashJoinRowHeap implements Closeable {
         this.initialCapacity = initialCapacity;
         this.hasRowId = hasPayload;
         this.rowSize = getRowSize(hasPayload);
+        this.physicalStride = rowSize;
     }
 
     /**
@@ -139,6 +145,8 @@ final class HashJoinRowHeap implements Closeable {
     @Override
     public void close() {
         rows.close();
+        borrowedAddress = 0;
+        physicalStride = rowSize;
         rowBytes = 0;
         hasChainLengths = false;
         generation++;
@@ -148,7 +156,7 @@ final class HashJoinRowHeap implements Closeable {
     /** Copies chain lengths without changing the links or the frozen snapshot. */
     void copyChainCounts(long destination) {
         assert !hasChainLengths;
-        final long base = rows.address;
+        final long base = getAddress();
         final int shift = hasRowId ? 4 : 3;
         // Same backward-link recurrence as countChains, with a separate dense destination.
         // Keeping links intact lets ordinary probes and generated consumers share this heap.
@@ -156,7 +164,7 @@ final class HashJoinRowHeap implements Closeable {
             if ((ordinal & (ROWS_PER_CHECK - 1)) == 0) {
                 circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
             }
-            final long link = Unsafe.getLong(base + (ordinal << shift));
+            final long link = Unsafe.getLong(base + ordinal * physicalStride);
             assert link == 0 || ((link - LINK_SIZE) >> shift) < ordinal;
             final long previous = link == 0 ? 0 : Unsafe.getLong(destination + (((link - LINK_SIZE) >> shift) << 3));
             Unsafe.putLong(destination + (ordinal << 3), previous + 1);
@@ -166,13 +174,13 @@ final class HashJoinRowHeap implements Closeable {
     /** Same backward-link recurrence, starting with caller-supplied row weights. */
     boolean sumChainWeights(long weights) {
         assert !hasChainLengths;
-        final long base = rows.address;
+        final long base = getAddress();
         final int shift = hasRowId ? 4 : 3;
         for (long ordinal = 0, count = getRowCount(); ordinal < count; ordinal++) {
             if ((ordinal & (ROWS_PER_CHECK - 1)) == 0) {
                 circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
             }
-            final long link = Unsafe.getLong(base + (ordinal << shift));
+            final long link = Unsafe.getLong(base + ordinal * physicalStride);
             assert link == 0 || ((link - LINK_SIZE) >> shift) < ordinal;
             final long previous = link == 0 ? 0 : Unsafe.getLong(weights + (((link - LINK_SIZE) >> shift) << 3));
             final long weight = Unsafe.getLong(weights + (ordinal << 3));
@@ -270,7 +278,7 @@ final class HashJoinRowHeap implements Closeable {
     }
 
     long getAddress() {
-        return rows.address;
+        return borrowedAddress != 0 ? borrowedAddress : rows.address;
     }
 
     /**
@@ -319,12 +327,24 @@ final class HashJoinRowHeap implements Closeable {
         return rowBytes / rowSize;
     }
 
+    int getRowStride() {
+        return physicalStride;
+    }
+
+    void relocateRows(long address, int stride) {
+        assert hasRowId && !hasChainLengths && borrowedAddress == 0 && address != 0 && stride >= rowSize && stride % 8 == 0;
+        rows.close();
+        borrowedAddress = address;
+        physicalStride = stride;
+        generation++;
+    }
+
     int getRowSize() {
         return rowSize;
     }
 
     /**
-     * Allocated native bytes, including unused capacity.
+     * Owned native bytes, including unused capacity. Borrowed rows are charged to the payload source.
      */
     long getSizeInBytes() {
         return rows.capacity;
@@ -406,14 +426,6 @@ final class HashJoinRowHeap implements Closeable {
     }
 
     /**
-     * The build row id of the heap's ordinal-th row, the rows starting at {@code rowsAddress}; only a
-     * heap with row ids stores one.
-     */
-    static long getRowIdAt(long rowsAddress, long ordinal) {
-        return getRowId(rowsAddress + (ordinal << ROW_ID_ROW_SHIFT));
-    }
-
-    /**
      * The build row id of the row at this address; only a heap with row ids stores one.
      */
     static long getRowId(long rowAddress) {
@@ -430,12 +442,14 @@ final class HashJoinRowHeap implements Closeable {
     // Replaces the link of every row between these byte offsets, in heap order, with the length of
     // its chain. The caller has counted every row that a link here reaches, which lies lower.
     private void countChains(long lo, long hi) {
-        final long base = rows.address;
+        final long base = getAddress();
         final int rowSize = this.rowSize;
+        final int shift = hasRowId ? 4 : 3;
         for (long offset = lo; offset < hi; offset += rowSize) {
-            final long link = Unsafe.getLong(base + offset);
+            final long address = base + (offset >>> shift) * physicalStride;
+            final long link = Unsafe.getLong(address);
             assert link == 0 || link - LINK_SIZE < offset;
-            Unsafe.putLong(base + offset, link == 0 ? 1 : Unsafe.getLong(base + link - LINK_SIZE) + 1);
+            Unsafe.putLong(address, link == 0 ? 1 : Unsafe.getLong(base + ((link - LINK_SIZE) >>> shift) * physicalStride) + 1);
         }
     }
 

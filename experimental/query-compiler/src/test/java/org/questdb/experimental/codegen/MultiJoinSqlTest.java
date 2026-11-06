@@ -517,6 +517,48 @@ public class MultiJoinSqlTest {
         matches("select p.k,length(a.label),count() from p join a on p.k=a.k join b on p.j=b.k group by p.k,length(a.label)", 2, false, compiler);
     }
 
+    @Test public void preparedLayoutsRebindAcrossMixedUniqueAndDuplicateBuilds() throws Exception {
+        long liveCode = LlvmBackend.liveFunctions();
+        buildThreshold = 1;
+        shardThreshold = 4;
+        engine.execute("create table rp as (select cast(x%16 as int) k,x%16+4503599627370496 l,cast('K'||(x%16) as symbol) s,cast(x%3 as int) j,x%23-11 v from long_sequence(10003))", context);
+        String rows = "select cast(x%16 as int) k,x%16+4503599627370496 l,cast('K'||(x%16) as symbol) s,cast(x%16 as int) nk,x%16+4503599627370496 nl,cast('K'||(x%16) as symbol) ns,case when x%7=0 then null else x%29-14 end v,case when x%5=0 then null else (x%17-8)*0.25 end d from long_sequence(";
+        engine.execute("create table ra as ("+rows+"48))", context);
+        engine.execute("create table rb as ("+rows+"16))", context);
+        engine.execute("create table rc as ("+rows+"48))", context);
+        for (String type : new String[]{"k", "l", "s"}) {
+            String sql = "select p.j,count(),sum(p.v),sum(a.v),sum(b.v),sum(c.v),min(c.v),max(c.d),avg(c.d),count(c.s) from rp p join ra a on p."+type+"=a."+type+" join rb b on a.n"+type+"=b."+type+" join rc c on b."+type+"=c."+type+" group by p.j";
+            context.setQueryCodeGenerator(compiler);
+            try (var factory = Demo.compileSql(engine, context, sql, true)) {
+                assertTrue(plan(factory), plan(factory).contains("compiledJoinPipeline"));
+                for (int round = 0; round < 5; round++) {
+                    context.setQueryCodeGenerator(null);
+                    try (var control = Demo.compileSql(engine, context, sql, true)) {
+                        var expected = Demo.readSql(control, context, 1);
+                        assertEquals(type+" round "+round, expected, Demo.readSql(factory, context, 1));
+                        assertEquals(type+" reused round "+round, expected, Demo.readSql(factory, context, 1));
+                    }
+                    if (round == 0) {
+                        engine.execute("truncate table rb", context);
+                        engine.execute("insert into rb "+rows+"48)", context);
+                    } else if (round == 1) {
+                        engine.execute("truncate table ra", context);
+                        engine.execute("insert into ra "+rows+"16)", context);
+                    } else if (round == 2) engine.execute("truncate table rc", context);
+                    else if (round == 3) {
+                        engine.execute("insert into rc "+rows+"48)", context);
+                    }
+                }
+            }
+            payloadCopyLimit = 128L << 20;
+            engine.execute("truncate table ra", context);
+            engine.execute("insert into ra "+rows+"48)", context);
+            engine.execute("truncate table rb", context);
+            engine.execute("insert into rb "+rows+"16)", context);
+        }
+        assertEquals(liveCode, LlvmBackend.liveFunctions());
+    }
+
     @Test public void compositeSymbolGroupsRebindAfterBuildChanges() throws Exception {
         engine.execute("create table labels as (select cast(x-15 as int) k,cast('old-'||(x%3) as symbol) label from long_sequence(31))", context);
         String sql = "select p.j,labels.label,count(),sum(b.v) from p join labels on p.k=labels.k join b on p.j=b.k group by p.j,labels.label";
@@ -606,6 +648,25 @@ public class MultiJoinSqlTest {
                 }
                 assertEquals(expected, Demo.readSql(factory, context, 0));
             }
+        }
+    }
+
+    @Test public void boundedIntegralHeadsPreserveNullsDuplicatesAndFullWidthDomains() throws Exception {
+        String[] types = {"int", "long", "long", "symbol"};
+        String[] bases = {"0", "9223372036854775777", "-9223372036854775807", "0"};
+        for (int kind = 0; kind < types.length; kind++) {
+            String value = kind == 3 ? "'s-'||cast(x%17 as string)" : "x%17+" + bases[kind];
+            String reverse = kind == 3 ? "'s-'||cast((53-x)%17 as string)" : "(53-x)%17+" + bases[kind];
+            engine.execute("create table np" + kind + " as (select cast(case when x%13=0 then null else " + value
+                    + " end as " + types[kind] + ") k,cast(x%7 as int) j,"
+                    + "case when x%11=0 then null else x%97-48 end v,"
+                    + "case when x%5=0 then null else (x%31-15)/4.0 end d from long_sequence(5003))", context);
+            engine.execute("create table na" + kind + " as (select cast(case when x%19=0 then null else " + reverse
+                    + " end as " + types[kind] + ") k,x%7-3 w from long_sequence(53))", context);
+            String from = " from np" + kind + " p join na" + kind + " a on p.k=a.k join b on p.j=b.k";
+            matches("select count(),count(p.v),sum(p.v),min(p.v),max(p.v),avg(p.v),"
+                    + "sum(p.d),min(p.d),max(p.d),avg(p.d),sum(a.w)" + from, 0, true, compiler);
+            matches("select p.j,count(),sum(p.v),min(a.w),max(a.w),avg(p.d)" + from + " group by p.j", 1, true, compiler);
         }
     }
 

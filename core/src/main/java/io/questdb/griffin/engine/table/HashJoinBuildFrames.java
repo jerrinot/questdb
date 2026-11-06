@@ -117,6 +117,9 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
     private final int[] copyOffsets;
     // Bytes of one copied row; zero when the payload cannot be copied.
     private final int copyRowSize;
+    private int copyStride;
+    private int copyPrefix;
+    private FrozenHashJoinBuild pendingHeaderBuild;
     // One reader per thread of a copy, kept across executions; see beginCopy().
     private final ObjList<Reader> copyReaders = new ObjList<>();
     // Bytes a row that a reader decodes a Parquet frame to: the size of every payload column, which
@@ -228,13 +231,39 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
      * failure path runs.
      */
     public void beginCopy(FrozenHashJoinBuild build, int copyReaderCount, SqlExecutionCircuitBreaker circuitBreaker) {
+        beginCopy(build, copyReaderCount, circuitBreaker, false);
+    }
+
+    /**
+     * May co-locate row headers with the payload, releasing the original heap at publication.
+     * The caller must reopen probes afterwards. Parquet retains its existing layout because
+     * decoder buffers can consume the temporary memory headroom during the copy.
+     */
+    public void beginCopy(FrozenHashJoinBuild build, int copyReaderCount, SqlExecutionCircuitBreaker circuitBreaker, boolean includeRowHeaders) {
         assert copyRowSize > 0 && copyAddress == 0 && pendingCopyAddress == 0 && frameCursor != null && copyReaderCount > 0;
         final long rowCount = build.getRowCount();
+        pendingHeaderBuild = null;
         assert rowCount > 0;
         if (rowCount > (Long.MAX_VALUE - copyRowSize) / copyRowSize) {
             throw CairoException.nonCritical().put("hash join payload copy overflow");
         }
-        final long size = rowCount * copyRowSize;
+        copyStride = copyRowSize;
+        copyPrefix = 0;
+        // The old heap stays live until all copying tasks complete. Its release repays the
+        // header bytes in this copy, so later group-map growth sees no extra steady-state use.
+        if (includeRowHeaders && !addressCache.hasParquetFrames() && build.getRowStride() == 16 && build.getKeyCount() < rowCount
+                && build.getRowHandle(0) >= 0 && copyRowSize <= Integer.MAX_VALUE - 23) {
+            int stride = (copyRowSize + 23) & -8;
+            // Avoid padding overhead beyond the bytes the old headers release.
+            if (stride == copyRowSize + 16 && rowCount <= Long.MAX_VALUE / stride
+                    && (memoryTracker == null || memoryTracker.getLimit() <= 0
+                    || rowCount * stride <= memoryTracker.getLimit() - memoryTracker.getUsed())) {
+                copyStride = stride;
+                copyPrefix = 16;
+                pendingHeaderBuild = build;
+            }
+        }
+        final long size = rowCount * copyStride;
         circuitBreaker.statefulThrowExceptionIfTrippedNoThrottle();
         while (copyReaders.size() < copyReaderCount) {
             // A copy reader walks its frames in order, and the MONOTONIC hint caps its cache at four
@@ -244,6 +273,9 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
         }
         pendingCopyAddress = Unsafe.malloc(size, MemoryTag.NATIVE_JOIN_MAP, memoryTracker);
         pendingCopySize = size;
+        if (pendingHeaderBuild != null) {
+            io.questdb.std.Files.adviseLargePages(pendingCopyAddress, pendingCopySize);
+        }
         for (int i = 0; i < copyReaderCount; i++) {
             // A copying thread reads its rows in build order, so a Parquet row group decodes once.
             copyReaders.getQuick(i).reopen(ParquetDecodeHint.MONOTONIC);
@@ -270,6 +302,9 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
         payloadAddresses.clear();
         rowCount = 0;
         memoryTracker = null;
+        pendingHeaderBuild = null;
+        copyStride = copyRowSize;
+        copyPrefix = 0;
         CairoException.rethrowCleanupFailure(failure);
     }
 
@@ -288,18 +323,23 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
      * copied again.
      */
     public void copyPayload(FrozenHashJoinBuild build, SqlExecutionCircuitBreaker circuitBreaker) {
+        copyPayload(build, circuitBreaker, false);
+    }
+
+    public void copyPayload(FrozenHashJoinBuild build, SqlExecutionCircuitBreaker circuitBreaker, boolean includeRowHeaders) {
         final long rowCount = build.getRowCount();
         if (rowCount < 1) {
             return;
         }
         try {
-            beginCopy(build, 1, circuitBreaker);
+            beginCopy(build, 1, circuitBreaker, includeRowHeaders);
             copyRows(0, build, 0, rowCount, circuitBreaker);
         } catch (Throwable th) {
             if (pendingCopyAddress != 0) {
                 pendingCopyAddress = Unsafe.free(pendingCopyAddress, pendingCopySize, MemoryTag.NATIVE_JOIN_MAP, memoryTracker);
                 pendingCopySize = 0;
             }
+            pendingHeaderBuild = null;
             // The decoded frames go with the reader; clear() closes it anyway.
             Misc.freeObjListAndKeepObjects(copyReaders);
             throw th;
@@ -316,13 +356,18 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
     public void copyRows(int reader, FrozenHashJoinBuild build, long lo, long hi, SqlExecutionCircuitBreaker circuitBreaker) {
         assert pendingCopyAddress != 0 && lo >= 0 && hi <= build.getRowCount();
         final Reader copyReader = copyReaders.getQuick(reader);
-        long row = pendingCopyAddress + lo * copyRowSize;
-        for (long ordinal = lo; ordinal < hi; ordinal++, row += copyRowSize) {
+        long row = pendingCopyAddress + lo * copyStride;
+        for (long ordinal = lo; ordinal < hi; ordinal++, row += copyStride) {
             if ((ordinal & (COPY_ROWS_PER_CHECK - 1)) == 0) {
                 circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
             }
             copyReader.positionRow(build.getRowId(ordinal));
-            copyRow(copyReader, row);
+            if (copyPrefix != 0) {
+                long header = build.getRowAddress(ordinal);
+                Unsafe.putLong(row, Unsafe.getLong(header));
+                Unsafe.putLong(row + 8, Unsafe.getLong(header + 8));
+            }
+            copyRow(copyReader, row + copyPrefix);
         }
     }
 
@@ -432,8 +477,8 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
             return false;
         }
         if (copyAddress != 0) {
-            Unsafe.putLong(address, copyAddress + copyOffsets[column]);
-            Unsafe.putLong(address + 8, copyRowSize);
+            Unsafe.putLong(address, copyAddress + copyPrefix + copyOffsets[column]);
+            Unsafe.putLong(address + 8, copyStride);
             Unsafe.putLong(address + 16, 1);
             return true;
         }
@@ -456,6 +501,10 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
         assert pendingCopyAddress != 0 && copyAddress == 0;
         // A decoded Parquet frame of the copy has no later use.
         Misc.freeObjListAndKeepObjects(copyReaders);
+        if (pendingHeaderBuild != null) {
+            pendingHeaderBuild.relocateRows(pendingCopyAddress, copyStride);
+            pendingHeaderBuild = null;
+        }
         copyAddress = pendingCopyAddress;
         copyCapacity = pendingCopySize;
         pendingCopyAddress = 0;
@@ -1012,7 +1061,7 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
         public void position(long rowIdAddress, long ordinal) {
             final long copy = copyAddress;
             if (copy != 0) {
-                copyRow = copy + ordinal * copyRowSize;
+                copyRow = copy + ordinal * copyStride + copyPrefix;
                 return;
             }
             positionRow(Unsafe.getLong(rowIdAddress));

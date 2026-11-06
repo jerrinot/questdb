@@ -520,13 +520,8 @@ public class UnorderedVarcharMap implements Map, Reopenable {
     }
 
     private void adviseLargePages(long address, long bytes) {
-        if (preferLargePages && io.questdb.std.Os.isLinux() && bytes >= (1L << 21)) {
-            long pageMask = io.questdb.std.Files.PAGE_SIZE - 1;
-            long start = (address + pageMask) & ~pageMask;
-            long end = (address + bytes) & ~pageMask;
-            // Linux MADV_HUGEPAGE=14. Exclude partial pages belonging to malloc metadata
-            // or neighbouring allocations; correctness does not depend on acceptance.
-            if (end > start) io.questdb.std.Files.madvise0(start, end - start, 14);
+        if (preferLargePages) {
+            io.questdb.std.Files.adviseLargePages(address, bytes);
         }
     }
 

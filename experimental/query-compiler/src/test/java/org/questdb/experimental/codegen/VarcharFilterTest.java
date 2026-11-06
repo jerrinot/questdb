@@ -96,6 +96,53 @@ public class VarcharFilterTest {
     }
 
     @Test
+    public void horizonProjectionPreparesFilterLiteralsOnEveryExecution() throws Exception {
+        String sql = "select h.offset,t.ts,p.id from strings t horizon join strings p list (0s,2s,4s) as h "
+                + "where t.v!='prefix-abcdef-suffix' order by h.offset,t.ts";
+        try (var factory = candidate(sql)) {
+            var physical = find(factory, io.questdb.griffin.engine.table.AsyncHorizonJoinProjectionRecordCursorFactory.class);
+            var filter = ((io.questdb.griffin.engine.table.AsyncHorizonJoinProjectionAtom) physical.getAtom()).getCompiledFilter();
+            assertNotNull(filter);
+            assertEquals(backend.name(), filter.getBackendName());
+            for (int repeat = 0; repeat < 2; repeat++) {
+                try (var cursor = physical.getCursor(context)) {
+                    assertTrue(cursor.hasNext());
+                    cursor.toTop();
+                    assertTrue(cursor.hasNext());
+                }
+                check(factory, sql);
+            }
+            assertTrue(filter.getNativeInputRows() > 0);
+        }
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
+    public void windowJoinPreparesLiteralAndSymbolPredicatesOnEveryExecution() throws Exception {
+        engine.execute("create table window_strings as (select id,v,cast(v as symbol) s,ts from strings) timestamp(ts)", context);
+        for (String predicate : List.of("t.v!='prefix-abcdef-suffix'", "t.s like 'prefix-%'")) {
+            String sql = "select t.ts,count(p.id),min(p.id),max(p.id) from window_strings t window join strings p "
+                    + "range between 2 second preceding and 2 second following where " + predicate + " order by t.ts";
+            try (var factory = candidate(sql)) {
+                var physical = find(factory, io.questdb.griffin.engine.join.AsyncWindowJoinRecordCursorFactory.class);
+                var filter = physical.getAtom().getCompiledMasterFilter();
+                assertNotNull(filter);
+                assertEquals(backend.name(), filter.getBackendName());
+                for (int repeat = 0; repeat < 2; repeat++) {
+                    try (var cursor = physical.getCursor(context)) {
+                        assertTrue(cursor.hasNext());
+                        cursor.toTop();
+                        assertTrue(cursor.hasNext());
+                    }
+                    check(factory, sql);
+                }
+                assertTrue(filter.getNativeInputRows() > 0);
+            }
+        }
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
     public void literalPredicatesKeepResolvedSemanticsAndReachConsumers() throws Exception {
         for (String predicate : List.of("v like 'prefix-%'", "v not like 'prefix-%'", "v like '%suffix'",
                 "v not like '%suffix'", "v='é'", "v!='é'", "v='prefix-abcdef-suffix'", "v=''", "v!=''",

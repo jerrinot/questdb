@@ -210,7 +210,19 @@ The binders and focused tests are authoritative. Current families include:
 - INT, full-width LONG, static-SYMBOL and composite fixed-width inner-join probe pipelines
   with supported COUNT and integer/DOUBLE SUM/MIN/MAX/AVG, post-join
   predicates and supported fixed-width grouping. They borrow the existing frozen join;
-  Java retains build and runtime ownership. Outer joins and general join-to-DISTINCT
+  Java retains build and runtime ownership. Before worker publication, core may replace
+  bounded INT/SYMBOL or LONG/DATE/TIMESTAMP key tables with packed chain-head arrays,
+  preserving the row heap and duplicate order. Known probe work, observed range and
+  query-memory bounds govern conversion; displaced hash storage is released. Java and
+  generated probes share this lookup. Sparse/composite keys retain hashing.
+  An already-admitted fixed-width payload copy may co-locate duplicate-row headers
+  and payload, then release the old heap. Logical handles and duplicate order stay
+  unchanged. Temporary query-memory headroom must cover the copy; Parquet and
+  layouts that need extra padding keep the existing separate storage.
+  Large compact copies share the existing Linux advisory huge-page hint with
+  UnorderedVarcharMap. Allocation accounting stays unchanged; kernel policy decides
+  whether to use large pages. Other platforms keep their ordinary allocation.
+  Outer joins and general join-to-DISTINCT
   remain outside this binding.
 - The join kernel accepts independent typed builds and dependent inner-join chains
   and branches. Keys can read the scan or earlier joined payloads, including composite
@@ -272,8 +284,22 @@ The binders and focused tests are authoritative. Current families include:
   and expanded membership, sharing the same compiled loop through slot-owned
   descriptors. It changes no descriptor while another worker uses it and preserves
   the selected representation across every growth retry. This adds no user switch
-  or third compiled loop. Frame timing remains sensitive to scheduling and shared
-  resources; it is not a guarantee of the best whole-query strategy.
+  or another compiled loop just for the expanded bitmap. Frame timing remains
+  sensitive to scheduling and shared resources; it is not a guarantee of the best
+  whole-query strategy.
+  After build preparation, the compiler specializes on physical facts: uniqueness,
+  direct lookup, payload layout and available dependency caches. Addresses, key
+  values and dictionary IDs stay in execution descriptors. Reopen checks these
+  facts and retains at most one specialized program set.
+  Eligible scalar aggregates can keep their existing update state in IR variables,
+  publishing it before cancellation polls and exits. Grouped and allocating state
+  retains memory updates. Generated alternatives also compare cached child heads
+  with direct re-probing when both exist. Up to eight kernels cover these choices
+  and membership filtering; compilation is paid before workers start.
+  Workers sample alternatives in coordinated periods without holding a policy lock
+  during native execution. Later exploration compares the winner with one rotating
+  challenger and occupies under 2% of completed frames. This is measured execution
+  adaptation, not a cost-based join-order optimizer.
 - Build-derived filters for an uninterrupted chain of INT inner joins sharing a
   frame scan. Generated checks reject rows before ordinary joins fetch payloads;
   duplicate multiplicity remains the joins' responsibility. Completed build keys

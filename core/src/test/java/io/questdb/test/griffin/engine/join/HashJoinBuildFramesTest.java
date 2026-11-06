@@ -70,6 +70,71 @@ import org.junit.Test;
 public class HashJoinBuildFramesTest extends AbstractCairoTest {
 
     @Test
+    public void testCombinedHeadersKeepHandlesAndReleaseOldHeap() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table compact as (select (x%4)::int k,x v,('s'||(x%3))::symbol s from long_sequence(64))");
+            MemoryTracker previous = sqlExecutionContext.getMemoryTracker();
+            try (LimitedMemoryTracker tracker = new LimitedMemoryTracker(0);
+                 RecordCursorFactory factory = select("compact");
+                 HashJoinBuildFrames frames = new HashJoinBuildFrames(configuration, ints(1, 2), factory.getMetadata());
+                 IntHashJoinBuild build = new IntHashJoinBuild(true, 2, 16)) {
+                sqlExecutionContext.setMemoryTracker(tracker);
+                for (boolean tight : new boolean[]{false, true}) {
+                    tracker.setLimit(0);
+                    // QueryProgress installs its own tracker; use the underlying scan so this
+                    // manually supplied tracker accounts for both the old heap and the copy.
+                    FrozenHashJoinBuild.IntKeyed frozen = FrameBuilds.buildInt(
+                            configuration, build, frames, factory.getBaseFactory(), 0, sqlExecutionContext
+                    );
+                    long[] ids = new long[64];
+                    long[] handles = new long[64];
+                    for (int i = 0; i < 64; i++) {
+                        ids[i] = frozen.getRowId(i);
+                        handles[i] = frozen.getRowHandle(i);
+                    }
+                    try (FrozenHashJoinBuild.IntProbe probe = frozen.newProbe()) {
+                        probe.find(1);
+                        probe.next();
+                        long before = tracker.getUsed();
+                        if (tight) {
+                            tracker.setLimit(before + 64 * 16);
+                        }
+                        frames.copyPayload(frozen, sqlExecutionContext.getCircuitBreaker(), true);
+                        Assert.assertEquals(tight ? 16 : 32, frozen.getRowStride());
+                        Assert.assertTrue("co-location must not raise retained memory", tracker.getUsed() <= before + 64 * 16);
+                        if (!tight) {
+                            Assert.assertThrows(AssertionError.class, () -> probe.find(1));
+                        }
+                        probe.reopen();
+                        for (int i = 0; i < 64; i++) {
+                            Assert.assertEquals(ids[i], frozen.getRowId(i));
+                            Assert.assertEquals(handles[i], frozen.getRowHandle(i));
+                            probe.recordAt(handles[i]);
+                            Assert.assertEquals(i + 1, probe.getRecord().getLong(0));
+                        }
+                        for (int key = 0; key < 4; key++) {
+                            probe.find(key);
+                            long expected = 64 - ((64 - key) % 4);
+                            while (probe.hasNext()) {
+                                probe.next();
+                                Assert.assertEquals(expected, probe.getRecord().getLong(0));
+                                TestUtils.assertEquals("s" + (expected % 3), probe.getRecord().getSymA(1));
+                                expected -= 4;
+                            }
+                            Assert.assertTrue(expected <= 0);
+                        }
+                    }
+                    build.close();
+                    frames.clear();
+                    Assert.assertEquals(0, tracker.getUsed());
+                }
+            } finally {
+                sqlExecutionContext.setMemoryTracker(previous);
+            }
+        });
+    }
+
+    @Test
     public void testAllPayloadTypesAndPrunedMapping() throws Exception {
         assertMemoryLeak(() -> {
             execute("CREATE TABLE payload (k INT, b BOOLEAN, by BYTE, sh SHORT, ch CHAR, i INT, l LONG, d DATE, ts TIMESTAMP, "
@@ -221,7 +286,7 @@ public class HashJoinBuildFramesTest extends AbstractCairoTest {
                             printRow(before, key, metadata, mapping, expected);
                         }
                         final long used = tracker.getUsed();
-                        frames.copyPayload(frozen, sqlExecutionContext.getCircuitBreaker());
+                        frames.copyPayload(frozen, sqlExecutionContext.getCircuitBreaker(), true);
                         // The copy is charged to the execution, and the pass releases what it decoded.
                         Assert.assertEquals(used + 72 * 200, tracker.getUsed());
                         // A reader that existed before the copy reads the copy from its next match on,
@@ -296,12 +361,12 @@ public class HashJoinBuildFramesTest extends AbstractCairoTest {
                             }
                         }
                     };
-                    Assert.assertThrows(CairoException.class, () -> frames.copyPayload(frozen, cancelled));
+                    Assert.assertThrows(CairoException.class, () -> frames.copyPayload(frozen, cancelled, true));
                     Assert.assertEquals(buildBytes, tracker.getUsed());
                 }
 
                 // The build survives both failures, and a copy after them reads every row.
-                frames.copyPayload(frozen, sqlExecutionContext.getCircuitBreaker());
+                frames.copyPayload(frozen, sqlExecutionContext.getCircuitBreaker(), true);
                 Assert.assertEquals(buildBytes + 70_000 * 16, tracker.getUsed());
                 try (FrozenHashJoinBuild.IntProbe probe = frozen.newProbe()) {
                     for (int key = 1; key <= 70_000; key += 997) {
@@ -672,7 +737,7 @@ public class HashJoinBuildFramesTest extends AbstractCairoTest {
             long buildBytes
     ) {
         final long copyBytes = frozen.getRowCount() * Double.BYTES;
-        frames.beginCopy(frozen, 1, SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER);
+        frames.beginCopy(frozen, 1, SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER, true);
         frames.copyRows(0, frozen, 0, frozen.getRowCount(), SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER);
         assertPayloadOnlyDecode(tracker.getUsed() - buildBytes - copyBytes);
         frames.publishCopy();

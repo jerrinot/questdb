@@ -266,6 +266,9 @@ public class IntHashJoinPartitionedBuildTest extends AbstractCairoTest {
                             }
                             assertChains(frozen, expected, hasPayload);
                             assertSegmentsCoverTheHeap(build, frozen, frames, hasPayload);
+                            Assert.assertTrue(build.prepareIntegralLookup(10_000, Numbers.INT_NULL, NOOP));
+                            assertChains(frozen, expected, hasPayload);
+                            assertSegmentsCoverTheHeap(build, frozen, frames, hasPayload);
                             try (FrozenHashJoinBuild.IntProbe probe = frozen.newProbe()) {
                                 if (partitionCount == 1) {
                                     serialProbeClass = probe.getClass();

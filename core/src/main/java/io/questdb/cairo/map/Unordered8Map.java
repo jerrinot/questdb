@@ -958,6 +958,11 @@ public class Unordered8Map implements Map, Reopenable {
             return 0;
         }
 
+        /** The staged integral key, without hashing or probing the bound map. */
+        public long getStagedLongKey() {
+            return key;
+        }
+
         @Override
         public long getStagedKeySize() {
             return KEY_SIZE;

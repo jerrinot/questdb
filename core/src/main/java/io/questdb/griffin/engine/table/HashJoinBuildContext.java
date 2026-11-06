@@ -1140,7 +1140,7 @@ public final class HashJoinBuildContext implements QuietCloseable {
                 // A parallel build keeps each partition's rows in one region of the heap, so a pass in
                 // heap order would walk the frames once per partition, or it keeps each frame's rows
                 // in bucket order. Each frame copies the rows it kept instead, on the workers.
-                buildFrames.beginCopy(frozen, slots.size(), circuitBreaker);
+                buildFrames.beginCopy(frozen, slots.size(), circuitBreaker, true);
                 roundTaskRowCounts.clear();
                 for (int frameIndex = 0, n = buildFrames.getFrameCount(); frameIndex < n; frameIndex++) {
                     long rows = 0;
@@ -1152,9 +1152,27 @@ public final class HashJoinBuildContext implements QuietCloseable {
                 frameSequence.dispatchRoundAndAwait(copyFramePayloadTask, roundTaskRowCounts);
                 buildFrames.publishCopy();
             } else {
-                buildFrames.copyPayload(frozen, circuitBreaker);
+                buildFrames.copyPayload(frozen, circuitBreaker, true);
             }
             isPayloadCopied = true;
+            reopenProbes();
+        }
+    }
+
+    /** Finalizes the lookup representation before any worker can read this execution. */
+    void prepareLookup(long probeRows, SqlExecutionCircuitBreaker breaker) {
+        boolean changed = isKeyStaged ? mapBuild.prepareIntegralLookup(probeRows, breaker)
+                : intBuild.prepareIntegralLookup(probeRows, isSymbolKey ? SymbolTable.VALUE_IS_NULL : Integer.MIN_VALUE, breaker);
+        if (changed) reopenProbes();
+    }
+
+    private void reopenProbes() {
+        for (int i = 0; i < slots.size(); i++) {
+            Slot slot = slots.getQuick(i);
+            FrozenHashJoinBuild.Probe probe = isKeyStaged
+                    ? (isBuildPartitioned ? slot.partitionedRecordProbe : slot.recordProbe)
+                    : (isBuildPartitioned ? slot.partitionedIntProbe : slot.intProbe);
+            probe.reopen();
         }
     }
 

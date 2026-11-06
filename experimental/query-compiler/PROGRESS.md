@@ -8888,3 +8888,263 @@ thresholds to compensate for physical-layout noise. The hardware evidence gate p
 before the source edit. Raw evidence, scripts, profiles and summaries remain under
 `target/preparation-choice/choice-*`; repeated result files are removed after validation,
 retaining one output per process and a validation manifest. No dataset copy or new flag.
+
+### 2026-11-05: join-free control confirms coherence and frame-local state protection
+
+**The false-sharing mechanism generalizes beyond joins; LLVM's existing scalar reduction
+is a useful negative control.** No production code changed. Ran `select count(),sum(v),
+min(v),max(v),avg(v) from p where v>=0` over 500M LONG rows, `v=x%97-48`. The previous
+external fixture was unavailable, so recreated only this column in a disposable ~4GB table.
+Independent arithmetic gives 252577311 selected rows, sum 6061855464, min 0, max 48, avg 24.
+
+Compared ordinary current-branch execution and LLVM, preserving each path's plan across
+before/after allocation classes. Eight workers plus owner throughout; affinity changes
+from eight physical cores to one. Five warmups, six measured complete queries per process.
+Natural allocation, two reversed process pairs (averages of process medians): ordinary
+213.5 -> 207.1ms, LLVM 75.2 -> 75.0ms on eight cores. Only one ordinary pair had live-line
+overlap and a noticeable gain (217.9 -> 205.9ms); the other was 209.0 -> 208.2ms. A later
+natural counter pair had no overlap and no gain: 210.2 -> 211.8ms. No blanket padding win.
+
+Controlled equal-size arenas place neighboring states on shared or isolated cache lines;
+original pointers are restored before close. All six fields have identical offsets.
+The cache-counter cohort gives these medians:
+
+| Execution | Physical cores | Shared ms | Isolated ms |
+| --- | ---: | ---: | ---: |
+| Ordinary filtered scalar | 8 | 388.1 | 208.5 |
+| LLVM filtered scalar | 8 | 73.4 | 75.2 |
+| Ordinary filtered scalar | 1 | 1297.5 | 1298.7 |
+| LLVM filtered scalar | 1 | 500.1 | 498.5 |
+
+Ordinary eight-core ownership requests/input fall 0.24471 -> 0.00321, local-CCX demand
+fills 0.24415 -> 0.00185, load-not-complete cycles 11.720 -> 3.651. On one core the
+ownership counts are ~0.0031-0.0032 for both layouts. LLVM stays ~0.00045-0.00047 on
+eight cores. A clean reverse-order cycles cohort reproduces ordinary 393.6 -> 213.1ms,
+with instructions/input unchanged (88.302 -> 88.292), cycles 33.765 -> 17.623; LLVM is
+74.0 -> 73.2ms. Napkin: 16.14 cycles/input * 500M / (8 * 5.38GHz) is ~188ms, versus
+180ms observed. This establishes the deliberately shared-state penalty, not a default
+1.9x engine improvement. LLVM's small layout differences reverse direction across runs.
+
+Optimized LLVM IR and machine code confirm six aggregate stores only at loop exit
+(kernel offsets 0x374-0x38b); values remain in registers/thread-private stack slots while
+scanning. Filtered native objects are byte-identical across all captured layouts/core
+counts. A separate 783-sample profile attributes 96.7% of weighted cycles to that kernel.
+Ordinary execution updates state per selected row. The whole ordinary/LLVM speed ratio
+also includes filter fusion and removal of row-ID materialization; this experiment does
+not attribute all of it to state promotion.
+
+463 complete outputs from 43 processes match the arithmetic oracle; every LLVM execution
+accounts for exactly the expected selected rows. Initial five-event PMU groups did not
+count and are excluded; smaller groups ran at 100%. Interleaved console messages were
+removed during parsing to recover every original timing record. One earlier controlled
+capture had 208896 timed read bytes/two major faults and was replaced by a clean pair.
+All retained comparisons have zero timed reads/major faults. Twenty-millisecond samples:
+peak RSS 4.07GiB, >=73.50GiB available, no query swap/limit events; eight-core cache/repeat
+cohorts have zero query IO PSI. Desktop activity and host swap activity remain; one-core
+IO PSI can reflect warmup. Do not interpret percent-level differences as new gains.
+Only Ryzen 9950X/JDK25 was measured. Compilation/first executions are recorded separately.
+
+Next candidate: reuse the existing scalar-state promotion for eligible join reductions,
+where `ResolvedJoinKernel.update` still emits updates against the state address. Validate
+actual generated stores first, preserve duplicate/resume/cancellation contracts, and
+cover mixed SUM/MIN/MAX/AVG/COUNT rather than a COUNT-only loop. Grouped/allocating state
+needs its own evidence. This is a proposed experiment, not an implemented join speedup.
+Reproduction scripts, SQL, raw counters/symbols and the validated study remain under
+`target/scalar-state-control/`; retain one output per process and remove the disposable
+fixture and duplicate outputs after validation.
+
+### 2026-11-06: frozen join layout and physical specialization
+
+Retained a general INNER JOIN improvement against frozen current-branch LLVM B0,
+6a72fc1248, which already includes scalar-state isolation. This is a new independent
+500M-row control suite, not a refreshed ClickBench/SSB score or additional strict
+whole-query generated coverage. Ordinary Java controls are from this branch, not
+upstream master. The separate scalar-state-isolation worktree was left alone.
+
+Core frozen builds can replace bounded integral hash tables with compressed I32
+chain-head arrays. INT/SYMBOL and LONG/DATE/TIMESTAMP share the representation, with
+a separate NULL head. Known probe work must amortize conversion; the range may span
+at most twice the distinct key count. Temporary allocation must fit, and retained
+lookup bytes cannot exceed released hash storage. Sparse/composite/unsupported keys
+keep hashing. Java and LLVM share the same snapshot and lookup; no query-name rule.
+
+An already-useful, aligned fixed-width payload copy can include duplicate-row links
+and row IDs, then release the old heap. Logical handles and duplicate order survive;
+physical addresses use ordinal and stride. Existing owners, workers, readers and
+trackers remain responsible for lifetime. Insufficient temporary headroom, Parquet,
+unique builds and layouts requiring extra padding keep separate storage. Large compact
+copies reuse the existing Linux advisory huge-page code, now shared with
+UnorderedVarcharMap through Files. It changes no global setting, forces no collapse,
+and correctness does not depend on page-size selection. Memory-pressure and second-
+machine performance remain unmeasured; the kernel controls allocation/compaction.
+
+After preparation, generated code specializes on uniqueness, lookup representation,
+payload offsets/stride and available dependency caches. Values, addresses and symbol
+IDs remain execution-local; reopen rechecks facts, retaining only one specialized
+program set. Scalar register state reuses existing aggregate update IR and publishes
+at cancellation polls/returns. Grouped/allocating state stays in memory. Coordinated
+worker sampling compares memory/register state and cached/re-probed direct child
+lookups, alongside membership filtering. Native calls never hold the policy lock;
+repeated exploration occupies under 2% of frames. Up to eight kernels compile before
+publication. The existing 10% switch margin can leave smaller gains unused.
+
+Five warmups and six measured complete executions per process; 500M inputs, eight
+physical cores, eight configured workers plus owner, full results consumed. Medians:
+
+| Mixed aggregate workload | B0 LLVM ms | Retained LLVM ms | Speedup |
+| --- | ---: | ---: | ---: |
+| Dependent INT, unique builds | 633.430 | 216.006 | 2.93x |
+| Random INT, three observed duplicates/key | 6186.718 | 1558.560 | 3.97x |
+| Random SYMBOL, three observed duplicates/key | 6981.533 | 2088.245 | 3.34x |
+| Seven hot keys, observed duplicates | 798.487 | 489.436 | 1.63x |
+| Grouped INT | 812.657 | 413.238 | 1.97x |
+| Seventeen mixed scalar aggregates | 488.018 | 365.781 | 1.33x |
+| Random composite INT/LONG keys | 8999.273 | 6465.520 | 1.39x |
+
+These comparisons have zero timed physical reads/major faults. Dense high-bit LONG
+also improves; the final random-duplicate LONG case takes 1501.6ms versus 3501.8ms
+for the array-only intermediate. Sparse LONG remains about 0.80s versus B0 0.82s;
+a final capture with 128KiB/one fault was replaced by a clean 795.5ms repeat. Variable
+1-15 duplicates/key, each with different observed payload, produces 3,999,919,890
+joined rows with ten COUNT/SUM/MIN/MAX/AVG outputs; all match an independent C++ oracle.
+The no-match control improves 71.3 -> 58.3ms, preserving NULL aggregate results.
+
+Random INT takes 19.86s on one-core affinity and 0.916s on sixteen, versus array-only
+32.92s and 2.084s. One-core measurements have two execution lanes and CPU PSI up to
+99%; these are core-allocation controls, not a single-thread or ideal-scaling claim.
+Ordinary Java single-join INT/SYMBOL controls preserve their plans. Shared layout work
+improves the observed-duplicate Java case 3.90 -> 3.47s relative to array-only storage.
+The ordinary multiway plan still uses Hash Join Light; its large LLVM gap must not be
+credited to this new layout change.
+
+Hardware evidence separates the mechanisms. A byte-identical locality control first
+located root-lookup cost: L2 misses 1.033 -> 0.007/input and load waits 19.27 -> 3.17
+cycles/input when only the key working set became hot. Array replacement then reduces
+unique-INT L2 misses about 1.035 -> 0.043/input. Packing alone initially added generic
+address/dispatch work; physical specialization removes that cost. For random INT,
+B0 -> compact specialized code reduces instructions 426 -> 278/input before the page
+hint. A fixed-machine-code page-size counterfactual reduces L2 DTLB walk requests
+1.058 -> 0.0031/input, cycles 163.74 -> 131.72/input and time 1899 -> 1539ms; a reversed
+pair reproduces the gain, while hot keys barely change. Napkin: 32 cycles * 500M /
+(8 * 5.5GHz) is 364ms, close to 360ms observed. Walk requests overlap and are not
+additive stall times. A live capture shows 22MiB anonymous huge pages in the hinted
+copy. No DRAM-bandwidth-saturation claim is established.
+
+DuckDB 2.0.0, uncompressed numeric storage, identical committed inputs and core affinity,
+uses the same five/six warm protocol: hot/random INT/composite take 789.8/2418.7/2624.2ms.
+The retained candidate wins the first two and still loses composite by 2.46x. Before
+the hint, composite LLVM/DuckDB retire 348/404 instructions per input but use 627/229
+cycles. Separate memory cohorts report 548/160 load-incomplete cycles and 8.09/6.33 L2
+misses/input. IBS identifies OrderedMap directory/key loads, duplicate links and payload;
+many sampled accesses reach L3/RAM. The IBS capture has 28KiB timed reads, so use the
+clean unprofiled cohorts for latency. Forced cached/direct alternatives recover only
+about 8% (6.46 -> 5.95s), leaving most of the external-control gap unexplained by choice.
+
+The cost: backend compilation grows from about 116-117 to 184-185ms of calling-thread
+CPU, two to eight functions, and 7841 to 10437 native text bytes. Cached reopens compile
+nothing. A separate phase capture attributes about 79 -> 120ms CPU to the LLVM bridge,
+30 -> 56ms to SSA/verification/emission, with native binding near 9ms in both; candidate
+IR construction adds 21ms outside the backend timer. These are instrumented phase
+measurements, not total process compiler CPU. Fresh-process SQL compile plus first
+no-match execution regresses roughly 0.51 -> 0.63s in reversed pairs, despite faster
+warm execution. Keep this tradeoff visible; query caching does not erase first use.
+
+166 focused core tests and 85 compiler tests pass. Existing aggregate oracles also run
+the promoted path: NULLs, wrapping overflow, signed zero, NaN/infinity, Kahan states,
+mixed lists and cancellation publication. Core checks cover serial/partitioned heaps,
+range extremes, stale probes, reopen and memory limits. Tight-budget controls show no
+increase over the array-only layout. All 6715 complete outputs from 611 successful
+processes match independent arithmetic; every generated query accounts for 500M inputs.
+PMU groups run at >=99%. Final eight-core USE: peak RSS 10.47GB, >=80.30GB available,
+no query swap/OOM/limit events or memory PSI; CPU PSI <=12.15. Desktop activity remains.
+Only Ryzen 9950X, Linux 7.0.0-38, JDK25 and LLVM21 were measured. Controller/ECC telemetry
+and child throttled_usec remain unavailable. Small I/O-contaminated captures are marked.
+
+Rejected: unconditional state promotion/polling ABI, an extra unaccounted packed-copy
+wrapper, current-row prefetch, dynamic cached/reprobe branching, and range-only filter
+specialization. The last removes 8.5% of instructions and 19% of total code bytes but
+barely changes cycles/time; retain neither its extra fact nor its implementation.
+
+Next: use the existing QuestMapProbe prefetch/prepare contracts to test a bounded
+root-lookup batch, consuming results in original probe order. Compare it with contiguous
+duplicate groups only after separating lookup and chain cost. Preserve typed/composite
+keys, dictionaries, observed payloads, aggregate order and budget fallback. The
+[unchained-table paper](https://db.in.tum.de/~birler/papers/hashtable.pdf) motivates
+adjacency layout; [AMAC](https://www.vldb.org/pvldb/vol9/p252-kocberber.pdf) motivates
+independent lookup progress under irregular chains. Neither paper proves a win here.
+Compilation economics is now a measured second priority; price IR and native phases
+before introducing deferred tiers or compiler workers. Current scripts, counters,
+symbols, validation and the B0 reference remain under `target/join-state-promotion/`;
+disposable datasets and rejected experiment copies are removed after validation.
+
+### 2026-11-06 — Adversarial SQL finds two compiled-filter lifecycle gaps
+
+Existing query fuzz seed `314159265/271828182` found HORIZON projection plus a
+VARCHAR literal throwing `Filter literals are not prepared`. The same 3,000-case
+seed passes with the experimental compiler disabled. A composed WINDOW JOIN
+control exposed the same exception, and SYMBOL LIKE silently returned **0 rows
+instead of 1,321**. Both atoms accepted a compiled filter without forwarding its
+execution lifecycle. They now prepare its literal/symbol state after function
+initialization, forward dispatch preparation, and clear state after workers drain.
+Cleanup retains the existing best-effort exception handling; no new abstraction
+or configuration switch. The reduced tests failed on LLVM, AsmJit and C before
+the fixes and now pass, including cursor rewind, early close and factory reuse.
+
+Final validation: **8,000 generated cases across four fixed seeds**, no unexpected
+failures; **866 compiler-axis comparisons actually executed native kernels** and
+916 injected faults fired. The fuzzer retains its expected SQL-error handling and
+existing floating-point tolerance. An additional **66 composed queries** all pass:
+56 execute native code, ten fall back or do no native work, and seven require the
+existing floating-point tolerance. Coverage includes nullable INT/LONG/DOUBLE/
+SYMBOL/VARCHAR, Unicode, overflow, binds, nested aggregates, DISTINCT, joins,
+temporal joins, sorting and deep CASE/predicate trees. This proves generated
+execution of parts of those queries, not full LLVM coverage of every operator.
+The full filter suite passes **15 tests across all three backends**; the package
+build and whitespace checks pass. Comparisons use ordinary execution in this
+branch, not upstream master. These are small correctness fixtures, not throughput
+measurements.
+
+Reproduction and concise seed results: `target/sql-stress-20261106/`
+(`fuzz-final-runs.json`, `run-compositions.sh`, `compositions.sql`, and its source
+fixture). Logs larger than 1 MiB are gzip-compressed. Permanent regressions are in
+`VarcharFilterTest`; the composed corpus is retained in `SqlCompositionStressTest`.
+
+### 2026-11-06 — Extend correctness coverage across SQL composition boundaries
+
+The first corpus mostly used fixed inputs and compared row multisets. The next
+corpus targets interactions between separately tested compiler paths and their
+ordinary fallbacks, rather than merely adding random predicates:
+
+| Additional coverage | Checks | Checks executing native code |
+| --- | ---: | ---: |
+| Empty/outer/anti joins, aggregate inputs to joins, repeated CTEs, set operations, nullable predicates, variable-width key tuples, wide projections | 135 | 111 |
+| Physical frame tails and additional join key types | 90 | 47 |
+| Ordered output, LIMIT boundaries and IEEE values | 41 | 39 |
+| Timestamp precision/ties, keyed temporal joins, column tops and mixed Parquet/native storage | 34 | 22 |
+| Six cached factories across binds, appends, O3 insertion, truncation and dictionary changes on both join sides | 144 | 144 |
+
+All **444 checks pass**; **363 execute at least one native kernel**. Eight additional
+INT/LONG `IN (subquery)` cases consistently produce the existing SQL rejection
+(`InLongFunctionFactory` rejects CURSOR arguments); they are not counted as passing
+execution cases. One check uses the existing floating-point tolerance. For tiny
+physical tables, supported scalar/grouped forms explicitly require native calls
+for every nonempty size from 1 through 257 around frame boundaries; mixed DISTINCT
+forms remain separate fallback controls. No compiler admission switches were added.
+
+Order-sensitive checks use the existing typed cursor comparator instead of the
+fuzzer's multiset oracle. IEEE checks additionally compare exact double bits and
+verify the stored input bits. This caught a fixture error: SQL casts of the string
+`Infinity` yielded NaN; direct table-writer insertion now supplies actual positive/
+negative infinity, signed zero and subnormal values. The corrected cases pass.
+No new production defect was found or production code changed in this round.
+
+The corpus is now retained in `src/test/java/org/questdb/experimental/codegen/SqlCompositionStressTest.java`,
+sharing the fixture and existing Griffin comparison infrastructure with the first
+66 cases. After building, replay both rounds from this module with
+`./run-griffin-tests.sh llvm org.questdb.experimental.codegen.SqlCompositionStressTest`.
+Use `stock` for the ordinary control. Scratch SQL catalogs and logs stay under
+`target/sql-stress-20261106/`; generated binaries and result archives are not committed.
+Remaining gaps include concurrent factory execution during updates/schema changes,
+fault/cancellation paths within these specific compositions, and large-state growth.
+Fallback-only queries do not establish LLVM operator coverage. Inputs are small
+correctness fixtures; this round makes no performance claim.

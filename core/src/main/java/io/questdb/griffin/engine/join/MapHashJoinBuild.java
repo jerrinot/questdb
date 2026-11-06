@@ -125,6 +125,7 @@ public final class MapHashJoinBuild implements Closeable {
     // longs. Keys may vary in size, so a bucket's rows do not tell where it starts.
     private final HashJoinBuffer bucketOffsets = new HashJoinBuffer(MAX_BUFFER_SIZE);
     private final HashJoinRowHeap heap;
+    private final HashJoinIntegralIndex integralIndex = new HashJoinIntegralIndex();
     private final int initialKeyCapacity;
     private final long initialMapHeapSize;
     // Bytes of a raw key, or -1 for a var-size key, whose chunk entry leads with its length.
@@ -459,6 +460,7 @@ public final class MapHashJoinBuild implements Closeable {
             frozen = null;
         }
         isOpen = false;
+        integralIndex.close();
         partitions.close();
         bucketOffsets.close();
         Misc.freeObjListAndKeepObjects(maps);
@@ -612,7 +614,7 @@ public final class MapHashJoinBuild implements Closeable {
         for (int i = 0, n = maps.size(); i < n; i++) {
             size += mapSizeInBytes(maps.getQuick(i));
         }
-        return size;
+        return size + integralIndex.getSizeInBytes();
     }
 
     /**
@@ -706,6 +708,37 @@ public final class MapHashJoinBuild implements Closeable {
             close();
             throw th;
         }
+    }
+
+    /**
+     * Replaces a bounded single integral key lookup before probe publication; see
+     * {@link IntHashJoinBuild#prepareIntegralLookup(long, int, SqlExecutionCircuitBreaker)}.
+     */
+    public boolean prepareIntegralLookup(long probeRows, SqlExecutionCircuitBreaker breaker) {
+        if (frozen == null) {
+            throw new IllegalStateException("hash join build is not frozen");
+        }
+        if (unordered8Map == null || integralIndex.isReady() || heap.hasChainLengths()) {
+            return false;
+        }
+        long replacedBytes = 0;
+        for (int i = 0, n = maps.size(); i < n; i++) {
+            replacedBytes += mapSizeInBytes(maps.getQuick(i));
+        }
+        try (var view = new Unordered8Map.ProbeView()) {
+            view.ofLayout(unordered8Map);
+            if (!integralIndex.prepare(frozen, probeRows, Long.MIN_VALUE, replacedBytes, memoryTracker, breaker, key -> {
+                view.withKey().putLong(key);
+                int partition = frozen instanceof PartitionedFrozen p ? HashJoinPartitions.bucketOf(view.hash(), p.partitionShift) : 0;
+                MapValue value = view.of((Unordered8Map) maps.getQuick(partition)).findValue();
+                return value == null ? 0 : CompressedOffsets.uncompressAligned8(value.getInt(0));
+            })) {
+                return false;
+            }
+        }
+        Misc.freeObjListAndKeepObjects(maps);
+        frozen.size = getSizeInBytes();
+        return true;
     }
 
     /**
@@ -1024,6 +1057,24 @@ public final class MapHashJoinBuild implements Closeable {
         long size;
 
         @Override
+        public long getMinIntegralKey() {
+            return integralIndex.isReady() ? integralIndex.getMinimum() : Long.MAX_VALUE;
+        }
+
+        @Override
+        public long getMaxIntegralKey() {
+            return integralIndex.isReady() ? integralIndex.getMaximum() : Long.MIN_VALUE;
+        }
+
+        @Override
+        public boolean writeIntegralLookup(long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            return !heap.hasChainLengths() && integralIndex.write(address, rowsAddress);
+        }
+
+        @Override
         public void countKeyRows() {
             if (frozen != this) {
                 throw new IllegalStateException("hash join build has expired");
@@ -1074,9 +1125,32 @@ public final class MapHashJoinBuild implements Closeable {
         }
 
         @Override
+        public int getRowStride() {
+            return heap.getRowStride();
+        }
+
+        @Override
+        public long getRowAddress(long ordinal) {
+            assert ordinal >= 0 && ordinal < rowsCount && generation == heap.getGeneration();
+            return rowsAddress + ordinal * heap.getRowStride();
+        }
+
+        @Override
+        public void relocateRows(long address, int stride) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            long released = heap.getSizeInBytes();
+            heap.relocateRows(address, stride);
+            rowsAddress = heap.getAddress();
+            generation = heap.getGeneration();
+            size -= released;
+        }
+
+        @Override
         public long getRowId(long ordinal) {
             assert heap.hasRowId() && ordinal >= 0 && ordinal < rowsCount && generation == heap.getGeneration();
-            return HashJoinRowHeap.getRowIdAt(rowsAddress, ordinal);
+            return HashJoinRowHeap.getRowId(rowsAddress + ordinal * heap.getRowStride());
         }
 
         @Override
@@ -1087,7 +1161,13 @@ public final class MapHashJoinBuild implements Closeable {
         @Override
         public boolean forEachIntegralKey(java.util.function.LongConsumer visitor, SqlExecutionCircuitBreaker breaker) {
             if (keyTypes.getColumnCount() != 1 || !Unordered8Map.isSupportedKeyType(keyTypes.getColumnType(0))) return false;
-            if (frozen != this || generation != heap.getGeneration()) throw new IllegalStateException("hash join build has expired");
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            if (integralIndex.isReady()) {
+                integralIndex.forEachKey(visitor, breaker);
+                return true;
+            }
             for (int i = 0, n = getNativeMapCount(); i < n; i++) {
                 breaker.statefulThrowExceptionIfTripped();
                 MapRecordCursor cursor = (n == 1 ? map : maps.getQuick(i)).getCursor();
@@ -1102,7 +1182,7 @@ public final class MapHashJoinBuild implements Closeable {
 
         @Override
         public int getNativeMapCount() {
-            return this instanceof PartitionedFrozen p ? p.partitionCount : 1;
+            return integralIndex.isReady() ? 0 : this instanceof PartitionedFrozen p ? p.partitionCount : 1;
         }
 
         @Override
@@ -1120,7 +1200,7 @@ public final class MapHashJoinBuild implements Closeable {
             if (frozen != this || generation != heap.getGeneration()) {
                 throw new IllegalStateException("hash join build has expired");
             }
-            if (heap.hasChainLengths() || mapViews == 0) return false;
+            if (heap.hasChainLengths() || integralIndex.isReady() || mapViews == 0) return false;
             Unsafe.putLong(address, mapViews);
             Unsafe.putLong(address + 8, getNativeMapCount() - 1);
             Unsafe.putLong(address + 16, 0);
@@ -1226,13 +1306,20 @@ public final class MapHashJoinBuild implements Closeable {
                 // The staging buffer belongs to the execution that charged it, so rebind the
                 // tracker before the view primes it against this execution's map.
                 view.setMemoryTracker(memoryTracker);
-                bindView(view, map);
+                if (integralIndex.isReady()) {
+                    ((Unordered8Map.ProbeView) view).ofLayout(unordered8Map);
+                } else {
+                    bindView(view, map);
+                }
                 ofSnapshot(payloads, handleBase, rowsAddress, rowsCount, generation);
             }
 
             private int findHead(Record probeRecord) {
                 assert isCurrent();
                 keySink.copy(probeRecord, view.withKey());
+                if (integralIndex.isReady()) {
+                    return integralIndex.find(((Unordered8Map.ProbeView) view).getStagedLongKey());
+                }
                 final MapValue value = view.findValue();
                 return value != null ? value.getInt(0) : 0;
             }
@@ -1325,8 +1412,12 @@ public final class MapHashJoinBuild implements Closeable {
                 view.setMemoryTracker(memoryTracker);
                 // Binding to every partition's map checks its layout once, so that the lookups
                 // can take whichever map a key selects without binding to it.
-                for (int p = 0; p < partitionCount; p++) {
-                    bindView(view, maps.getQuick(p));
+                if (integralIndex.isReady()) {
+                    ((Unordered8Map.ProbeView) view).ofLayout(unordered8Map);
+                } else {
+                    for (int p = 0; p < partitionCount; p++) {
+                        bindView(view, maps.getQuick(p));
+                    }
                 }
                 lookupShift = partitionShift;
                 ofSnapshot(payloads, handleBase, rowsAddress, rowsCount, generation);
@@ -1335,6 +1426,9 @@ public final class MapHashJoinBuild implements Closeable {
             private int findHead(Record probeRecord) {
                 assert isCurrent();
                 keySink.copy(probeRecord, view.withKey());
+                if (integralIndex.isReady()) {
+                    return integralIndex.find(((Unordered8Map.ProbeView) view).getStagedLongKey());
+                }
                 final MapValue value = view.findValueIn(maps.getQuick(HashJoinPartitions.bucketOf(view.hash(), lookupShift)));
                 return value != null ? value.getInt(0) : 0;
             }
