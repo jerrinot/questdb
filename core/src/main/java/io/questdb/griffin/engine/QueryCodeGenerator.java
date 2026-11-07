@@ -96,16 +96,19 @@ public interface QueryCodeGenerator {
     record CompiledFilters(io.questdb.jit.CompiledFilter rows, io.questdb.jit.CompiledCountOnlyFilter count) { }
 
     /**
-     * A completed ordinary INT join map, borrowed only during owner-thread preparation.
+     * A completed ordinary join map, borrowed only during owner-thread preparation.
+     * Immutable column/type arrays follow RecordSink key order. Keys use the resolved
+     * comparison types and the probe columns' SYMBOL dictionaries.
      * A null map means pass-through (for example, the join swapped build/probe sides).
      * Generated filters must copy keys into their own tracked state before worker dispatch.
      */
-    record IntJoinFilterSource(int probeColumn, int mapKeyColumn, java.util.function.Supplier<Map> completedBuild) { }
+    record JoinFilterSource(int[] probeColumns, int[] keyTypes, int mapKeyColumn,
+                            java.util.function.Supplier<Map> completedBuild) { }
 
     /** The row kernel owns execution state; the Java fallback and count kernel borrow it. */
     record JoinFilter(Function fallback, CompiledFilters compiled) { }
 
-    default @Nullable JoinFilter compileJoinFilter(ColumnTypes inputs, ObjList<IntJoinFilterSource> sources) { return null; }
+    default @Nullable JoinFilter compileJoinFilter(ColumnTypes inputs, ObjList<JoinFilterSource> sources) { return null; }
 
     /**
      * Borrows planning inputs only for this call. Return null for unsupported implementations;

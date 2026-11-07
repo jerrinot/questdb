@@ -114,6 +114,36 @@ public class PipelineTest {
     }
 
     @Test
+    public void calendarYearMatchesDriversAtBoundariesAndAcrossFullWidth() throws Exception {
+        for (int type : new int[]{ColumnType.DATE, ColumnType.TIMESTAMP_MICRO, ColumnType.TIMESTAMP_NANO}) {
+            String name = ColumnType.nameOf(type);
+            engine.execute("create table years as (select cast(x as int) k,cast(case when x%23=0 then null "
+                    + "when x%23=1 then 9223372036854775807L when x%23=2 then -9223372036854775807L "
+                    + "when x%23=3 then -1L when x%23=4 then 0L when x%23=5 then 1152921504606846976L "
+                    + "else x*7046029254386353131L end as " + name + ") t from long_sequence(2003))", context);
+            long ticksPerMillisecond = type == ColumnType.DATE ? 1 : type == ColumnType.TIMESTAMP_NANO ? 1_000_000 : 1_000;
+            int key = 2004;
+            for (String instant : List.of("1900-01-01T00:00:00Z", "1900-03-01T00:00:00Z", "1969-01-01T00:00:00Z",
+                    "1970-01-01T00:00:00Z", "2000-01-01T00:00:00Z", "2000-03-01T00:00:00Z", "2100-01-01T00:00:00Z")) {
+                long boundary = java.time.Instant.parse(instant).toEpochMilli() * ticksPerMillisecond;
+                for (long delta : new long[]{-1, 0, 1}) {
+                    engine.execute("insert into years values (" + key++ + "," + (boundary + delta) + ")", context);
+                }
+            }
+            Column k = new Column(0, "k", ColumnType.INT);
+            Column t = new Column(1, "t", type);
+            Scalar input = type == ColumnType.DATE ? new Multiply(t, new Constant(1_000), ColumnType.LONG) : t;
+            Scalar year = new TimestampYear(input, type == ColumnType.DATE ? ColumnType.TIMESTAMP_MICRO : type);
+            var aggregates = List.<Aggregate>of(new Sum(year), new CountValue(year));
+            assertMatches("years", new Pipeline(List.of(k, t), new All(), List.of(k), aggregates),
+                    "select k,sum(year(t)),count(year(t)) from years group by k", 4096);
+            assertMatches("years", new Pipeline(List.of(k, t), new Compare(Ir.Op.LT, year, new Constant(1970)), List.of(k), aggregates),
+                    "select k,sum(year(t)),count(year(t)) from years where year(t)<1970 group by k", 4096);
+            engine.execute("drop table years", context);
+        }
+    }
+
+    @Test
     public void nullsMultipleKeysExpressionsAndAggregates() throws Exception {
         engine.execute("create table t (a int, b long, v long)", context);
         engine.execute("""

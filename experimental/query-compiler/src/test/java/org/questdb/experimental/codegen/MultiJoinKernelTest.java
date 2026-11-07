@@ -125,6 +125,38 @@ public class MultiJoinKernelTest {
         }
     }
 
+    @Test public void completedMapAndReducedKeysAgreeAcrossRepresentations() {
+        try (var map = io.questdb.cairo.map.MapFactory.createUnorderedMap(engine.getConfiguration(),
+                new ArrayColumnTypes().add(ColumnType.LONG), new ArrayColumnTypes().add(ColumnType.LONG));
+             var keys = new DirectLongList(8, MemoryTag.NATIVE_JIT);
+             var ordinary = new IntegralMembership();
+             var reduced = new IntegralMembership()) {
+            for (long[] values : new long[][]{{}, {-2, -1, 0, 1}, {-2, 0, 3},
+                    {Long.MIN_VALUE, Long.MAX_VALUE, 0, 1L << 40}, {}}) {
+                map.clear();
+                keys.clear();
+                for (long value : values) {
+                    var key = map.withKey();
+                    key.putLong(value);
+                    key.createValue().putLong(0, 0);
+                    keys.add(value);
+                }
+                ordinary.prepareJoin(map, record -> record.getLong(1), Long.BYTES,
+                        context.getMemoryTracker(), context.getCircuitBreaker());
+                reduced.prepareReducedKeys(keys, context.getMemoryTracker(), context.getCircuitBreaker());
+                assertEquals(reduced.hasBitmap(), ordinary.hasBitmap());
+                for (long value : values) {
+                    assertTrue(ordinary.contains(value));
+                    assertTrue(reduced.contains(value));
+                }
+                for (long value = -100; value <= 100; value++) {
+                    assertEquals(reduced.contains(value), ordinary.contains(value));
+                    assertEquals(reduced.contains(Hash.hashLong64(value)), ordinary.contains(Hash.hashLong64(value)));
+                }
+            }
+        }
+    }
+
     @Test public void dependencyReductionBoundsPreparationAndReleasesScratch() throws Exception {
         engine.execute("create table budget_a as (select cast(x as int) k,cast(x%17 as int) v from long_sequence(31))", context);
         try (var a = new Input("budget_a", true); var b = new Input("b", true);
@@ -145,7 +177,7 @@ public class MultiJoinKernelTest {
             assertTrue(JoinDependencyFilter.affordable(a.frozen, 10000, tracker));
             var children = new ObjList<JoinDependencyFilter.Lookup>();
             children.add(child);
-            assertTrue(JoinDependencyFilter.prepare(a.frozen, ColumnType.INT, children, set, tracker, context.getCircuitBreaker()));
+            assertTrue(JoinDependencyFilter.prepare(a.frozen, new int[]{ColumnType.INT}, children, set, tracker, context.getCircuitBreaker()));
             assertTrue(tracker.getUsed() > 0);
             assertTrue("only retained filter remains", tracker.getUsed() <= a.frozen.getKeyCount() * 8 + 32);
             try (var probe = b.frozen.newProbe()) {
@@ -411,6 +443,7 @@ public class MultiJoinKernelTest {
                     assertTrue(cursor.hasNext());
                     for (int i = 0; i < functions.size(); i++) assertEquals(cursor.getRecord().getLong(i), functions.getQuick(i).getLong(value));
                 }
+                slot.clearExecution();
                 code.clearExecution();
                 assertEquals(before, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
             }

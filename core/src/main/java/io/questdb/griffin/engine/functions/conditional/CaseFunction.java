@@ -34,6 +34,14 @@ public interface CaseFunction extends MultiArgFunction {
         return Function.addComplexity(5, MultiArgFunction.super.getComplexity());
     }
 
+    /**
+     * Returns the picker used by this function's getters, or null when not exposed for
+     * code generation. Its resolved, casted branches are borrowed from this function.
+     */
+    default CaseFunctionPicker getPicker() {
+        return null;
+    }
+
     @Override
     default void toPlan(PlanSink sink) {
         sink.val("case(").val(args()).val(')');

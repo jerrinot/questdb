@@ -84,7 +84,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    public sealed interface Scalar permits Column, Constant, FloatingConstant, ToFloating, Parameter, Add, Subtract, Multiply, Divide, TimestampPart, IPv4Subtract, DictionaryLookup, FrameScalar {
+    public sealed interface Scalar permits Column, Constant, FloatingConstant, ToFloating, Conditional, Parameter, Add, Subtract, Multiply, Divide, TimestampPart, TimestampYear, IPv4Subtract, DictionaryLookup, FrameScalar {
         Value emit(Row row);
     }
 
@@ -147,6 +147,15 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
 
     public record FloatingConstant(double value) implements Scalar {
         @Override public Value emit(Row row) { return new Value(f64(value), bool(!Double.isFinite(value))); }
+    }
+
+    /** Both admitted branches must be total and side-effect-free: Select may evaluate both. */
+    public record Conditional(Predicate condition, Scalar whenTrue, Scalar whenFalse) implements Scalar {
+        @Override public Value emit(Row row) {
+            Expr selected = condition.emit(row);
+            Value yes = whenTrue.emit(row), no = whenFalse.emit(row);
+            return new Value(new Select(selected, yes.data(), no.data()), new Select(selected, yes.isNull(), no.isNull()));
+        }
     }
 
     /** Integer getters widen their already wrapped value, replacing the source NULL with NaN. */
@@ -218,6 +227,40 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
             Expr units = binary(Op.SDIV, adjusted, i64(unitTicks));
             Expr remainder = binary(Op.SUB, units, binary(Op.MUL, binary(Op.SDIV, units, i64(period)), i64(period)));
             return new Value(new Select(positive, remainder, add(i64(period - 1), remainder)), value.isNull());
+        }
+    }
+
+    /** The timestamp drivers' year estimate and correction, including year-start overflow. */
+    public record TimestampYear(Scalar argument, int timestampType) implements Scalar {
+        public TimestampYear {
+            if (!ColumnType.isTimestamp(timestampType)) throw new IllegalArgumentException("Timestamp type required");
+        }
+        @Override
+        public Value emit(Row row) {
+            Value value = argument.emit(row);
+            boolean nanos = timestampType == ColumnType.TIMESTAMP_NANO;
+            long day = nanos ? io.questdb.std.datetime.nanotime.Nanos.DAY_NANOS : io.questdb.std.datetime.microtime.Micros.DAY_MICROS;
+            long averageYear = nanos ? io.questdb.std.datetime.nanotime.Nanos.AVG_YEAR_NANOS : io.questdb.std.datetime.microtime.Micros.AVG_YEAR_MICROS;
+            Expr estimate = add(i64(1970), binary(Op.SDIV, value.data(), i64(averageYear)));
+            Expr year = new Select(binary(Op.BOTH, binary(Op.LT, value.data(), i64(0)), binary(Op.GE, estimate, i64(1970))),
+                    i64(1969), estimate);
+            Expr centuries = binary(Op.SDIV, year, i64(100));
+            Expr cycles = binary(Op.SDIV, year, i64(400));
+            Expr leap = binary(Op.BOTH, eq(binary(Op.AND, year, i64(3)), i64(0)),
+                    binary(Op.EITHER, binary(Op.NE, year, binary(Op.MUL, centuries, i64(100))),
+                            eq(year, binary(Op.MUL, cycles, i64(400)))));
+            // In the negative-year arm of yearMicros/yearNanos, (year + 3) >> 2
+            // equals truncating year / 4; the same identity holds for centuries.
+            Expr leapYears = binary(Op.SUB, add(binary(Op.SUB, binary(Op.SDIV, year, i64(4)), centuries), cycles),
+                    new Select(binary(Op.EITHER, binary(Op.LT, year, i64(0)), leap), i64(1), i64(0)));
+            Expr days = add(binary(Op.MUL, year, i64(365)), binary(Op.SUB, leapYears, i64(719527)));
+            Expr start = binary(Op.MUL, days, i64(day));
+            start = new Select(binary(Op.BOTH, binary(Op.LT, days, i64(0)), binary(Op.GE, start, i64(1))), i64(Long.MIN_VALUE), start);
+            Expr difference = binary(Op.SUB, value.data(), start);
+            Expr length = new Select(leap, i64(366 * day), i64(365 * day));
+            Expr result = new Select(binary(Op.LT, difference, i64(0)), binary(Op.SUB, year, i64(1)),
+                    new Select(binary(Op.GE, difference, length), add(year, i64(1)), year));
+            return new Value(result, value.isNull());
         }
     }
 

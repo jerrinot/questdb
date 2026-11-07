@@ -32,4 +32,21 @@ import org.jetbrains.annotations.NotNull;
 public interface CaseFunctionPicker {
     @NotNull
     Function pick(Record record);
+
+    /**
+     * A resolved switch over integral keys. Keys use the selector's native getter
+     * representation, including its NULL sentinel. SYMBOL keys are cursor-bound.
+     * Branch functions include the ordinary return-type casts and remain borrowed.
+     */
+    interface Integral extends CaseFunctionPicker {
+        int getBranchCount();
+
+        Function getElseBranch();
+
+        long getKey(int index);
+
+        Function getKeyFunction();
+
+        Function getValue(int index);
+    }
 }

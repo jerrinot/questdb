@@ -31,7 +31,6 @@ import io.questdb.std.QuietCloseable;
 import io.questdb.std.Unsafe;
 
 import java.util.function.LongConsumer;
-import java.util.function.LongUnaryOperator;
 
 /** A bounded replacement for an integral build's key tables; row heaps stay unchanged. */
 final class HashJoinIntegralIndex implements QuietCloseable {
@@ -97,7 +96,7 @@ final class HashJoinIntegralIndex implements QuietCloseable {
             long replacedBytes,
             MemoryTracker tracker,
             SqlExecutionCircuitBreaker breaker,
-            LongUnaryOperator lookup
+            Runnable copyHeads
     ) {
         if (ready) {
             return false;
@@ -138,27 +137,26 @@ final class HashJoinIntegralIndex implements QuietCloseable {
         heads.of(tracker, breaker);
         try {
             heads.allocate(bytes, true);
-            boolean[] supported = {true};
-            boolean visited = build.forEachIntegralKey(key -> {
-                long head = lookup.applyAsLong(key);
-                if (head < 0) {
-                    supported[0] = false;
-                } else if (key == nullKey) {
-                    nullHead = CompressedOffsets.compressAligned8(head);
-                } else {
-                    Unsafe.putInt(heads.address + (key - first) * Integer.BYTES, CompressedOffsets.compressAligned8(head));
-                }
-            }, breaker);
-            if (!visited || !supported[0]) {
-                close();
-                return false;
-            }
+            // The build copies occupied entries directly; looking their keys up again
+            // adds hashing and dependent loads without discovering any new information.
+            copyHeads.run();
             // Until this point iteration and lookups must still use the original tables.
             ready = true;
             return true;
         } catch (Throwable failure) {
             close();
             throw failure;
+        }
+    }
+
+    /** Copies an occupied entry while prepare owns both representations. */
+    void put(long key, int compressedHead) {
+        assert !ready && compressedHead != 0;
+        if (key == nullKey) {
+            nullHead = compressedHead;
+        } else {
+            assert key >= first && key <= last;
+            Unsafe.putInt(heads.address + (key - first) * Integer.BYTES, compressedHead);
         }
     }
 

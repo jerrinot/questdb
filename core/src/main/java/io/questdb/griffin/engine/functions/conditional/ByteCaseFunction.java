@@ -45,6 +45,11 @@ class ByteCaseFunction extends ByteFunction implements CaseFunction {
     }
 
     @Override
+    public CaseFunctionPicker getPicker() {
+        return picker;
+    }
+
+    @Override
     public byte getByte(Record rec) {
         return picker.pick(rec).getByte(rec);
     }

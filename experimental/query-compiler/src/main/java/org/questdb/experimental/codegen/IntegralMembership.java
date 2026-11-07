@@ -74,17 +74,63 @@ final class IntegralMembership implements AutoCloseable {
         }
     }
 
-    /** Necessary condition for a join match; sparse bounds may admit false positives. */
-    void prepareJoin(Map map, int keyColumn, MemoryTracker tracker, SqlExecutionCircuitBreaker breaker) {
-        prepareJoin(map == null ? -1 : map.size(), visitor -> {
-            var cursor = map.getCursor();
-            var record = cursor.getRecord();
-            while (cursor.hasNext()) {
-                breaker.statefulThrowExceptionIfTrippedOrYield();
-                visitor.accept(record.getInt(keyColumn));
-            }
-            return true;
-        }, tracker);
+    /** Completed ordinary keys; sparse domains use the same bounded Bloom layout as reduced builds. */
+    void prepareJoin(Map map, java.util.function.ToLongFunction<io.questdb.cairo.sql.Record> key,
+                     int keyBytes, MemoryTracker tracker, SqlExecutionCircuitBreaker breaker) {
+        long size = map == null ? -1 : map.size();
+        if (size < 0 || !canPrepareJoin(size, tracker, 0)) {
+            universal();
+            return;
+        }
+        close();
+        memory.setMemoryTracker(tracker);
+        if (size == 0) return;
+        first = Long.MAX_VALUE;
+        last = Long.MIN_VALUE;
+        var cursor = map.getCursor();
+        var record = cursor.getRecord();
+        while (cursor.hasNext()) {
+            breaker.statefulThrowExceptionIfTrippedOrYield();
+            long value = key.applyAsLong(record);
+            first = Math.min(first, value);
+            last = Math.max(last, value);
+        }
+        allocateJoin(size, size * keyBytes);
+        if (count == 0) return;
+        cursor.toTop();
+        while (cursor.hasNext()) {
+            breaker.statefulThrowExceptionIfTrippedOrYield();
+            insertJoin(key.applyAsLong(record));
+        }
+    }
+
+    static boolean canPrepareJoin(long size, MemoryTracker tracker, long scratchBytes) {
+        return size <= (Integer.MAX_VALUE - 31L) / Long.BYTES
+                && (size <= 0 || tracker == null || tracker.getLimit() <= 0
+                    || size * Long.BYTES + 32 + scratchBytes <= tracker.getLimit() - tracker.getUsed());
+    }
+
+    /** Same representation policy after a generated scan supplies the completed map's bounds. */
+    void prepareJoin(long size, long first, long last, int keyBytes, MemoryTracker tracker) {
+        close();
+        memory.setMemoryTracker(tracker);
+        this.first = first;
+        this.last = last;
+        allocateJoin(size, size * keyBytes);
+    }
+
+    // Completed maps and reduced keys have repeatable iteration. Optional frozen-build
+    // iteration below retains its bounds-only fallback and lazy bitmap allocation.
+    private void allocateJoin(long size, long bitmapBudget) {
+        long span = last - first + 1;
+        if (span > 0 && span == size) return;
+        long bitmapBytes = bitmapBytes(span);
+        boolean bitmap = bitmapBytes <= bitmapBudget;
+        long bytes = bitmap ? bitmapBytes : Math.max(SplitBlockBloomFilter.BLOCK_SIZE,
+                (size * Long.BYTES + SplitBlockBloomFilter.BLOCK_SIZE - 1) & -SplitBlockBloomFilter.BLOCK_SIZE);
+        memory.ensureCapacity(bytes / Long.BYTES);
+        memory.fill(0);
+        count = bitmap ? -1 : -bytes;
     }
 
     /** Exact bitmap footprint, or -1 when the producer does not provide bounds. */
@@ -207,24 +253,20 @@ final class IntegralMembership implements AutoCloseable {
             first = Math.min(first, key);
             last = Math.max(last, key);
         }
-        long span = last - first + 1;
-        if (span > 0 && span == size) return;
-        long bitmapBytes = bitmapBytes(span);
-        boolean bitmap = bitmapBytes <= size * Long.BYTES;
-        long bytes = bitmap ? bitmapBytes : Math.max(SplitBlockBloomFilter.BLOCK_SIZE,
-                (size * Long.BYTES + SplitBlockBloomFilter.BLOCK_SIZE - 1) & -SplitBlockBloomFilter.BLOCK_SIZE);
-        memory.ensureCapacity(bytes / Long.BYTES);
-        memory.fill(0);
+        allocateJoin(size, size * Long.BYTES);
+        if (count == 0) return;
         for (long i = 0; i < size; i++) {
             breaker.statefulThrowExceptionIfTrippedTimeThrottled();
-            long key = keys.get(i);
-            if (bitmap) {
-                long bit = key - first;
-                long address = memory.getAddress() + (bit >>> 6) * Long.BYTES;
-                Unsafe.putLong(address, Unsafe.getLong(address) | (1L << bit));
-            } else SplitBlockBloomFilter.insert(memory.getAddress(), (int) bytes, Hash.hashLong64(key));
+            insertJoin(keys.get(i));
         }
-        count = bitmap ? -1 : -bytes;
+    }
+
+    private void insertJoin(long key) {
+        if (count == -1) {
+            long bit = key - first;
+            long address = memory.getAddress() + (bit >>> 6) * Long.BYTES;
+            Unsafe.putLong(address, Unsafe.getLong(address) | (1L << bit));
+        } else SplitBlockBloomFilter.insert(memory.getAddress(), (int) -count, Hash.hashLong64(key));
     }
 
     boolean isUniversal() {
@@ -273,23 +315,81 @@ final class IntegralMembership implements AutoCloseable {
     }
 
     private static Expr bloomContains(Builder b, Descriptor descriptor, Expr key) {
+        Var found = b.let(bool(true));
+        bloomMasks(b, descriptor, key, (address, bits) ->
+                b.assign(found, binary(Op.BOTH, found, eq(binary(Op.AND, load(address), bits), bits))));
+        return found;
+    }
+
+    /** Key loads denote consecutive lanes; membership loads use explicit indexes. */
+    static Var maskJoin(Builder b, Descriptor descriptor, Expr key, int lanes) {
+        Expr inRange = binary(Op.BOTH, binary(Op.GE, key, descriptor.first()), binary(Op.GE, descriptor.last(), key));
+        Var mask = b.let(new VectorMask(lanes, inRange));
+        b.when(ne(mask, i64(0)), present -> present.when(ne(descriptor.base(), nil()), stored -> {
+            stored.when(binary(Op.LT, descriptor.count(), i64(-1)), bloom -> {
+                Expr hash = QuestMapProbe.hashLong(key);
+                Expr block = bloomBlockBytes(descriptor, hash);
+                Expr found = bool(true);
+                for (int lane = 0; lane < 8; lane += 2) {
+                    Expr bits = bloomMask(hash, lane);
+                    Expr word = new Gather(MemoryType.I64, descriptor.base(), add(block, i64(lane * 4L)));
+                    found = binary(Op.BOTH, found, eq(binary(Op.AND, word, bits), bits));
+                }
+                bloom.assign(mask, binary(Op.AND, mask, new VectorMask(lanes, found)));
+            });
+            stored.when(eq(descriptor.count(), i64(-1)), bitmap -> {
+                // Vector predicates are eager: excluded keys must still read an allocated word.
+                Expr bit = new Select(inRange, binary(Op.SUB, key, descriptor.first()), i64(0));
+                Expr word = new Gather(MemoryType.I64, descriptor.base(), binary(Op.MUL, binary(Op.USHR, bit, i64(6)), i64(8)));
+                Expr found = ne(binary(Op.AND, binary(Op.USHR, word, binary(Op.AND, bit, i64(63))), i64(1)), i64(0));
+                bitmap.assign(mask, binary(Op.AND, mask, new VectorMask(lanes, found)));
+            });
+        }));
+        return mask;
+    }
+
+    /** Owner-only insertion into an allocated bitmap or split-block Bloom filter. */
+    static void insertJoin(Builder b, Descriptor descriptor, Expr key) {
+        b.when(eq(descriptor.count(), i64(-1)), bitmap -> {
+            Var bit = bitmap.let(binary(Op.SUB, key, descriptor.first()));
+            Expr address = new Offset(descriptor.base(), binary(Op.MUL, binary(Op.USHR, bit, i64(6)), i64(8)));
+            putBits(bitmap, address, binary(Op.USHR, i64(Long.MIN_VALUE), binary(Op.SUB, i64(63), binary(Op.AND, bit, i64(63)))));
+        });
+        b.when(binary(Op.LT, descriptor.count(), i64(-1)), bloom ->
+                bloomMasks(bloom, descriptor, key, (address, bits) -> putBits(bloom, address, bits)));
+    }
+
+    private static void putBits(Builder b, Expr address, Expr bits) {
+        Var old = b.let(load(address));
+        // a | b = (a ^ b) ^ (a & b); LLVM folds the existing IR operations to OR.
+        b.store(address, binary(Op.XOR, binary(Op.XOR, old, bits), binary(Op.AND, old, bits)));
+    }
+
+    private static void bloomMasks(Builder b, Descriptor descriptor, Expr key,
+                                   java.util.function.BiConsumer<Expr, Expr> consumer) {
         Var hash = QuestMapProbe.direct(0, ColumnType.LONG, false).hash(b, key);
+        Var block = b.let(new Offset(descriptor.base(), bloomBlockBytes(descriptor, hash)));
+        for (int lane = 0; lane < 8; lane += 2) {
+            Var bits = b.let(bloomMask(hash, lane));
+            consumer.accept(at(block, lane * 4L), bits);
+        }
+    }
+
+    private static Expr bloomBlockBytes(Descriptor descriptor, Expr hash) {
         Expr blocks = binary(Op.USHR, binary(Op.SUB, i64(0), descriptor.count()), i64(SplitBlockBloomFilter.BLOCK_SIZE_SHIFT));
         Expr index = binary(Op.USHR, binary(Op.MUL, binary(Op.USHR, hash, i64(32)), blocks), i64(32));
-        Var block = b.let(new Offset(descriptor.base(), binary(Op.MUL, index, i64(SplitBlockBloomFilter.BLOCK_SIZE))));
-        Expr found = bool(true);
-        for (int lane = 0; lane < 8; lane += 2) {
-            Expr mask = i64(0);
-            for (int half = 0; half < 2; half++) {
-                Expr product = binary(Op.AND, binary(Op.MUL, hash, i64(SplitBlockBloomFilter.getSalt(lane + half))), i64(0xffff_ffffL));
-                Expr bit = add(binary(Op.USHR, product, i64(27)), i64(half * 32L));
-                // The two lanes occupy disjoint 32-bit halves; the IR already has logical right shift.
-                mask = binary(Op.XOR, mask, binary(Op.USHR, i64(Long.MIN_VALUE), binary(Op.SUB, i64(63), bit)));
-            }
-            Var bits = b.let(mask);
-            found = binary(Op.BOTH, found, eq(binary(Op.AND, load(at(block, lane * 4L)), bits), bits));
+        return binary(Op.MUL, index, i64(SplitBlockBloomFilter.BLOCK_SIZE));
+    }
+
+    private static Expr bloomMask(Expr hash, int lane) {
+        Expr mask = i64(0);
+        for (int half = 0; half < 2; half++) {
+            Expr product = binary(Op.AND, binary(Op.MUL, hash, i64(SplitBlockBloomFilter.getSalt(lane + half))), i64(0xffff_ffffL));
+            Expr bit = add(binary(Op.USHR, product, i64(27)), i64(half * 32L));
+            // The two lanes occupy disjoint 32-bit halves; the IR already has logical right shift.
+            mask = binary(Op.XOR, mask, binary(Op.USHR, i64(Long.MIN_VALUE), binary(Op.SUB, i64(63), bit)));
         }
-        return found;
+        return mask;
     }
 
     private static Expr bitmapContains(Builder b, Descriptor descriptor, Expr key) {

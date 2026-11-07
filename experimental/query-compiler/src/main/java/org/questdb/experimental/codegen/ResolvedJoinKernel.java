@@ -51,11 +51,15 @@ import io.questdb.std.Unsafe;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.List;
+import java.util.function.IntSupplier;
 
 import static org.questdb.experimental.codegen.Ir.*;
 
 /** Generated typed joins, predicates and updates over engine-owned scalar or keyed state. */
 final class ResolvedJoinKernel {
+    private static final int LOOKAHEAD_ROWS = 16;
+    private static final int LOOKAHEAD_SLOTS = 2 * LOOKAHEAD_ROWS;
     private static final int MATCHED = 8;
     private static final int POSITION = 16;
     private static final int MISSING_KEY = 24;
@@ -74,7 +78,10 @@ final class ResolvedJoinKernel {
     private static final int KEY_BYTES = 56;
     private static final int SYMBOL_CACHE = 24, SYMBOL_COUNT = 32, SYMBOL_INPUT = 40, SYMBOL_RESULT = 48;
     private static final int ARGUMENT_BYTES = HashJoinPayloadSource.NATIVE_COLUMN_BYTES;
-    private static final int GROUP_KEY = MapKernelState.CONTROL_BYTES + GroupByMapFragment.NUM_SHARDS * QuestMapProbe.VIEW_BYTES;
+    private static final int FACT_BYTES = FrozenHashJoinBuild.INTEGRAL_LOOKUP_BYTES;
+    private static int groupKeyOffset(QuestMapProbe probe) {
+        return probe.controlBytes() + GroupByMapFragment.NUM_SHARDS * QuestMapProbe.VIEW_BYTES;
+    }
 
     private record Source(int build, int column) {
         static Source bind(int column, int probeColumns, CompiledJoin.Build[] builds, int available) {
@@ -99,6 +106,17 @@ final class ResolvedJoinKernel {
         boolean dependent() {
             for (Source source : sources) if (source.build >= 0) return true;
             return false;
+        }
+
+        Expr membershipKey(Builder b, Expr key) {
+            if (widths.length == 1) return map != null && map.orderedNative() ? new Load(widths[0], key) : key;
+            Expr hash = i64(0);
+            int offset = 0;
+            for (MemoryType width : widths) {
+                hash = QuestMapProbe.hashLong128(b, hash, new Load(width, at(key, offset)));
+                offset += width.bytes;
+            }
+            return hash;
         }
 
         static Key bind(CompiledJoin.Build build, int probeColumns, CompiledJoin.Build[] builds, int available) {
@@ -132,8 +150,8 @@ final class ResolvedJoinKernel {
     }
 
     private record Layout(CompiledJoin.Build[] builds, Key[] keys, int[] sourceBuilds, int[] sourceColumns,
-                          boolean[] counts, boolean subtrees, boolean rowCountsOnly, Facts facts) {
-        Layout specialize(Facts facts) { return new Layout(builds, keys, sourceBuilds, sourceColumns, counts, subtrees, rowCountsOnly, facts); }
+                          boolean[] counts, boolean subtrees, boolean rowCountsOnly, List<IntSupplier> parameters, Source[] strings, byte[] literals, Facts facts) {
+        Layout specialize(Facts facts) { return new Layout(builds, keys, sourceBuilds, sourceColumns, counts, subtrees, rowCountsOnly, parameters, strings, literals, facts); }
         Layout withoutDirectCaches() {
             if (facts == null) return this;
             var shapes = new ArrayList<BuildShape>(facts.builds);
@@ -145,7 +163,7 @@ final class ResolvedJoinKernel {
                     changed = true;
                 }
             }
-            return changed ? specialize(new Facts(facts.constants, java.util.List.copyOf(shapes))) : this;
+            return changed ? specialize(new Facts(facts.constants, java.util.List.copyOf(shapes), facts.groupCache)) : this;
         }
         Expr meta(Expr address) {
             Expr base = address;
@@ -177,12 +195,22 @@ final class ResolvedJoinKernel {
         int key(int build, int key) { return build(build) + keyStart(build) + key * KEY_BYTES; }
         int scratch(int build) { return key(build, keys[build].widths.length); }
         int arguments() { return build(builds.length); }
+        long stringOffset() { return arguments() + (long) ARGUMENT_BYTES * sourceBuilds.length; }
+        long literalOffset() { return stringOffset() + strings.length * 48L; }
+        long parameterOffset() { return (literalOffset() + literals.length + 7) & -8L; }
+        // One validity word followed by root heads. Twice the staging distance
+        // prevents a future write from overwriting the current row's slot.
+        long ringOffset() { return parameterOffset() + parameters.size() * 8L; }
+        long groupCacheOffset() { return ringOffset() + ringBytes(); }
+        long ringBytes() { return (long) LOOKAHEAD_SLOTS * (builds.length + 1) * 8; }
+        Expr ring(Expr position) { return new Offset(at(COLUMNS, ringOffset()),
+                binary(Op.MUL, binary(Op.AND, position, i64(LOOKAHEAD_SLOTS - 1)), i64((builds.length + 1) * 8L))); }
         boolean dependent() {
             for (Key key : keys) if (key.dependent()) return true;
             return false;
         }
+        boolean canFilter(int index) { return keys[index].widths.length == 1 || canReduce(index); }
         boolean canReduce(int producer) {
-            if (keys[producer].widths.length != 1) return false;
             for (Key key : keys) if (key.producer() == producer) return true;
             return false;
         }
@@ -195,7 +223,7 @@ final class ResolvedJoinKernel {
 
     private record BuildShape(boolean unique, boolean direct, boolean cached, long stride,
                               java.util.List<Integer> columns) { }
-    private record Facts(java.util.Map<Long, Long> constants, java.util.List<BuildShape> builds) { }
+    private record Facts(java.util.Map<Long, Long> constants, java.util.List<BuildShape> builds, boolean groupCache) { }
 
     private ResolvedJoinKernel() {
     }
@@ -243,36 +271,54 @@ final class ResolvedJoinKernel {
             columns += build.payloadColumnCount();
         }
         if (columns != joinedTypes.getColumnCount()) return null;
-        var inputs = new ResolvedInputs(joinedTypes);
-        var predicate = inputs.predicate(postJoinFilter);
-        if (predicate == null) return null;
+        var parameters = new ArrayList<IntSupplier>();
+        var inputs = new ResolvedInputs(joinedTypes, parameters);
         QuestMapProbe mapProbe = null;
         Pipeline.Column groupKey = null;
+        ResolvedVarchar.Expression groupString = null;
         if (groupLayout != null) {
             if (keyTypes.getColumnCount() == 1 && keyColumns.size() == 1 && keyColumns.getQuick(0) > 0
                     && (keyFunctions == null || keyFunctions.size() == 0)) {
                 int index = keyColumns.getQuick(0) - 1;
                 if (index >= joinedTypes.getColumnCount() || joinedTypes.getColumnType(index) != keyTypes.getColumnType(0)) return null;
                 mapProbe = QuestMapProbe.bind(index, keyTypes.getColumnType(0), groupLayout);
-                if (mapProbe != null) groupKey = inputs.column(index, keyTypes.getColumnType(0));
+                if (mapProbe != null && mapProbe.varchar()) groupString = inputs.strings().column(index);
+                else if (mapProbe != null) groupKey = inputs.column(index, keyTypes.getColumnType(0));
+            }
+            if (mapProbe == null && groupLayout instanceof io.questdb.cairo.map.UnorderedVarcharMap
+                    && keyTypes.getColumnCount() == 1 && keyTypes.getColumnType(0) == ColumnType.VARCHAR
+                    && keyColumns.size() == 0 && keyFunctions != null && keyFunctions.size() == 1) {
+                groupString = inputs.strings().bind(keyFunctions.getQuick(0));
+                if (groupString == null) return null;
+                mapProbe = QuestMapProbe.varchar(new QuestVarchar.Key(inputs.strings().binding(), groupString));
+            }
+            if (mapProbe == null) {
+                var variable = QuestVariableKey.bind(inputs, joinedTypes, keyTypes, keyColumns, keyFunctions, groupLayout);
+                if (variable != null) mapProbe = QuestMapProbe.variable(variable);
             }
             if (mapProbe == null) {
                 var key = QuestFixedKey.bind(inputs, keyTypes, keyColumns, keyFunctions, groupLayout);
                 // Joined rows have numeric cells; dictionary-derived keys need execution preparation.
-                if (key == null || !key.dictionaries().isEmpty() || !key.frameInputs().expressions().isEmpty()) return null;
+                if (key == null || !key.dictionaries().isEmpty()) return null;
                 mapProbe = QuestMapProbe.fixed(key, keyTypes.getColumnCount() == 1 ? keyTypes.getColumnType(0) : -1,
                         groupLayout instanceof io.questdb.cairo.map.OrderedMap);
             }
         }
+        // Before predicate and aggregate binding, these are precisely the grouping inputs.
+        int groupBuild = mapProbe != null && (mapProbe.variable() || mapProbe.varchar())
+                ? groupBuild(inputs.strings().binding(), probeColumnCount, builds) : -1;
+        var predicate = inputs.predicate(postJoinFilter);
+        if (predicate == null) return null;
         var packed = new FlyweightPackedMapValue(valueTypes);
         long base = layout != null ? layout.getAddress(0) : 0;
         var updates = AggregateUpdates.bind(valueTypes, functions,
                 index -> groupLayout != null ? packed.getOffset(index) : layout.getAddress(index) - base, false, inputs);
         if (updates == null) return null;
-        if (!updates.inputs().expressions().isEmpty()) return null;
-        // Joined rows currently carry numeric cells, not VARCHAR frame descriptors.
-        for (var update : updates.updates()) if (update instanceof AggregateUpdates.VarcharCount) return null;
-        var target = new Target(mapProbe, groupKey);
+        // Capture helpers own separate per-slot state; leave those on the ordinary path.
+        if (!updates.inputs().captures().isEmpty()) return null;
+        long valueBytes = 0;
+        for (int i = 0; i < valueTypes.getColumnCount(); i++) valueBytes += ColumnType.sizeOf(valueTypes.getColumnType(i));
+        var target = new Target(mapProbe, groupKey, groupString, null, groupBuild, valueBytes);
         int[] sourceBuilds = new int[updates.sourceIndexes().length];
         int[] sourceColumns = new int[sourceBuilds.length];
         for (int i = 0; i < sourceBuilds.length; i++) {
@@ -286,6 +332,11 @@ final class ResolvedJoinKernel {
             sourceBuilds[i] = owner;
             sourceColumns[i] = index;
         }
+        Source[] strings = new Source[updates.inputs().varcharColumns().length];
+        for (int i = 0; i < strings.length; i++) {
+            strings[i] = Source.bind(updates.inputs().varcharColumns()[i], probeColumnCount, builds, builds.length);
+            if (strings[i] == null) return null;
+        }
         boolean[] counts = new boolean[builds.length];
         boolean subtrees = true;
         boolean dependent = false;
@@ -297,6 +348,11 @@ final class ResolvedJoinKernel {
             subtrees = false;
             lastObserved = Math.max(lastObserved, owner);
         }
+        for (Source source : strings) if (source.build >= 0) {
+            counts[source.build] = false;
+            subtrees = false;
+            lastObserved = Math.max(lastObserved, source.build);
+        }
         // Folding an earlier unobserved join would turn a,b,a,b into a,a,b,b.
         // SUM sentinel overflow and floating updates require consecutive identical inputs.
         if (!updates.countsRowsOnly()) java.util.Arrays.fill(counts, 0, lastObserved + 1, false);
@@ -307,7 +363,8 @@ final class ResolvedJoinKernel {
                 subtrees &= key.producer() >= 0;
             }
         }
-        var descriptors = new Layout(builds, keys, sourceBuilds, sourceColumns, counts, subtrees && dependent, updates.countsRowsOnly(), null);
+        var descriptors = new Layout(builds, keys, sourceBuilds, sourceColumns, counts, subtrees && dependent,
+                updates.countsRowsOnly(), List.copyOf(parameters), strings, updates.inputs().literals(), null);
         var programs = new Programs(updates, predicate, target, descriptors, backend, artifacts, false, 1);
         try {
             return new Prepared(programs, descriptors, mapProbe, backend.name(), updates, predicate, target, backend, artifacts);
@@ -318,15 +375,15 @@ final class ResolvedJoinKernel {
     }
 
     private static Program program(AggregateUpdates updates, Pipeline.Predicate predicate, Target target,
-                                   Layout layout, boolean membership, boolean promoteState) {
+                                   Layout layout, boolean membership, boolean promoteState, Lookahead lookahead) {
         Builder b = new Builder();
         var state = promoteState ? ScalarAggregateState.bind(b, updates) : null;
-        var destinationTarget = new Target(target.probe, target.key, state);
+        var destinationTarget = new Target(target.probe, target.key, target.varchar, state, target.groupBuild, target.valueBytes);
         if (layout.subtrees) b.when(eq(layout.meta(at(COLUMNS, MODE)), i64(2)), folded -> {
-            emitScan(folded, updates, predicate, destinationTarget, layout, Iteration.SUBTREES, membership);
+            emitScan(folded, updates, predicate, destinationTarget, layout, Iteration.SUBTREES, membership, lookahead);
             folded.exit(0);
         });
-        b.when(ne(layout.meta(at(COLUMNS, MODE)), i64(0)), unique -> emitScan(unique, updates, predicate, destinationTarget, layout, Iteration.UNIQUE, membership));
+        b.when(ne(layout.meta(at(COLUMNS, MODE)), i64(0)), unique -> emitScan(unique, updates, predicate, destinationTarget, layout, Iteration.UNIQUE, membership, lookahead));
         b.when(eq(layout.meta(at(COLUMNS, MODE)), i64(0)), multiple -> {
             Expr counted = bool(false);
             for (int i = 0; i < layout.counts.length; i++) if (layout.counts[i]) {
@@ -335,21 +392,35 @@ final class ResolvedJoinKernel {
             // Unique leaves and declined preparation retain the ordinary loop. Choose once
             // per frame instead of paying unused multiplicity checks for every joined row.
             Var hasCounts = multiple.let(counted);
-            multiple.when(eq(hasCounts, bool(false)), ordinary -> emitScan(ordinary, updates, predicate, destinationTarget, layout, Iteration.EXPANDED, membership));
-            multiple.when(hasCounts, folded -> emitScan(folded, updates, predicate, destinationTarget, layout, Iteration.COUNTED, membership));
+            multiple.when(eq(hasCounts, bool(false)), ordinary -> emitScan(ordinary, updates, predicate, destinationTarget, layout, Iteration.EXPANDED, membership, lookahead));
+            multiple.when(hasCounts, folded -> emitScan(folded, updates, predicate, destinationTarget, layout, Iteration.COUNTED, membership, lookahead));
         });
         b.exit(0);
         return new Program(state == null ? b.block() : state.publishExits(b.block()));
     }
 
-    private record Target(QuestMapProbe probe, Pipeline.Column key, ScalarAggregateState state) {
-        Target(QuestMapProbe probe, Pipeline.Column key) { this(probe, key, null); }
+    private record Target(QuestMapProbe probe, Pipeline.Column key, ResolvedVarchar.Expression varchar,
+                          ScalarAggregateState state, int groupBuild, long valueBytes) { }
+
+    private static int groupBuild(ResolvedVarchar.Binding inputs, int probeColumns, CompiledJoin.Build[] builds) {
+        int owner = -1;
+        for (int[] columns : new int[][]{inputs.numericColumns(), inputs.varcharColumns()}) {
+            for (int column : columns) {
+                Source source = Source.bind(column, probeColumns, builds, builds.length);
+                if (source == null || source.build < 0 || owner >= 0 && source.build != owner) return -1;
+                owner = source.build;
+            }
+        }
+        return owner;
     }
     private record Lookup(Var table, Var mask, Var directory, Var shift, Var heap, Var counts, IntegralJoinIndex.Descriptor direct, Var stride) { }
+    private record RowInputs(List<Var> addresses, List<Expr> parameters) { }
     private enum Iteration { UNIQUE, EXPANDED, COUNTED, SUBTREES }
+    private enum Lookahead { NONE, JOINS, JOINS_AND_GROUPS }
 
     private static void emitScan(Builder b, AggregateUpdates updates, Pipeline.Predicate predicate,
-                                 Target target, Layout layout, Iteration iteration, boolean membership) {
+                                 Target target, Layout layout, Iteration iteration, boolean membership, Lookahead lookahead) {
+        boolean prefetch = lookahead != Lookahead.NONE;
         Var rowIds = b.let(new Load(MemoryType.ADDRESS, COLUMNS));
         Lookup[] lookups = new Lookup[layout.builds.length];
         IntegralMembership.Descriptor[] sets = membership ? new IntegralMembership.Descriptor[lookups.length] : null;
@@ -378,41 +449,197 @@ final class ResolvedJoinKernel {
         var addresses = new ArrayList<Var>();
         for (int i = 0; i < updates.columns().size(); i++)
             addresses.add(b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, layout.arguments() + (long) ARGUMENT_BYTES * i))));
+        var parameters = new ArrayList<Expr>();
+        for (int i = 0; i < layout.parameters.size(); i++)
+            parameters.add(b.let(new Load(MemoryType.I32, at(COLUMNS, layout.parameterOffset() + i * 8L))));
+        var inputs = new RowInputs(addresses, parameters);
         Var destination = target.state != null ? STATE : b.let(STATE);
         Var position = b.let(load(at(COLUMNS, POSITION)));
+        // Every native re-entry warms the ring again; no stored head survives by assumption.
+        Var ringBegin = prefetch ? b.let(position) : null;
         Var matched = b.let(load(at(COLUMNS, MATCHED)));
         Var pairs = b.let(i64(0));
         b.loop(binary(Op.LT, position, ROWS), loop -> {
             loop.when(eq(binary(Op.AND, position, i64(1023)), i64(0)), Builder::poll);
-            Var row = loop.let(position);
-            loop.when(ne(rowIds, nil()), filtered -> filtered.assign(row,
-                    load(new Offset(rowIds, binary(Op.MUL, position, i64(8))))));
+            // Future keys use the scratch before the current row stages its keys.
+            if (prefetch) loop.when(binary(Op.LT, add(position, i64(LOOKAHEAD_SLOTS)), ROWS), future -> {
+                Var futurePosition = future.let(add(position, i64(LOOKAHEAD_SLOTS)));
+                Var futureRow = rowAt(future, rowIds, futurePosition);
+                Var[] futureKeys = new Var[lookups.length];
+                loadKeys(future, layout, futureKeys, 0, futureRow, position, matched, lookups, links, true, loaded ->
+                        filterAll(loaded, futureKeys, sets, layout, 0, eligible -> {
+                            for (int i = 0; i < lookups.length; i++) {
+                                if (!layout.keys[i].dependent()) prefetchLookup(eligible, lookups[i], futureKeys[i], layout, i);
+                            }
+                        }));
+            });
+            Var row = rowAt(loop, rowIds, position);
             Var[] heads = new Var[lookups.length];
-            Var[] keys = new Var[lookups.length];
-            loadKeys(loop, layout, keys, 0, row, position, matched, lookups, links, loaded ->
-                    filterAll(loaded, keys, sets, layout, 0, eligible ->
-                            lookupAll(eligible, lookups, heads, keys, layout, 0, found -> {
-                                if (iteration == Iteration.SUBTREES) {
-                                    consumeSubtrees(found, updates, predicate, target, layout, lookups, heads, links, addresses,
-                                            row, destination, matched, position, i64(1), 0);
-                                } else expand(found, updates, predicate, target, layout, lookups, heads, links, resumes, sets, addresses,
-                                        row, destination, matched, position, pairs, i64(1), 0, iteration == Iteration.UNIQUE);
-                            })));
+            java.util.function.Consumer<Builder> consume = found -> {
+                if (iteration == Iteration.SUBTREES) {
+                    consumeSubtrees(found, updates, predicate, target, layout, lookups, heads, links, inputs,
+                            row, destination, matched, position, i64(1), 0);
+                } else expand(found, updates, predicate, target, layout, lookups, heads, links, resumes, sets, inputs,
+                        row, destination, matched, position, pairs, i64(1), 0, iteration == Iteration.UNIQUE);
+            };
+            if (prefetch) lookupAhead(loop, layout, lookahead == Lookahead.JOINS_AND_GROUPS ? target : null, iteration, lookups, sets, links, rowIds,
+                    position, ringBegin, matched, row, heads, consume);
+            else {
+                Var[] keys = new Var[lookups.length];
+                loadKeys(loop, layout, keys, 0, row, position, matched, lookups, links, false, loaded ->
+                        filterAll(loaded, keys, sets, layout, 0, eligible ->
+                                lookupAll(eligible, lookups, heads, keys, layout, 0, consume)));
+            }
             loop.assign(position, add(position, i64(1)));
         });
         b.store(at(COLUMNS, MATCHED), matched);
     }
 
+    /** Stage roots once, retaining their exact heads until consumption in probe order. */
+    private static void lookupAhead(Builder loop, Layout layout, Target target, Iteration iteration,
+                                    Lookup[] lookups, IntegralMembership.Descriptor[] sets, Var[] links,
+                                    Var rowIds, Var position, Var ringBegin, Var matched, Var row,
+                                    Var[] heads, java.util.function.Consumer<Builder> consume) {
+        loop.when(binary(Op.LT, add(position, i64(LOOKAHEAD_ROWS)), ROWS), future -> {
+            Var futurePosition = future.let(add(position, i64(LOOKAHEAD_ROWS)));
+            Var futureRow = rowAt(future, rowIds, futurePosition);
+            Expr entry = layout.ring(futurePosition);
+            future.store(entry, i64(0));
+            for (int i = 0; i < lookups.length; i++) if (!layout.keys[i].dependent())
+                future.store(at(entry, (i + 1) * 8L), i64(0));
+            Var[] futureKeys = new Var[lookups.length];
+            Var[] futureHeads = new Var[lookups.length];
+            loadKeys(future, layout, futureKeys, 0, futureRow, position, matched, lookups, links, true, loaded -> {
+                // An unresolved future SYMBOL leaves this entry invalid; current-row
+                // execution retains its ordinary translation and resume protocol.
+                loaded.store(entry, i64(1));
+                filterAll(loaded, futureKeys, sets, layout, 0, eligible ->
+                        lookupAll(eligible, lookups, futureHeads, futureKeys, layout, 0, found -> {
+                            prefetchChildren(found, layout, iteration, lookups, sets, futureHeads, futureRow, position, matched);
+                            if (target != null) prefetchGroup(found, target, layout, futureHeads);
+                            for (int i = 0; i < lookups.length; i++) if (!layout.keys[i].dependent()) {
+                                found.store(at(entry, (i + 1) * 8L), futureHeads[i]);
+                                if (layout.builds[i].payloadColumnCount() > 0) {
+                                    Expr ordinal = binary(Op.USHR, binary(Op.SUB, futureHeads[i], i64(8)), i64(4));
+                                    found.prefetch(new Offset(lookups[i].heap, binary(Op.MUL, ordinal, lookups[i].stride)), false);
+                                }
+                            }
+                        }));
+            });
+        });
+        Var ready = loop.let(bool(false));
+        for (int i = 0; i < lookups.length; i++) if (!layout.keys[i].dependent()) heads[i] = loop.let(i64(0));
+        Var cached = loop.let(bool(false));
+        loop.when(binary(Op.GE, position, add(ringBegin, i64(LOOKAHEAD_ROWS))), warmed ->
+                warmed.assign(cached, ne(load(layout.ring(position)), i64(0))));
+        loop.when(cached, hit -> {
+            Expr all = bool(true);
+            for (int i = 0; i < lookups.length; i++) if (!layout.keys[i].dependent()) {
+                hit.assign(heads[i], load(at(layout.ring(position), (i + 1) * 8L)));
+                all = binary(Op.BOTH, all, ne(heads[i], i64(0)));
+            }
+            hit.assign(ready, all);
+        });
+        loop.when(eq(cached, bool(false)), ordinary -> {
+            Var[] keys = new Var[lookups.length];
+            Var[] ordinaryHeads = new Var[lookups.length];
+            loadKeys(ordinary, layout, keys, 0, row, position, matched, lookups, links, false, loaded ->
+                    filterAll(loaded, keys, sets, layout, 0, eligible ->
+                            lookupAll(eligible, lookups, ordinaryHeads, keys, layout, 0, found -> {
+                                for (int i = 0; i < lookups.length; i++) if (!layout.keys[i].dependent())
+                                    found.assign(heads[i], ordinaryHeads[i]);
+                                found.assign(ready, bool(true));
+                            })));
+        });
+        loop.when(ready, consume);
+    }
+
+    private static void prefetchGroup(Builder b, Target target, Layout layout, Var[] roots) {
+        if (layout.facts == null || !layout.facts.groupCache || target.valueBytes == 0) return;
+        Expr head = futureHead(b, layout, roots, target.groupBuild);
+        if (head == null) return;
+        b.when(ne(head, i64(0)), present -> {
+            Expr ordinal = binary(Op.USHR, binary(Op.SUB, head, i64(8)), i64(4));
+            Expr cache = new Load(MemoryType.ADDRESS, at(COLUMNS, layout.groupCacheOffset()));
+            Var value = present.let(new Load(MemoryType.ADDRESS, new Offset(cache, binary(Op.MUL, ordinal, i64(8)))));
+            present.when(ne(value, nil()), cached -> {
+                // The state may be unaligned after a variable key. Prefetch its last byte too;
+                // all addresses remain within the value, independent of cache-line alignment.
+                for (long offset = 0; offset < target.valueBytes; offset += io.questdb.std.Misc.CACHE_LINE_SIZE)
+                    cached.prefetch(at(value, offset), true);
+                if (target.valueBytes > 1) cached.prefetch(at(value, target.valueBytes - 1), true);
+            });
+        });
+    }
+
+    private static boolean canPrefetchGroup(Target target, Layout layout) {
+        if (layout.facts == null || !layout.facts.groupCache || target.valueBytes == 0) return false;
+        for (int owner = target.groupBuild; layout.keys[owner].dependent(); owner = layout.keys[owner].producer()) {
+            if (layout.keys[owner].producer() < 0 || !layout.facts.builds.get(owner).cached) return false;
+        }
+        return true;
+    }
+
+    /** A hint for the first duplicate only; consumption still expands every exact match. */
+    private static Expr futureHead(Builder b, Layout layout, Var[] roots, int build) {
+        if (!layout.keys[build].dependent()) return roots[build];
+        int producer = layout.keys[build].producer();
+        if (producer < 0 || !layout.facts.builds.get(build).cached) return null;
+        Expr parent = futureHead(b, layout, roots, producer);
+        if (parent == null) return null;
+        Var head = b.let(i64(0));
+        b.when(ne(parent, i64(0)), present -> {
+            Expr ordinal = binary(Op.USHR, binary(Op.SUB, parent, i64(8)), i64(4));
+            Expr links = new Load(MemoryType.ADDRESS, at(COLUMNS, layout.build(build) + DEPENDENCY_LINKS));
+            Expr packed = new Load(MemoryType.I32, new Offset(links, binary(Op.MUL, ordinal, i64(4))));
+            present.assign(head, binary(Op.MUL, binary(Op.AND, packed, i64(0xffffffffL)), i64(8)));
+        });
+        return head;
+    }
+
+    /** Only a unique root has one payload to inspect without expanding duplicates. */
+    private static void prefetchChildren(Builder found, Layout layout, Iteration iteration,
+                                         Lookup[] lookups, IntegralMembership.Descriptor[] sets,
+                                         Var[] futureHeads, Var futureRow, Var position, Var matched) {
+        if (layout.facts != null && iteration != Iteration.SUBTREES) {
+            Var[] futureLinks = new Var[lookups.length];
+            for (int i = 0; i < lookups.length; i++) futureLinks[i] =
+                    found.let(layout.keys[i].dependent() ? i64(0) : futureHeads[i]);
+            for (int child = 0; child < lookups.length; child++) {
+                int parent = layout.keys[child].producer();
+                if (parent < 0 || layout.keys[parent].dependent()
+                        || !layout.facts.builds.get(parent).unique
+                        || layout.facts.builds.get(child).cached) continue;
+                int index = child;
+                loadKey(found, layout, child, futureRow, position, matched, lookups, futureLinks, true,
+                        (loadedChild, key) -> {
+                            if (sets != null && layout.canFilter(index)) {
+                                Expr value = layout.keys[index].membershipKey(loadedChild, key);
+                                loadedChild.when(IntegralMembership.containsJoin(loadedChild, sets[index], value, layout.canReduce(index)),
+                                        hit -> prefetchLookup(hit, lookups[index], key, layout, index));
+                            } else prefetchLookup(loadedChild, lookups[index], key, layout, index);
+                        });
+            }
+        }
+    }
+
+    private static Var rowAt(Builder b, Var rowIds, Expr position) {
+        Var row = b.let(position);
+        b.when(ne(rowIds, nil()), selected -> selected.assign(row,
+                load(new Offset(rowIds, binary(Op.MUL, position, i64(8))))));
+        return row;
+    }
+
     private static void consumeSubtrees(Builder b, AggregateUpdates updates, Pipeline.Predicate predicate, Target target,
-                                      Layout layout, Lookup[] lookups, Var[] heads, Var[] links, ArrayList<Var> addresses,
+                                      Layout layout, Lookup[] lookups, Var[] heads, Var[] links, RowInputs inputs,
                                       Var row, Var destination, Var matched, Var position, Expr repetitions, int index) {
         if (index == links.length) {
-            consume(b, updates, predicate, target, loadRow(b, updates, layout, addresses, row, lookups, links),
+            consume(b, updates, predicate, target, loadRow(b, updates, layout, inputs, row, lookups, links),
                     destination, matched, position, layout, links, repetitions);
             return;
         }
         if (layout.keys[index].dependent()) {
-            consumeSubtrees(b, updates, predicate, target, layout, lookups, heads, links, addresses,
+            consumeSubtrees(b, updates, predicate, target, layout, lookups, heads, links, inputs,
                     row, destination, matched, position, repetitions, index + 1);
             return;
         }
@@ -426,26 +653,26 @@ final class ResolvedJoinKernel {
         });
         // Preparation rejects subtree overflow, so zero here really means no joined row.
         b.when(ne(count, i64(0)), present -> consumeSubtrees(present, updates, predicate, target, layout,
-                lookups, heads, links, addresses, row, destination, matched, position,
+                lookups, heads, links, inputs, row, destination, matched, position,
                 present.let(binary(Op.MUL, repetitions, count)), index + 1));
     }
 
     private static void loadKeys(Builder b, Layout layout, Var[] keys, int index, Var row,
-                                 Var position, Var matched, Lookup[] lookups, Var[] links,
+                                 Var position, Var matched, Lookup[] lookups, Var[] links, boolean speculative,
                                  java.util.function.Consumer<Builder> loaded) {
         if (index == keys.length) { loaded.accept(b); return; }
         if (layout.keys[index].dependent()) {
-            loadKeys(b, layout, keys, index + 1, row, position, matched, lookups, links, loaded);
+            loadKeys(b, layout, keys, index + 1, row, position, matched, lookups, links, speculative, loaded);
         } else {
-            loadKey(b, layout, index, row, position, matched, lookups, links, (hit, key) -> {
+            loadKey(b, layout, index, row, position, matched, lookups, links, speculative, (hit, key) -> {
                 keys[index] = key;
-                loadKeys(hit, layout, keys, index + 1, row, position, matched, lookups, links, loaded);
+                loadKeys(hit, layout, keys, index + 1, row, position, matched, lookups, links, speculative, loaded);
             });
         }
     }
 
     private static void loadKey(Builder b, Layout layout, int index, Var row, Var position, Var matched,
-                                Lookup[] lookups, Var[] links, java.util.function.BiConsumer<Builder, Var> loaded) {
+                                Lookup[] lookups, Var[] links, boolean speculative, java.util.function.BiConsumer<Builder, Var> loaded) {
         Key shape = layout.keys[index];
         Var accepted = b.let(bool(true));
         Var result = null;
@@ -468,17 +695,25 @@ final class ResolvedJoinKernel {
                         unresolved.when(eq(key, load(at(COLUMNS, descriptor + SYMBOL_INPUT))), supplied ->
                                 supplied.assign(translated, load(at(COLUMNS, descriptor + SYMBOL_RESULT))));
                         unresolved.when(eq(translated, i64(SymbolKeyTranslator.UNRESOLVED)), missing -> {
-                            missing.store(at(COLUMNS, POSITION), position);
-                            missing.store(at(COLUMNS, MATCHED), matched);
-                            // A dependent dictionary miss occurs inside duplicate expansion. Resume
-                            // its selected prefix, without replaying pairs already consumed.
-                            if (shape.dependent()) for (int i = 0; i < links.length; i++) {
-                                missing.store(at(COLUMNS, layout.build(i) + RESUME_LINK), i < buildIndex ? links[i] : i64(0));
+                            // A future dictionary miss must not publish a later row's resume state.
+                            if (speculative) {
+                                missing.assign(accepted, bool(false));
+                            } else {
+                                missing.store(at(COLUMNS, POSITION), position);
+                                missing.store(at(COLUMNS, MATCHED), matched);
+                                // A dependent dictionary miss occurs inside duplicate expansion. Resume
+                                // its selected prefix, without replaying pairs already consumed.
+                                for (int i = 0; i < links.length; i++) {
+                                    // Independent keys are read before consuming this row. Older map
+                                    // misses must not supply duplicate positions for a new row.
+                                    missing.store(at(COLUMNS, layout.build(i) + RESUME_LINK),
+                                            shape.dependent() && i < buildIndex ? links[i] : i64(0));
+                                }
+                                missing.store(at(COLUMNS, SYMBOL_BUILD), i64(buildIndex));
+                                missing.store(at(COLUMNS, SYMBOL_KEY), i64(keyIndex));
+                                missing.store(at(COLUMNS, descriptor + SYMBOL_INPUT), key);
+                                missing.exit(NEED_SYMBOL);
                             }
-                            missing.store(at(COLUMNS, SYMBOL_BUILD), i64(buildIndex));
-                            missing.store(at(COLUMNS, SYMBOL_KEY), i64(keyIndex));
-                            missing.store(at(COLUMNS, descriptor + SYMBOL_INPUT), key);
-                            missing.exit(NEED_SYMBOL);
                         });
                     });
                 });
@@ -496,9 +731,8 @@ final class ResolvedJoinKernel {
     private static void filterAll(Builder b, Var[] keys, IntegralMembership.Descriptor[] sets, Layout layout, int index,
                                   java.util.function.Consumer<Builder> eligible) {
         if (sets == null || index == sets.length) { eligible.accept(b); return; }
-        if (!layout.keys[index].dependent() && layout.keys[index].widths.length == 1) {
-            Expr key = layout.keys[index].map != null && layout.keys[index].map.orderedNative()
-                    ? new Load(layout.keys[index].widths[0], keys[index]) : keys[index];
+        if (!layout.keys[index].dependent() && layout.canFilter(index)) {
+            Expr key = layout.keys[index].membershipKey(b, keys[index]);
             b.when(IntegralMembership.containsJoin(b, sets[index], key, layout.canReduce(index)), hit -> filterAll(hit, keys, sets, layout, index + 1, eligible));
         } else filterAll(b, keys, sets, layout, index + 1, eligible);
     }
@@ -533,6 +767,50 @@ final class ResolvedJoinKernel {
         } else lookupHash(b, lookups, heads, key, layout, index, found);
     }
 
+    private static void prefetchLookup(Builder b, Lookup lookup, Var key, Layout layout, int index) {
+        Key shape = layout.keys[index];
+        Expr direct = shape.widths.length == 1
+                ? layout.facts == null ? ne(lookup.direct.address(), nil()) : bool(layout.facts.builds.get(index).direct)
+                : bool(false);
+        if (shape.widths.length == 1) {
+            Expr value = shape.map != null && shape.map.orderedNative() ? new Load(shape.widths[0], key) : key;
+            b.when(direct, dense -> dense.when(binary(Op.BOTH, binary(Op.GE, value, lookup.direct.first()),
+                    binary(Op.GE, lookup.direct.last(), value)), inside -> inside.prefetch(new Offset(lookup.direct.address(),
+                    binary(Op.MUL, binary(Op.SUB, value, lookup.direct.first()), i64(Integer.BYTES))), false)));
+        }
+        b.when(eq(direct, bool(false)), hashLookup -> {
+            if (shape.map != null) {
+                Var hash = shape.map.hash(hashLookup, key);
+                Var partition = hashLookup.let(binary(Op.AND, binary(Op.USHR, binary(Op.USHR, hash, i64(32)), lookup.shift), lookup.mask));
+                Var view = hashLookup.let(new Offset(lookup.table, binary(Op.MUL, partition, i64(NativeMapView.PROBE_BYTES))));
+                shape.map.prefetchExisting(hashLookup, view, hash);
+            } else {
+                IntSlot slot = intSlot(hashLookup, lookup, key);
+                hashLookup.prefetch(slot.entry, false);
+            }
+        });
+    }
+
+    private record IntSlot(Var base, Var mask, Var slot, Var entry) { }
+
+    private static IntSlot intSlot(Builder b, Lookup lookup, Var key) {
+        Var hash = b.let(binary(Op.AND, key, i64(0xffff_ffffL)));
+        b.assign(hash, binary(Op.XOR, hash, binary(Op.USHR, hash, i64(37))));
+        b.assign(hash, binary(Op.MUL, hash, i64(0x165667919E3779F9L)));
+        b.assign(hash, binary(Op.XOR, hash, binary(Op.USHR, hash, i64(32))));
+        Var base = b.let(lookup.table);
+        Var mask = b.let(lookup.mask);
+        b.when(ne(lookup.directory, nil()), partitioned -> {
+            Var partition = partitioned.let(binary(Op.USHR, binary(Op.USHR, hash, i64(32)), lookup.shift));
+            Var entry = partitioned.let(new Offset(lookup.directory, binary(Op.MUL, partition, i64(16))));
+            partitioned.assign(base, new Load(MemoryType.ADDRESS, entry));
+            partitioned.assign(mask, load(at(entry, 8)));
+        });
+        Var slot = b.let(binary(Op.AND, hash, mask));
+        Var entry = b.let(new Offset(base, binary(Op.MUL, slot, i64(8))));
+        return new IntSlot(base, mask, slot, entry);
+    }
+
     private static void lookupHash(Builder b, Lookup[] lookups, Var[] heads, Var key, Layout layout, int index,
                                    java.util.function.Consumer<Builder> found) {
         Lookup lookup = lookups[index];
@@ -549,20 +827,8 @@ final class ResolvedJoinKernel {
             });
             return;
         }
-        Var hash = b.let(binary(Op.AND, key, i64(0xffff_ffffL)));
-        b.assign(hash, binary(Op.XOR, hash, binary(Op.USHR, hash, i64(37))));
-        b.assign(hash, binary(Op.MUL, hash, i64(0x165667919E3779F9L)));
-        b.assign(hash, binary(Op.XOR, hash, binary(Op.USHR, hash, i64(32))));
-        Var base = b.let(lookup.table);
-        Var mask = b.let(lookup.mask);
-        b.when(ne(lookup.directory, nil()), partitioned -> {
-            Var partition = partitioned.let(binary(Op.USHR, binary(Op.USHR, hash, i64(32)), lookup.shift));
-            Var entry = partitioned.let(new Offset(lookup.directory, binary(Op.MUL, partition, i64(16))));
-            partitioned.assign(base, new Load(MemoryType.ADDRESS, entry));
-            partitioned.assign(mask, load(at(entry, 8)));
-        });
-        Var slot = b.let(binary(Op.AND, hash, mask));
-        Var entry = b.let(new Offset(base, binary(Op.MUL, slot, i64(8))));
+        IntSlot first = intSlot(b, lookup, key);
+        Var base = first.base, mask = first.mask, slot = first.slot, entry = first.entry;
         Var head = b.let(new Load(MemoryType.I32, at(entry, 4)));
         b.loop(binary(Op.BOTH, ne(head, i64(0)), ne(new Load(MemoryType.I32, entry), key)), collision -> {
             collision.assign(slot, binary(Op.AND, add(slot, i64(1)), mask));
@@ -576,15 +842,15 @@ final class ResolvedJoinKernel {
 
     private static void expand(Builder b, AggregateUpdates updates, Pipeline.Predicate predicate, Target target,
                                Layout layout, Lookup[] lookups, Var[] heads, Var[] links, Var[] resumes,
-                               IntegralMembership.Descriptor[] sets, ArrayList<Var> addresses,
+                               IntegralMembership.Descriptor[] sets, RowInputs inputs,
                                Var row, Var destination, Var matched, Var position, Var pairs, Expr repetitions, int index, boolean unique) {
         if (index == links.length) {
-            consume(b, updates, predicate, target, loadRow(b, updates, layout, addresses, row, lookups, links),
+            consume(b, updates, predicate, target, loadRow(b, updates, layout, inputs, row, lookups, links),
                     destination, matched, position, layout, links, repetitions);
             return;
         }
         if (!layout.keys[index].dependent()) {
-            expandMatches(b, updates, predicate, target, layout, lookups, heads, links, resumes, sets, addresses,
+            expandMatches(b, updates, predicate, target, layout, lookups, heads, links, resumes, sets, inputs,
                     row, destination, matched, position, pairs, repetitions, index, unique);
             return;
         }
@@ -601,12 +867,11 @@ final class ResolvedJoinKernel {
             ready.assign(head, binary(Op.MUL, binary(Op.AND, compressed, i64(0xffff_ffffL)), i64(8)));
         });
         java.util.function.Consumer<Builder> ordinary = fallback ->
-                loadKey(fallback, layout, index, row, position, matched, lookups, links, (loaded, key) -> {
+                loadKey(fallback, layout, index, row, position, matched, lookups, links, false, (loaded, key) -> {
                     java.util.function.Consumer<Builder> probe = eligible ->
                             lookupOne(eligible, lookups, heads, key, layout, index, hit -> hit.assign(head, heads[index]));
-                    if (sets != null && layout.keys[index].widths.length == 1) {
-                        Expr value = layout.keys[index].map != null && layout.keys[index].map.orderedNative()
-                                ? new Load(layout.keys[index].widths[0], key) : key;
+                    if (sets != null && layout.canFilter(index)) {
+                        Expr value = layout.keys[index].membershipKey(loaded, key);
                         loaded.when(IntegralMembership.containsJoin(loaded, sets[index], value, layout.canReduce(index)), probe);
                     } else probe.accept(loaded);
                 });
@@ -616,15 +881,15 @@ final class ResolvedJoinKernel {
         // double at every dependency in a longer chain.
         heads[index] = head;
         b.when(ne(head, i64(0)), hit -> expandMatches(hit, updates, predicate, target, layout, lookups, heads,
-                links, resumes, sets, addresses, row, destination, matched, position, pairs, repetitions, index, unique));
+                links, resumes, sets, inputs, row, destination, matched, position, pairs, repetitions, index, unique));
     }
 
     private static void expandMatches(Builder b, AggregateUpdates updates, Pipeline.Predicate predicate, Target target,
-                               Layout layout, Lookup[] lookups, Var[] heads, Var[] links, Var[] resumes, IntegralMembership.Descriptor[] sets, ArrayList<Var> addresses,
+                               Layout layout, Lookup[] lookups, Var[] heads, Var[] links, Var[] resumes, IntegralMembership.Descriptor[] sets, RowInputs inputs,
                                Var row, Var destination, Var matched, Var position, Var pairs, Expr repetitions, int index, boolean unique) {
         b.assign(links[index], heads[index]);
         if (unique || layout.facts != null && layout.facts.builds.get(index).unique) {
-            expand(b, updates, predicate, target, layout, lookups, heads, links, resumes, sets, addresses,
+            expand(b, updates, predicate, target, layout, lookups, heads, links, resumes, sets, inputs,
                     row, destination, matched, position, pairs, repetitions, index + 1, unique);
         } else {
             if (resumes[index] != null) b.when(ne(resumes[index], i64(0)), resumed -> {
@@ -644,7 +909,7 @@ final class ResolvedJoinKernel {
             b.loop(ne(links[index], i64(0)), duplicate -> {
                 duplicate.when(eq(binary(Op.AND, pairs, i64(1023)), i64(0)), Builder::poll);
                 duplicate.assign(pairs, add(pairs, i64(1)));
-                expand(duplicate, updates, predicate, target, layout, lookups, heads, links, resumes, sets, addresses,
+                expand(duplicate, updates, predicate, target, layout, lookups, heads, links, resumes, sets, inputs,
                         row, destination, matched, position, pairs, repeated, index + 1, false);
                 Expr ordinal = binary(Op.USHR, binary(Op.SUB, links[index], i64(8)), i64(layout.builds[index].payloadColumnCount() > 0 ? 4 : 3));
                 Expr next = load(new Offset(lookups[index].heap, binary(Op.MUL, ordinal, lookups[index].stride)));
@@ -654,47 +919,99 @@ final class ResolvedJoinKernel {
     }
 
     private static void consume(Builder b, AggregateUpdates updates, Pipeline.Predicate predicate, Target target,
-                                Pipeline.Row row, Var destination, Var matched, Var position, Layout layout, Var[] links, Expr repetitions) {
+                                ResolvedVarchar.Frame frame, Var destination, Var matched, Var position, Layout layout, Var[] links, Expr repetitions) {
         if (predicate instanceof Pipeline.All) {
-            update(b, updates, target, row, destination, matched, position, layout, links, repetitions);
+            update(b, updates, target, frame, destination, matched, position, layout, links, repetitions);
         } else {
-            b.when(predicate.emit(row), accepted -> update(accepted, updates, target, row, destination, matched, position, layout, links, repetitions));
+            b.when(predicate.emit(frame.numeric(b)), accepted -> update(accepted, updates, target, frame, destination, matched, position, layout, links, repetitions));
         }
     }
 
-    private static void update(Builder b, AggregateUpdates updates, Target target, Pipeline.Row row,
+    private static void update(Builder b, AggregateUpdates updates, Target target, ResolvedVarchar.Frame frame,
                                Var scalar, Var matched, Var position, Layout layout, Var[] links, Expr repetitions) {
         Var destination = scalar;
         if (target.probe != null) {
-            Var key = target.key != null ? b.let(target.key.emit(row).data())
-                    : target.probe.orderedNative() ? target.probe.fixedKey().stage(b, row, at(STATE, GROUP_KEY))
-                    : target.probe.fixedKey().scalar(b, row);
-            destination = target.probe.find(b, key, position, load(at(COLUMNS, SHARD_MASK)), missing -> {
-                for (int i = 0; i < links.length; i++) missing.store(at(COLUMNS, layout.build(i) + RESUME_LINK), links[i]);
-                missing.store(target.probe.orderedNative() ? MemoryType.ADDRESS : MemoryType.I64, at(COLUMNS, MISSING_KEY), key);
-            });
+            if (layout.facts != null && layout.facts.groupCache) {
+                Expr ordinal = binary(Op.USHR, binary(Op.SUB, links[target.groupBuild], i64(8)), i64(4));
+                Var entry = b.let(new Offset(new Load(MemoryType.ADDRESS, at(COLUMNS, layout.groupCacheOffset())),
+                        binary(Op.MUL, ordinal, i64(8))));
+                Var cached = b.let(new Load(MemoryType.ADDRESS, entry));
+                b.when(eq(cached, nil()), miss -> {
+                    miss.assign(cached, findGroup(miss, target, frame, position, layout, links));
+                    miss.store(MemoryType.ADDRESS, entry, cached);
+                });
+                destination = cached;
+            } else destination = findGroup(b, target, frame, position, layout, links);
         }
         b.assign(matched, i64(1));
-        if (target.state == null) updates.emitRepeated(b, row, destination, repetitions);
+        if (target.state == null) updates.emitRepeated(b, frame, destination, repetitions);
         else {
             Builder emitted = b.fork();
-            updates.emitRepeated(emitted, row, STATE, repetitions);
+            updates.emitRepeated(emitted, frame, STATE, repetitions);
             b.append(target.state.promote(emitted.block()));
         }
     }
 
-    private static Pipeline.Row loadRow(Builder b, AggregateUpdates updates, Layout layout,
-                                       ArrayList<Var> addresses, Var row, Lookup[] lookups, Var[] links) {
+    private static Var findGroup(Builder b, Target target, ResolvedVarchar.Frame frame,
+                                 Var position, Layout layout, Var[] links) {
+        Pipeline.Row row = frame.numeric(b);
+        if (target.probe.variable()) {
+            // Staging can grow before lookup. Preserve duplicate-chain coordinates too.
+            b.store(at(STATE, MapKernelState.RESUME_ROW), position);
+            for (int i = 0; i < links.length; i++) b.store(at(COLUMNS, layout.build(i) + RESUME_LINK), links[i]);
+            b.store(at(STATE, MapKernelState.VariableKey.STAGING_USED), i64(0));
+        }
+        Var key = target.key != null ? b.let(target.key.emit(row).data())
+                : target.probe.varchar() ? QuestVarchar.stage(b, target.varchar.emit(b, frame), at(STATE, groupKeyOffset(target.probe)))
+                : target.probe.variable() ? target.probe.variableKey().stage(b, frame)
+                : target.probe.orderedNative() ? target.probe.fixedKey().stage(b, row, at(STATE, groupKeyOffset(target.probe)))
+                : target.probe.fixedKey().scalar(b, row);
+        return target.probe.find(b, key, position, load(at(COLUMNS, SHARD_MASK)), missing -> {
+            for (int i = 0; i < links.length; i++) missing.store(at(COLUMNS, layout.build(i) + RESUME_LINK), links[i]);
+            missing.store(target.probe.stagedKeyType(), at(COLUMNS, MISSING_KEY), key);
+        });
+    }
+
+    private static ResolvedVarchar.Frame loadRow(Builder b, AggregateUpdates updates, Layout layout,
+                                       RowInputs inputs, Var row, Lookup[] lookups, Var[] links) {
         var values = new ArrayList<Pipeline.Value>();
         for (int i = 0; i < updates.columns().size(); i++) {
             var column = updates.columns().get(i);
-            Var base = addresses.get(i);
+            Var base = inputs.addresses.get(i);
             Var value = loadValue(b, layout, column.width(), column.nullLiteral(),
                     new Source(layout.sourceBuilds[i], layout.sourceColumns[i]),
                     at(COLUMNS, layout.arguments() + (long) ARGUMENT_BYTES * i), base, row, lookups, links);
             values.add(column.value(value));
         }
-        return new Pipeline.Row(updates.columns(), values);
+        var strings = new ArrayList<Pipeline.Utf8Value>();
+        for (int i = 0; i < layout.strings.length; i++) {
+            Source source = layout.strings[i];
+            Expr descriptor = at(COLUMNS, layout.stringOffset() + i * 48L);
+            if (source.build < 0) strings.add(QuestVarchar.decode(b, descriptor, row));
+            else {
+                Var id = payloadRowId(b, source.build, lookups, links);
+                Expr offset = binary(Op.MUL, binary(Op.USHR, id, i64(44)), load(at(descriptor, 32)));
+                Expr[] view = new Expr[4];
+                for (int word = 0; word < view.length; word++) {
+                    Expr entry = new Offset(new Load(MemoryType.ADDRESS, at(descriptor, word * 8L)), offset);
+                    view[word] = b.let(new Load(word < 2 ? MemoryType.ADDRESS : MemoryType.I64, entry));
+                }
+                strings.add(QuestVarchar.decode(b, view[0], view[1], view[2], view[3], i64(0), i64(0),
+                        binary(Op.AND, id, i64(0xfffffffffffL))));
+            }
+        }
+        var frame = new ResolvedVarchar.Frame(new Pipeline.Row(updates.columns(), values, inputs.parameters),
+                row, nil(), at(COLUMNS, layout.literalOffset()), nil(), null, strings);
+        var numeric = frame.numeric(b);
+        // Pure frame expressions are row inputs, not aggregate state operations. Materialize
+        // before register promotion so their byte reads stay outside the update block.
+        for (var expression : updates.inputs().expressions()) numeric.computed().apply(expression);
+        return new ResolvedVarchar.Frame(numeric, row, nil(), frame.literals(), nil(), null, strings);
+    }
+
+    private static Var payloadRowId(Builder b, int build, Lookup[] lookups, Var[] links) {
+        Expr ordinal = binary(Op.USHR, binary(Op.SUB, links[build], i64(8)), i64(4));
+        return b.let(load(at(new Offset(lookups[build].heap, binary(Op.MUL, ordinal, lookups[build].stride)), 8)));
     }
 
     private static Var loadValue(Builder b, Layout layout, MemoryType width, Expr nullLiteral, Source source,
@@ -719,8 +1036,7 @@ final class ResolvedJoinKernel {
         });
         b.when(eq(mode, i64(0)), direct -> {
             // A payload-bearing heap row is [next link, row id]; link is biased by eight.
-            Expr ordinal = binary(Op.USHR, binary(Op.SUB, link, i64(8)), i64(4));
-            Var id = direct.let(load(at(new Offset(heap, binary(Op.MUL, ordinal, lookups[source.build].stride)), 8)));
+            Var id = payloadRowId(direct, source.build, lookups, links);
             Expr frame = binary(Op.USHR, id, i64(44));
             Var page = direct.let(new Load(MemoryType.ADDRESS, new Offset(base, binary(Op.MUL, frame, stride))));
             direct.when(ne(page, nil()), present -> present.assign(address,
@@ -733,20 +1049,23 @@ final class ResolvedJoinKernel {
 
     /** One owner for exact/filter code and the existing measured execution choices. */
     private static final class Programs implements AutoCloseable {
-        private record Variant(CompiledKernel code, boolean originalMembership) implements Kernel {
+        private enum Membership { NONE, ORIGINAL, EXPANDED }
+
+        private record Variant(CompiledKernel code, boolean originalMembership, Lookahead lookahead) implements Kernel {
             @Override public long run(long columns, long rows, long state) { return code.run(columns, rows, state); }
         }
-        private final java.util.List<CompiledKernel> owned = new ArrayList<>();
+        private final java.util.List<Variant> owned = new ArrayList<>();
         private final Variant first;
-        private final ParallelAdaptiveKernel exactChoices, choices, expandedChoices;
+        // Rows admit group prefetch; columns select the available membership sets.
+        private final ParallelAdaptiveKernel[][] choices;
         private final boolean membership;
 
         Programs(AggregateUpdates updates, Pipeline.Predicate predicate, Target target, Layout layout,
-                 Backend backend, Path artifacts, boolean allowPromotion, int parallelism) {
+                 Backend backend, Path artifacts, boolean specialized, int parallelism) {
             boolean filter = false;
-            for (Key key : layout.keys) filter |= key.widths.length == 1;
+            for (int i = 0; i < layout.keys.length; i++) filter |= layout.canFilter(i);
             membership = filter;
-            boolean promote = allowPromotion && target.probe == null;
+            boolean promote = specialized && target.probe == null;
             for (var update : updates.updates()) promote &= !update.allocates() && !update.scalarState().isEmpty();
             var exact = new ArrayList<Variant>();
             var normal = new ArrayList<Variant>();
@@ -757,19 +1076,23 @@ final class ResolvedJoinKernel {
                 for (Layout selected : lookups) {
                     for (int state = 0; state < (promote ? 2 : 1); state++) {
                         boolean registers = state != 0;
-                        CompiledKernel code = CompiledKernel.defer(backend,
-                                () -> program(updates, predicate, target, selected, false, registers), artifacts);
-                        owned.add(code);
-                        Variant plain = new Variant(code, false);
-                        exact.add(plain); normal.add(plain); expanded.add(plain);
-                        if (filter) {
-                            CompiledKernel filtered = CompiledKernel.defer(backend,
-                                    () -> program(updates, predicate, target, selected, true, registers), artifacts);
-                            owned.add(filtered);
-                            Variant complete = new Variant(filtered, false);
-                            normal.add(complete);
-                            expanded.add(new Variant(filtered, true));
-                            expanded.add(complete);
+                        Lookahead[] aheads = !specialized ? new Lookahead[]{Lookahead.NONE}
+                                : canPrefetchGroup(target, selected) ? Lookahead.values() : new Lookahead[]{Lookahead.NONE, Lookahead.JOINS};
+                        for (Lookahead ahead : aheads) {
+                            CompiledKernel code = CompiledKernel.defer(backend,
+                                    () -> program(updates, predicate, target, selected, false, registers, ahead), artifacts);
+                            Variant plain = new Variant(code, false, ahead);
+                            owned.add(plain);
+                            exact.add(plain); normal.add(plain); expanded.add(plain);
+                            if (filter) {
+                                CompiledKernel filtered = CompiledKernel.defer(backend,
+                                        () -> program(updates, predicate, target, selected, true, registers, ahead), artifacts);
+                                Variant complete = new Variant(filtered, false, ahead);
+                                owned.add(complete);
+                                normal.add(complete);
+                                expanded.add(new Variant(filtered, true, ahead));
+                                expanded.add(complete);
+                            }
                         }
                     }
                 }
@@ -778,26 +1101,45 @@ final class ResolvedJoinKernel {
                 throw failure;
             }
             first = exact.getFirst();
-            exactChoices = choices(exact, parallelism);
-            choices = membership ? choices(normal, parallelism) : exactChoices;
-            expandedChoices = membership ? choices(expanded, parallelism) : exactChoices;
+            var alternatives = membership ? List.of(exact, normal, expanded) : List.of(exact);
+            choices = new ParallelAdaptiveKernel[2][alternatives.size()];
+            boolean groupPrefetch = exact.stream().anyMatch(variant -> variant.lookahead == Lookahead.JOINS_AND_GROUPS);
+            for (int prefetch = 0; prefetch < choices.length; prefetch++) {
+                if (prefetch == 1 && !groupPrefetch) {
+                    choices[prefetch] = choices[0];
+                    continue;
+                }
+                for (int mode = 0; mode < alternatives.size(); mode++) {
+                    var variants = alternatives.get(mode);
+                    choices[prefetch][mode] = choices(prefetch == 0 ? withoutGroupPrefetch(variants) : variants, parallelism);
+                }
+            }
+        }
+
+        private static java.util.List<Variant> withoutGroupPrefetch(java.util.List<Variant> variants) {
+            return variants.stream().filter(variant -> variant.lookahead != Lookahead.JOINS_AND_GROUPS).toList();
         }
 
         private static ParallelAdaptiveKernel choices(java.util.List<Variant> variants, int parallelism) {
             return variants.size() > 1 ? new ParallelAdaptiveKernel(variants.toArray(Kernel[]::new), parallelism, System::nanoTime) : null;
         }
 
-        void prepare() { for (var code : owned) code.prepare(); }
+        void prepare() {
+            // Optional lookahead compiles only when sampled. The existing settling
+            // period excludes that first call from the policy's measured costs.
+            for (var variant : owned) if (variant.lookahead == Lookahead.NONE) variant.code.prepare();
+        }
 
-        void runBatch(long rows, boolean filter, boolean expanded, java.util.function.Consumer<Variant> work) {
-            ParallelAdaptiveKernel policy = filter && membership ? expanded ? expandedChoices : choices : exactChoices;
+        void runBatch(long rows, boolean filter, boolean expanded, boolean prefetchGroups, java.util.function.Consumer<Variant> work) {
+            Membership mode = !filter || !membership ? Membership.NONE : expanded ? Membership.EXPANDED : Membership.ORIGINAL;
+            ParallelAdaptiveKernel policy = choices[prefetchGroups ? 1 : 0][mode.ordinal()];
             if (policy == null) work.accept(first);
             else policy.runBatch(rows, variant -> work.accept((Variant) variant));
         }
 
         @Override public void close() {
             Throwable failure = null;
-            for (var code : owned) try { code.close(); }
+            for (var variant : owned) try { variant.code.close(); }
             catch (Throwable cleanup) { if (failure == null) failure = cleanup; else failure.addSuppressed(cleanup); }
             owned.clear();
             io.questdb.cairo.CairoException.rethrowCleanupFailure(failure);
@@ -819,6 +1161,7 @@ final class ResolvedJoinKernel {
         private final AggregateUpdates updates;
         private final Pipeline.Predicate predicate;
         private final Target target;
+        private final long groupPrefetchThreshold;
         private final Backend backend;
         private final Path artifacts;
         private Facts cachedFacts;
@@ -827,10 +1170,16 @@ final class ResolvedJoinKernel {
         private boolean membershipReady;
         private boolean membershipCanReject;
         private boolean subtreesReady;
+        private final JoinGroupCache groupCache = new JoinGroupCache();
 
         Prepared(Programs programs, Layout layout, QuestMapProbe probe, String name,
                  AggregateUpdates updates, Pipeline.Predicate predicate, Target target, Backend backend, Path artifacts) {
             this.updates = updates; this.predicate = predicate; this.target = target; this.backend = backend; this.artifacts = artifacts;
+            // A packed value may begin anywhere within a cache line. Bound the lines it
+            // touches, excluding cold key bytes, using the existing per-worker cache budget.
+            long line = io.questdb.std.Misc.CACHE_LINE_SIZE;
+            long footprint = (target.valueBytes + 2 * line - 2) / line * line;
+            groupPrefetchThreshold = CacheSizing.LOCAL_AGGREGATE_BYTES / Math.max(1, footprint);
             this.programs = programs;
             expanded = new boolean[layout.builds.length];
             this.layout = layout;
@@ -853,6 +1202,7 @@ final class ResolvedJoinKernel {
             membershipCanReject = false;
             hasExpanded = false;
             java.util.Arrays.fill(expanded, false);
+            groupCache.close();
             for (var set : sets) set.close();
             for (int i = 0; i < mapViews.length; i++) {
                 if (chainCounts[i] != null) { chainCounts[i].close(); chainCounts[i] = null; }
@@ -873,7 +1223,8 @@ final class ResolvedJoinKernel {
         @Override
         public void preparePayloads(FrozenHashJoinBuild[] builds, long probeRows, MemoryTracker tracker,
                                     SqlExecutionCircuitBreaker breaker) {
-            if (tracker == null || tracker.getLimit() <= 0 || tracker.getLimit() - tracker.getUsed() >= 40) specialize(builds, tracker);
+            groupCache.prepare(builds, target.groupBuild, probeRows, updaterCount, FACT_BYTES, tracker);
+            if (tracker == null || tracker.getLimit() <= 0 || tracker.getLimit() - tracker.getUsed() >= FACT_BYTES) specialize(builds, tracker);
             else {
                 programs.prepare();
             }
@@ -909,7 +1260,7 @@ final class ResolvedJoinKernel {
         private Facts facts(FrozenHashJoinBuild[] builds, MemoryTracker tracker) {
             var constants = new java.util.HashMap<Long, Long>();
             var shapes = new java.util.ArrayList<BuildShape>();
-            long descriptor = Unsafe.malloc(40, MemoryTag.NATIVE_JIT, tracker);
+            long descriptor = Unsafe.malloc(FACT_BYTES, MemoryTag.NATIVE_JIT, tracker);
             try {
                 boolean unique = true;
                 for (int i = 0; i < builds.length; i++) {
@@ -933,8 +1284,8 @@ final class ResolvedJoinKernel {
                     if (layout.sourceBuilds[i] >= 0) payloadFacts(builds, layout.sourceBuilds[i], layout.sourceColumns[i],
                             layout.arguments() + (long) ARGUMENT_BYTES * i, descriptor, constants);
                 }
-                return new Facts(java.util.Map.copyOf(constants), java.util.List.copyOf(shapes));
-            } finally { Unsafe.free(descriptor, 40, MemoryTag.NATIVE_JIT, tracker); }
+                return new Facts(java.util.Map.copyOf(constants), java.util.List.copyOf(shapes), groupCache.isAllocated());
+            } finally { Unsafe.free(descriptor, FACT_BYTES, MemoryTag.NATIVE_JIT, tracker); }
         }
 
         /** Structural offsets only: addresses stay in the execution descriptors. */
@@ -970,11 +1321,11 @@ final class ResolvedJoinKernel {
         }
 
         @Override
-        public CompiledJoin.Updater newUpdater(Runnable checkpoint) { updaterCount++; return new Slot(this, checkpoint); }
+        public CompiledJoin.Updater newUpdater(Runnable checkpoint) { return new Slot(this, checkpoint, updaterCount++); }
 
-        private void runBatch(long rows, long arguments, java.util.function.Consumer<Kernel> work) {
+        private void runBatch(long rows, long arguments, boolean prefetchGroups, java.util.function.Consumer<Kernel> work) {
             Programs active = specializationReady ? specializedPrograms : programs;
-            active.runBatch(rows, membershipCanReject, hasExpanded, variant -> {
+            active.runBatch(rows, membershipCanReject, hasExpanded, prefetchGroups, variant -> {
                 boolean original = variant.originalMembership;
                 if (original) {
                     for (int i = 0; i < sets.length; i++) if (expanded[i]) {
@@ -1067,25 +1418,37 @@ final class ResolvedJoinKernel {
         private final KernelMemory memory;
         private final long bytes;
         private final long argumentBytes;
+        private final JoinGroupCache.Slot groupCache;
         private final FrozenHashJoinBuild[] single = new FrozenHashJoinBuild[1];
         private long arguments;
         private long nativeRows;
         private long mapMisses;
+        private final io.questdb.std.str.DirectUtf8String keyString = new io.questdb.std.str.DirectUtf8String();
         private final SymbolKeyTranslator.View[][] translators;
 
-        Slot(Prepared prepared, Runnable checkpoint) {
+        Slot(Prepared prepared, Runnable checkpoint, int slotIndex) {
             this.prepared = prepared;
+            groupCache = prepared.target.groupBuild >= 0 ? prepared.groupCache.new Slot(slotIndex) : null;
             translators = new SymbolKeyTranslator.View[prepared.layout.builds.length][];
             for (int i = 0; i < translators.length; i++) translators[i] = new SymbolKeyTranslator.View[prepared.layout.keys[i].widths.length];
             memory = KernelMemory.reusable(checkpoint);
-            argumentBytes = prepared.layout.arguments() + (long) ARGUMENT_BYTES * prepared.layout.sourceBuilds.length;
+            argumentBytes = prepared.layout.groupCacheOffset() + 8;
             bytes = argumentBytes + (prepared.probe == null ? 0
-                    : GROUP_KEY + (prepared.probe.orderedNative() ? prepared.probe.keyBytes() : 0));
-            arguments = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
+                    : groupKeyOffset(prepared.probe) + (prepared.probe.varchar() ? 24 : prepared.probe.orderedNative() ? prepared.probe.keyBytes() : 0));
         }
 
         @Override
-        public void close() { arguments = Unsafe.free(arguments, bytes, MemoryTag.NATIVE_JIT); }
+        public void clearExecution() {
+            arguments = Unsafe.free(arguments, bytes, MemoryTag.NATIVE_JIT);
+            if (groupCache != null) groupCache.clear();
+        }
+
+        @Override
+        public void close() { clearExecution(); }
+
+        private void reopen() {
+            if (arguments == 0) arguments = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
+        }
 
         @Override
         public void bindSymbol(int build, int key, SymbolKeyTranslator.View translator) {
@@ -1109,7 +1472,7 @@ final class ResolvedJoinKernel {
                         if (lookup != null) children.add(lookup);
                     }
                     if (children.size() > 0 && JoinDependencyFilter.prepare(builds[producer],
-                            layout.builds[producer].keyTypes()[0], children, prepared.sets[producer], tracker, breaker)) {
+                            layout.builds[producer].keyTypes(), children, prepared.sets[producer], tracker, breaker)) {
                         // Retain the exact alternative. Reduced membership owns its own representation;
                         // disabling an expanded bitmap must not reinterpret its Bloom storage.
                         prepared.expanded[producer] = false;
@@ -1232,6 +1595,19 @@ final class ResolvedJoinKernel {
                     return false;
                 }
             }
+            for (int i = 0; i < layout.strings.length; i++) {
+                Source source = layout.strings[i];
+                long descriptor = arguments + layout.stringOffset() + i * 48L;
+                if (source.build < 0) {
+                    if (!record.writeNativeVarcharView(source.column, descriptor)) return false;
+                } else if (!builds[source.build].writeNativeVarcharPayload(source.column, descriptor)) return false;
+            }
+            for (int i = 0; i < layout.literals.length; i++)
+                Unsafe.getUnsafe().putByte(arguments + layout.literalOffset() + i, layout.literals[i]);
+            // Function.init resolves these IDs against this cursor's symbol sources before
+            // worker publication. Rebind on every frame; cached code must not retain old IDs.
+            for (int i = 0; i < layout.parameters.size(); i++)
+                Unsafe.putInt(arguments + layout.parameterOffset() + i * 8L, layout.parameters.get(i).getAsInt());
             Unsafe.putLong(arguments + MODE, prepared.subtreesReady ? 2 : unique ? 1 : 0);
             Unsafe.putLong(arguments + MATCHED, 0);
             return true;
@@ -1269,11 +1645,12 @@ final class ResolvedJoinKernel {
             if (prepared.probe != null) return false;
             if (builds.length != prepared.layout.builds.length) return false;
             if (rowCount == 0 || empty(builds)) return true;
+            reopen();
             try {
                 if (!bind(record, rowIdsAddress, builds)) return false;
                 memory.enter(null);
                 try {
-                    prepared.runBatch(rowCount, arguments, kernel -> {
+                    prepared.runBatch(rowCount, arguments, false, kernel -> {
                         while (true) {
                             long status = kernel.run(arguments, rowCount, value.getAddress(0));
                             memory.throwIfFailed();
@@ -1300,26 +1677,43 @@ final class ResolvedJoinKernel {
             if (prepared.probe == null) return false;
             if (builds.length != prepared.layout.builds.length) return false;
             if (rowCount == 0 || empty(builds)) return true;
+            reopen();
             final long state = arguments + argumentBytes;
             try {
                 if (!bind(record, rowIdsAddress, builds)) return false;
                 int count = shards == null ? 1 : shards.size();
                 if (shards != null && count != GroupByMapFragment.NUM_SHARDS) return false;
+                long groups = 0;
                 for (int i = 0; i < count; i++) {
                     Map current = shards == null ? map : shards.getQuick(i);
-                    current.writeNativeProbeView(state + MapKernelState.CONTROL_BYTES + (long) i * QuestMapProbe.VIEW_BYTES);
+                    current.writeNativeProbeView(state + prepared.probe.controlBytes() + (long) i * QuestMapProbe.VIEW_BYTES);
+                    if (prepared.groupCache.isAllocated()) groups += current.size();
+                }
+                boolean prefetchGroups = groups > prepared.groupPrefetchThreshold;
+                if (groupCache != null) Unsafe.putLong(arguments + prepared.layout.groupCacheOffset(),
+                        groupCache.bind(state + prepared.probe.controlBytes(), count));
+                if (prepared.probe.variable()) {
+                    ((io.questdb.cairo.map.OrderedMap) map).writeNativeKeyStagingView(
+                            state + MapKernelState.VariableKey.STAGING_ADDRESS, prepared.probe.variableKey().minimumBytes());
                 }
                 Unsafe.putLong(arguments + SHARD_MASK, count - 1);
                 Unsafe.putLong(arguments + POSITION, 0);
                 for (int i = 0; i < builds.length; i++) Unsafe.putLong(arguments + prepared.layout.build(i) + RESUME_LINK, 0);
                 memory.enter(null);
                 try {
-                    prepared.runBatch(rowCount, arguments, kernel -> {
+                    prepared.runBatch(rowCount, arguments, prefetchGroups, kernel -> {
                         while (true) {
                             long status = kernel.run(arguments, rowCount, state);
                             memory.throwIfFailed();
                             if (status == 0) break;
                             if (status == NEED_SYMBOL) { resolveSymbol(); continue; }
+                            if (status == MapKernelState.NEED_STAGING && prepared.probe.variable()) {
+                                ((io.questdb.cairo.map.OrderedMap) map).writeNativeKeyStagingView(
+                                        state + MapKernelState.VariableKey.STAGING_ADDRESS,
+                                        Unsafe.getLong(state + MapKernelState.VariableKey.REQUIRED_BYTES));
+                                Unsafe.putLong(arguments + POSITION, Unsafe.getLong(state + MapKernelState.RESUME_ROW));
+                                continue;
+                            }
                             if (status != MapKernelState.NEED_KEY) throw new IllegalStateException("Join map kernel failed: " + status);
                             // A miss has not updated its match. Keep its probe and duplicate positions;
                             // the ordinary map remains the only owner of insertion and growth.
@@ -1327,7 +1721,16 @@ final class ResolvedJoinKernel {
                             long rawKey = Unsafe.getLong(arguments + MISSING_KEY);
                             MapKey key;
                             if (prepared.probe.orderedNative()) {
-                                key = ((io.questdb.cairo.map.OrderedMap) map).withRawKey(rawKey, prepared.probe.keyBytes());
+                                key = ((io.questdb.cairo.map.OrderedMap) map).withRawKey(
+                                        rawKey + (prepared.probe.variable() ? 4 : 0),
+                                        prepared.probe.variable() ? Unsafe.getInt(rawKey) : prepared.probe.keyBytes());
+                            } else if (prepared.probe.varchar()) {
+                                long header = Unsafe.getLong(rawKey);
+                                int size = (int) (header >>> 32) & 0x3fffffff;
+                                long pointer = Unsafe.getLong(rawKey + 8) & Long.MAX_VALUE;
+                                key = map.withKey();
+                                key.putVarchar((header & 0x4000000000000000L) != 0 ? null
+                                        : keyString.of(pointer, pointer + size, (header & Long.MIN_VALUE) != 0));
                             } else {
                                 key = map.withKey();
                                 if (prepared.probe.keyType() == ColumnType.INT) key.putInt((int) rawKey);
@@ -1348,8 +1751,9 @@ final class ResolvedJoinKernel {
                             functions.updateEmpty(value);
                             mapMisses++;
                             // OrderedMap scratch-key writes may also move shard zero's heap.
-                            map.writeNativeProbeView(state + MapKernelState.CONTROL_BYTES);
-                            target.writeNativeProbeView(state + MapKernelState.CONTROL_BYTES + (long) shardIndex * QuestMapProbe.VIEW_BYTES);
+                            map.writeNativeProbeView(state + prepared.probe.controlBytes());
+                            target.writeNativeProbeView(state + prepared.probe.controlBytes() + (long) shardIndex * QuestMapProbe.VIEW_BYTES);
+                            if (groupCache != null) groupCache.inserted(state + prepared.probe.controlBytes(), shardIndex);
                         }
                     });
                 } finally {

@@ -27,7 +27,7 @@ package org.questdb.experimental.codegen;
 import java.util.function.UnaryOperator;
 import static org.questdb.experimental.codegen.Ir.*;
 
-/** Verifies the safe, read-only lane region and rewrites its consecutive loads. */
+/** Verifies read-only lane expressions and expands consecutive and indexed reads. */
 final class LaneExpressions {
     private LaneExpressions() { }
 
@@ -43,6 +43,7 @@ final class LaneExpressions {
                 if (l.width() == MemoryType.ADDRESS) reject();
                 invariantAddress(l.address());
             }
+            case Gather g -> { invariantAddress(g.base()); verify(g.bytes()); }
             default -> reject();
         }
     }
@@ -61,6 +62,7 @@ final class LaneExpressions {
     static Expr mapLoads(Expr e, UnaryOperator<Load> mapper) {
         return switch (e) {
             case Load l -> mapper.apply(l);
+            case Gather g -> new Load(g.width(), new Offset(g.base(), mapLoads(g.bytes(), mapper)));
             case Binary b -> new Binary(b.op(), mapLoads(b.left(), mapper), mapLoads(b.right(), mapper));
             case Select s -> new Select(mapLoads(s.condition(), mapper), mapLoads(s.yes(), mapper), mapLoads(s.no(), mapper));
             case ToDouble c -> new ToDouble(mapLoads(c.value(), mapper));
@@ -71,5 +73,5 @@ final class LaneExpressions {
         };
     }
 
-    private static void reject() { throw new IllegalArgumentException("Lane predicates require pure arithmetic and consecutive numeric reads"); }
+    private static void reject() { throw new IllegalArgumentException("Lane predicates require arithmetic and explicit numeric lane reads"); }
 }

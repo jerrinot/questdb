@@ -1,5 +1,10 @@
 # General generated joins
 
+Follow-up plan (2026-11-07): [selective transfer through dependent joins](DEPENDENT_JOIN_FILTER_PLAN.md)
+connects the typed fused machinery below to ordinary runtime filters and closes
+composite-producer membership reduction. The completed milestones below remain
+the implementation baseline, not a request to rebuild their infrastructure.
+
 2026-11-02. This is the active execution slice of WHOLE_QUERY_PLAN.md. SSB is a
 control, not the specification. Narrow prototypes do not satisfy completion.
 
@@ -136,8 +141,10 @@ producer keys and ordinary child probes, publishing conservative necessary condi
 before workers run. Compact sets use the existing bitmap; sparse LONG and sparse INT
 use the existing split-block Bloom layout with generated probes. SYMBOL uses the
 ordinary dictionary translator. Exact lookups still decide payloads and multiplicity.
-Composite child keys are supported when all components share one producer; composite
-producer keys and mixed-source conditions do not use this reduction. Known probe work
+At this measured checkpoint, composite child keys are supported when all components
+share one producer; composite producer keys and mixed-source conditions did not use
+this reduction. The 2026-11-07 follow-up implements composite producers, with performance
+validation pending. Mixed-source conditions remain excluded. Known probe work
 must amortize construction, and scratch/filter memory must fit the query budget.
 
 500M-row, eight-core selective INT/LONG/SYMBOL: **562/1414/679 -> 198/346/249ms**,

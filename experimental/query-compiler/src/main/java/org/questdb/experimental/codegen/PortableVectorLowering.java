@@ -128,6 +128,7 @@ final class PortableVectorLowering {
                 yield new Offset(address, expr(o.bytes(), out));
             }
             case Load l -> new Load(l.width(), expr(l.address(), out));
+            case Gather g -> new Load(g.width(), expr(new Offset(g.base(), g.bytes()), out));
             case AtomicLoad l -> new AtomicLoad(expr(l.address(), out), l.acquire());
             case AtomicAdd a -> {
                 Expr address = let(out, expr(a.address(), out));
@@ -181,6 +182,7 @@ final class PortableVectorLowering {
             case Select s -> contains(s.condition()) || contains(s.yes()) || contains(s.no());
             case Offset o -> contains(o.address()) || contains(o.bytes());
             case Load l -> contains(l.address());
+            case Gather ignored -> true;
             case AtomicLoad l -> contains(l.address());
             case AtomicAdd a -> contains(a.address()) || contains(a.value());
             case CompareExchange c -> contains(c.address()) || contains(c.expected()) || contains(c.value());

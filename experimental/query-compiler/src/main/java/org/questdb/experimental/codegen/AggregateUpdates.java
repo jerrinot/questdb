@@ -83,8 +83,13 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
 
     /** Consume consecutive identical inputs. Only row counts permit a wrapped multiplicity. */
     void emitRepeated(Builder b, Pipeline.Row row, Expr destination, Expr rows) {
+        emitRepeated(b, new ResolvedVarchar.Frame(row, i64(0), nil(), nil()), destination, rows);
+    }
+
+    void emitRepeated(Builder b, ResolvedVarchar.Frame frame, Expr destination, Expr rows) {
+        Pipeline.Row row = frame.numeric(b);
         if (rows.equals(i64(1))) {
-            emit(b, row, destination, nil());
+            emit(b, frame, destination, nil());
             return;
         }
         if (countsRowsOnly()) {
@@ -94,7 +99,6 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
             }
             return;
         }
-        var frame = new ResolvedVarchar.Frame(row, i64(0), nil(), nil());
         b.when(binary(Op.LT, i64(0), rows), present -> {
             var repeated = new ArrayList<Update>();
             for (var update : updates) {
@@ -326,7 +330,7 @@ record AggregateUpdates(ResolvedVarchar.Binding inputs, List<AggregateUpdates.Up
     }
 
     private void emit(Builder b, ResolvedVarchar.Frame source, Expr destination, Expr cardinalityAddress, boolean next) {
-        var frame = new ResolvedVarchar.Frame(source.numeric(b), source.row(), source.columns(), source.literals(), source.helpers(), source.materialized());
+        var frame = new ResolvedVarchar.Frame(source.numeric(b), source.row(), source.columns(), source.literals(), source.helpers(), source.materialized(), source.joinedValues());
         for (var update : updates) {
             if (next) update.emitNext(b, frame, destination, cardinalityAddress);
             else update.emit(b, frame, destination, cardinalityAddress);

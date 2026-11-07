@@ -45,6 +45,7 @@ public final class VarcharCaseFunction extends VarcharFunction implements CaseFu
         return args;
     }
 
+    @Override
     public CaseFunctionPicker getPicker() {
         return picker;
     }

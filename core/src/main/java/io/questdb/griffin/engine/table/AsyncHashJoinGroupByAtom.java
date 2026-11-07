@@ -793,6 +793,9 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
         }
 
         void clear(GroupByFunctionsUpdater updater) {
+            if (compiledUpdater != null) {
+                compiledUpdater.clearExecution();
+            }
             for (int i = 0; i < joinedRecords.length; i++) joinedRecords[i].clear();
             if (probes != null) {
                 java.util.Arrays.fill(probes, null);

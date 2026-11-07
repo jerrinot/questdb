@@ -26,6 +26,7 @@ package org.questdb.experimental.codegen;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import static org.questdb.experimental.codegen.Ir.*;
 
@@ -33,18 +34,22 @@ import static org.questdb.experimental.codegen.Ir.*;
 final class LlvmEmitter {
     private final StringBuilder out = new StringBuilder();
     private final Map<Integer, String> exits = new HashMap<>();
+    private final Set<String> declarations;
     private int temporary;
 
+    private LlvmEmitter(Set<String> declarations) { this.declarations = declarations; }
+
     static String emit(SsaProgram graph) {
-        StringBuilder source = new StringBuilder(new LlvmEmitter().module(graph, "query", false));
+        Set<String> declarations = new java.util.LinkedHashSet<>();
+        StringBuilder source = new StringBuilder(new LlvmEmitter(declarations).module(graph, "query", false));
         Map<String, Helper> helpers = new java.util.LinkedHashMap<>();
         collectHelpers(graph, helpers);
         for (Helper helper : helpers.values()) {
             SsaProgram body = SsaProgram.lower(helper);
             SsaOptimizer.verify(body);
-            source.append(new LlvmEmitter().module(body, helper.name(), true));
+            source.append(new LlvmEmitter(declarations).module(body, helper.name(), true));
         }
-        return source.toString();
+        return String.join("\n", declarations) + "\n" + source;
     }
 
     private static void collectHelpers(SsaProgram graph, Map<String, Helper> helpers) {
@@ -155,7 +160,7 @@ final class LlvmEmitter {
                 String pair = temp("cmpxchg ptr " + pointer + ", i64 " + operand(c.expected()) + ", i64 " + operand(c.value()) + " monotonic monotonic, align 8");
                 line(result + " = extractvalue { i64, i1 } " + pair + ", 0");
             }
-            case VectorMask m -> line(result + " = or i64 " + new LlvmVectorEmitter(m.lanes(), this::temp).mask(m.predicate()) + ", 0");
+            case VectorMask m -> line(result + " = or i64 " + new LlvmVectorEmitter(m.lanes(), this::temp, declarations::add).mask(m.predicate()) + ", 0");
             case PopulationCount z -> line(result + " = call i64 @llvm.ctpop.i64(i64 " + operand(z.value()) + ")");
             case TrailingZeros z -> line(result + " = call i64 @llvm.cttz.i64(i64 " + operand(z.value()) + ", i1 false)");
             case SelectRows s -> selectRows(result, s);

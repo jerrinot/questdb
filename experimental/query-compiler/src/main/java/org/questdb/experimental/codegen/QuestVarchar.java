@@ -69,23 +69,33 @@ final class QuestVarchar {
 
     // Native split and Parquet slice headers both carry NULL at bit 2.
     static Var header(Builder b, Expr descriptor, Expr row) {
-        Var aux = b.let(new Load(MemoryType.ADDRESS, descriptor));
+        return header(b, new Load(MemoryType.ADDRESS, descriptor), load(at(descriptor, 16)), row);
+    }
+
+    private static Var header(Builder b, Expr auxAddress, Expr auxBytes, Expr row) {
+        Var aux = b.let(auxAddress);
         Var raw = b.let(i64(4)); // column top
         b.when(ne(aux, nil()), present -> {
             Var offset = present.let(binary(Op.MUL, row, i64(16)));
-            present.when(binary(Op.LT, load(at(descriptor, 16)), add(offset, i64(16))), bad -> bad.exit(INVALID_FRAME));
+            present.when(binary(Op.LT, auxBytes, add(offset, i64(16))), bad -> bad.exit(INVALID_FRAME));
             present.assign(raw, new Load(MemoryType.I32, new Offset(aux, offset)));
         });
         return raw;
     }
 
     static Pipeline.Utf8Value decode(Builder b, Expr descriptor, Expr row) {
-        Var raw = header(b, descriptor, row);
+        return decode(b, new Load(MemoryType.ADDRESS, descriptor), new Load(MemoryType.ADDRESS, at(descriptor, 8)),
+                load(at(descriptor, 16)), load(at(descriptor, 24)), load(at(descriptor, 32)), load(at(descriptor, 40)), row);
+    }
+
+    static Pipeline.Utf8Value decode(Builder b, Expr auxAddress, Expr dataAddress, Expr auxBytes,
+                                     Expr dataBytes, Expr format, Expr stable, Expr row) {
+        Var raw = header(b, auxAddress, auxBytes, row);
         Var isNull = b.let(ne(binary(Op.AND, raw, i64(4)), i64(0)));
         Var ptr = b.let(nil()), size = b.let(i64(0));
         b.when(eq(isNull, bool(false)), value -> {
-            Var aux = value.let(new Offset(new Load(MemoryType.ADDRESS, descriptor), binary(Op.MUL, row, i64(16))));
-            Var slice = value.let(ne(load(at(descriptor, 32)), i64(0)));
+            Var aux = value.let(new Offset(auxAddress, binary(Op.MUL, row, i64(16))));
+            Var slice = value.let(ne(format, i64(0)));
             value.when(slice, parquet -> {
                 parquet.assign(size, binary(Op.USHR, binary(Op.AND, raw, i64(0xffff_ffffL)), i64(4)));
                 parquet.assign(ptr, new Load(MemoryType.ADDRESS, at(aux, 8)));
@@ -100,13 +110,13 @@ final class QuestVarchar {
                 nativeFrame.when(eq(inline, bool(false)), split -> {
                     split.assign(size, binary(Op.AND, binary(Op.USHR, raw, i64(4)), i64(0x0fff_ffffL)));
                     Var offset = split.let(binary(Op.USHR, load(at(aux, 8)), i64(16)));
-                    split.when(binary(Op.LT, load(at(descriptor, 24)), add(offset, size)), bad -> bad.exit(INVALID_FRAME));
-                    split.assign(ptr, new Offset(new Load(MemoryType.ADDRESS, at(descriptor, 8)), offset));
+                    split.when(binary(Op.LT, dataBytes, add(offset, size)), bad -> bad.exit(INVALID_FRAME));
+                    split.assign(ptr, new Offset(dataAddress, offset));
                 });
             });
         });
         return new Pipeline.Utf8Value(ptr, size, isNull, ne(binary(Op.AND, raw, i64(2)), i64(0)),
-                ne(load(at(descriptor, 40)), i64(0)));
+                ne(stable, i64(0)));
     }
 
     /** Zero-padded six-byte prefix of a decoded non-NULL value, including Parquet slices. */
@@ -195,6 +205,10 @@ final class QuestVarchar {
             QuestMapProbe.count(step, PROBE_COUNT);
             Var entry = step.let(new Offset(lookup.base(), binary(Op.MUL, lookup.slot(), stride)));
             step.when(eq(load(entry), i64(0)), missing -> {
+                if (initialize == null) {
+                    QuestMapProbe.miss(missing, position, lookup.shard(), beforeMiss);
+                    return;
+                }
                 missing.when(binary(Op.LT, load(at(lookup.view(), NativeMapView.FREE)), i64(2)), full ->
                         QuestMapProbe.miss(full, position, lookup.shard(), beforeMiss));
                 Var ptr = missing.let(load(at(key, 8)));

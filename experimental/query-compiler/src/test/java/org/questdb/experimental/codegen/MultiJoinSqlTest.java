@@ -57,6 +57,7 @@ public class MultiJoinSqlTest {
     private long buildThreshold = Long.MAX_VALUE;
     private long payloadCopyLimit = 128L << 20;
     private int shardThreshold = Integer.MAX_VALUE;
+    private int maxFrameRows = 256;
     private long memory;
     private long joinMemory;
 
@@ -64,7 +65,7 @@ public class MultiJoinSqlTest {
         memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
         joinMemory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JOIN_MAP);
         var config = new DefaultCairoConfiguration(temporary.newFolder().toString()) {
-            @Override public int getSqlPageFrameMaxRows() { return 256; }
+            @Override public int getSqlPageFrameMaxRows() { return maxFrameRows; }
             @Override public int getSqlPageFrameMinRows() { return 64; }
             @Override public long getSqlParallelHashJoinGroupByBuildParallelMinRows() { return buildThreshold; }
             @Override public long getSqlParallelHashJoinGroupByBuildRowsPerPartition() { return 64; }
@@ -95,6 +96,123 @@ public class MultiJoinSqlTest {
         if (engine != null) engine.close();
         assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
         assertEquals(joinMemory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JOIN_MAP));
+    }
+
+    @Test public void varcharPayloadsGroupAcrossTypedDependentJoins() throws Exception {
+        // Enough full frames to sample both ordinary and lookahead kernels, including tails.
+        maxFrameRows = 4096;
+        engine.execute("create table vp as (select cast(x%31 as int) k,(x%31-15)*4294967297 l,"
+                + "cast('K'||cast(x%31 as string) as symbol) s,x v from long_sequence(200003))", context);
+        engine.execute("create table va as (select cast((93-x)%31 as int) k,((93-x)%31-15)*4294967297 l,"
+                + "cast('K'||cast((93-x)%31 as string) as symbol) s,cast(x%17 as int) nk,x v,"
+                + "cast(case when x%7=0 then null when x%7=1 then '' when x%7=2 then 'é中' "
+                + "when x%7=3 then '" + "long-ä-".repeat(300) + "' else 'name-'||cast(x%13 as string) end as varchar) name "
+                + "from long_sequence(93))", context);
+        engine.execute("create table vb as (select cast((51-x)%17 as int) k,x v,"
+                + "cast(case when x%5=0 then null else 'other-'||cast(x%9 as string) end as varchar) name "
+                + "from long_sequence(51))", context);
+        shardThreshold = 4;
+        for (long threshold : new long[]{Long.MAX_VALUE, 1}) {
+            buildThreshold = threshold;
+            for (String key : new String[]{"p.k=a.k", "p.l=a.l", "p.s=a.s", "p.l=a.l and p.s=a.s"}) {
+                String from = " from vp p join va a on " + key + " join vb b on a.nk=b.k";
+                matches("select a.name,count(),sum(p.v)" + from + " group by a.name", 1, true, compiler);
+                matches("select b.name,count(),sum(p.v)" + from + " group by b.name", 1, true, compiler);
+                matches("select a.name,count(),count(b.name),sum(p.v),min(a.v),max(b.v)" + from + " group by a.name", 1, true, compiler);
+                matches("select a.name,b.name,p.k,count(),sum(a.v),min(p.v),max(b.v),avg(p.v)" + from
+                        + " group by a.name,b.name,p.k", 3, true, compiler);
+            }
+        }
+        String from = " from vp p join va a on p.k=a.k join vb b on a.nk=b.k";
+        matches("select count(a.name),sum(length(a.name)),min(length(b.name)),max(p.v)" + from, 0, true, compiler);
+        matches("select case when a.v>20 then a.name else b.name end n,count(),sum(p.v)" + from
+                + " group by n", 1, true, compiler);
+        matches("select case when a.v>20 then a.name else cast('other' as varchar) end n,count(),sum(p.v)" + from
+                + " group by n", 1, true, compiler);
+        matches("select a.name,a.v*0.5 d,count(),sum(p.v*0.5),min(a.v*0.5),max(b.v*0.5),avg(p.v*0.5)"
+                + from + " group by a.name,d", 2, true, compiler);
+        matches("select a.name,count(),sum(p.v) from vp p join va a on p.k=a.k group by a.name", 1, true, compiler);
+        matches("select a.name,count(),sum(p.v)" + from + " where p.v>a.v group by a.name", 1, true, compiler);
+        String sql = "select a.name,count(),sum(p.v)" + from + " group by a.name";
+        AtomicBoolean fail = new AtomicBoolean(true);
+        context.setQueryCodeGenerator(intercepted(false, fail));
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            assertThrows(CairoException.class, () -> Demo.readSql(factory, context, 1));
+            fail.set(false);
+            context.setQueryCodeGenerator(null);
+            try (var control = Demo.compileSql(engine, context, sql, true)) {
+                assertEquals(Demo.readSql(control, context, 1), Demo.readSql(factory, context, 1));
+            }
+            // Reuse the compiled factory while the frozen row identities and key bytes change.
+            engine.execute("truncate table va", context);
+            assertTrue(Demo.readSql(factory, context, 1).isEmpty());
+            engine.execute("insert into va select cast(x%31 as int),(x%31-15)*4294967297,"
+                    + "cast('K'||cast(x%31 as string) as symbol),cast(x%17 as int),x,"
+                    + "cast(case when x%3=0 then null else 'replacement-'||cast(x%11 as string) end as varchar) "
+                    + "from long_sequence(93)", context);
+            try (var control = Demo.compileSql(engine, context, sql, true)) {
+                assertEquals(Demo.readSql(control, context, 1), Demo.readSql(factory, context, 1));
+            }
+            engine.execute("truncate table vp", context);
+            engine.execute("insert into vp select cast(x%31 as int),(x%31-15)*4294967297,"
+                    + "cast('K'||cast(x%31 as string) as symbol),x from long_sequence(1000)", context);
+            // Disable the destination cache while keeping the probe larger than the builds,
+            // so row-count changes do not invalidate this factory's join orientation.
+            try (var control = Demo.compileSql(engine, context, sql, true)) {
+                assertEquals(Demo.readSql(control, context, 1), Demo.readSql(factory, context, 1));
+            }
+        }
+    }
+
+    @Test public void growingJoinedGroupsPreserveWideAggregateState() throws Exception {
+        maxFrameRows = 4096;
+        buildThreshold = 1;
+        shardThreshold = 4;
+        engine.execute("create table gp as (select (x%8193-4096)*4294967297 k,x v from long_sequence(1000003))", context);
+        engine.execute("create table ga as (select (x-4097)*4294967297 k,"
+                + "((x*73)%8193-4096)*4294967297 nk,x v,"
+                + "cast(case when x%19=0 then null else 'g-'||cast(x as string) end as varchar) name "
+                + "from long_sequence(8193))", context);
+        // Group state crosses the local-cache admission boundary as the maps grow.
+        // The key comes from the dependent build, including NULL VARCHAR values.
+        matches("select b.k,b.name,count(),sum(p.v),min(a.v),max(b.v),avg(p.v),sum(p.v*0.5) "
+                + "from gp p join ga a on p.k=a.k join ga b on a.nk=b.k group by b.k,b.name", 2, true, compiler);
+    }
+
+    @Test public void varcharPayloadsHandleColumnTopsReopenAndParquetFallback() throws Exception {
+        engine.execute("create table vp as (select cast(x%31 as int) k,x v,timestamp_sequence('2024-01-01',60000000L) ts from long_sequence(2003)) timestamp(ts) partition by day", context);
+        engine.execute("alter table vp add label varchar", context);
+        engine.execute("insert into vp select cast(x%31 as int),x,timestamp_sequence('2024-01-03',60000000L),cast('p-'||cast(x%5 as string) as varchar) from long_sequence(2003)", context);
+        engine.execute("create table va as (select cast(x%31 as int) k,cast(x%17 as int) nk,x v,"
+                + "timestamp_sequence('2024-01-01',3600000000L) ts from long_sequence(48)) timestamp(ts) partition by day", context);
+        engine.execute("alter table va add label varchar", context);
+        engine.execute("insert into va select cast(x%31 as int),cast(x%17 as int),x,"
+                + "timestamp_sequence('2024-01-03',3600000000L),cast(case when x%3=0 then null else 'a-'||cast(x%7 as string) end as varchar) from long_sequence(48)", context);
+        String sql = "select p.label,a.label,count(),count(a.label),sum(p.v),min(a.v),max(b.v) "
+                + "from vp p join va a on p.k=a.k join b on a.nk=b.k group by p.label,a.label";
+        shardThreshold = 4;
+        buildThreshold = 1;
+        matches(sql, 2, true, compiler);
+        context.setQueryCodeGenerator(compiler);
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            RecordCursorFactory base = factory;
+            while (!(base instanceof AsyncHashJoinGroupByRecordCursorFactory)) base = base.getBaseFactory();
+            var atom = ((AsyncHashJoinGroupByRecordCursorFactory) base).getAtom();
+            for (int round = 0; round < 4; round++) {
+                long nativeBefore = atom.getCompiledJoinNativeRows();
+                context.setQueryCodeGenerator(null);
+                try (var control = Demo.compileSql(engine, context, sql, true)) {
+                    var expected = Demo.readSql(control, context, 2);
+                    assertEquals(expected, Demo.readSql(factory, context, 2));
+                    assertEquals(expected, Demo.readSql(factory, context, 2));
+                }
+                if (round < 3) assertTrue(atom.getCompiledJoinNativeRows() > nativeBefore);
+                else assertEquals(nativeBefore, atom.getCompiledJoinNativeRows());
+                if (round == 0) engine.execute("insert into va values(1,1,999,'2024-01-05','new-中')", context);
+                else if (round == 1) engine.execute("alter table vp convert partition to parquet where ts < '2024-01-03'", context);
+                else if (round == 2) engine.execute("alter table va convert partition to parquet where ts < '2024-01-04'", context);
+            }
+        }
     }
 
     @Test public void typedKeysPreserveDictionaryDomainsAndDuplicateProducts() throws Exception {
@@ -134,6 +252,40 @@ public class MultiJoinSqlTest {
         matches("select count(),sum(p.v),sum(a.v),sum(b.v),sum(c.v) from dp p join da a on p.l=a.l join db b on a.ns=b.s join db c on a.nl=c.l", 0, true, compiler);
         matches("select count(),sum(p.v),sum(a.v),sum(b.v),sum(c.v) from dp p join da a on p.s=a.s join db b on a.nk=b.k join da c on b.l=c.nl", 0, true, compiler);
         matches("select count(),sum(p.value),sum(a.v),sum(b.v) from (select s,k,j,v value,l from dp) p join da a on p.s=a.s join db b on a.nl=b.l where a.v<b.v and p.value>10", 0, true, compiler);
+    }
+
+    @Test public void connectedJoinsDoNotDependOnFromOrder() throws Exception {
+        String[] types = {"int", "long", "symbol", "date", "timestamp", "timestamp_ns"};
+        String[] orders = {"rp p,ra a,rb b", "rp p,rb b,ra a", "ra a,rp p,rb b",
+                "ra a,rb b,rp p", "rb b,rp p,ra a", "rb b,ra a,rp p"};
+        for (String type : types) {
+            String value = type.equals("symbol") ? "'k'||cast(x%17 as string)"
+                    : type.equals("int") ? "x%17-8" : "(x%17-8)*4294967297+4503599627370496";
+            String next = value.replace("%17", "%11");
+            engine.execute("create table rp as (select cast(case when x%19=0 then null else " + value
+                    + " end as " + type + ") k,cast(x%3 as int) j,x v from long_sequence(2003))", context);
+            engine.execute("create table ra as (select cast(case when x%19=0 then null else " + value.replace("x%", "(93-x)%")
+                    + " end as " + type + ") k,cast(case when x%13=0 then null else " + next
+                    + " end as " + type + ") n,cast(x%3 as int) j,x v from long_sequence(93))", context);
+            engine.execute("create table rb as (select cast(case when x%13=0 then null else " + next.replace("x%", "(51-x)%")
+                    + " end as " + type + ") k,cast(x%3 as int) j,x v from long_sequence(51))", context);
+            for (String order : orders) {
+                matches("select p.j,count(),sum(p.v),min(a.v),max(b.v) from " + order
+                                + " where p.k=a.k and a.n=b.k group by p.j",
+                        "select p.j,count(),sum(p.v),min(a.v),max(b.v) from rp p,ra a,rb b"
+                                + " where p.k=a.k and a.n=b.k group by p.j", 1, true, compiler);
+            }
+            // A cycle introduces a build key from two already produced inputs. Keep both
+            // equalities, the composite key and the non-equality predicate when rerooting.
+            matches("select p.j,count(),sum(p.v),min(a.v),max(b.v) from rb b,ra a,rp p"
+                    + " where p.k=a.k and p.j=a.j and a.n=b.k and p.j=b.j and a.v>b.v group by p.j",
+                    "select p.j,count(),sum(p.v),min(a.v),max(b.v) from rp p,ra a,rb b"
+                            + " where p.k=a.k and p.j=a.j and a.n=b.k and p.j=b.j and a.v>b.v group by p.j",
+                    1, true, compiler);
+            engine.execute("drop table rp", context);
+            engine.execute("drop table ra", context);
+            engine.execute("drop table rb", context);
+        }
     }
 
     @Test public void dependentNullsMissingMatchesAndReopen() throws Exception {
@@ -385,6 +537,62 @@ public class MultiJoinSqlTest {
         }
     }
 
+    @Test public void calendarYearsReadProbeAndBuildValuesInEveryTemporalUnit() throws Exception {
+        shardThreshold = 4;
+        for (String type : new String[]{"date", "timestamp", "timestamp_ns"}) {
+            for (String source : new String[]{"cp", "ca"}) {
+                engine.execute("create table " + source + "_" + type + " as (select cast(x%31-15 as int) k,"
+                        + "cast(x%17-8 as int) j,cast(case when x%23=0 then null "
+                        + "when x%23=1 then 9223372036854775807L when x%23=2 then -9223372036854775807L "
+                        + "when x%23=3 then -1L when x%23=4 then 0L when x%23=5 then 1152921504606846976L "
+                        + "else x*7046029254386353131L end as " + type + ") t,x v from long_sequence("
+                        + (source.equals("cp") ? 2003 : 93) + "))", context);
+            }
+            String from = " from cp_" + type + " p join ca_" + type + " a on p.k=a.k join b on p.j=b.k";
+            matches("select year(p.t),count(),sum(p.v),min(year(a.t)),max(year(a.t))"
+                    + from + " group by year(p.t)", 1, true, compiler);
+            matches("select extract(year from a.t),count(),sum(year(p.t)),sum(a.v)"
+                    + from + " group by extract(year from a.t)", 1, true, compiler);
+        }
+    }
+
+    @Test public void extractFieldLiteralsReachExistingTemporalBindings() throws Exception {
+        for (String type : new String[]{"timestamp", "timestamp_ns"}) {
+            String table = "extract_" + type;
+            engine.execute("create table " + table + " as (select cast(x%31-15 as int) k,cast(x%17-8 as int) j,"
+                    + "cast(case when x%19=0 then null else (x-1000)*1000000001L end as " + type
+                    + ") t,x v from long_sequence(2003))", context);
+            for (String part : new String[]{"hour", "minute", "second"}) {
+                String key = "extract(" + part + " from p.t)";
+                matches("select " + key + ",count(),sum(a.v),min(b.v) from " + table
+                        + " p join a on p.k=a.k join b on p.j=b.k group by " + key, 1, true, compiler);
+            }
+        }
+    }
+
+    @Test public void temporalPayloadsPreserveUnitsNullsAndColumnTops() throws Exception {
+        shardThreshold = 4;
+        for (String type : new String[]{"date", "timestamp", "timestamp_ns"}) {
+            String parent = "parent_" + type;
+            String child = "child_" + type;
+            engine.execute("create table " + parent + " as (select cast(x%31-15 as int) k,x v from long_sequence(93))", context);
+            engine.execute("alter table " + parent + " add column t " + type, context);
+            engine.execute("insert into " + parent + " values (0,94,4294967297),(1,95,-4294967297),(2,96,9223372036854775807)", context);
+            engine.execute("create table " + child + " (t " + type + ",v long)", context);
+            engine.execute("insert into " + child + " values (null,11),(null,13),(4294967297,17),(-4294967297,19),(9223372036854775807,23)", context);
+            String from = " from p join " + parent + " a on p.k=a.k join " + child + " b on a.t=b.t";
+            for (long copy : new long[]{0, 128L << 20}) {
+                payloadCopyLimit = copy;
+                buildThreshold = copy == 0 ? Long.MAX_VALUE : 1;
+                // t is both a dependent join key and an observed build-side group key.
+                // matches checks native execution and opens the same factory twice.
+                matches("select count(),sum(p.v),sum(a.v),min(b.v),max(b.v)" + from, 0, true, compiler);
+                matches("select a.t,p.j,count(),sum(p.v),sum(a.v),min(b.v),max(b.v)" + from
+                        + " group by a.t,p.j", 2, true, compiler);
+            }
+        }
+    }
+
     @Test public void typedNullsExtremeKeysAndDictionaryReopen() throws Exception {
         engine.execute("create table tp as (select case when x%7=0 then null else (x%13-6)*4294967297 end l, cast(case when x%11=0 then null else 'K'||cast(x%13 as string) end as symbol) s,cast(x%3 as int) j,x v from long_sequence(2003))", context);
         engine.execute("create table td as (select case when x%7=0 then null else ((39-x)%13-6)*4294967297 end l, cast(case when x%11=0 then null else 'K'||cast((39-x)%13 as string) end as symbol) s,cast((39-x)%3 as int) j,x v from long_sequence(39))", context);
@@ -559,6 +767,130 @@ public class MultiJoinSqlTest {
         assertEquals(liveCode, LlvmBackend.liveFunctions());
     }
 
+    @Test public void symbolResidualsUseEachInputsDictionaryAndRebindOnReopen() throws Exception {
+        shardThreshold = 4;
+        engine.execute("alter table p add column label symbol", context);
+        engine.execute("insert into p select cast(x%31-15 as int),cast(x%17-8 as int),x,"
+                + "cast(case when x%5=0 then null else 'key-'||(x%3) end as symbol) from long_sequence(2003)", context);
+        engine.execute("create table labels as (select cast(x-15 as int) k,"
+                + "cast(case when x%5=0 then null else 'key-'||((31-x)%3) end as symbol) label from long_sequence(31))", context);
+        String from = " from p join labels a on p.k=a.k join b on p.j=b.k where ";
+        for (long copy : new long[]{0, 128L << 20}) {
+            payloadCopyLimit = copy;
+            for (String predicate : new String[]{
+                    "(p.label='key-1' and a.label='key-2') or (p.label='key-2' and a.label='key-1')",
+                    "(p.label in ('key-1',null,'absent','key-1') and a.label!='key-2') or a.label='absent'",
+                    "p.label='x' or a.label='key-1'", "p.label=null or a.label!=null"}) {
+                matches("select p.j,count(),sum(p.v),min(b.v),max(b.v)" + from + predicate + " group by p.j", 1, true, compiler);
+            }
+        }
+        String sql = "select count(),sum(p.v),min(b.v),max(b.v)" + from + "p.label='key-2' or a.label in ('new','absent',null,'new')";
+        context.setQueryCodeGenerator(compiler);
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            assertTrue(plan(factory), plan(factory).contains("compiledJoinPipeline"));
+            RecordCursorFactory base = factory;
+            while (!(base instanceof AsyncHashJoinGroupByRecordCursorFactory)) base = base.getBaseFactory();
+            var atom = ((AsyncHashJoinGroupByRecordCursorFactory) base).getAtom();
+            for (int round = 0; round < 3; round++) {
+                context.setQueryCodeGenerator(null);
+                try (var control = Demo.compileSql(engine, context, sql, true)) {
+                    var expected = Demo.readSql(control, context, 0);
+                    long before = atom.getCompiledJoinNativeRows();
+                    assertEquals(expected, Demo.readSql(factory, context, 0));
+                    assertEquals(expected, Demo.readSql(factory, context, 0));
+                    assertTrue(atom.getCompiledJoinNativeRows() > before);
+                }
+                engine.execute("truncate table labels", context);
+                engine.execute("insert into labels select cast(x%31-15 as int),cast(case when x%5=0 then null else '"
+                        + (round == 0 ? "new" : "key-2") + "' end as symbol) from long_sequence(62)", context);
+                engine.execute("truncate table p", context);
+                engine.execute("insert into p select cast(x%31-15 as int),cast(x%17-8 as int),x,"
+                        + "cast(case when x%5=0 then null else 'key-'||((" + (4007 + round)
+                        + "-x)%3) end as symbol) from long_sequence(4006)", context);
+            }
+        }
+    }
+
+    @Test public void numericCasesUseResolvedBranchesAcrossJoinedInputs() throws Exception {
+        engine.execute("create table cases as (select cast(x%31-15 as int) k,"
+                + "cast(x%17-8 as byte) n,cast(x%17-8 as short) s,"
+                + "cast(case when x%7=0 then null else x%17-8 end as int) i,"
+                + "case when x%7=0 then null else (x%17-8)*4294967297L end l,"
+                + "cast(case when x%7=0 then null else (x%17-8)*0.5 end as float) f,"
+                + "case when x%7=0 then null else (x%17-8)*0.5 end d,"
+                + "cast(case when x%5=0 then null else 'key-'||(x%3) end as symbol) label from long_sequence(93))", context);
+        String from = " from p join cases a on p.k=a.k join b on p.j=b.k";
+        for (long copy : new long[]{0, 128L << 20}) {
+            payloadCopyLimit = copy;
+            for (String column : new String[]{"n", "s", "i", "l", "f", "d"}) {
+                String type = switch (column) {
+                    case "n" -> "byte"; case "s" -> "short"; case "i" -> "int";
+                    case "l" -> "long"; case "f" -> "float"; default -> "double";
+                };
+                String value = "case when p.v<700 then a." + column
+                        + " when p.v<1400 then case when a.label in ('key-1',null) then cast(3 as " + type + ") end end";
+                // Existing aggregate admission is narrower than numeric expression support.
+                // Keep the CASE's resolved width, then widen for this complete aggregate set.
+                if (column.equals("n") || column.equals("s")) value = "cast(" + value + " as int)";
+                if (column.equals("f")) value = "cast(" + value + " as double)";
+                matches("select p.j,count(" + value + "),sum(" + value + "),min(" + value + "),max(" + value
+                        + "),avg(" + value + ")" + from + " group by p.j", 1, true, compiler);
+            }
+            String key = "case when p.v<700 then a.i when p.v<1400 then a.l else p.j end";
+            String value = "case when a.label='key-1' then a.i when p.v<1400 then a.d else b.v end";
+            matches("select " + key + ",count(),sum(" + value + "),min(" + value + "),max(" + value
+                    + ")" + from + " group by " + key, 1, true, compiler);
+        }
+        // Unsupported conversions must retain ordinary short-circuit evaluation.
+        engine.execute("alter table cases add column invalid varchar", context);
+        engine.execute("update cases set invalid='not-a-number'", context);
+        matches("select sum(case when p.v>0 then a.i else cast(a.invalid as long) end)"
+                + from + " where p.v>0", 0, false, compiler);
+    }
+
+    @Test public void integralSwitchesPreserveKeysNullsAndReboundSymbols() throws Exception {
+        engine.execute("create table choices as (select cast(x%31-15 as int) k,"
+                + "case when x%11=0 then null else (x%3-1)*4294967297L end l,"
+                + "cast(case when x%7=0 then null else 'key-'||(x%3) end as symbol) s,x*0.5 v from long_sequence(93))", context);
+        String from = " from p join choices a on p.k=a.k join b on p.j=b.k";
+        for (String value : new String[]{
+                "case a.k when -1 then p.v when 0 then a.v else b.v end",
+                "case a.l when -4294967297L then p.v when 4294967297L then a.v when null then b.v end",
+                "case a.s when 'key-1' then p.v else a.v end",
+                "case a.s when 'key-1' then p.v when 'key-2' then a.v when null then b.v end",
+                "case a.s when 'key-1' then p.v when 'key-2' then a.v when 'key-0' then b.v when 'absent' then 11 else 0 end",
+                "case a.s when 'key-1' then 9 end", "case a.s when 'absent' then 9 else -1 end"}) {
+            matches("select p.j,count(" + value + "),sum(" + value + "),min(" + value + "),max(" + value
+                    + ")" + from + " group by p.j", 1, true, compiler);
+        }
+        StringBuilder large = new StringBuilder("case a.k");
+        for (int i = 0; i < 17; i++) large.append(" when ").append(i).append(" then a.v");
+        matches("select sum(" + large + " else p.v end)" + from, 0, false, compiler);
+
+        String sql = "select count(case a.s when 'new' then 1 end),sum(case a.s when 'new' then a.v "
+                + "when 'key-1' then p.v when 'key-2' then b.v when null then 11 else 0 end)" + from;
+        context.setQueryCodeGenerator(compiler);
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            assertTrue(plan(factory), plan(factory).contains("compiledJoinPipeline"));
+            RecordCursorFactory base = factory;
+            while (!(base instanceof AsyncHashJoinGroupByRecordCursorFactory)) base = base.getBaseFactory();
+            var atom = ((AsyncHashJoinGroupByRecordCursorFactory) base).getAtom();
+            for (int round = 0; round < 3; round++) {
+                context.setQueryCodeGenerator(null);
+                try (var control = Demo.compileSql(engine, context, sql, true)) {
+                    var expected = Demo.readSql(control, context, 0);
+                    long before = atom.getCompiledJoinNativeRows();
+                    assertEquals(expected, Demo.readSql(factory, context, 0));
+                    assertEquals(expected, Demo.readSql(factory, context, 0));
+                    assertTrue(atom.getCompiledJoinNativeRows() > before);
+                }
+                engine.execute("truncate table choices", context);
+                engine.execute("insert into choices select cast(x%31-15 as int),null,cast(case when x%7=0 then null else '"
+                        + (round == 0 ? "new" : "key-1") + "' end as symbol),x*0.5 from long_sequence(62)", context);
+            }
+        }
+    }
+
     @Test public void compositeSymbolGroupsRebindAfterBuildChanges() throws Exception {
         engine.execute("create table labels as (select cast(x-15 as int) k,cast('old-'||(x%3) as symbol) label from long_sequence(31))", context);
         String sql = "select p.j,labels.label,count(),sum(b.v) from p join labels on p.k=labels.k join b on p.j=b.k group by p.j,labels.label";
@@ -694,8 +1026,12 @@ public class MultiJoinSqlTest {
     }
 
     private void matches(String sql, int keyCount, boolean compiled, QueryCodeGenerator generator) throws Exception {
+        matches(sql, sql, keyCount, compiled, generator);
+    }
+
+    private void matches(String sql, String controlSql, int keyCount, boolean compiled, QueryCodeGenerator generator) throws Exception {
         context.setQueryCodeGenerator(null);
-        try (var baseline = Demo.compileSql(engine, context, sql, true)) {
+        try (var baseline = Demo.compileSql(engine, context, controlSql, true)) {
             var expected = Demo.readSql(baseline, context, keyCount);
             context.setQueryCodeGenerator(generator);
             try (var candidate = Demo.compileSql(engine, context, sql, true)) {

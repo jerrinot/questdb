@@ -82,6 +82,7 @@ final class SsaProgram {
             case Binary b -> new Binary(b.op(), map(b.left(), leaf), map(b.right(), leaf));
             case Offset o -> new Offset(map(o.address(), leaf), map(o.bytes(), leaf));
             case Load l -> new Load(l.width(), map(l.address(), leaf));
+            case Gather g -> new Gather(g.width(), map(g.base(), leaf), map(g.bytes(), leaf));
             case AtomicLoad l -> new AtomicLoad(map(l.address(), leaf), l.acquire());
             case AtomicAdd a -> new AtomicAdd(map(a.address(), leaf), map(a.value(), leaf));
             case CompareExchange c -> new CompareExchange(map(c.address(), leaf), map(c.expected(), leaf), map(c.value(), leaf));
@@ -258,6 +259,7 @@ final class SsaProgram {
                 }
                 case Offset o -> new Offset(emit(o.address()), emit(o.bytes()));
                 case Load l -> new Load(l.width(), emit(l.address()));
+                case Gather g -> new Load(g.width(), emit(new Offset(g.base(), g.bytes())));
                 case AtomicLoad l -> new AtomicLoad(emit(l.address()), l.acquire());
                 case AtomicAdd a -> new AtomicAdd(emit(a.address()), emit(a.value()));
                 case CompareExchange c -> new CompareExchange(emit(c.address()), emit(c.expected()), emit(c.value()));

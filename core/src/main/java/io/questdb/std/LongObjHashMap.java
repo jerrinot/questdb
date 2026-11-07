@@ -63,6 +63,10 @@ public class LongObjHashMap<V> extends AbstractLongHashSet {
         return valueAt(keyIndex(key));
     }
 
+    public long getNoEntryKey() {
+        return noEntryKeyValue;
+    }
+
     public long[] keys() {
         return keys;
     }

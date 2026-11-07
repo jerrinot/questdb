@@ -315,6 +315,14 @@ final class QuestMapProbe {
         return findExisting(b, key, lookup(b, key, i64(0)));
     }
 
+    /** Read-only first-slot prefetch in a borrowed join map. */
+    void prefetchExisting(Builder b, Var view, Var hash) {
+        Var slot = b.let(binary(Op.AND, hash, load(at(view, NativeMapView.MASK))));
+        Expr base = new Load(MemoryType.ADDRESS, at(view, ordered() ? NativeMapView.OFFSETS : NativeMapView.ENTRIES));
+        Expr stride = ordered() ? i64(8) : load(at(view, NativeMapView.STRIDE));
+        b.prefetch(new Offset(base, binary(Op.MUL, slot, stride)), false);
+    }
+
     /** Lookup in a borrowed frozen join map, outside aggregate state/sharding. */
     Var findExisting(Builder b, Var key, Var view, Var hash) {
         Var base = b.let(new Load(MemoryType.ADDRESS, view));
@@ -391,6 +399,21 @@ final class QuestMapProbe {
         Var mask = b.let(load(at(view, NativeMapView.MASK)));
         Var slot = b.let(binary(Op.AND, hash, mask));
         return new Lookup(key, hash, shard, view, base, mask, slot);
+    }
+
+    /** Hash.hashLong128_64 for canonical integral tuples without staging native scratch. */
+    static Var hashLong128(Builder b, Expr first, Expr second) {
+        return direct(0, ColumnType.LONG, false).hash(b, add(binary(Op.MUL, first, i64(0x517cc1b727220a95L)), second));
+    }
+
+    static Expr hashLong128(Expr first, Expr second) {
+        return hashLong(add(binary(Op.MUL, first, i64(0x517cc1b727220a95L)), second));
+    }
+
+    static Expr hashLong(Expr key) {
+        Expr hash = binary(Op.XOR, key, binary(Op.USHR, key, i64(37)));
+        hash = binary(Op.MUL, hash, i64(0x165667919E3779F9L));
+        return binary(Op.XOR, hash, binary(Op.USHR, hash, i64(32)));
     }
 
     Var hash(Builder b, Expr key) {

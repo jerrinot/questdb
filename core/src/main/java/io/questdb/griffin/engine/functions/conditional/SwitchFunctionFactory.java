@@ -427,24 +427,65 @@ public class SwitchFunctionFactory implements FunctionFactory {
     ) throws SqlException {
         final IntObjHashMap<Function> map = new IntObjHashMap<>();
         final ObjList<Function> argsToPoke = new ObjList<>();
+        final int[] branchKeys = new int[n / 2];
+        Function sentinelBranch = null;
         for (int i = 1; i < n; i += 2) {
             final Function fun = args.getQuick(i);
             final int key = intMethod.getKey(fun, null);
-            final int index = map.keyIndex(key);
-            if (index < 0) {
-                throw SqlException.$(argPositions.getQuick(i), "duplicate branch");
+            branchKeys[i / 2] = key;
+            // The map's empty-key marker is a legal SQL value, kept outside the map.
+            if (key == map.getNoEntryKey()) {
+                if (sentinelBranch != null) {
+                    throw SqlException.$(argPositions.getQuick(i), "duplicate branch");
+                }
+                sentinelBranch = args.getQuick(i + 1);
+            } else {
+                final int index = map.keyIndex(key);
+                if (index < 0) {
+                    throw SqlException.$(argPositions.getQuick(i), "duplicate branch");
+                }
+                map.putAt(index, key, args.getQuick(i + 1));
             }
-            map.putAt(index, key, args.getQuick(i + 1));
             argsToPoke.add(args.getQuick(i + 1));
         }
 
         final Function elseB = getElseFunction(valueType, elseBranch);
-        final CaseFunctionPicker picker = record -> {
-            final int index = map.keyIndex(intMethod.getKey(keyFunction, record));
-            if (index < 0) {
-                return map.valueAtQuick(index);
+        final Function sentinelValue = sentinelBranch != null ? sentinelBranch : elseB;
+        final CaseFunctionPicker picker = new CaseFunctionPicker.Integral() {
+            @Override
+            public int getBranchCount() {
+                return branchKeys.length;
             }
-            return elseB;
+
+            @Override
+            public Function getElseBranch() {
+                return elseB;
+            }
+
+            @Override
+            public long getKey(int index) {
+                return branchKeys[index];
+            }
+
+            @Override
+            public Function getKeyFunction() {
+                return keyFunction;
+            }
+
+            @Override
+            public Function getValue(int index) {
+                return argsToPoke.getQuick(index);
+            }
+
+            @Override
+            public @NotNull Function pick(Record record) {
+                final int key = intMethod.getKey(keyFunction, record);
+                if (key == map.getNoEntryKey()) {
+                    return sentinelValue;
+                }
+                final int index = map.keyIndex(key);
+                return index < 0 ? map.valueAtQuick(index) : elseB;
+            }
         };
 
         argsToPoke.add(elseB);
@@ -465,24 +506,65 @@ public class SwitchFunctionFactory implements FunctionFactory {
     ) throws SqlException {
         final LongObjHashMap<Function> map = new LongObjHashMap<>();
         final ObjList<Function> argsToPoke = new ObjList<>();
+        final long[] branchKeys = new long[n / 2];
+        Function sentinelBranch = null;
         for (int i = 1; i < n; i += 2) {
             final Function fun = args.getQuick(i);
             final long key = longMethod.getKey(fun, null);
-            final int index = map.keyIndex(key);
-            if (index < 0) {
-                throw SqlException.$(argPositions.getQuick(i), "duplicate branch");
+            branchKeys[i / 2] = key;
+            // The map's empty-key marker is a legal SQL value, kept outside the map.
+            if (key == map.getNoEntryKey()) {
+                if (sentinelBranch != null) {
+                    throw SqlException.$(argPositions.getQuick(i), "duplicate branch");
+                }
+                sentinelBranch = args.getQuick(i + 1);
+            } else {
+                final int index = map.keyIndex(key);
+                if (index < 0) {
+                    throw SqlException.$(argPositions.getQuick(i), "duplicate branch");
+                }
+                map.putAt(index, key, args.getQuick(i + 1));
             }
-            map.putAt(index, key, args.getQuick(i + 1));
             argsToPoke.add(args.getQuick(i + 1));
         }
 
         final Function elseB = getElseFunction(valueType, elseBranch);
-        final CaseFunctionPicker picker = record -> {
-            final int index = map.keyIndex(longMethod.getKey(keyFunction, record));
-            if (index < 0) {
-                return map.valueAtQuick(index);
+        final Function sentinelValue = sentinelBranch != null ? sentinelBranch : elseB;
+        final CaseFunctionPicker picker = new CaseFunctionPicker.Integral() {
+            @Override
+            public int getBranchCount() {
+                return branchKeys.length;
             }
-            return elseB;
+
+            @Override
+            public Function getElseBranch() {
+                return elseB;
+            }
+
+            @Override
+            public long getKey(int index) {
+                return branchKeys[index];
+            }
+
+            @Override
+            public Function getKeyFunction() {
+                return keyFunction;
+            }
+
+            @Override
+            public Function getValue(int index) {
+                return argsToPoke.getQuick(index);
+            }
+
+            @Override
+            public @NotNull Function pick(Record record) {
+                final long key = longMethod.getKey(keyFunction, record);
+                if (key == map.getNoEntryKey()) {
+                    return sentinelValue;
+                }
+                final int index = map.keyIndex(key);
+                return index < 0 ? map.valueAtQuick(index) : elseB;
+            }
         };
         argsToPoke.add(elseB);
         argsToPoke.add(keyFunction);
@@ -621,7 +703,7 @@ public class SwitchFunctionFactory implements FunctionFactory {
      * participate in the MultiArgFunction.init() lifecycle when added to the CaseFunction's
      * args list.
      */
-    private abstract static class SymbolPicker extends IntFunction implements CaseFunctionPicker {
+    private abstract static class SymbolPicker extends IntFunction implements CaseFunctionPicker.Integral {
         protected final Function elseFunc;
         protected final SymbolFunction keyFunction;
         protected final Function nullFunc;
@@ -630,6 +712,16 @@ public class SwitchFunctionFactory implements FunctionFactory {
             this.keyFunction = keyFunction;
             this.nullFunc = nullFunc;
             this.elseFunc = elseFunc;
+        }
+
+        @Override
+        public Function getElseBranch() {
+            return elseFunc;
+        }
+
+        @Override
+        public Function getKeyFunction() {
+            return keyFunction;
         }
 
         @Override
@@ -662,7 +754,7 @@ public class SwitchFunctionFactory implements FunctionFactory {
      * a valid resolved key (>= 0) or VALUE_NOT_FOUND (-2), so NULL naturally maps
      * to the else value without an explicit check.
      */
-    private static class SymbolSwitchConstIntFunction extends IntFunction {
+    public static final class SymbolSwitchConstIntFunction extends IntFunction {
         // The wide getters serve the same two constants, so widen them once here rather than
         // per row. A no-ELSE branch yields elseValue == INT_NULL, and Numbers.intToLong /
         // intToDouble / intToFloat map that onto the matching wide NULL exactly as the base
@@ -700,6 +792,22 @@ public class SwitchFunctionFactory implements FunctionFactory {
             this.doubleElseValue = Numbers.intToDouble(elseValue);
             this.floatThenValue = Numbers.intToFloat(thenValue);
             this.floatElseValue = Numbers.intToFloat(elseValue);
+        }
+
+        public int getElseValue() {
+            return elseValue;
+        }
+
+        public Function getKeyFunction() {
+            return keyFunction;
+        }
+
+        public int getResolvedKey() {
+            return resolvedKey;
+        }
+
+        public int getThenValue() {
+            return thenValue;
         }
 
         @Override
@@ -779,6 +887,21 @@ public class SwitchFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public int getBranchCount() {
+            return 2 + (nullFunc != null ? 1 : 0);
+        }
+
+        @Override
+        public long getKey(int index) {
+            return index == 0 ? resolvedKey1 : index == 1 ? resolvedKey2 : SymbolTable.VALUE_IS_NULL;
+        }
+
+        @Override
+        public Function getValue(int index) {
+            return index == 0 ? branch1 : index == 1 ? branch2 : nullFunc;
+        }
+
+        @Override
         public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
             final StaticSymbolTable symbolTable = keyFunction.getStaticSymbolTable();
             assert symbolTable != null;
@@ -816,6 +939,7 @@ public class SwitchFunctionFactory implements FunctionFactory {
     private static class SymbolSwitchPicker extends SymbolPicker {
         private final IntObjHashMap<Function> intMap = new IntObjHashMap<>();
         private final ObjList<Function> keyBranches;
+        private final int[] resolvedKeys;
         private final ObjList<String> strKeys;
 
         SymbolSwitchPicker(
@@ -828,6 +952,22 @@ public class SwitchFunctionFactory implements FunctionFactory {
             super(keyFunction, nullFunc, elseFunc);
             this.strKeys = strKeys;
             this.keyBranches = keyBranches;
+            this.resolvedKeys = new int[strKeys.size()];
+        }
+
+        @Override
+        public int getBranchCount() {
+            return strKeys.size() + (nullFunc != null ? 1 : 0);
+        }
+
+        @Override
+        public long getKey(int index) {
+            return index < resolvedKeys.length ? resolvedKeys[index] : SymbolTable.VALUE_IS_NULL;
+        }
+
+        @Override
+        public Function getValue(int index) {
+            return index < keyBranches.size() ? keyBranches.getQuick(index) : nullFunc;
         }
 
         @Override
@@ -837,6 +977,8 @@ public class SwitchFunctionFactory implements FunctionFactory {
             assert symbolTable != null;
             for (int i = 0, n = strKeys.size(); i < n; i++) {
                 final int symbolKey = symbolTable.keyOf(strKeys.getQuick(i));
+                // Generated workers borrow these IDs; symbol-table readers have mutable cursors.
+                resolvedKeys[i] = symbolKey;
                 if (symbolKey != SymbolTable.VALUE_NOT_FOUND) {
                     intMap.put(symbolKey, keyBranches.getQuick(i));
                 }
@@ -887,6 +1029,21 @@ public class SwitchFunctionFactory implements FunctionFactory {
             super(keyFunction, nullFunc, elseFunc);
             this.strKey = strKey;
             this.branch = branch;
+        }
+
+        @Override
+        public int getBranchCount() {
+            return 1 + (nullFunc != null ? 1 : 0);
+        }
+
+        @Override
+        public long getKey(int index) {
+            return index == 0 ? resolvedKey : SymbolTable.VALUE_IS_NULL;
+        }
+
+        @Override
+        public Function getValue(int index) {
+            return index == 0 ? branch : nullFunc;
         }
 
         @Override

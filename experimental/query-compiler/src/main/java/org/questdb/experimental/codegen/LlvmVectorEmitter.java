@@ -28,16 +28,20 @@ import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.Consumer;
 import static org.questdb.experimental.codegen.Ir.*;
 
 /** Legalizes a typed, read-only lane region to LLVM vectors, independent of SQL. */
 final class LlvmVectorEmitter {
     private final int lanes;
     private final Function<String, String> temp;
+    private final Consumer<String> declaration;
     private final Map<Expr, String> values = new HashMap<>();
     private final Map<Expr, String> invariants = new HashMap<>();
 
-    LlvmVectorEmitter(int lanes, Function<String, String> temp) { this.lanes = lanes; this.temp = temp; }
+    LlvmVectorEmitter(int lanes, Function<String, String> temp, Consumer<String> declaration) {
+        this.lanes = lanes; this.temp = temp; this.declaration = declaration;
+    }
 
     String mask(Expr predicate) {
         String bits = temp.apply("bitcast " + vector(Type.BOOL) + " " + value(predicate) + " to i" + lanes);
@@ -56,6 +60,19 @@ final class LlvmVectorEmitter {
                 String loaded = temp.apply("load " + memoryType + ", ptr " + pointer + ", align 1");
                 yield l.width().bytes == 8 ? loaded : temp.apply((l.width() == MemoryType.F32 ? "fpext " : "sext ")
                         + memoryType + " " + loaded + " to " + vector(l.type()));
+            }
+            case Gather g -> {
+                String addresses = temp.apply("add " + vector(Type.I64) + " " + splat(g.base()) + ", " + value(g.bytes()));
+                String pointers = temp.apply("inttoptr " + vector(Type.I64) + " " + addresses + " to <" + lanes + " x ptr>");
+                String memoryType = "<" + lanes + " x " + LlvmEmitter.memoryType(g.width()) + ">";
+                String intrinsic = "@llvm.masked.gather.v" + lanes
+                        + (g.width().resultType == Type.F64 ? "f" : "i") + g.width().bytes * 8 + ".v" + lanes + "p0";
+                declaration.accept("declare " + memoryType + " " + intrinsic + "(<" + lanes + " x ptr>, i32 immarg, "
+                        + vector(Type.BOOL) + ", " + memoryType + ")");
+                String loaded = temp.apply("call " + memoryType + " " + intrinsic + "(<" + lanes + " x ptr> "
+                        + pointers + ", i32 1, " + vector(Type.BOOL) + " " + value(bool(true)) + ", " + memoryType + " poison)");
+                yield g.width().bytes == 8 ? loaded : temp.apply((g.width() == MemoryType.F32 ? "fpext " : "sext ")
+                        + memoryType + " " + loaded + " to " + vector(g.type()));
             }
             case Binary b -> {
                 if (b.op() == Op.SDIV && Long.bitCount(((Literal) b.right()).value()) != 1)

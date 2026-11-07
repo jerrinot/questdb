@@ -45,6 +45,11 @@ class DoubleCaseFunction extends DoubleFunction implements CaseFunction {
     }
 
     @Override
+    public CaseFunctionPicker getPicker() {
+        return picker;
+    }
+
+    @Override
     public double getDouble(Record rec) {
         return picker.pick(rec).getDouble(rec);
     }

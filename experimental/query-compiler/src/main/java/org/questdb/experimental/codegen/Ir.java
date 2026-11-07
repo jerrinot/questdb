@@ -61,13 +61,13 @@ public final class Ir {
 
     public enum Op { ADD, SUB, MUL, AND, XOR, USHR, EQ, NE, LT, GE, BOTH, EITHER, FADD, FSUB, FMUL, FDIV, SDIV, FEQ, FNE, FLT, FGE }
 
-    public sealed interface Expr permits Var, Literal, Binary, Load, Offset, Select, Allocate, Reallocate, NativeCall, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, BitCast, AtomicLoad, CompareExchange, AtomicAdd {
+    public sealed interface Expr permits Var, Literal, Binary, Load, Gather, Offset, Select, Allocate, Reallocate, NativeCall, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, BitCast, AtomicLoad, CompareExchange, AtomicAdd {
         Type type();
     }
 
     /**
-     * Bit j is the predicate for lane j. Every numeric load reads its address plus
-     * j * width. Other values are invariant. The caller must establish that ALL
+     * Bit j is the predicate for lane j. Load reads its address plus j * width;
+     * Gather uses explicit per-lane offsets. Other values are invariant. The caller must establish that ALL
      * lanes of EVERY load are readable, including both arms of a select.
      * This is a read effect, not pure scalar arithmetic.
      */
@@ -78,6 +78,17 @@ public final class Ir {
             LaneExpressions.verify(predicate);
         }
         @Override public Type type() { return Type.I64; }
+    }
+
+    /** Numeric read at base+bytes. Within a lane expression, base stays invariant
+     * and bytes varies by lane; unlike Load, no implicit lane stride is added.
+     * Every lane address must be readable, including both arms of a select. */
+    public record Gather(MemoryType width, Expr base, Expr bytes) implements Expr {
+        public Gather {
+            require(base, Type.ADDRESS); require(bytes, Type.I64);
+            if (width == MemoryType.ADDRESS) throw new IllegalArgumentException("Gather requires numeric memory");
+        }
+        @Override public Type type() { return width.resultType; }
     }
 
     /** Defined for zero: trailingZeros(0) == 64 on every backend. */
@@ -429,6 +440,7 @@ public final class Ir {
             case Var v -> reads.add(v);
             case Binary b -> {collectReads(b.left(), reads); collectReads(b.right(), reads);}
             case Load l -> collectReads(l.address(), reads);
+            case Gather g -> { collectReads(g.base(), reads); collectReads(g.bytes(), reads); }
             case AtomicLoad l -> collectReads(l.address(), reads);
             case AtomicAdd a -> { collectReads(a.address(), reads); collectReads(a.value(), reads); }
             case CompareExchange c -> { collectReads(c.address(), reads); collectReads(c.expected(), reads); collectReads(c.value(), reads); }
@@ -504,6 +516,7 @@ public final class Ir {
             case Literal ignored -> { }
             case Binary b -> { verify(b.left(), scope); verify(b.right(), scope); }
             case Load l -> verify(l.address(), scope);
+            case Gather g -> { verify(g.base(), scope); verify(g.bytes(), scope); }
             case AtomicLoad l -> verify(l.address(), scope);
             case AtomicAdd a -> { verify(a.address(), scope); verify(a.value(), scope); }
             case CompareExchange c -> { verify(c.address(), scope); verify(c.expected(), scope); verify(c.value(), scope); }

@@ -39,6 +39,7 @@ import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.StaticSymbolTable;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.engine.join.FrozenHashJoinBuild;
+import io.questdb.griffin.engine.join.HashJoinPayloadSource;
 import io.questdb.griffin.engine.join.IntHashJoinBuild;
 import io.questdb.griffin.engine.join.MapHashJoinBuild;
 import io.questdb.griffin.engine.table.HashJoinBuildFrames;
@@ -49,11 +50,13 @@ import io.questdb.std.Decimals;
 import io.questdb.std.IntList;
 import io.questdb.std.Long256;
 import io.questdb.std.Long256Impl;
+import io.questdb.std.MemoryTag;
 import io.questdb.std.MemoryTracker;
 import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
 import io.questdb.std.Rnd;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.StringSink;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.CountingSqlExecutionCircuitBreaker;
@@ -68,6 +71,49 @@ import org.junit.Test;
  * owner makes once the build froze.
  */
 public class HashJoinBuildFramesTest extends AbstractCairoTest {
+
+    @Test
+    public void testNativeVarcharPayloadViewsAndParquetDecline() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table vc as (select (x%7)::int k,timestamp_sequence('2024-01-01',3600000000L) ts from long_sequence(48)) timestamp(ts) partition by day");
+            execute("alter table vc add v varchar");
+            execute("insert into vc select (x%7)::int,timestamp_sequence('2024-01-03',3600000000L),"
+                    + "case when x%3=0 then null when x%3=1 then '' else 'long-中-ä-payload' end from long_sequence(48)");
+            final long descriptor = Unsafe.malloc(HashJoinPayloadSource.NATIVE_VARCHAR_COLUMN_BYTES, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (boolean parquet : new boolean[]{false, true}) {
+                    if (parquet) execute("alter table vc convert partition to parquet where ts < '2024-01-04'");
+                    try (RecordCursorFactory factory = select("vc");
+                         HashJoinBuildFrames frames = new HashJoinBuildFrames(configuration, ints(2), factory.getMetadata());
+                         IntHashJoinBuild build = new IntHashJoinBuild(true, 2, 16)) {
+                        FrozenHashJoinBuild.IntKeyed frozen = FrameBuilds.buildInt(configuration, build, frames, factory, 0, sqlExecutionContext);
+                        Assert.assertEquals(!parquet, frozen.writeNativeVarcharPayload(0, descriptor));
+                        Assert.assertFalse(frozen.writeNativePayload(0, descriptor));
+                        Assert.assertEquals(0, frames.getCopyRowSize());
+                        if (!parquet) {
+                            var value = new io.questdb.std.str.Utf8SplitString();
+                            try (var probe = frozen.newProbe()) {
+                                for (long ordinal = 0; ordinal < frozen.getRowCount(); ordinal++) {
+                                    long id = frozen.getRowId(ordinal);
+                                    long offset = io.questdb.std.Rows.toPartitionIndex(id) * Unsafe.getLong(descriptor + 32);
+                                    long aux = Unsafe.getLong(Unsafe.getLong(descriptor) + offset);
+                                    long data = Unsafe.getLong(Unsafe.getLong(descriptor + 8) + offset);
+                                    long auxBytes = Unsafe.getLong(Unsafe.getLong(descriptor + 16) + offset);
+                                    long dataBytes = Unsafe.getLong(Unsafe.getLong(descriptor + 24) + offset);
+                                    probe.recordAt(frozen.getRowHandle(ordinal));
+                                    var actual = aux == 0 ? null : io.questdb.cairo.VarcharTypeDriver.getSplitValue(
+                                            aux, aux + auxBytes, data, data + dataBytes, io.questdb.std.Rows.toLocalRowID(id), value);
+                                    TestUtils.assertEquals(probe.getRecord().getVarcharA(0), actual);
+                                }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                Unsafe.free(descriptor, HashJoinPayloadSource.NATIVE_VARCHAR_COLUMN_BYTES, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
 
     @Test
     public void testCombinedHeadersKeepHandlesAndReleaseOldHeap() throws Exception {
@@ -281,12 +327,14 @@ public class HashJoinBuildFramesTest extends AbstractCairoTest {
                     Assert.assertEquals(200, frames.getCopyRowSize());
                     FrozenHashJoinBuild.IntKeyed frozen = FrameBuilds.buildInt(configuration, build, frames, factory, 0, sqlExecutionContext);
                     Assert.assertEquals(72, frozen.getRowCount());
+                    assertNativePayloads(frames, frozen, metadata, mapping, false);
                     try (FrozenHashJoinBuild.IntProbe before = frozen.newProbe()) {
                         for (int key = 1; key <= 72; key++) {
                             printRow(before, key, metadata, mapping, expected);
                         }
                         final long used = tracker.getUsed();
                         frames.copyPayload(frozen, sqlExecutionContext.getCircuitBreaker(), true);
+                        assertNativePayloads(frames, frozen, metadata, mapping, true);
                         // The copy is charged to the execution, and the pass releases what it decoded.
                         Assert.assertEquals(used + 72 * 200, tracker.getUsed());
                         // A reader that existed before the copy reads the copy from its next match on,
@@ -742,6 +790,44 @@ public class HashJoinBuildFramesTest extends AbstractCairoTest {
         assertPayloadOnlyDecode(tracker.getUsed() - buildBytes - copyBytes);
         frames.publishCopy();
         Assert.assertEquals(buildBytes + copyBytes, tracker.getUsed());
+    }
+
+    private static void assertNativePayloads(
+            HashJoinBuildFrames frames,
+            FrozenHashJoinBuild.IntKeyed frozen,
+            RecordMetadata metadata,
+            IntList mapping,
+            boolean copied
+    ) {
+        final long descriptor = Unsafe.malloc(HashJoinPayloadSource.NATIVE_COLUMN_BYTES, MemoryTag.NATIVE_DEFAULT);
+        try (FrozenHashJoinBuild.IntProbe probe = frozen.newProbe()) {
+            for (int column = 0; column < mapping.size(); column++) {
+                final int type = ColumnType.tagOf(metadata.getColumnType(mapping.getQuick(column)));
+                if (type != ColumnType.DATE && type != ColumnType.TIMESTAMP && type != ColumnType.FLOAT) {
+                    continue;
+                }
+                // Mixed Parquet/native frames require readers until their payload is copied.
+                Assert.assertEquals(copied, frames.writeNativeColumn(column, descriptor));
+                if (copied) {
+                    Assert.assertEquals(1, Unsafe.getLong(descriptor + 16));
+                    final long base = Unsafe.getLong(descriptor);
+                    final long stride = Unsafe.getLong(descriptor + 8);
+                    for (long row = 0; row < frozen.getRowCount(); row++) {
+                        probe.recordAt(frozen.getRowHandle(row));
+                        final Record record = probe.getRecord();
+                        if (type == ColumnType.FLOAT) {
+                            Assert.assertEquals(Float.floatToIntBits(record.getFloat(column)),
+                                    Float.floatToIntBits(Unsafe.getFloat(base + row * stride)));
+                        } else {
+                            final long expected = type == ColumnType.DATE ? record.getDate(column) : record.getTimestamp(column);
+                            Assert.assertEquals(expected, Unsafe.getLong(base + row * stride));
+                        }
+                    }
+                }
+            }
+        } finally {
+            Unsafe.free(descriptor, HashJoinPayloadSource.NATIVE_COLUMN_BYTES, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     // A reader that decodes the two Parquet row groups of 1_000 rows each, and of their build scan

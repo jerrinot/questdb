@@ -426,9 +426,9 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
      * A reader decodes no other column of the build scan: neither a join key, which the key table
      * holds, nor a column that only the build's own filters read, its scan's WHERE filter and an
      * outer join's ON condition on the build alone, which the build decodes once per frame through
-     * pools of its own. The planner admits only fixed-size payload columns, so a frame decodes to the
-     * payload's size a row, which the share's budget counts. A payload column that a type change
-     * turned from a var-size type into a fixed-size one after its partition became Parquet decodes
+     * pools of its own. This estimate counts fixed-size payload bytes; variable-size payloads cannot
+     * use the copy and remain under the reader pool's actual decode-cache budget. A payload column
+     * that a type change turned from a var-size type into a fixed-size one after its partition became Parquet decodes
      * from the stored text instead, which this count misses.
      */
     public boolean isReaderCacheExceeded(long parquetFrameRows) {
@@ -473,7 +473,8 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
         }
         final int type = payloadTypes[column];
         if (type != ColumnType.BYTE && type != ColumnType.SHORT && type != ColumnType.INT
-                && type != ColumnType.LONG && type != ColumnType.DOUBLE && type != ColumnType.SYMBOL) {
+                && type != ColumnType.LONG && type != ColumnType.FLOAT && type != ColumnType.DOUBLE && type != ColumnType.SYMBOL
+                && type != ColumnType.DATE && type != ColumnType.TIMESTAMP) {
             return false;
         }
         if (copyAddress != 0) {
@@ -489,6 +490,21 @@ public final class HashJoinBuildFrames implements HashJoinPayloadSource, QuietCl
         Unsafe.putLong(address, addressCache.getPageAddresses().getAddress() + (long) payloadColumns[column] * Long.BYTES);
         Unsafe.putLong(address + 8, (long) addressCache.getColumnCount() * Long.BYTES);
         Unsafe.putLong(address + 16, 0);
+        return true;
+    }
+
+    @Override
+    public boolean writeNativeVarcharColumn(int column, long address) {
+        if (frameCursor == null || column < 0 || column >= payloadColumns.length
+                || payloadTypes[column] != ColumnType.VARCHAR || addressCache.hasParquetFrames()) {
+            return false;
+        }
+        final long offset = (long) payloadColumns[column] * Long.BYTES;
+        Unsafe.putLong(address, addressCache.getAuxPageAddresses().getAddress() + offset);
+        Unsafe.putLong(address + 8, addressCache.getPageAddresses().getAddress() + offset);
+        Unsafe.putLong(address + 16, addressCache.getAuxPageSizes().getAddress() + offset);
+        Unsafe.putLong(address + 24, addressCache.getPageSizes().getAddress() + offset);
+        Unsafe.putLong(address + 32, (long) addressCache.getColumnCount() * Long.BYTES);
         return true;
     }
 

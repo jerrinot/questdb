@@ -129,6 +129,7 @@ final class MachineCode {
                 emit(op,result,left,right,0);yield result;
             }
             case Load l -> {var address=address(l.address());int result=reg();emit(l.width()==MemoryType.F32?LOAD_F32:LOAD,result,address.base(),address.offset(),l.width().bytes);yield result;}
+            case Gather g -> expression(new Load(g.width(), new Offset(g.base(), g.bytes())));
             case Offset o -> {int address=expression(o.address()),offset=expression(o.bytes()),result=reg();emit(ADD,result,address,offset,0);yield result;}
             case PopulationCount ignored -> throw new IllegalArgumentException("Population count requires portable lowering");
             case TrailingZeros z -> { int input=expression(z.value()),result=reg();emit(CTZ,result,input,0,0);yield result; }

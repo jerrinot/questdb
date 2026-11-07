@@ -53,6 +53,11 @@ import io.questdb.std.NumericException;
 import io.questdb.std.ObjList;
 import org.jetbrains.annotations.Nullable;
 
+import static io.questdb.griffin.HashJoinGraph.baseTable;
+import static io.questdb.griffin.HashJoinGraph.hasBarrier;
+import static io.questdb.griffin.HashJoinGraph.hasInputFilter;
+import static io.questdb.griffin.HashJoinGraph.isProjection;
+
 /**
  * Pre-construction eligibility contract for the fused parallel hash join GROUP BY. This descriptor borrows optimized models:
  * use it before ordinary join generation mutates them, and never retain it in a cursor factory.
@@ -254,8 +259,8 @@ public final class HashJoinGroupByCandidate {
     }
 
     /**
-     * Build payload types: the row heap copies a build column, so only a build column answers to
-     * this set. A probe column reaches the joined record straight off its page frame and takes no
+     * Fixed-size build payload types that the row heap can copy. VARCHAR payloads are admitted
+     * separately and borrow pinned frames. A probe column reaches the joined record straight off its page frame and takes no
      * type check at all, and a key column and a grouping expression answer to
      * {@link HashJoinGroupByKeys#isSupportedKeyType(int)} instead. A build column that only the
      * build's filters read, its scan's WHERE filter and an outer join's ON condition on the build
@@ -521,8 +526,15 @@ public final class HashJoinGroupByCandidate {
         final int count = join.getJoinModels().size();
         final IntList order = join.getOrderedJoinModels();
         if (order.size() != count) return null;
-        JoinContext first = join.getJoinModels().getQuick(order.getQuick(1)).getJoinContext();
-        if (first == null || first.aNames.size() == 0) return null;
+        for (int i = 1; i < count; i++) {
+            IQueryModel input = join.getJoinModels().getQuick(order.getQuick(i));
+            JoinContext edge = input.getJoinContext();
+            if (input.getJoinType() != IQueryModel.JOIN_INNER || input.getOuterJoinExpressionClause() != null
+                    || edge == null || edge.aNames.size() == 0) return null;
+            for (int k = 0; k < edge.aIndexes.size(); k++) {
+                if (edge.aIndexes.getQuick(k) == edge.bIndexes.getQuick(k)) return null;
+            }
+        }
         ObjList<TableReader> readers = new ObjList<>();
         try {
             RecordMetadata[] metadata = new RecordMetadata[count];
@@ -533,47 +545,21 @@ public final class HashJoinGroupByCandidate {
                 readers.add(reader);
                 metadata[source] = reader.getMetadata();
             }
-            // Keep the existing common-probe orientation when it fits. Otherwise follow the
-            // optimizer's left-deep order, binding each later key to an already produced input.
+            // Keep every build bounded by the probe's base row count, independently of FROM
+            // order. This is a memory bound, not an estimate of filtered join cardinalities.
             int probe = order.getQuick(0);
-            boolean commonProbe = false;
-            for (int endpoint = 0; endpoint < 2; endpoint++) {
-                int candidate = endpoint == 0 ? first.aIndexes.getQuick(0) : first.bIndexes.getQuick(0);
-                boolean common = true;
-                for (int i = 1; i < count && common; i++) {
-                    JoinContext edge = join.getJoinModels().getQuick(order.getQuick(i)).getJoinContext();
-                    if (edge == null || edge.aNames.size() == 0) { common = false; break; }
-                    for (int k = 0; k < edge.aIndexes.size(); k++) {
-                        int a = edge.aIndexes.getQuick(k), b = edge.bIndexes.getQuick(k);
-                        if (a == b || a != candidate && b != candidate
-                                || readers.getQuick(a == candidate ? b : a).size() > readers.getQuick(candidate).size()) {
-                            common = false;
-                            break;
-                        }
-                    }
-                }
-                if (common) { probe = candidate; commonProbe = true; break; }
-            }
-            IntList indexes = new IntList();
-            IntList available = new IntList();
-            available.add(probe);
-            ObjList<HashJoinGroupByKeys> builds = new ObjList<>();
-            int firstBuild = first.aIndexes.getQuick(0) == probe ? first.bIndexes.getQuick(0) : first.aIndexes.getQuick(0);
-            Analyzer analyzer = new Analyzer(join, IQueryModel.JOIN_INNER, firstBuild, probe, metadata, parser, executionContext);
             for (int i = 1; i < count; i++) {
-                IQueryModel input = join.getJoinModels().getQuick(order.getQuick(i));
-                JoinContext edge = input.getJoinContext();
-                if (input.getJoinType() != IQueryModel.JOIN_INNER || input.getOuterJoinExpressionClause() != null
-                        || edge == null || edge.aNames.size() == 0) return null;
-                int build = commonProbe
-                        ? (edge.aIndexes.getQuick(0) == probe ? edge.bIndexes.getQuick(0) : edge.aIndexes.getQuick(0))
-                        : order.getQuick(i);
-                if (available.contains(build) || readers.getQuick(build).size() > readers.getQuick(probe).size()) return null;
-                for (int k = 0; k < edge.aIndexes.size(); k++) {
-                    int a = edge.aIndexes.getQuick(k), b = edge.bIndexes.getQuick(k);
-                    if (!((a == build && available.contains(b)) || (b == build && available.contains(a)))) return null;
-                }
-                HashJoinGroupByKeys keys = analyzer.resolveKeys(edge, build);
+                int source = order.getQuick(i);
+                if (readers.getQuick(source).size() > readers.getQuick(probe).size()) probe = source;
+            }
+            HashJoinGraph.Order graph = HashJoinGraph.order(join, probe);
+            if (graph == null) return null;
+            IntList indexes = graph.builds();
+            ObjList<JoinContext> contexts = graph.keys();
+            ObjList<HashJoinGroupByKeys> builds = new ObjList<>();
+            Analyzer analyzer = new Analyzer(join, IQueryModel.JOIN_INNER, indexes.getQuick(0), probe, metadata, parser, executionContext);
+            for (int i = 0; i < indexes.size(); i++) {
+                HashJoinGroupByKeys keys = analyzer.resolveKeys(contexts.getQuick(i), indexes.getQuick(i));
                 if (keys == null || keys.size() == 0) return null;
                 for (int k = 0; k < keys.size(); k++) {
                     int type = keys.getProbeType(k);
@@ -585,9 +571,7 @@ public final class HashJoinGroupByCandidate {
                         if (!required.contains(keys.getProbeColumn(k))) required.add(keys.getProbeColumn(k));
                     }
                 }
-                indexes.add(build);
                 builds.add(keys);
-                available.add(build);
             }
             if (!analyzer.resolveOutput(groupBy)) return null;
             analyzer.captureInputColumns();
@@ -634,30 +618,6 @@ public final class HashJoinGroupByCandidate {
         return resolvedPostJoinFilters;
     }
 
-    private static IQueryModel baseTable(IQueryModel input, IQueryModel join) {
-        IQueryModel current = input;
-        while (current != null) {
-            if (hasBarrier(current) || (current != join && current.getJoinModels().size() != 1)) {
-                return null;
-            }
-            if (current.getTableName() != null) {
-                return current.getTableNameFunction() == null && current.getLatestBy().size() == 0 ? current : null;
-            }
-            if (!isProjection(current)) {
-                return null;
-            }
-            current = current.getNestedModel();
-        }
-        return null;
-    }
-
-    private static boolean hasBarrier(IQueryModel model) {
-        return !model.isOptimisable() || model.getSharedRefCount() > 0
-                || model.getLimitLo() != null || model.getLimitHi() != null || model.getUnionModel() != null
-                || model.getSelectModelType() == IQueryModel.SELECT_MODEL_DISTINCT
-                || model.getSampleBy() != null;
-    }
-
     /**
      * True when the resolved node is, or holds, a literal, which resolution turns into a column.
      */
@@ -687,26 +647,6 @@ public final class HashJoinGroupByCandidate {
                 return values == null || (values.size() > 0
                         && !(values.size() == 1 && SqlKeywords.isNoneKeyword(values.getQuick(0).token)));
             }
-        }
-        return false;
-    }
-
-    /**
-     * True when a model on the input's chain, from its join model down to its table model, has a
-     * WHERE clause or a constant WHERE clause. These are the clauses that the compile of the input
-     * applies to its scan. The chain is the one that baseTable() admits. The join model's post-join
-     * WHERE clause and outer join ON condition apply after the join, so they do not count.
-     */
-    private static boolean hasInputFilter(IQueryModel input) {
-        IQueryModel current = input;
-        while (current != null) {
-            if (current.getWhereClause() != null || current.getConstWhereClause() != null) {
-                return true;
-            }
-            if (current.getTableName() != null) {
-                return false;
-            }
-            current = current.getNestedModel();
         }
         return false;
     }
@@ -787,12 +727,6 @@ public final class HashJoinGroupByCandidate {
             }
         }
         return true;
-    }
-
-    private static boolean isProjection(IQueryModel model) {
-        return !hasBarrier(model) && (model.getSelectModelType() == IQueryModel.SELECT_MODEL_CHOOSE
-                || model.getSelectModelType() == IQueryModel.SELECT_MODEL_VIRTUAL
-                || model.getSelectModelType() == IQueryModel.SELECT_MODEL_NONE);
     }
 
     /**
@@ -1096,15 +1030,16 @@ public final class HashJoinGroupByCandidate {
                 return null;
             }
             final int source = columnSources.getQuick(index);
-            // The row heap copies a build column, so only a build column takes the payload type set.
-            // A probe column of any type reaches the joined record straight off its page frame, and
-            // a build filter reads a build column of any type straight off the build's page frame,
-            // which the analysis notes for the ON condition; see analyse().
+            // Only build payloads need this capability check. Probe and input-filter columns
+            // are read directly from their page frames; ON filter cost is tracked separately.
             if (!isResolvingInputColumn && source != probeIndex && !isSupportedValueType(metadata.getColumnType(index))) {
+                // VARCHAR payloads borrow pinned frames. Keep variable-size filter costing
+                // independent of this capability: an expensive ON expression still needs its guard.
                 if (!isResolvingFrameFilter) {
-                    return null;
+                    if (metadata.getColumnType(index) != ColumnType.VARCHAR) return null;
+                } else {
+                    hasVarSizeFrameFilterColumn = true;
                 }
-                hasVarSizeFrameFilterColumn = true;
             }
             usedSources.add(source);
             if (source != probeIndex && !isResolvingInputColumn && !isResolvingFrameFilter) {
@@ -1224,7 +1159,9 @@ public final class HashJoinGroupByCandidate {
                 }
                 return resolve(alias.getAst(), model.getNestedModel(), source, depth + 1);
             }
-            if (node.type != ExpressionNode.CONSTANT && node.type != ExpressionNode.BIND_VARIABLE
+            // MEMBER_ACCESS is a literal argument (for example EXTRACT's field name);
+            // FunctionParser resolves it to a string constant, without reading a column.
+            if (node.type != ExpressionNode.CONSTANT && node.type != ExpressionNode.MEMBER_ACCESS && node.type != ExpressionNode.BIND_VARIABLE
                     && node.type != ExpressionNode.FUNCTION && node.type != ExpressionNode.OPERATION
                     && node.type != ExpressionNode.SET_OPERATION) {
                 return null;

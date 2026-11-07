@@ -27,6 +27,7 @@ package io.questdb.cairo.map;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
+import io.questdb.std.Numbers;
 import io.questdb.std.Transient;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -49,6 +50,35 @@ public class MapFactory {
      * {@link UnorderedVarcharMap}, for a single VARCHAR key.
      */
     private static final int MAP_IMPL_UNORDERED_VARCHAR = 3;
+
+    /**
+     * Conservative backing-memory bound for a fixed-size key, assuming every row is distinct.
+     * Includes power-of-two slot growth and the old/new backing overlap during a resize.
+     * It covers either unordered cells or an ordered heap plus offsets, independently of the
+     * configured implementation. Unknown widths and unrepresentable bounds return MAX_VALUE.
+     */
+    public static long fixedKeyMemoryUpperBound(CairoConfiguration configuration, ColumnTypes keyTypes, int valueSize, long rows) {
+        final int keySize = ColumnTypes.sizeInBytes(keyTypes);
+        if (keySize <= 0 || valueSize < 0 || rows < 0) {
+            return Long.MAX_VALUE;
+        }
+        try {
+            final long entrySize = (keySize + (long) valueSize + 7) & ~7L;
+            final double requiredSlots = Math.ceil(Math.max(rows, configuration.getSqlSmallMapKeyCapacity())
+                    / configuration.getSqlFastMapLoadFactor());
+            if (requiredSlots > 1L << 30) {
+                return Long.MAX_VALUE;
+            }
+            final long slots = Math.max(16, Numbers.ceilPow2((long) requiredSlots));
+            final long heap = Math.max(configuration.getSqlSmallMapPageSize(),
+                    Math.multiplyExact(Math.multiplyExact(rows, entrySize), 2));
+            final long backing = Math.max(Math.multiplyExact(slots + 1, entrySize),
+                    Math.addExact(heap, slots * Long.BYTES));
+            return Math.addExact(backing, backing / 2);
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
+        }
+    }
 
     /**
      * Creates a Map pre-allocated to a small capacity to be used in SAMPLE BY, GROUP BY queries, but not only.

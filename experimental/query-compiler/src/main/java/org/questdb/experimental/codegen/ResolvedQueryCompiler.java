@@ -182,7 +182,7 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     }
 
     @Override
-    public JoinFilter compileJoinFilter(ColumnTypes inputs, ObjList<IntJoinFilterSource> sources) {
+    public JoinFilter compileJoinFilter(ColumnTypes inputs, ObjList<JoinFilterSource> sources) {
         try { return ResolvedJoinFilter.compile(inputs, sources, backend, artifacts); }
         catch (IOException failure) { throw CairoException.nonCritical().put("Join filter compilation failed: ").put(failure.getMessage()); }
     }

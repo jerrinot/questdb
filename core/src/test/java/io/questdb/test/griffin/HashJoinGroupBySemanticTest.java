@@ -598,7 +598,8 @@ public class HashJoinGroupBySemanticTest extends AbstractCairoTest {
                 assertDifferential("select count(*) from a r left join b p on r.id=p.id and r.d>0", context, false);
                 assertDifferential("select count(*) from a r right join b p on r.id=p.id and p.d>0", context, false);
                 assertDifferential("select count(*) from a r left join b p on r.id=p.id where r.d>p.d", context, false);
-                assertDifferential("select count(*) from a r join b p on r.id=p.id join b q on r.id=q.id", context, false);
+                assertDifferential("select count(*) from a r join b p on r.id=p.id join b q on r.id=q.id",
+                        context, context.getQueryCodeGenerator() != null);
                 // Random arguments cannot be compared across executions; assert plan equality and
                 // deterministic row counts while still consuming the unsupported expression.
                 String sql = "select count(*) n, sum(rnd_double()) d" + from(JOINS[0]);

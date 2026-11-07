@@ -26,6 +26,8 @@ package io.questdb.griffin.engine.join;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnFilter;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.TableToken;
@@ -59,13 +61,14 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
     private final RecordSink masterSink;
     private final int @Nullable [] masterSymbolKeyColumnIndices;
     private final RecordSink slaveKeySink;
-    private final int runtimeProbeColumn;
-    private final int runtimeSlaveColumn;
+    private final int @Nullable [] runtimeProbeColumns;
+    private final int @Nullable [] runtimeSlaveColumns;
+    private final int @Nullable [] runtimeKeyTypes;
     private final int @Nullable [] slaveSymbolKeyColumnIndices;
     private HashJoinRecordCursor cursor;
     private boolean masterDetermined = false;
-    private AsyncJitFilteredRecordCursorFactory runtimeFilterFactory;
-    private boolean runtimeFilterOnSlave;
+    private AsyncJitFilteredRecordCursorFactory runtimeMasterFilter;
+    private AsyncJitFilteredRecordCursorFactory runtimeSlaveFilter;
     private @Nullable SymbolTranslatingRecord symbolTranslatingRecord;
 
     public HashJoinLightRecordCursorFactory(
@@ -81,12 +84,24 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
             JoinContext joinContext,
             int @Nullable [] masterSymbolKeyColumnIndices,
             int @Nullable [] slaveSymbolKeyColumnIndices,
-            int runtimeProbeColumn,
-            int runtimeSlaveColumn
+            @Transient @Nullable ColumnFilter runtimeProbeColumns,
+            @Transient @Nullable ColumnFilter runtimeSlaveColumns
     ) {
         super(metadata, joinContext, masterFactory, slaveFactory);
-        this.runtimeProbeColumn = runtimeProbeColumn;
-        this.runtimeSlaveColumn = runtimeSlaveColumn;
+        if (runtimeProbeColumns == null) {
+            this.runtimeProbeColumns = null;
+            this.runtimeSlaveColumns = null;
+            this.runtimeKeyTypes = null;
+        } else {
+            this.runtimeProbeColumns = new int[joinColumnTypes.getColumnCount()];
+            this.runtimeSlaveColumns = new int[joinColumnTypes.getColumnCount()];
+            this.runtimeKeyTypes = new int[joinColumnTypes.getColumnCount()];
+            for (int i = 0; i < runtimeKeyTypes.length; i++) {
+                this.runtimeProbeColumns[i] = runtimeProbeColumns.getColumnIndexFactored(i);
+                this.runtimeSlaveColumns[i] = runtimeSlaveColumns.getColumnIndexFactored(i);
+                this.runtimeKeyTypes[i] = joinColumnTypes.getColumnType(i);
+            }
+        }
         this.masterSymbolKeyColumnIndices = masterSymbolKeyColumnIndices;
         this.slaveSymbolKeyColumnIndices = slaveSymbolKeyColumnIndices;
         this.symbolTranslatingRecord = masterSymbolKeyColumnIndices != null ?
@@ -117,8 +132,8 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
             masterCursor = masterFactory.getCursor(executionContext);
             boolean swapped = false;
             if (masterFactory.recordCursorSupportsRandomAccess() && !masterDetermined) {
-                long masterSize = runtimeFilterFactory == null || runtimeFilterOnSlave ? masterCursor.size() : runtimeFilterFactory.getUnfilteredSize();
-                long slaveSize = runtimeFilterFactory == null || !runtimeFilterOnSlave ? slaveCursor.size() : runtimeFilterFactory.getUnfilteredSize();
+                long masterSize = runtimeMasterFilter == null ? masterCursor.size() : runtimeMasterFilter.getUnfilteredSize();
+                long slaveSize = runtimeSlaveFilter == null ? slaveCursor.size() : runtimeSlaveFilter.getUnfilteredSize();
 
                 if (masterSize > 0 && slaveSize > 0 && masterSize < slaveSize) {
                     RecordCursor temp = masterCursor;
@@ -153,12 +168,12 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
         return false;
     }
 
-    /** Push redundant membership through an uninterrupted INNER chain to its common frame scan. */
+    /** Outer builds complete before their master chain consumes an inner build or probe scan. */
     public void prepareRuntimeFilter(SqlExecutionContext context, PageFrameReduceTaskFactory tasks) {
         ObjList<HashJoinLightRecordCursorFactory> joins = new ObjList<>();
         HashJoinLightRecordCursorFactory inner = this;
         while (true) {
-            if (inner.runtimeProbeColumn < 0 || inner.runtimeFilterFactory != null) {
+            if (inner.runtimeKeyTypes == null || inner.runtimeMasterFilter != null || inner.runtimeSlaveFilter != null) {
                 return;
             }
             joins.add(inner);
@@ -167,32 +182,65 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
             }
             inner = next;
         }
-        int masterColumns = inner.masterFactory.getMetadata().getColumnCount();
-        // An ordinary first join can swap at execution time. The common scan can therefore
-        // appear on either side in the resolved SQL; outer keys identify its column interval.
-        boolean onSlave = joins.size() > 1 && joins.getQuick(0).runtimeProbeColumn >= masterColumns;
-        RecordCursorFactory base = onSlave ? inner.slaveFactory : inner.masterFactory;
-        int offset = onSlave ? masterColumns : 0;
-        // Single-build pipelines already have their own compilation path. Do not cross filters,
-        // projections, outer joins or other operators whose semantics need separate reasoning.
-        if (joins.size() < 2 || !base.supportsPageFrameCursor()
-                || base instanceof AsyncJitFilteredRecordCursorFactory || base instanceof FilteredRecordCursorFactory) {
+        if (joins.size() < 2) {
             return;
         }
-        ObjList<QueryCodeGenerator.IntJoinFilterSource> sources = new ObjList<>(joins.size());
+        // Build inputs are separate scans. Only earlier (outer) builds are ready here.
+        // Filtering one build lets its ordinary completed map transfer the reduction onward.
+        for (int i = 1; i < joins.size(); i++) {
+            HashJoinLightRecordCursorFactory target = joins.getQuick(i);
+            int offset = target.masterFactory.getMetadata().getColumnCount();
+            target.installRuntimeFilter(context, tasks, joins, i, true, offset);
+        }
+        inner.installRuntimeFilter(context, tasks, joins, joins.size() - 1, false, 0);
+    }
+
+    private void installRuntimeFilter(SqlExecutionContext context, PageFrameReduceTaskFactory tasks,
+                                      ObjList<HashJoinLightRecordCursorFactory> joins, int targetIndex,
+                                      boolean onSlave, int offset) {
+        RecordCursorFactory base = onSlave ? slaveFactory : masterFactory;
+        // Do not cross operators with a separate predicate/projection/lifetime contract.
+        if (!base.supportsPageFrameCursor() || base instanceof AsyncJitFilteredRecordCursorFactory
+                || base instanceof FilteredRecordCursorFactory) {
+            return;
+        }
+        ObjList<QueryCodeGenerator.JoinFilterSource> sources = new ObjList<>();
         IntHashSet columns = new IntHashSet();
-        for (int i = joins.size() - 1; i >= 0; i--) {
-            HashJoinLightRecordCursorFactory join = joins.getQuick(i);
-            int column = join == inner ? (onSlave ? join.runtimeSlaveColumn : join.runtimeProbeColumn)
-                    : join.runtimeProbeColumn - offset;
-            if (column < 0 || column >= base.getMetadata().getColumnCount()) {
-                return;
+        for (int i = 0; i <= targetIndex; i++) {
+            HashJoinLightRecordCursorFactory producer = joins.getQuick(i);
+            boolean reversed = onSlave && i == targetIndex;
+            // A nested join is not random-access and cannot swap. Do not add a permanently
+            // unavailable self-filter, or filter an isolated build with only its own map.
+            if (reversed && (targetIndex != joins.size() - 1 || sources.size() == 0)) {
+                continue;
             }
-            boolean expectedSwap = join == inner && onSlave;
-            // The map record stores two INT chain endpoints before its single key.
-            sources.add(new QueryCodeGenerator.IntJoinFilterSource(column, 2,
-                    () -> join.cursor.isMapBuilt && join.cursor.swapped == expectedSwap ? join.cursor.joinKeyMap : null));
-            columns.add(column);
+            int[] probeColumns = new int[producer.runtimeKeyTypes.length];
+            boolean eligible = probeColumns.length > 0;
+            for (int k = 0; k < probeColumns.length && eligible; k++) {
+                int column = reversed ? producer.runtimeSlaveColumns[k] : producer.runtimeProbeColumns[k] - offset;
+                if (column < 0 || column >= base.getMetadata().getColumnCount()) {
+                    eligible = false;
+                    break;
+                }
+                int type = producer.runtimeKeyTypes[k];
+                int inputType = base.getMetadata().getColumnType(column);
+                eligible = (type == ColumnType.INT || type == ColumnType.LONG)
+                        && (inputType == type || type == ColumnType.INT && inputType == ColumnType.SYMBOL);
+                probeColumns[k] = column;
+            }
+            if (!eligible) {
+                continue;
+            }
+            // Keys in this map use the dictionaries of its actual probe columns. The
+            // resolved column interval proves those are the same columns as this scan.
+            sources.add(new QueryCodeGenerator.JoinFilterSource(probeColumns, producer.runtimeKeyTypes, 2,
+                    () -> producer.cursor.isMapBuilt && producer.cursor.swapped == reversed ? producer.cursor.joinKeyMap : null));
+            for (int column : probeColumns) {
+                columns.add(column);
+            }
+        }
+        if (sources.size() == 0) {
+            return;
         }
         QueryCodeGenerator.JoinFilter generated = context.getQueryCodeGenerator().compileJoinFilter(base.getMetadata(), sources);
         if (generated == null) {
@@ -204,10 +252,13 @@ public class HashJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFa
                     new ObjList<>(), generated.compiled().rows(), generated.compiled().count(), generated.fallback(),
                     columns, tasks, null, null, null, 0, context.getSharedQueryWorkerCount(), false
             );
-            if (onSlave) inner.slaveFactory = filtered;
-            else inner.masterFactory = filtered;
-            inner.runtimeFilterFactory = filtered;
-            inner.runtimeFilterOnSlave = onSlave;
+            if (onSlave) {
+                slaveFactory = filtered;
+                runtimeSlaveFilter = filtered;
+            } else {
+                masterFactory = filtered;
+                runtimeMasterFilter = filtered;
+            }
         } catch (Throwable failure) {
             Misc.free(generated.compiled().rows(), failure);
             Misc.free(generated.compiled().count(), failure);

@@ -70,6 +70,11 @@ public class LongChain implements Closeable, Mutable, Reopenable {
         this(valuePageSize, valueMaxPages, false);
     }
 
+    /** Bytes occupied by row IDs and compressed links, excluding allocation headroom. */
+    public static long requiredHeapSize(long rows) {
+        return Math.multiplyExact(rows, CHAIN_VALUE_SIZE);
+    }
+
     public LongChain(long valuePageSize, int valueMaxPages, boolean keepClosed) {
         assert valuePageSize >= CHAIN_VALUE_SIZE;
         this.initialHeapSize = valuePageSize;

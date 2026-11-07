@@ -109,6 +109,19 @@ final class IntHashJoinKeyTable implements QuietCloseable {
         }
     }
 
+    void copyHeads(HashJoinIntegralIndex index, SqlExecutionCircuitBreaker circuitBreaker) {
+        for (int i = 0; i < slotCount; i++) {
+            if ((i & (KEY_SLOTS_PER_CHECK - 1)) == 0) {
+                circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+            }
+            long address = slots.address + (long) i * SLOT_SIZE;
+            int head = Unsafe.getInt(address + Integer.BYTES);
+            if (head != 0) {
+                index.put(Unsafe.getInt(address), head);
+            }
+        }
+    }
+
     /**
      * Binds the execution and the calling thread's circuit breaker, which growth checks, and
      * allocates this many empty slots, a power of two. The caller's failure path closes the table.

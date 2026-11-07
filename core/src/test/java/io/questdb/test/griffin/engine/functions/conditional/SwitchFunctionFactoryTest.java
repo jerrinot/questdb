@@ -24,10 +24,82 @@
 
 package io.questdb.test.griffin.engine.functions.conditional;
 
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.SymbolTableSource;
+import io.questdb.griffin.engine.functions.columns.SymbolColumn;
+import io.questdb.griffin.engine.functions.conditional.CaseFunction;
+import io.questdb.griffin.engine.functions.conditional.CaseFunctionPicker;
+import io.questdb.griffin.engine.functions.conditional.SwitchFunctionFactory;
+import io.questdb.griffin.engine.functions.constants.IntConstant;
+import io.questdb.griffin.engine.functions.constants.StrConstant;
+import io.questdb.std.IntList;
+import io.questdb.std.ObjList;
 import io.questdb.test.AbstractCairoTest;
+import org.junit.Assert;
 import org.junit.Test;
 
 public class SwitchFunctionFactoryTest extends AbstractCairoTest {
+
+    @Test
+    public void testResolvedSymbolKeysDoNotReadDictionaryAfterInit() throws Exception {
+        boolean[] initializing = {true};
+        int[] generation = {0};
+        StaticSymbolTable table = new StaticSymbolTable() {
+            @Override public boolean containsNullValue() { return true; }
+            @Override public int getSymbolCount() { return 8; }
+            @Override public int keyOf(CharSequence value) {
+                Assert.assertTrue("dictionary lookup outside cursor initialization", initializing[0]);
+                return switch (value.toString()) {
+                    case "a" -> generation[0];
+                    case "b" -> generation[0] + 1;
+                    default -> SymbolTable.VALUE_NOT_FOUND;
+                };
+            }
+            @Override public CharSequence valueOf(int key) { throw new AssertionError(); }
+            @Override public CharSequence valueBOf(int key) { throw new AssertionError(); }
+        };
+        SymbolTableSource source = new SymbolTableSource() {
+            @Override public SymbolTable getSymbolTable(int columnIndex) { return table; }
+            @Override public SymbolTable newSymbolTable(int columnIndex) { return table; }
+        };
+        ObjList<Function> args = new ObjList<>();
+        args.add(new SymbolColumn(0, true));
+        for (String key : new String[]{"a", "b", "absent", null}) {
+            args.add(new StrConstant(key));
+            args.add(new IntConstant(args.size()));
+        }
+        args.add(new IntConstant(99));
+        IntList positions = new IntList();
+        positions.setPos(args.size());
+        try (Function function = new SwitchFunctionFactory().newInstance(0, args, positions, configuration, sqlExecutionContext)) {
+            var picker = (CaseFunctionPicker.Integral) ((CaseFunction) function).getPicker();
+            for (int round = 0; round < 2; round++) {
+                initializing[0] = true;
+                generation[0] = round * 3;
+                function.init(source, sqlExecutionContext);
+                initializing[0] = false;
+                Assert.assertEquals(4, picker.getBranchCount());
+                Assert.assertEquals(generation[0], picker.getKey(0));
+                Assert.assertEquals(generation[0] + 1, picker.getKey(1));
+                Assert.assertEquals(SymbolTable.VALUE_NOT_FOUND, picker.getKey(2));
+                Assert.assertEquals(SymbolTable.VALUE_IS_NULL, picker.getKey(3));
+            }
+        }
+    }
+
+    @Test
+    public void testIntegralMapSentinelIsAValidBranch() throws Exception {
+        for (String type : new String[]{"byte", "short", "int", "long", "date"}) {
+            assertQuery("select switch(cast(x-3 as " + type + "),cast(-1 as " + type
+                    + "),11,cast(0 as " + type + "),22,33) v from long_sequence(5)")
+                    .expectSize()
+                    .returns("v\n33\n11\n22\n33\n33\n");
+        }
+        String sql = "select switch(x,-1,1,-1,2) from long_sequence(2)";
+        assertException(sql, sql.lastIndexOf("-1"), "duplicate branch");
+    }
 
     @Test
     public void testBindVar() throws Exception {

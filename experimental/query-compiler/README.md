@@ -207,18 +207,56 @@ The binders and focused tests are authoritative. Current families include:
   admission, worker-result merge, survivor heap packing, compaction/final sorting
   and final LIMIT prefix selection in the existing EncodedTopKBuffer. EXPLAIN uses
   `compiledTopK`; execution counters and result checks establish actual coverage.
-- INT, full-width LONG, static-SYMBOL and composite fixed-width inner-join probe pipelines
+- INT, full-width LONG, DATE, both timestamp units, static-SYMBOL and composite fixed-width inner-join probe pipelines
   with supported COUNT and integer/DOUBLE SUM/MIN/MAX/AVG, post-join
-  predicates and supported fixed-width grouping. They borrow the existing frozen join;
+  predicates, fixed-width grouping, single VARCHAR keys and mixed VARCHAR/composite
+  grouping. They borrow the existing frozen join;
   Java retains build and runtime ownership. Before worker publication, core may replace
-  bounded INT/SYMBOL or LONG/DATE/TIMESTAMP key tables with packed chain-head arrays,
+  bounded INT/SYMBOL or LONG/DATE/microsecond-TIMESTAMP key tables with packed chain-head arrays,
   preserving the row heap and duplicate order. Known probe work, observed range and
   query-memory bounds govern conversion; displaced hash storage is released. Java and
   generated probes share this lookup. Sparse/composite keys retain hashing.
+  Conversion copies occupied keys and their existing compressed heads directly;
+  it does not hash each key again. Nanosecond timestamps currently retain OrderedMap.
   An already-admitted fixed-width payload copy may co-locate duplicate-row headers
   and payload, then release the old heap. Logical handles and duplicate order stay
   unchanged. Temporary query-memory headroom must cover the copy; Parquet and
   layouts that need extra padding keep the existing separate storage.
+  DATE and both timestamp units retain their raw 64-bit representation when read
+  from build payloads for dependent joins and grouping, including NULL column tops.
+  YEAR/EXTRACT(YEAR), HOUR, MINUTE and SECOND lower to numeric IR for DATE and
+  both timestamp units, including DATE-to-timestamp casts, NULLs and wrapped conversions.
+  Joined static-SYMBOL literal predicates reuse the ordinary functions' cursor-bound
+  dictionary IDs, loaded before the generated row loop. EQ/NE, IN/NOT IN and NULL
+  predicates compose across probe/build inputs without embedding IDs in cached code.
+  Numeric searched CASE reuses resolved/casted branches through shared scalar IR,
+  including nested first-match selection and typed NULLs. Only total, pure branch
+  expressions qualify. The existing aggregate type limits still apply; BYTE/SHORT
+  and FLOAT results may need widening casts for a complete aggregate combination.
+  Small integral/static-SYMBOL SWITCH expressions reuse the ordinary picker's
+  resolved branches, including missing symbols and cursor reinitialization. Up to
+  16 branches lower to shared conditional IR; larger switches retain ordinary
+  lookup. Floating-point and temporal SWITCH selectors remain outside this binding.
+  Constant temporal BETWEEN ranges use the same DATE conversion and timestamp-unit
+  rules as the resolved ordinary function, including wrapped DATE conversions.
+  Cursor-bound SYMBOL conditions are wired into joins and filters; single-table
+  aggregate argument bindings still lack these parameter cells.
+  VARCHAR values from either side use the shared frame expression binding and decoder;
+  COUNT(VARCHAR), code-point LENGTH and supported searched CASE compose with the same
+  numeric aggregate updates. Group keys use the existing UnorderedVarcharMap or
+  OrderedMap encoding; insertion owns the key bytes, so results do not retain borrowed
+  build strings. Native build VARCHAR views borrow pinned frame address/size tables.
+  When one frozen build supplies every variable group-key input, a slot-local array
+  can memoize that build row's group-value address. Exact row identity is sufficient:
+  keys need not be unique, and duplicate expansion and aggregate updates are unchanged.
+  Known probe work and query-memory headroom bound allocation. Map relocation or
+  sharding clears the slot's destinations; cursor close frees the execution cache.
+  Probe-derived and multiple-build group keys keep ordinary lookup. This reuses the
+  existing maps, insertion and merge rather than introducing another grouping format.
+  Numeric payload views borrow ordinary frames or an admitted fixed-width copy.
+  Probe VARCHAR frames support native and decoded Parquet storage; uncopied build
+  Parquet payloads retain the Java reader fallback. Capture helpers, STRING/BINARY/ARRAY
+  build payloads and general VARCHAR join equality keys remain outside this binding.
   Large compact copies share the existing Linux advisory huge-page hint with
   UnorderedVarcharMap. Allocation accounting stays unchanged; kernel policy decides
   whether to use large pages. Other platforms keep their ordinary allocation.
@@ -228,8 +266,15 @@ The binders and focused tests are authoritative. Current families include:
   and branches. Keys can read the scan or earlier joined payloads, including composite
   keys from multiple inputs. Dependent lookups execute inside their producer's duplicate
   loop; dictionary resolution and group-map growth preserve every selected position.
-  Build-only child membership can be transferred to a single INT/LONG/SYMBOL producer
-  key before scanning, using existing probes and dictionary views. Compact keys use
+  Multiway admission can select the largest unfiltered base input as the scan root
+  and attach connected inputs in optimizer order. Reorientation requires the proposed
+  builds' maximum-distinctness storage bound to fit below the displaced row chain;
+  filters, unknown types and order-sensitive consumers can keep the original root.
+  This is a storage-risk guard, not a full cost model. Reorientation retains every equality, including
+  cyclic constraints, while input compilation keeps its original bind-inference order.
+  Base row counts bound build sizes; they do not estimate filtered cost or fanout.
+  Build-only child membership can be transferred to INT/LONG/SYMBOL and composite
+  producer keys before scanning, using existing probes and dictionary views. Compact keys use
   a bitmap; sparse keys use QuestDB's split-block Bloom layout. Exact joins retain
   duplicate multiplicity. Preparation requires known amortizable probe work and
   available query memory; mixed-source conditions remain in the exact pipeline.
@@ -260,21 +305,22 @@ The binders and focused tests are authoritative. Current families include:
   SQL planning retains the existing join order when no common probe fits, admitting
   supported plans into one fused aggregate factory. Each build reuses the existing serial/parallel
   build, payload and probe lifecycle; all share the ordinary frame workers. Scalar
-  output and composite numeric/SYMBOL grouping use the existing fixed-key encoder
-  and maps; supported numeric expressions share the aggregate input bindings.
+  output and numeric/SYMBOL/VARCHAR grouping use the existing key encoders and
+  maps; supported expressions share the aggregate input bindings.
   INT/SYMBOL lookup retains the narrow table. LONG/composite lookup borrows existing
   Unordered8Map/OrderedMap views, using the same generated hashing/equality as other
   map consumers. SYMBOL keys translate through the existing per-execution cache;
   unresolved entries resume after ordinary dictionary lookup. Mixed key components
   preserve RecordSink encoding. Range arithmetic never narrows LONG values.
   SYMBOL payloads retain their source dictionaries. Dictionary-derived grouping
-  expressions and variable-width grouping remain outside this binding. Unsupported frames
+  expressions remain outside this binding. Unsupported frames
   use an exact Java fallback; unsupported plans retain ordinary execution. No new toggle.
   Completed scalar integral keys feed shared conservative bounds or exact bitmaps,
   including full-width LONG and translated SYMBOL IDs. Unknown map bounds use a
   construction scan only when known probe work can amortize it. Composite keys use
-  exact probes. All-composite plans compile only that exact loop. The standalone
-  filter-only integration below is still INT-only. An alternative generated loop checks all sets before exact probing;
+  exact probes, with redundant hashed membership available during dependency
+  preparation. The ordinary-plan filter integration below also handles typed tuples.
+  An alternative generated loop checks all sets before exact probing;
   the existing adaptive policy measures complete frames, including map-growth retries.
   Exact probing is the initial choice. Universal sets bypass alternative sampling.
   Sets are shared immutable execution state, charged to the query and freed after drain.
@@ -294,20 +340,42 @@ The binders and focused tests are authoritative. Current families include:
   Eligible scalar aggregates can keep their existing update state in IR variables,
   publishing it before cancellation polls and exits. Grouped and allocating state
   retains memory updates. Generated alternatives also compare cached child heads
-  with direct re-probing when both exist. Up to eight kernels cover these choices
-  and membership filtering; compilation is paid before workers start.
+  with direct re-probing when both exist. The same policy also compares ordinary
+  probing with bounded read-only lookahead. It prefetches independent first slots,
+  stages exact root heads in a 32-entry slot-owned ring, then consumes them in
+  original row order. Proven unique roots also prefetch uncached direct children;
+  duplicate expansion and aggregate updates remain at consumption. Typed keys,
+  selected-row coordinates and collision handling stay shared. Unresolved future
+  SYMBOL translations leave an invalid entry and never publish resume state.
+  Each native re-entry warms the ring again, preserving existing map-growth and
+  translation retries. An additional alternative prefetches memoized group values
+  from these future heads, following already-prepared dependency links when available.
+  It hints only the first duplicate's state; consumption still expands every match.
+  The previous plain and join-lookahead loops remain candidates because group prefetch
+  can lose on cache-resident state. Small states retain those previous choices;
+  group prefetch becomes available once actual group counts imply a touched-line
+  footprint above the existing per-worker cache budget. This check runs once per
+  frame and uses no estimated group cardinality. Original alternatives compile before
+  dispatch. Lookahead alternatives compile only if sampled, with first-use cost
+  excluded from training by the existing settling period. At most sixteen kernels
+  cover these choices and membership filtering; first-request latency still pays
+  for every alternative actually sampled.
   Workers sample alternatives in coordinated periods without holding a policy lock
   during native execution. Later exploration compares the winner with one rotating
   challenger and occupies under 2% of completed frames. This is measured execution
   adaptation, not a cost-based join-order optimizer.
-- Build-derived filters for an uninterrupted chain of INT inner joins sharing a
-  frame scan. Generated checks reject rows before ordinary joins fetch payloads;
-  duplicate multiplicity remains the joins' responsibility. Completed build keys
-  become query-owned ranges/bitmaps before frame dispatch, using the existing
-  scheduler. Sparse domains retain conservative bounds. Both sides of the first
-  join can supply the common scan without changing its ordinary build choice.
+- Build-derived filters for uninterrupted inner-join chains with INT, full-width
+  LONG, static SYMBOL and fixed composite keys. Completed outer builds can filter
+  intermediate build inputs; their surviving outbound keys then filter subsequent
+  scans. This reuses the existing build order, maps and frame workers. Generated
+  checks reject rows before exact payload lookup; exact joins retain multiplicity.
+  Query-owned ranges, bitmaps and bounded Bloom filters use the actual probe
+  dictionary domains. Runtime swaps retain unfiltered size information; unavailable
+  builds pass through. Existing filtered-input barriers remain in place.
   These are partial generated pipelines. The ordinary filter-only path still lacks
   the fused path's adaptive bypass for filters that reject few rows.
+  The typed dependency extension has correctness validation; controlled performance
+  measurements remain pending. See [the implementation plan](DEPENDENT_JOIN_FILTER_PLAN.md).
 
 Integer MIN/MAX accepts LONG, INT and SHORT inputs and preserves the ordinary
 8-byte LONG or 4-byte INT state. Generated ordering normalizes SHORT/INT/LONG/DOUBLE results into signed 64-bit

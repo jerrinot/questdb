@@ -36,6 +36,7 @@ import io.questdb.griffin.engine.join.CompiledJoin;
 import io.questdb.griffin.engine.join.FrozenHashJoinBuild;
 import io.questdb.griffin.engine.join.SymbolKeyTranslator;
 import io.questdb.std.DirectLongList;
+import io.questdb.std.Hash;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.MemoryTracker;
 import io.questdb.std.ObjList;
@@ -55,31 +56,26 @@ final class JoinDependencyFilter {
                     || keys * 16 + 32 <= tracker.getLimit() - tracker.getUsed());
     }
 
-    static boolean prepare(FrozenHashJoinBuild producer, int type, ObjList<Lookup> children,
+    static boolean prepare(FrozenHashJoinBuild producer, int[] types, ObjList<Lookup> children,
                            IntegralMembership result, MemoryTracker tracker, SqlExecutionCircuitBreaker breaker) {
-        try (Lookup parent = new Lookup(producer, new int[]{0}, new int[]{type}, null, null);
+        try (Lookup parent = new Lookup(producer, new int[types.length], types, null, null);
              DirectLongList keys = new DirectLongList(0, MemoryTag.NATIVE_JIT, true)) {
             keys.setMemoryTracker(tracker);
             keys.ensureCapacity(producer.getKeyCount());
-            boolean visited = producer.forEachIntegralKey(key -> {
-                parent.findKey(key);
-                while (parent.probe.hasNext()) {
-                    breaker.statefulThrowExceptionIfTrippedTimeThrottled();
-                    parent.probe.next();
-                    Record row = parent.probe.getRecord();
-                    boolean survives = true;
-                    for (int i = 0; i < children.size(); i++) {
-                        if (!children.getQuick(i).find(row)) {
-                            survives = false;
-                            break;
-                        }
-                    }
-                    if (survives) {
-                        keys.add(key);
-                        break; // A key needs only one surviving producer duplicate.
-                    }
-                }
-            }, breaker);
+            boolean visited;
+            if (types.length == 1) {
+                visited = producer.forEachIntegralKey(key -> {
+                    parent.findKey(key);
+                    if (parent.survives(children, breaker)) keys.add(key);
+                }, breaker);
+            } else {
+                visited = producer.forEachRecordKey((record, column) -> {
+                    for (int i = 0; i < types.length; i++) parent.values[i] = types[i] == ColumnType.INT || types[i] == ColumnType.SYMBOL
+                            ? record.getInt(column + i) : record.getLong(column + i);
+                    parent.findKey(parent.values[0]);
+                    if (parent.survives(children, breaker)) keys.add(parent.membershipKey());
+                }, breaker);
+            }
             if (!visited || keys.size() == producer.getKeyCount()) return false;
             result.prepareReducedKeys(keys, tracker, breaker);
             return true;
@@ -252,9 +248,33 @@ final class JoinDependencyFilter {
                 else value = row.getLong(columns[i]);
                 values[i] = value;
             }
-            if (values.length == 1 && membership != null && !membership.contains(values[0])) return false;
+            if (membership != null && !membership.isUniversal() && !membership.contains(membershipKey())) return false;
             findKey(values[0]);
             return probe.hasNext();
+        }
+
+        private long membershipKey() {
+            if (values.length == 1) return values[0];
+            long hash = 0;
+            for (long value : values) hash = Hash.hashLong128_64(hash, value);
+            return hash;
+        }
+
+        private boolean survives(ObjList<Lookup> children, SqlExecutionCircuitBreaker breaker) {
+            while (probe.hasNext()) {
+                breaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                probe.next();
+                Record row = probe.getRecord();
+                boolean survives = true;
+                for (int i = 0; i < children.size(); i++) {
+                    if (!children.getQuick(i).find(row)) {
+                        survives = false;
+                        break;
+                    }
+                }
+                if (survives) return true; // All children must match the same producer duplicate.
+            }
+            return false;
         }
 
         private void findKey(long key) {

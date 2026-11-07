@@ -1,22 +1,85 @@
 # Deferred aggregation performance work
 
-Current checkpoint (2026-11-06): frozen integral lookups, compact duplicate payloads,
-physical specialization and coordinated kernel sampling are retained. See the latest
-entry in [PROGRESS.md](PROGRESS.md). The next measured target is composite root lookup:
-DuckDB remains 2.46x faster on the independent random control, and forced alternatives
-recover only about 8%. Test staged lookup using existing QuestMapProbe operations,
-preserving probe/aggregate order and typed key semantics. Contiguous duplicate groups
-would require finalizing row order before dependency-head caches and worker publication;
-do not bolt another permanent old-to-new handle map onto the retained layout.
-Code constraint: `QuestMapProbe.prepare`/`prefetchOffset` currently bind aggregate STATE
-and sharding, and their prefetches request write ownership. They cannot be called
-unchanged for a frozen join. Share their mechanics through borrowed-view, read-only
-operations alongside `findExisting`; preserve exact collision handling and return NULL
-on misses. Staging must fit existing ownership/budget contracts and consume completed
-lookups in probe order. Price staging against the already-fast direct-array path.
-First-request compilation is the other demonstrated cost: price IR/SSA, LLVM and
-code reuse before adding background compilation infrastructure. No new ClickBench/SSB
-score or second-machine performance claim accompanies this checkpoint.
+Join-filter checkpoint (2026-11-07): [selective transfer through dependent joins](DEPENDENT_JOIN_FILTER_PLAN.md).
+Typed ordinary membership, transfer through existing build inputs and fused
+composite-producer reduction are implemented with focused correctness validation.
+Fresh hardware evidence, 500M-row controls and cost-driven admission/scheduling
+remain pending: the user requested avoiding the competing desktop benchmark.
+No speedup claim, new scheduler or configuration switch accompanies this change.
+
+Current milestone (2026-11-06): multiway root selection now makes connected inner
+join plans reachable independently of FROM order. Original SF100 Q3 improves
+20.837 -> 2.223s (9.37x); Q5 54.933 -> 4.614-4.632s (about 11.9x), with native
+execution and complete result checks. 84 focused tests pass, including six source
+orders across INT/LONG/SYMBOL/DATE and both timestamp units. Temporal payloads also
+use existing native descriptors. Strict whole-query coverage is unchanged.
+See [root-selection evidence](target/join-root-selection/analysis.json) and PROGRESS.
+1. EXTRACT field literals and YEAR now use
+   the existing numeric IR for DATE and both timestamp units. Original SF100 Q9
+   improves 111.692 -> 4.952-5.039s (22.2-22.6x), with complete output checks.
+   Cross-input static-SYMBOL predicates now reuse cursor-time dictionary parameters.
+   Q7 improves 220.742 -> 5.26-5.37s, but most of this is parallel plan admission:
+   the same fused plan running Java takes 9.25s (about 1.75x generated execution).
+   Numeric searched CASE now shares resolved/casted branches and scalar IR. Q12
+   improves only 4-9%: its 150M-key build still takes 1.19s. Integral/SYMBOL SWITCH
+   metadata now admits unchanged Q8: 53.844 -> 2.73-2.79s, with 3.512s for the same
+   fused Java plan. Constant DATE ranges lower this to 2.63-2.64s. Direct-lookup
+   conversion accounted for 0.54s before workers ran; copying occupied entries
+   directly cuts that to 0.25s and Q8 to 2.36-2.38s. Skipping conversion loses.
+   Single-table aggregate bindings also need the existing cursor-parameter contract
+   before SYMBOL conditions inside their numeric CASE arguments can qualify.
+2. Price filtered work and build order after reachability. In the 600M-row 2%-pass
+   control, building fewer rows loses: 3.19-3.39s versus 1.67-1.72s. It saves build
+   work but increases preparation/probe work and load waits. Raw or filtered build
+   counts alone are insufficient. No guessed selectivity or new chooser is retained.
+3. Normalize deterministic typed constants before both filter backends. Stock's
+   enabled JIT rejects Q6's constant CAST; equivalent date literals cut 687 -> 277ms,
+   leaving LLVM at 276ms. Do not count frontend recovery as a new compiler gain.
+   OR necessary-condition pushdown is a separate semantic/planning experiment.
+4. Nanosecond timestamp joins already execute natively through OrderedMap, but
+   Unordered8Map's type gate excludes their unit flag. Changing that gate also
+   requires changing ResolvedJoinKernel.Key's physical-map binding; do not change
+   one side alone. A full-width-domain test exposed this conversion limitation.
+Q15's DOUBLE equality control is excluded: independently evaluated parallel sums
+can differ enough to lose its only row. Preserve that limitation; do not round it
+away. None of these experiments constitutes an official TPC-H score.
+
+Retained kernel checkpoint (2026-11-06): buffered root staging now shares the
+existing adaptive chooser. Root results are reused in probe order; unique roots
+can prefetch their direct children without speculative duplicate expansion.
+Independent 500M-row INT/LONG/SYMBOL/composite controls improve beyond first-slot
+prefetch alone; selective, no-match and cache-local controls retain the plain loop
+when useful. Optional kernels compile only if sampled. Evidence and limits:
+`target/join-lookahead/`, PROGRESS. No calibrated controller ceiling or second-box claim.
+
+Next measured gap is build locality, not missing parallel scheduling. Q12's 150M-row
+build uses 7.8 CPUs: about 0.92s in partition-map insertion versus 0.20s partitioning.
+The 256-partition cap leaves roughly 586K rows and 16MiB per map, despite the existing
+32K-row target. Map scratch encodes buckets in one byte; raising the cap alone is
+incorrect. Test wider buckets and smaller partitions against extra partitioning,
+metadata, payload-copy and probe-directory costs before choosing a policy. Also
+compare generated staged insertion or bounded integral arrays; do not infer that
+recompiling the same dependent loads removes the stall. Keep full-width LONG,
+SYMBOL, temporal, composite and duplicate contracts. See `target/join-build-profile/`.
+The scratch 4,096-partition variant now cuts Q12 from 1.94-2.10s to 1.43s and Q9
+from 4.55s to 3.50s, but Q5 loses 2.6% and Q8 changes little. Q12 insertion drops
+888 -> 268ms while partitioning grows 204 -> 316ms. Retain the existing production
+cap until larger independent build controls price this tradeoff; small-build 500M-row
+probe controls alone cannot establish it. Reuse existing row/frame bounds and task
+ownership. Investigate bounded scatter or hierarchical partitioning before adding
+machine-specific cache constants or another chooser/configuration framework.
+The scatter counterexample is concrete: at 4,096 partitions store-queue stalls
+rise 10.68 -> 49.82 cycles/build row and L2 DTLB misses 0.019 -> 0.155. First test
+small per-bucket staging inside the existing KeyStager lifetime and MemoryTracker,
+using existing copy primitives. Compare against a bounded two-pass scatter if
+buffer footprint defeats locality. Preserve row IDs, duplicate order, variable-key
+lengths, partial flushes, cancellation and the existing frame/build barrier. Require
+whole-query wins with mixed-width keys and skew, including low-selectivity controls;
+do not partition the probe stream or replace the scheduler to solve a build scatter.
+A separate admission gap remains in temporal comparisons: shared filter lowering
+recognizes numeric LT/EQ classes but not LtDate/EqDate and timestamp variants. Any
+extension must preserve resolved units, mixed-precision conversion, NULLs and
+cached/runtime constants rather than treating every temporal value as raw LONG.
 
 Active experiment order (2026-11-03): [whole-query plan](WHOLE_QUERY_PLAN.md).
 Join and multiway-join acceleration remain goals through a general architecture.
@@ -55,7 +118,8 @@ gain 18-22%. No-root-match input pays ~1.8ms of wasted preparation, averaging +2
 closed build forests now reuse non-destructive heap counts/weighted sums; typed
 branches gain another 2.76-2.99x over leaf folding. See [subtree evidence](target/join-subtrees.md).
 Next separate remaining root lookup cost from grouping work before broadening the
-aggregate proof. Composite producer membership reduction remains open.
+aggregate proof. Composite producer membership reduction is now implemented;
+its performance validation remains open (see the 2026-11-07 plan checkpoint).
 The local-loop items below remain candidates, not the next automatic sequence.
 
 - [ ] Complete live-query memory accounting for filter row-ID/address lists.
@@ -741,3 +805,26 @@ mixed-source dependencies independently. Keep first-request/code-size costs visi
 this extension adds ~56-73ms compilation in the primary cases, roughly doubles their
 generated code, and adds ~80ms to no-match compile-plus-first time. Warm no-match and
 ordinary AVG controls retain ~3-4% costs. Do not hide these behind duplicate-heavy wins.
+
+
+## Joined variable grouping after destination reuse
+
+- Resolve the remaining 5–11% small-state fresh-process variance before claiming
+  parity. Identical emitted loops and differing adaptive choices explain only
+  part of it; see [the measured limits](PROGRESS.md).
+- Next experiment: a shared build-derived grouping dictionary with aligned,
+  worker-private aggregate state. Current high-group execution transfers about
+  141 GB/500M rows and approaches the measured read/write ceiling. Native calls
+  grow with per-slot group insertion (2.36M/4.46M/8.65M at 8/16/32 workers).
+  Predict fewer controller bytes and duplicated insertions, including preparation
+  and export costs; additional worker occupancy alone is insufficient.
+- Reuse `DenseAggregate`, `AggregateUpdates` and `DictionaryAggregate` rather than
+  adding COUNT-only state. Prove all grouping inputs belong to the dictionary;
+  export only groups seen by actual updates. Preserve duplicate/update order,
+  query memory, bounded cancellation, failure/reopen and ordinary key encoding.
+- `AsyncHashJoinGroupByRecordCursor.buildResult` supplies the drained-worker
+  boundary before merge. `CompiledJoin` still lacks a finish-scan hook;
+  `DictionaryAggregate` limits arrays to local cache, and `DenseAggregate.merge`
+  lacks in-loop cancellation. Resolve these constraints before widening admission.
+  This remains a proposal. Require typed joins, mixed aggregates, NULL/Unicode,
+  skew and low-reuse controls alongside the large-state case.

@@ -725,16 +725,18 @@ public final class MapHashJoinBuild implements Closeable {
         for (int i = 0, n = maps.size(); i < n; i++) {
             replacedBytes += mapSizeInBytes(maps.getQuick(i));
         }
-        try (var view = new Unordered8Map.ProbeView()) {
-            view.ofLayout(unordered8Map);
-            if (!integralIndex.prepare(frozen, probeRows, Long.MIN_VALUE, replacedBytes, memoryTracker, breaker, key -> {
-                view.withKey().putLong(key);
-                int partition = frozen instanceof PartitionedFrozen p ? HashJoinPartitions.bucketOf(view.hash(), p.partitionShift) : 0;
-                MapValue value = view.of((Unordered8Map) maps.getQuick(partition)).findValue();
-                return value == null ? 0 : CompressedOffsets.uncompressAligned8(value.getInt(0));
-            })) {
-                return false;
+        if (!integralIndex.prepare(frozen, probeRows, Long.MIN_VALUE, replacedBytes, memoryTracker, breaker, () -> {
+            for (int i = 0, n = frozen.getNativeMapCount(); i < n; i++) {
+                breaker.statefulThrowExceptionIfTripped();
+                MapRecordCursor cursor = maps.getQuick(i).getCursor();
+                MapRecord record = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    breaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    integralIndex.put(record.getLong(1), record.getInt(0));
+                }
             }
+        })) {
+            return false;
         }
         Misc.freeObjListAndKeepObjects(maps);
         frozen.size = getSizeInBytes();
@@ -1181,6 +1183,23 @@ public final class MapHashJoinBuild implements Closeable {
         }
 
         @Override
+        public boolean forEachRecordKey(java.util.function.ObjIntConsumer<Record> visitor, SqlExecutionCircuitBreaker breaker) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            if (integralIndex.isReady()) return false;
+            for (int i = 0, n = getNativeMapCount(); i < n; i++) {
+                MapRecordCursor cursor = (n == 1 ? map : maps.getQuick(i)).getCursor();
+                MapRecord record = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    breaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    visitor.accept(record, 1); // One row-chain head precedes the key tuple.
+                }
+            }
+            return true;
+        }
+
+        @Override
         public int getNativeMapCount() {
             return integralIndex.isReady() ? 0 : this instanceof PartitionedFrozen p ? p.partitionCount : 1;
         }
@@ -1216,6 +1235,15 @@ public final class MapHashJoinBuild implements Closeable {
             }
             return !heap.hasChainLengths() && heap.hasRowId() && payloads != null
                     && payloads.writeNativeColumn(column, address);
+        }
+
+        @Override
+        public boolean writeNativeVarcharPayload(int column, long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            return !heap.hasChainLengths() && heap.hasRowId() && payloads != null
+                    && payloads.writeNativeVarcharColumn(column, address);
         }
 
         void ofHeap(HashJoinPayloadSource payloads, long keysCount) {

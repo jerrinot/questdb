@@ -179,7 +179,11 @@ final class ResolvedVarchar {
     }
 
     record Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals, Expr helpers,
-                 java.util.Map<Expression, Pipeline.Utf8Value> materialized) {
+                 java.util.Map<Expression, Pipeline.Utf8Value> materialized, List<Pipeline.Utf8Value> joinedValues) {
+        Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals, Expr helpers,
+              java.util.Map<Expression, Pipeline.Utf8Value> materialized) {
+            this(numeric, row, columns, literals, helpers, materialized, null);
+        }
         Frame(Pipeline.Row numeric, Expr row, Expr columns, Expr literals) {
             this(numeric, row, columns, literals, nil(), null);
         }
@@ -232,10 +236,12 @@ final class ResolvedVarchar {
     private record Column(int index) implements Expression {
         @Override
         public Pipeline.Utf8Value emit(Builder b, Frame frame) {
-            return QuestVarchar.decode(b, at(frame.columns, index * 48L), frame.row);
+            return frame.joinedValues != null ? frame.joinedValues.get(index)
+                    : QuestVarchar.decode(b, at(frame.columns, index * 48L), frame.row);
         }
         @Override public Expr isNull(Builder b, Frame frame) {
-            return ne(binary(Op.AND, QuestVarchar.header(b, at(frame.columns, index * 48L), frame.row), i64(4)), i64(0));
+            return frame.joinedValues != null ? frame.joinedValues.get(index).isNull()
+                    : ne(binary(Op.AND, QuestVarchar.header(b, at(frame.columns, index * 48L), frame.row), i64(4)), i64(0));
         }
     }
 

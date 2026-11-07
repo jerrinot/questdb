@@ -24,6 +24,7 @@
 
 package io.questdb.griffin;
 
+import io.questdb.cairo.ArrayColumnTypes;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
@@ -38,6 +39,7 @@ import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableReaderMetadata;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.pool.ex.EntryLockedException;
 import io.questdb.cairo.sql.BindVariableService;
 import io.questdb.cairo.sql.Function;
@@ -62,6 +64,7 @@ import io.questdb.griffin.engine.functions.catalogue.ShowTransactionIsolationLev
 import io.questdb.griffin.engine.functions.constants.CharConstant;
 import io.questdb.griffin.engine.functions.date.TimestampFloorFromOffsetUtcFunctionFactory;
 import io.questdb.griffin.engine.functions.date.ToUTCTimestampFunctionFactory;
+import io.questdb.griffin.engine.join.LongChain;
 import io.questdb.griffin.engine.join.NullRecordFactory;
 import io.questdb.griffin.engine.table.ShowColumnsRecordCursorFactory;
 import io.questdb.griffin.engine.table.ShowPartitionsRecordCursorFactory;
@@ -7630,9 +7633,171 @@ public class SqlOptimiser implements Mutable {
         }
     }
 
+    /**
+     * Avoid a large unfiltered build when the alternative has substantially less potential
+     * key state. These are unfiltered storage bounds, not selectivity or join-cardinality estimates.
+     */
+    private void chooseHashJoinProbeRoot(IQueryModel join, SqlExecutionContext executionContext, boolean inputOrderIndependent) throws SqlException {
+        ObjList<IQueryModel> inputs = join.getJoinModels();
+        IntList oldOrder = join.getOrderedJoinModels();
+        int count = inputs.size();
+        if (count < 3 || oldOrder.size() != count || HashJoinGraph.hasBarrier(join)
+                || join.getLatestBy().size() != 0 || !inputOrderIndependent && join.getTimestamp() != null) {
+            return;
+        }
+        for (int i = 0; i < count; i++) {
+            IQueryModel input = inputs.getQuick(oldOrder.getQuick(i));
+            if (i > 0 && (input.getJoinType() != IQueryModel.JOIN_INNER
+                    || input.getOuterJoinExpressionClause() != null
+                    || input.getJoinContext() == null || input.getJoinContext().aIndexes.size() == 0)) {
+                return;
+            }
+            // Computed/volatile projections do not provide a row-preserving scan contract here.
+            for (IQueryModel m = input; m != null && m.getTableName() == null; m = m.getNestedModel()) {
+                if (!HashJoinGraph.isProjection(m) || m.getOrderBy().size() != 0) {
+                    return;
+                }
+                for (int c = 0; c < m.getColumns().size(); c++) {
+                    if (m.getColumns().getQuick(c).getAst().type != LITERAL) {
+                        return;
+                    }
+                }
+            }
+        }
+        int original = oldOrder.getQuick(0), probe = original;
+        long largest = -1;
+        long[] rowCounts = new long[count];
+        for (int i = 0; i < count; i++) {
+            int source = oldOrder.getQuick(i);
+            IQueryModel table = HashJoinGraph.baseTable(inputs.getQuick(source), join);
+            if (table == null) {
+                return;
+            }
+            try (TableReader reader = executionContext.getReader(executionContext.getTableToken(table.getTableName()), table.getMetadataVersion())) {
+                if (!inputOrderIndependent && source == original && reader.getMetadata().getTimestampIndex() >= 0) {
+                    return;
+                }
+                long rows = reader.size();
+                rowCounts[source] = rows;
+                if (rows > largest) {
+                    largest = rows;
+                    probe = source;
+                }
+            }
+        }
+        IQueryModel root = inputs.getQuick(probe);
+        if (probe == original || largest <= 0 || HashJoinGraph.hasInputFilter(root)
+                || !inputOrderIndependent && root.getTimestamp() != null || root.getOrderBy().size() != 0) {
+            return;
+        }
+        IQueryModel table = HashJoinGraph.baseTable(root, join);
+        if (!inputOrderIndependent && table.getTimestamp() != null) {
+            return;
+        }
+        // assignFilters has not placed the residual predicates yet. A filter on the proposed
+        // probe makes its row count unknown, so its base size cannot establish dominance.
+        literalCollector.withModel(join);
+        for (int i = 0; i < join.getParsedWhere().size(); i++) {
+            tempIntHashSet.clear();
+            literalCollector.resetCounts();
+            traversalAlgo.traverse(join.getParsedWhere().getQuick(i), literalCollector.to(tempIntHashSet));
+            if (tempIntHashSet.size() == 0 || tempIntHashSet.contains(probe)) {
+                return;
+            }
+        }
+        HashJoinGraph.Order graph = HashJoinGraph.order(join, probe);
+        if (graph == null || !hasBoundedHashJoinBuilds(join, graph, rowCounts, largest)) {
+            return;
+        }
+        // Analysis above leaves the original models untouched. Publish one complete connected
+        // order, retaining all source indexes, names and equality nodes for normal code generation.
+        IntList order = join.nextOrderedJoinModels();
+        order.clear();
+        order.add(probe);
+        for (int i = 0; i < count; i++) {
+            inputs.getQuick(i).getDependencies().clear();
+        }
+        root.setContext(null);
+        for (int i = 0; i < graph.builds().size(); i++) {
+            int source = graph.builds().getQuick(i);
+            JoinContext keys = graph.keys().getQuick(i);
+            inputs.getQuick(source).setContext(keys);
+            inputs.getQuick(source).setJoinType(IQueryModel.JOIN_INNER);
+            for (int k = 0; k < keys.parents.size(); k++) {
+                inputs.getQuick(keys.parents.get(k)).getDependencies().add(source);
+            }
+            order.add(source);
+        }
+        join.setOrderedJoinModels(order);
+    }
+
+    private boolean hasBoundedHashJoinBuilds(IQueryModel join, HashJoinGraph.Order graph, long[] rows, long probeRows) {
+        // A nearly equal row count can hide a vastly larger distinct-key map. Compare all
+        // proposed builds at maximum distinctness with just the removed build's row chain.
+        // Runtime filters may already reduce that old build, so this is a risk bound on the
+        // unfiltered plans, not a proof of lower execution cost for every data distribution.
+        final ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+        long bytes = 0;
+        try {
+            final long removedChainBytes = LongChain.requiredHeapSize(probeRows);
+            for (int i = 0; i < graph.builds().size(); i++) {
+                final int source = graph.builds().getQuick(i);
+                final JoinContext keys = graph.keys().getQuick(i);
+                keyTypes.clear();
+                for (int k = 0; k < keys.aIndexes.size(); k++) {
+                    final IQueryModel a = join.getJoinModels().getQuick(keys.aIndexes.getQuick(k));
+                    final IQueryModel b = join.getJoinModels().getQuick(keys.bIndexes.getQuick(k));
+                    final int typeA = getQueryColumnType(a, a.getAliasToColumnMap().get(keys.aNames.getQuick(k)));
+                    final int typeB = getQueryColumnType(b, b.getAliasToColumnMap().get(keys.bNames.getQuick(k)));
+                    if (typeA < 0 || typeA != typeB || ColumnType.sizeOf(typeA) <= 0) {
+                        return false;
+                    }
+                    // Both sides are literal columns of ordinary table scans: SYMBOL keys
+                    // use the existing static-dictionary translation into fixed INT IDs.
+                    keyTypes.add(typeA == ColumnType.SYMBOL ? ColumnType.INT : typeA);
+                }
+                final long mapBytes = MapFactory.fixedKeyMemoryUpperBound(configuration, keyTypes, 2 * Integer.BYTES, rows[source]);
+                final long chainBytes = Math.max(configuration.getSqlHashJoinLightValuePageSize(),
+                        Math.multiplyExact(LongChain.requiredHeapSize(rows[source]), 2));
+                bytes = Math.addExact(bytes, Math.addExact(mapBytes, chainBytes));
+                if (bytes >= removedChainBytes) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (ArithmeticException overflow) {
+            return false;
+        }
+    }
+
     private void optimiseJoins(IQueryModel model, SqlExecutionContext sqlExecutionContext) throws SqlException {
+        optimiseJoins(model, sqlExecutionContext, sqlExecutionContext.getQueryCodeGenerator() != null,
+                OrderByMnemonic.ORDER_BY_UNKNOWN);
+    }
+
+    private void optimiseJoins(IQueryModel model, SqlExecutionContext sqlExecutionContext,
+                               boolean allowRootChoice, int inputOrder) throws SqlException {
         if (!model.isOptimisable()) {
             return;
+        }
+        allowRootChoice &= model.getSelectModelType() != IQueryModel.SELECT_MODEL_WINDOW
+                && model.getSampleBy() == null && model.getFillStride() == null && model.getSharedRefCount() == 0
+                && model.getUnionModel() == null && model.getLatestBy().size() == 0 && !model.isUpdate();
+        for (int i = 0; allowRootChoice && i < model.getColumns().size(); i++) {
+            allowRootChoice = !hasOrderedGroupByFunc(model.getColumns().getQuick(i).getAst());
+        }
+        // As in optimiseOrderBy, LIMIT consumes order, a sort establishes it, and an
+        // unordered aggregate can discard an otherwise unobserved input order. ORDER BY
+        // may still sit below its SELECT/LIMIT wrappers until rewriteOrderBy runs.
+        if (model.getLimitLo() != null || model.getLimitHi() != null) {
+            inputOrder = OrderByMnemonic.ORDER_BY_REQUIRED;
+        }
+        if (model.getOrderBy().size() > 0
+                || inputOrder == OrderByMnemonic.ORDER_BY_UNKNOWN && model.getSelectModelType() == IQueryModel.SELECT_MODEL_GROUP_BY) {
+            inputOrder = OrderByMnemonic.ORDER_BY_INVARIANT;
+        }
+        if (model.hasExplicitTimestamp()) {
+            inputOrder = OrderByMnemonic.ORDER_BY_REQUIRED;
         }
         ObjList<IQueryModel> joinModels = model.getJoinModels();
 
@@ -7679,6 +7844,9 @@ public class SqlOptimiser implements Mutable {
             homogenizeCrossJoins(model);
             constrainJoinsAfterReorderedNullingJoins(model);
             reorderTables(model);
+            if (allowRootChoice && inputOrder != OrderByMnemonic.ORDER_BY_REQUIRED) {
+                chooseHashJoinProbeRoot(model, sqlExecutionContext, inputOrder == OrderByMnemonic.ORDER_BY_INVARIANT);
+            }
             assignFilters(model);
             alignJoinClauses(model);
             addTransitiveFilters(model, sqlExecutionContext);
@@ -7689,13 +7857,13 @@ public class SqlOptimiser implements Mutable {
             IQueryModel m = model.getJoinModels().getQuick(i).getNestedModel();
             if (m != null) {
                 clearConstNameMaps();
-                optimiseJoins(m, sqlExecutionContext);
+                optimiseJoins(m, sqlExecutionContext, allowRootChoice, n == 1 ? inputOrder : OrderByMnemonic.ORDER_BY_UNKNOWN);
             }
 
             m = model.getJoinModels().getQuick(i).getUnionModel();
             if (m != null) {
                 clearConstNameMaps();
-                optimiseJoins(m, sqlExecutionContext);
+                optimiseJoins(m, sqlExecutionContext, allowRootChoice, OrderByMnemonic.ORDER_BY_UNKNOWN);
             }
         }
     }
@@ -8249,9 +8417,10 @@ public class SqlOptimiser implements Mutable {
             }
         }
 
-        // process join models and their join conditions
+        // The original SQL root can become a build input after reordering. Retain its
+        // join keys too; source position zero no longer implies an empty join context.
         final ObjList<IQueryModel> joinModels = model.getJoinModels();
-        for (int i = 1, n = joinModels.size(); i < n; i++) {
+        for (int i = 0, n = joinModels.size(); i < n; i++) {
             final IQueryModel jm = joinModels.getQuick(i);
             final JoinContext jc = jm.getJoinContext();
             if (jc != null && jc.aIndexes.size() > 0) {

@@ -618,13 +618,12 @@ public final class IntHashJoinBuild implements Closeable {
         for (int i = 0, n = tables.size(); i < n; i++) {
             replacedBytes += tables.getQuick(i).getSizeInBytes();
         }
-        try (var probe = frozen.newProbe()) {
-            if (!integralIndex.prepare(frozen, probeRows, nullKey, replacedBytes, memoryTracker, breaker, key -> {
-                probe.findUnchecked((int) key);
-                return probe.getNextRowLink();
-            })) {
-                return false;
+        if (!integralIndex.prepare(frozen, probeRows, nullKey, replacedBytes, memoryTracker, breaker, () -> {
+            for (int i = 0, n = tables.size(); i < n; i++) {
+                tables.getQuick(i).copyHeads(integralIndex, breaker);
             }
+        })) {
+            return false;
         }
         for (int i = 0, n = tables.size(); i < n; i++) {
             tables.getQuick(i).close();
@@ -882,6 +881,15 @@ public final class IntHashJoinBuild implements Closeable {
             }
             return !heap.hasChainLengths() && heap.hasRowId() && payloads != null
                     && payloads.writeNativeColumn(column, address);
+        }
+
+        @Override
+        public boolean writeNativeVarcharPayload(int column, long address) {
+            if (frozen != this || generation != heap.getGeneration()) {
+                throw new IllegalStateException("hash join build has expired");
+            }
+            return !heap.hasChainLengths() && heap.hasRowId() && payloads != null
+                    && payloads.writeNativeVarcharColumn(column, address);
         }
 
         void ofHeap(HashJoinPayloadSource payloads, long keysCount, int minKey, int maxKey) {

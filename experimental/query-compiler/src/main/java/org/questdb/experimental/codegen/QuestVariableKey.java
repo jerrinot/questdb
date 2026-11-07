@@ -44,12 +44,16 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
 
     static QuestVariableKey bind(ColumnTypes input, ColumnTypes types, ListColumnFilter columns,
                                  ObjList<Function> functions, io.questdb.cairo.map.Map map) {
+        return bind(new ResolvedInputs(input), input, types, columns, functions, map);
+    }
+
+    static QuestVariableKey bind(ResolvedInputs resolved, ColumnTypes input, ColumnTypes types,
+                                 ListColumnFilter columns, ObjList<Function> functions, io.questdb.cairo.map.Map map) {
         int computed = functions == null ? 0 : functions.size();
         if (!(map instanceof OrderedMap ordered) || ordered.getFixedKeySize() != -1
                 || types.getColumnCount() != columns.size() + computed) return null;
-        var resolved = new ResolvedInputs(input);
         var parts = new ArrayList<Part>();
-        var strings = new ResolvedVarchar(input, resolved);
+        var strings = resolved.strings();
         boolean variable = false;
         for (int i = 0; i < types.getColumnCount(); i++) {
             int type = types.getColumnType(i);
@@ -102,7 +106,10 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
     Var stage(Builder b, Expr row) {
         Var descriptors = b.let(new Load(MemoryType.ADDRESS, at(STATE, KEY_COLUMNS)));
         var source = ResolvedInputs.loadFrameRow(b, inputs.numericInputs(), descriptors, row);
-        var frame = inputs.frame(source, row, descriptors);
+        return stage(b, inputs.frame(source, row, descriptors));
+    }
+
+    Var stage(Builder b, ResolvedVarchar.Frame frame) {
         var strings = new ArrayList<Pipeline.Utf8Value>();
         Expr bytes = i64(4);
         for (Part part : parts) {

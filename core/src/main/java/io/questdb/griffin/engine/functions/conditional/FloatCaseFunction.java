@@ -45,6 +45,11 @@ class FloatCaseFunction extends FloatFunction implements CaseFunction {
     }
 
     @Override
+    public CaseFunctionPicker getPicker() {
+        return picker;
+    }
+
+    @Override
     public float getFloat(Record rec) {
         return picker.pick(rec).getFloat(rec);
     }

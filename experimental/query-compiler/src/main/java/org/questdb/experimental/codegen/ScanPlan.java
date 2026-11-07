@@ -94,6 +94,8 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
                 : s instanceof Multiply a ? 1 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof IPv4Subtract a ? 4 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof TimestampPart a ? 12 + cost(a.argument(), memo)
+                : s instanceof TimestampYear a ? 48 + cost(a.argument(), memo)
+                : s instanceof Conditional a ? 2 + cost(a.condition(), memo) + cost(a.whenTrue(), memo) + cost(a.whenFalse(), memo)
                 : s instanceof Subtract a ? 1 + cost(a.left(), memo) + cost(a.right(), memo) : 1;
         value = Math.min(MAX_FUSED_EXPRESSION_NODES + 1, value); memo.put(s, value); return value;
     }
@@ -118,6 +120,8 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case IPv4Subtract a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
             case Subtract a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
             case TimestampPart a -> validate(a.argument(), schema, parameters, checked);
+            case TimestampYear a -> validate(a.argument(), schema, parameters, checked);
+            case Conditional a -> { validate(a.condition(), schema, parameters, checked); validate(a.whenTrue(), schema, parameters, checked); validate(a.whenFalse(), schema, parameters, checked); }
             case DictionaryLookup a -> validate(a.symbol(), schema, parameters, checked);
             case FrameScalar ignored -> { }
             case ToFloating a -> validate(a.argument(), schema, parameters, checked);
@@ -152,6 +156,8 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case Divide a -> new Divide(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
             case Parameter p -> p;
             case TimestampPart a -> new TimestampPart(rewrite(a.argument(), schema, bindings), a.unitTicks(), a.period());
+            case TimestampYear a -> new TimestampYear(rewrite(a.argument(), schema, bindings), a.timestampType());
+            case Conditional a -> new Conditional(rewrite(a.condition(), schema, bindings), rewrite(a.whenTrue(), schema, bindings), rewrite(a.whenFalse(), schema, bindings));
             case DictionaryLookup a -> new DictionaryLookup(rewrite(a.symbol(), schema, bindings), a.table());
             case FrameScalar ignored -> throw new IllegalArgumentException("Frame expressions cannot be substituted into a numeric scan");
             case Add a -> new Add(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
@@ -176,6 +182,8 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
         switch (e) {
             case Column c -> used.set(c.index());
             case TimestampPart a -> collect(a.argument(), used);
+            case TimestampYear a -> collect(a.argument(), used);
+            case Conditional a -> { collect(a.condition(), used); collect(a.whenTrue(), used); collect(a.whenFalse(), used); }
             case DictionaryLookup a -> collect(a.symbol(), used);
             case FrameScalar expression -> expression.collectColumns(used);
             case ToFloating a -> collect(a.argument(), used);

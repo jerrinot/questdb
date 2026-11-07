@@ -78,6 +78,11 @@ public interface FrozenHashJoinBuild {
         return false;
     }
 
+    /** Borrowed distinct key records and their first key column, on the owner before publication. */
+    default boolean forEachRecordKey(java.util.function.ObjIntConsumer<Record> visitor, SqlExecutionCircuitBreaker breaker) {
+        return false;
+    }
+
     /** Number of NativeMapView descriptors required by a staged-key native lookup. */
     default int getNativeMapCount() {
         return 0;
@@ -95,6 +100,11 @@ public interface FrozenHashJoinBuild {
 
     /** Borrowed payload descriptor, with the same lifetime as the frozen lookup. */
     default boolean writeNativePayload(int column, long address) {
+        return false;
+    }
+
+    /** Borrows {@link HashJoinPayloadSource#writeNativeVarcharColumn}'s frame tables. */
+    default boolean writeNativeVarcharPayload(int column, long address) {
         return false;
     }
 

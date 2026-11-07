@@ -109,6 +109,7 @@ abstract class SourceEmitter {
             case Literal l -> literal(l);
             case Binary b -> binary(b.op(), expression(b.left()), expression(b.right()));
             case Load l -> load(l.width(), expression(l.address()));
+            case Gather g -> load(g.width(), offset(expression(g.base()), expression(g.bytes())));
             case AtomicLoad l -> atomicLoad(expression(l.address()), l.acquire());
             case AtomicAdd a -> atomicAdd(expression(a.address()), expression(a.value()));
             case CompareExchange c -> compareExchange(expression(c.address()), expression(c.expected()), expression(c.value()));

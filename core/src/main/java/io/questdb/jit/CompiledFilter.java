@@ -67,6 +67,8 @@ public class CompiledFilter implements Closeable {
 
     public long getNativeInputRows() { return 0; }
 
+    public long getNativeOutputRows() { return 0; }
+
     /** Owner-only frame admission. Called before dispatch, or after draining on rewind. */
     public boolean prepareLimit(long limit) { return false; }
 

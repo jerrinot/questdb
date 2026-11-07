@@ -132,6 +132,7 @@ public final class IrOptimizer {
             case Var v -> facts.getOrDefault(v, v);
             case Literal l -> l;
             case Load l -> new Load(l.width(), simplify(l.address(), facts));
+            case Gather g -> new Gather(g.width(), simplify(g.base(), facts), simplify(g.bytes(), facts));
             case AtomicLoad l -> new AtomicLoad(simplify(l.address(), facts), l.acquire());
             case AtomicAdd a -> new AtomicAdd(simplify(a.address(), facts), simplify(a.value(), facts));
             case CompareExchange c -> new CompareExchange(simplify(c.address(), facts), simplify(c.expected(), facts), simplify(c.value(), facts));
@@ -266,6 +267,7 @@ public final class IrOptimizer {
             case Var ignored -> true;
             case Literal ignored -> true;
             case Load ignored -> false;
+            case Gather ignored -> false;
             case AtomicLoad ignored -> false;
             case AtomicAdd ignored -> false;
             case CompareExchange ignored -> false;

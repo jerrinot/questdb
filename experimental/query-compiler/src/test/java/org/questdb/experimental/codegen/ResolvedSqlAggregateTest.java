@@ -1020,15 +1020,66 @@ public class ResolvedSqlAggregateTest {
                 + "when x%19=2 then -9223372036854775807L else (x-5000)*1000001L end as timestamp) tm,"
                 + "cast(case when x%19=0 then null when x%19=1 then 9223372036854775807L "
                 + "when x%19=2 then -9223372036854775807L else (x-5000)*1000000001L end as timestamp_ns) tn,"
+                + "cast(case when x%19=0 then null else x*7046029254386353131L end as date) dt,"
                 + "cast(x%31 as short) v,timestamp_sequence('2024-01-01',1000000L) ts from long_sequence(10003)) "
                 + "timestamp(ts) partition by day bypass wal", context);
         for (boolean parquet : new boolean[]{false, true}) {
             if (parquet) engine.execute("alter table time_parts convert partition to parquet list '2024-01-01'", context);
             for (String key : List.of("hour(tm)", "minute(tm)", "second(tm)", "hour(tn)", "minute(tn)", "second(tn)",
-                    "extract(minute from tm)", "minute(tm)+1,second(tn)")) {
+                    "extract(minute from tm)", "minute(tm)+1,second(tn)", "year(tm)", "extract(year from tn)",
+                    "year(dt)", "year(cast(dt as timestamp_ns))", "hour(dt)", "minute(cast(dt as timestamp))", "second(cast(dt as timestamp_ns))")) {
                 long before = compiler.mapRows.get();
                 assertMatches("select " + key + ",count(),sum(v),avg(v) from time_parts where v>=0 group by " + key, true);
                 assertTrue(lastPlan, compiler.mapRows.get() > before);
+            }
+        }
+    }
+
+    @Test
+    public void numericCasesPreserveFirstMatchNullsAndWrappedArithmetic() throws Exception {
+        shardingThreshold = 2;
+        engine.execute("create table numeric_cases as (select cast(case when x%19=0 then null else x%31-15 end as int) k,"
+                + "cast(case when x%13=0 then null else (x%17-8)*0.5 end as float) f,"
+                + "cast(case when x%7=0 then null else 'key-'||(x%3) end as symbol) s,"
+                + "timestamp_sequence('2024-01-01',1000000L) ts from long_sequence(10003)) "
+                + "timestamp(ts) partition by day bypass wal", context);
+        String key = "case when k<0 then 1 when k<10 then 2 else 3 end";
+        for (boolean parquet : new boolean[]{false, true}) {
+            if (parquet) engine.execute("alter table numeric_cases convert partition to parquet list '2024-01-01'", context);
+            for (String value : List.of(
+                    "case when k<10 then k+2147483647 when k<12 then k else null end",
+                    "case when k<5 then k*0.5 when k<10 then cast(f as double) end",
+                    "case k when -1 then 11 when 0 then 22 when null then 33 else k end",
+                    "switch(cast(k as long)*4294967297L,-4294967297L,11,4294967297L,22,null,33,0)")) {
+                long before = compiler.mapRows.get();
+                assertMatches("select " + key + ",count(" + value + "),sum(" + value + "),min(" + value
+                        + "),max(" + value + ") from numeric_cases group by " + key, true);
+                assertTrue(lastPlan, compiler.mapRows.get() > before);
+            }
+            long before = compiler.filterRows.get();
+            assertMatches("select k,count(),sum(k) from numeric_cases where case when k<0 then k+1 else k end>0 group by k", true);
+            assertTrue(lastPlan, compiler.filterRows.get() > before);
+        }
+    }
+
+    @Test
+    public void temporalRangesUseResolvedTimestampConversions() throws Exception {
+        engine.execute("create table temporal_ranges as (select d,cast(d as timestamp) tm,cast(d as timestamp_ns) tn,"
+                + "cast(x%7 as int) k,timestamp_sequence('2024-01-01',1000000L) ts from (select x,"
+                + "cast(case when x%17=0 then null when x%17=1 then 9223372036854775807L "
+                + "when x%17=2 then -9223372036854775807L else (x-5000)*86400000L end as date) d "
+                + "from long_sequence(10003))) timestamp(ts) partition by day bypass wal", context);
+        for (boolean parquet : new boolean[]{false, true}) {
+            if (parquet) engine.execute("alter table temporal_ranges convert partition to parquet list '2024-01-01'", context);
+            for (String predicate : List.of(
+                    "d between cast('1969-12-30' as date) and cast('1970-01-03' as date)",
+                    "d between cast('1970-01-03' as date) and cast('1969-12-30' as date)",
+                    "cast(d as timestamp_ns) between cast(-2000000000L as timestamp_ns) and cast(2000000000L as timestamp_ns)",
+                    "tm between cast('1969-12-30' as timestamp_ns) and cast('1970-01-03' as timestamp)",
+                    "tn between cast(-172800000000L as timestamp) and cast(172800000000L as timestamp)")) {
+                long before = compiler.filterRows.get();
+                assertMatches("select k,count(),sum(k) from temporal_ranges where " + predicate + " group by k", true);
+                assertTrue(predicate + " / " + lastPlan, compiler.filterRows.get() > before);
             }
         }
     }

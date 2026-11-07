@@ -47,6 +47,18 @@ import io.questdb.std.QuietCloseable;
  */
 public interface HashJoinPayloadSource {
     int NATIVE_COLUMN_BYTES = 24;
+    int NATIVE_VARCHAR_COLUMN_BYTES = 40;
+
+    /**
+     * Borrowed native VARCHAR frame tables: aux addresses, data addresses, aux sizes,
+     * data sizes, then the byte stride between frames. Each table starts at this
+     * column of frame zero. The caller decodes a frame-local row with the ordinary
+     * VARCHAR representation. A zero aux address denotes a column top. The source
+     * keeps the tables and pages pinned until the build execution drains.
+     */
+    default boolean writeNativeVarcharColumn(int column, long address) {
+        return false;
+    }
 
     /**
      * Optional fixed-width native column view, borrowed until the build execution drains.

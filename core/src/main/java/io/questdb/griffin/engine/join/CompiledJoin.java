@@ -70,6 +70,10 @@ public interface CompiledJoin extends QuietCloseable {
     Updater newUpdater(Runnable checkpoint);
 
     interface Updater extends QuietCloseable {
+        /** Releases slot scratch after the owning frame sequence has drained; the updater can reopen. */
+        default void clearExecution() {
+        }
+
         /** Owner-only preparation using this execution's bound dictionary views, before worker publication. */
         default void prepareDependencies(FrozenHashJoinBuild[] builds, long probeRows, MemoryTracker tracker,
                                          SqlExecutionCircuitBreaker breaker) {

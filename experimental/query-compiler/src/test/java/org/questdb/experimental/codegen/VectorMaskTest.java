@@ -61,6 +61,59 @@ public class VectorMaskTest {
             }
         }
     }
+    @Test public void indexedReadsPreserveWidthsOffsetsAndLaneOrder() throws Exception {
+        MemoryType[] widths = {MemoryType.I8, MemoryType.I16, MemoryType.I32, MemoryType.I64,
+                MemoryType.F32, MemoryType.F64};
+        Builder b = new Builder();
+        Var table = b.let(new Load(MemoryType.ADDRESS, COLUMNS));
+        Expr index = new Load(MemoryType.I32, at(COLUMNS, 8));
+        for (int w = 0; w < widths.length; w++) {
+            MemoryType width = widths[w];
+            Expr read = new Gather(width, at(table, w * 512L), binary(Op.MUL, index, i64(width.bytes)));
+            Expr negative = binary(width.resultType == Type.F64 ? Op.FLT : Op.LT,
+                    read, width.resultType == Type.F64 ? f64(0) : i64(0));
+            b.store(at(STATE, w * 8L), new VectorMask(63, negative));
+        }
+        b.exit(0);
+        try (var kernel = backend.compile(new Program(b.block()), temporary.getRoot().toPath());
+             var arena = Arena.ofConfined()) {
+            long input = arena.allocate(8 + 63 * 4, 8).address();
+            long tableAddress = arena.allocate(widths.length * 512, 8).address();
+            long output = arena.allocate(widths.length * 8, 8).address();
+            Unsafe.putLong(input, tableAddress);
+            long expected = 0;
+            for (int lane = 0; lane < 63; lane++) {
+                int slot = lane * 17 % 31; // Repeated, nonconsecutive indexes; no lane stride on the table.
+                Unsafe.putInt(input + 8 + lane * 4L, slot);
+                if ((slot & 1) == 0) expected |= 1L << lane;
+            }
+            for (int w = 0; w < widths.length; w++) for (int slot = 0; slot < 31; slot++) {
+                long address = tableAddress + w * 512L + slot * widths[w].bytes;
+                long value = (slot & 1) == 0 ? -slot - 1 : slot + 1;
+                if (widths[w] == MemoryType.F32) Unsafe.getUnsafe().putFloat(address, value);
+                else if (widths[w] == MemoryType.F64) Unsafe.getUnsafe().putDouble(address, value);
+                else write(widths[w], address, value);
+            }
+            assertEquals(0, kernel.run(input, 63, output));
+            for (int w = 0; w < widths.length; w++) assertEquals(expected, Unsafe.getLong(output + w * 8L));
+        }
+    }
+
+    @Test public void indexedReadsCannotCrossStores() throws Exception {
+        Builder b = new Builder();
+        Expr read = new VectorMask(8, ne(new Gather(MemoryType.I64, COLUMNS, i64(0)), i64(0)));
+        Var before = b.let(read);
+        b.store(COLUMNS, i64(1));
+        Var after = b.let(read);
+        b.store(STATE, before); b.store(at(STATE, 8), after); b.exit(0);
+        try (var kernel = backend.compile(new Program(b.block()), temporary.getRoot().toPath());
+             var arena = Arena.ofConfined()) {
+            long data = arena.allocate(8, 8).address(), output = arena.allocate(16, 8).address();
+            assertEquals(0, kernel.run(data, 8, output));
+            assertEquals(0, Unsafe.getLong(output));
+            assertEquals(255, Unsafe.getLong(output + 8));
+        }
+    }
     @Test public void byteEqualityMasksPreserveSignednessAndComposition() throws Exception {
         Builder b = new Builder();
         Expr signed = new Load(MemoryType.I8, COLUMNS);
@@ -195,6 +248,8 @@ public class VectorMaskTest {
         assertThrows(IllegalArgumentException.class,()->new VectorMask(64,eq(new Load(MemoryType.ADDRESS,COLUMNS),nil())));
         assertThrows(IllegalArgumentException.class,()->new VectorMask(64,eq(load(new Load(MemoryType.ADDRESS,COLUMNS)),i64(0))));
         assertThrows(IllegalArgumentException.class,()->new VectorMask(64,eq(new VectorMask(1,bool(true)),i64(1))));
+        assertThrows(IllegalArgumentException.class,()->new Gather(MemoryType.ADDRESS,COLUMNS,i64(0)));
+        assertThrows(IllegalArgumentException.class,()->new VectorMask(8,eq(new Gather(MemoryType.I64,new Load(MemoryType.ADDRESS,COLUMNS),i64(0)),i64(0))));
     }
     private static void write(MemoryType type,long address,long value) {
         var u=Unsafe.getUnsafe();switch(type){case I8->u.putByte(address,(byte)value);case I16->u.putShort(address,(short)value);case I32->u.putInt(address,(int)value);case I64->u.putLong(address,value);default->throw new AssertionError();}
