@@ -314,6 +314,7 @@ public class VirtualFunctionRecordCursor implements RecordCursor {
         }
         @Override public long getRowId() { return rowId; }
         @Override public long getUpdateRowId() { return getBaseRecord().getUpdateRowId(); }
+        @Override public boolean getBool(int col) { return projection.isProjected(col) ? projection.getValue(row, col) != 0 : super.getBool(col); }
         @Override public byte getByte(int col) { return projection.isProjected(col) ? (byte) projection.getValue(row, col) : super.getByte(col); }
         @Override public short getShort(int col) { return projection.isProjected(col) ? (short) projection.getValue(row, col) : super.getShort(col); }
         @Override public int getInt(int col) {

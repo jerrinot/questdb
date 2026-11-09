@@ -28,6 +28,7 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.sql.Function;
 import io.questdb.griffin.engine.functions.BinaryFunction;
+import io.questdb.griffin.engine.functions.columns.ColumnFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.griffin.engine.functions.bool.AndFunctionFactory;
 import io.questdb.griffin.engine.functions.bool.BetweenTimestampFunctionFactory;
@@ -45,12 +46,19 @@ import io.questdb.griffin.engine.functions.eq.EqLongFunctionFactory;
 import io.questdb.griffin.engine.functions.constants.*;
 import io.questdb.griffin.engine.functions.NegatableBooleanFunction;
 import io.questdb.griffin.engine.functions.columns.ByteColumn;
+import io.questdb.griffin.engine.functions.columns.DateColumn;
 import io.questdb.griffin.engine.functions.columns.IntColumn;
 import io.questdb.griffin.engine.functions.columns.LongColumn;
 import io.questdb.griffin.engine.functions.columns.ShortColumn;
 import io.questdb.griffin.engine.functions.lt.LtIntFunctionFactory;
 import io.questdb.griffin.engine.functions.lt.LtLongFunctionFactory;
 import io.questdb.griffin.engine.functions.lt.LtDoubleVVFunctionFactory;
+import io.questdb.griffin.engine.functions.math.AddFloatFunctionFactory;
+import io.questdb.griffin.engine.functions.math.RemFloatFunctionFactory;
+import io.questdb.griffin.engine.functions.math.RemDoubleFunctionFactory;
+import io.questdb.griffin.engine.functions.math.SubFloatFunctionFactory;
+import io.questdb.griffin.engine.functions.math.MulFloatFunctionFactory;
+import io.questdb.griffin.engine.functions.math.DivFloatFunctionFactory;
 import io.questdb.griffin.engine.functions.math.AddDoubleFunctionFactory;
 import io.questdb.griffin.engine.functions.math.SubDoubleFunctionFactory;
 import io.questdb.griffin.engine.functions.math.MulDoubleFunctionFactory;
@@ -59,6 +67,12 @@ import io.questdb.griffin.engine.functions.math.AddIntFunctionFactory;
 import io.questdb.griffin.engine.functions.math.AddLongFunctionFactory;
 import io.questdb.griffin.engine.functions.math.MulIntFunctionFactory;
 import io.questdb.griffin.engine.functions.math.MulLongFunctionFactory;
+import io.questdb.griffin.engine.functions.math.NegByteFunctionFactory;
+import io.questdb.griffin.engine.functions.math.NegDoubleFunctionFactory;
+import io.questdb.griffin.engine.functions.math.NegFloatFunctionFactory;
+import io.questdb.griffin.engine.functions.math.NegIntFunctionFactory;
+import io.questdb.griffin.engine.functions.math.NegLongFunctionFactory;
+import io.questdb.griffin.engine.functions.math.NegShortFunctionFactory;
 import io.questdb.griffin.engine.functions.math.SubIntFunctionFactory;
 import io.questdb.griffin.engine.functions.math.SubLongFunctionFactory;
 import io.questdb.griffin.engine.functions.cast.*;
@@ -80,6 +94,7 @@ final class ResolvedInputs {
     private ResolvedVarchar strings;
     private final List<IntSupplier> parameters;
     private final ColumnTypes types;
+    private final CompilerOptions options;
     private final int columnOffset;
     private final ArrayList<Pipeline.Column> columns = new ArrayList<>();
     private final ArrayList<Integer> indexes = new ArrayList<>();
@@ -89,20 +104,27 @@ final class ResolvedInputs {
     }
 
     ResolvedInputs(ColumnTypes types, int columnOffset) {
-        this(types, columnOffset, null);
+        this(types, columnOffset, null, CompilerOptions.DEFAULT);
     }
 
     ResolvedInputs(ColumnTypes types, List<IntSupplier> parameters) {
-        this(types, 0, parameters);
+        this(types, 0, parameters, CompilerOptions.DEFAULT);
     }
 
-    private ResolvedInputs(ColumnTypes types, int columnOffset, List<IntSupplier> parameters) {
+    ResolvedInputs(ColumnTypes types, CompilerOptions options) { this(types, 0, null, options); }
+    ResolvedInputs(ColumnTypes types, int columnOffset, CompilerOptions options) { this(types, columnOffset, null, options); }
+    ResolvedInputs(ColumnTypes types, List<IntSupplier> parameters, CompilerOptions options) { this(types, 0, parameters, options); }
+
+    private ResolvedInputs(ColumnTypes types, int columnOffset, List<IntSupplier> parameters, CompilerOptions options) {
+        this.options = options;
         this.types = types;
         this.columnOffset = columnOffset;
         this.parameters = parameters;
     }
 
     ColumnTypes types() { return types; }
+
+    List<IntSupplier> parameters() { return parameters == null ? List.of() : List.copyOf(parameters); }
 
     ResolvedVarchar strings() {
         return strings == null ? new ResolvedVarchar(types, this) : strings;
@@ -122,9 +144,21 @@ final class ResolvedInputs {
     Pipeline.Column column(Function function, int readType) {
         int index;
         int type;
-        if (function.getClass() == LongColumn.class) {
+        if (function.getClass() == io.questdb.griffin.engine.functions.columns.BooleanColumn.class) {
+            index = ((io.questdb.griffin.engine.functions.columns.BooleanColumn) function).getColumnIndex();
+            type = ColumnType.BOOLEAN;
+        } else if (function.getClass() == io.questdb.griffin.engine.functions.columns.CharColumn.class && readType == ColumnType.CHAR) {
+            index = ((ColumnFunction) function).getColumnIndex();
+            type = ColumnType.CHAR;
+        } else if (function.getClass() == LongColumn.class) {
             index = ((LongColumn) function).getColumnIndex();
             type = ColumnType.LONG;
+        } else if (function.getClass() == DateColumn.class && (readType == ColumnType.DATE || readType == ColumnType.LONG)) {
+            index = ((DateColumn) function).getColumnIndex();
+            type = ColumnType.DATE;
+        } else if (function.getClass() == TimestampColumn.class && (readType == function.getType() || readType == ColumnType.LONG)) {
+            index = ((TimestampColumn) function).getColumnIndex();
+            type = function.getType();
         } else if (function.getClass() == io.questdb.griffin.engine.functions.columns.DoubleColumn.class && readType == ColumnType.DOUBLE) {
             index = ((io.questdb.griffin.engine.functions.columns.DoubleColumn) function).getColumnIndex();
             type = ColumnType.DOUBLE;
@@ -214,6 +248,11 @@ final class ResolvedInputs {
         if (implementation == BooleanConstant.class) {
             return function.getBool(null) ? new Pipeline.All() : new Pipeline.Not(new Pipeline.All());
         }
+        if (implementation == io.questdb.griffin.engine.functions.columns.BooleanColumn.class
+                || function.getType() == ColumnType.BOOLEAN && function instanceof CaseFunction) {
+            var value = booleanValue(function, depth + 1);
+            return value == null ? null : new Pipeline.Compare(Ir.Op.NE, value, new Pipeline.Constant(0));
+        }
         var conjunction = andArguments(function);
         if (conjunction != null) return conjunction(depth, conjunction);
         if (implementation == OrFunctionFactory.MyBooleanFunction.class) {
@@ -232,8 +271,7 @@ final class ResolvedInputs {
             var argument = range.getArg();
             // Bounds already use getTimestamp's unit. DATE and its explicit casts
             // need the same NULL-preserving, wrapped conversion as calendar functions.
-            var value = timestampInput(argument);
-            if (value == null) value = scalar(argument, ColumnType.LONG, depth + 1);
+            var value = timestampInput(argument, depth + 1);
             return value == null ? null : new Pipeline.And(
                     new Pipeline.SqlCompare(Ir.Op.GE, value, new Pipeline.Constant(range.getLowerBound())),
                     new Pipeline.SqlCompare(Ir.Op.GE, new Pipeline.Constant(range.getUpperBound()), value));
@@ -327,7 +365,10 @@ final class ResolvedInputs {
         if (implementation == LtLongFunctionFactory.LtLongFunction.class) { type = ColumnType.LONG; equality = false; }
         else if (implementation == LtIntFunctionFactory.LtIntFunction.class) { type = ColumnType.INT; equality = false; }
         else if (implementation == EqLongFunctionFactory.Func.class) { type = ColumnType.LONG; equality = true; }
+        else if (implementation == io.questdb.griffin.engine.functions.eq.EqBooleanFunctionFactory.Func.class) { type = ColumnType.BOOLEAN; equality = true; }
         else if (implementation == EqIntFunctionFactory.Func.class) { type = ColumnType.INT; equality = true; }
+        else if (implementation == io.questdb.griffin.engine.functions.eq.EqCharCharFunctionFactory.Func.class) { type = ColumnType.CHAR; equality = true; }
+        else if (implementation == io.questdb.griffin.engine.functions.lt.LtCharFunctionFactory.LtCharFunction.class) { type = ColumnType.CHAR; equality = false; }
         else if (implementation == LtDoubleVVFunctionFactory.FuncVV.class) { type = ColumnType.DOUBLE; equality = false; }
         else if (implementation == EqDoubleFunctionFactory.Func.class) { type = ColumnType.DOUBLE; equality = true; }
         else return null;
@@ -338,6 +379,9 @@ final class ResolvedInputs {
         boolean negated = ((NegatableBooleanFunction) function).isNegated();
         Ir.Op op = equality ? (negated ? Ir.Op.NE : Ir.Op.EQ) : (negated ? Ir.Op.GE : Ir.Op.LT);
         if (type == ColumnType.DOUBLE) return new Pipeline.FloatingCompare(op, left, right);
+        if (type == ColumnType.CHAR && !equality)
+            return new Pipeline.And(new Pipeline.And(new Pipeline.IsNotNull(left), new Pipeline.IsNotNull(right)),
+                    new Pipeline.SqlCompare(op, left, right));
         // Numbers.lessThan treats two nulls as equal for the negated (>=) form.
         return new Pipeline.SqlCompare(op, left, right);
     }
@@ -367,11 +411,42 @@ final class ResolvedInputs {
         Class<?> implementation = function.getClass();
         if (implementation == NullConstant.class) {
             if (readType == ColumnType.DOUBLE) return new Pipeline.FloatingConstant(Double.NaN);
+            if (readType == ColumnType.FLOAT) return Pipeline.FloatingConstant.ofFloat(Float.NaN);
             // BYTE/SHORT have no NULL sentinel; NullConstant's narrow getters return zero.
-            return new Pipeline.Constant(readType == ColumnType.BYTE || readType == ColumnType.SHORT ? 0 : Long.MIN_VALUE);
+            return new Pipeline.Constant(readType == ColumnType.BOOLEAN || readType == ColumnType.BYTE || readType == ColumnType.SHORT ? 0 : Long.MIN_VALUE);
         }
         int type = function.getType();
-        if (readType == ColumnType.DOUBLE) return floating(function, depth);
+        if (type == ColumnType.BOOLEAN) {
+            if (readType != ColumnType.BOOLEAN && readType != ColumnType.BYTE && readType != ColumnType.SHORT
+                    && readType != ColumnType.INT && readType != ColumnType.LONG && readType != ColumnType.FLOAT
+                    && readType != ColumnType.DOUBLE && readType != ColumnType.DATE && !ColumnType.isTimestamp(readType)) return null;
+            var value = booleanValue(function, depth);
+            return value == null || readType != ColumnType.FLOAT && readType != ColumnType.DOUBLE
+                    ? value : new Pipeline.ToFloating(value, readType);
+        }
+        if (readType == ColumnType.BOOLEAN) return null;
+        if (type == ColumnType.CHAR) {
+            // Numeric CharFunction getters parse digits and can throw; never reinterpret code points.
+            if (readType != ColumnType.CHAR) return null;
+            if (implementation == io.questdb.griffin.engine.functions.constants.CharConstant.class) {
+                char value = function.getChar(null);
+                return new Pipeline.Constant(value == 0 ? Long.MIN_VALUE : value);
+            }
+            if (options.expressions()) {
+                if (function instanceof CaseFunction conditional) return conditional(conditional.getPicker(), type, depth);
+                if (implementation == CastIntToCharFunctionFactory.Func.class) {
+                    var argument = scalar(((UnaryFunction) function).getArg(), ColumnType.INT, depth + 1);
+                    return argument == null ? null : new Pipeline.IntegerCast(argument, ColumnType.CHAR);
+                }
+            }
+            return column(function, ColumnType.CHAR);
+        }
+        if (readType == ColumnType.CHAR) return null;
+        if (type == ColumnType.DATE || ColumnType.isTimestamp(type)) {
+            var value = temporal(function, depth);
+            return value == null ? null : temporalGetter(value, type, readType);
+        }
+        if (readType == ColumnType.DOUBLE || readType == ColumnType.FLOAT) return floating(function, readType, depth);
         if (strings != null && implementation == io.questdb.griffin.engine.functions.str.LengthVarcharFunctionFactory.Func.class
                 && (readType == ColumnType.INT || readType == ColumnType.LONG)) {
             return strings.length(((UnaryFunction) function).getArg(), depth + 1);
@@ -384,6 +459,13 @@ final class ResolvedInputs {
         if (type == ColumnType.IPv4 && readType == ColumnType.IPv4) {
             if (implementation == io.questdb.griffin.engine.functions.columns.IPv4Column.class)
                 return column(((io.questdb.griffin.engine.functions.columns.IPv4Column) function).getColumnIndex(), type);
+            if (options.expressions()) {
+                if (function instanceof CaseFunction conditional) return conditional(conditional.getPicker(), type, depth);
+                if (implementation == CastIntToIPv4FunctionFactory.Func.class) {
+                    var argument = scalar(((UnaryFunction) function).getArg(), ColumnType.INT, depth + 1);
+                    return argument == null ? null : new Pipeline.IPv4Cast(argument, ColumnType.IPv4);
+                }
+            }
             if (implementation == IPv4Constant.class) {
                 int value = function.getIPv4(null);
                 return new Pipeline.Constant(value == 0 ? Long.MIN_VALUE : value);
@@ -404,7 +486,36 @@ final class ResolvedInputs {
             if (readType == ColumnType.INT && value == Integer.MIN_VALUE) value = Long.MIN_VALUE;
             return new Pipeline.Constant(value);
         }
-        if (Boolean.parseBoolean(System.getProperty("query.codegen.expressions", "true"))) {
+        if (options.expressions()) {
+            if (implementation == NegByteFunctionFactory.Func.class || implementation == NegShortFunctionFactory.Func.class
+                    || implementation == NegIntFunctionFactory.Func.class || implementation == NegLongFunctionFactory.Func.class) {
+                var argument = scalar(((UnaryFunction) function).getArg(), type, depth + 1);
+                return argument == null ? null : new Pipeline.Negate(argument, type);
+            }
+            int floatingSource = floatingIntegerSource(implementation);
+            if (floatingSource != ColumnType.UNDEFINED) {
+                var argument = scalar(((UnaryFunction) function).getArg(), floatingSource, depth + 1);
+                return argument == null ? null : new Pipeline.FloatingIntegerCast(argument, type);
+            }
+            if (implementation == CastLongToByteFunctionFactory.CastLongToByteFunction.class
+                    || implementation == CastLongToShortFunctionFactory.CastLongToShortFunction.class
+                    || implementation == CastLongToIntFunctionFactory.CastLongToIntFunction.class
+                    || implementation == CastIntToByteFunctionFactory.Func.class || implementation == CastIntToShortFunctionFactory.Func.class
+                    || implementation == CastShortToByteFunctionFactory.Func.class) {
+                int sourceType = implementation == CastIntToByteFunctionFactory.Func.class || implementation == CastIntToShortFunctionFactory.Func.class
+                        ? ColumnType.INT : implementation == CastShortToByteFunctionFactory.Func.class ? ColumnType.SHORT : ColumnType.LONG;
+                var argument = scalar(((UnaryFunction) function).getArg(), sourceType, depth + 1);
+                return argument == null ? null : new Pipeline.IntegerCast(argument, type);
+            }
+            if (implementation == CastIPv4ToIntFunctionFactory.CastIPv4ToIntFunction.class) {
+                var argument = scalar(((UnaryFunction) function).getArg(), ColumnType.IPv4, depth + 1);
+                return argument == null ? null : new Pipeline.IPv4Cast(argument, ColumnType.INT);
+            }
+            if (implementation == CastBooleanToByteFunctionFactory.Func.class || implementation == CastBooleanToShortFunctionFactory.Func.class
+                    || implementation == CastBooleanToIntFunctionFactory.Func.class || implementation == CastBooleanToLongFunctionFactory.Func.class)
+                return scalar(((UnaryFunction) function).getArg(), readType, depth + 1);
+            if (implementation == CastDateToLongFunctionFactory.Func.class || implementation == CastTimestampToLongFunctionFactory.Func.class)
+                return scalar(((UnaryFunction) function).getArg(), ColumnType.LONG, depth + 1);
             if (function instanceof CaseFunction conditional) return conditional(conditional.getPicker(), readType, depth);
             if (implementation == SymbolSwitchConstIntFunction.class && parameters != null) {
                 var choice = (SymbolSwitchConstIntFunction) function;
@@ -415,19 +526,23 @@ final class ResolvedInputs {
                         new Pipeline.Constant(io.questdb.std.Numbers.intToLong(choice.getElseValue())));
             }
             if (implementation == io.questdb.griffin.engine.functions.math.DivIntFunctionFactory.Func.class
-                    || implementation == io.questdb.griffin.engine.functions.math.DivLongFunctionFactory.Func.class) {
+                    || implementation == io.questdb.griffin.engine.functions.math.DivLongFunctionFactory.Func.class
+                    || implementation == io.questdb.griffin.engine.functions.math.RemIntFunctionFactory.Func.class
+                    || implementation == io.questdb.griffin.engine.functions.math.RemLongFunctionFactory.Func.class) {
                 var division = (BinaryFunction) function;
                 var left = scalar(division.getLeft(), type, depth + 1);
                 var right = scalar(division.getRight(), type, depth + 1);
-                return left != null && right instanceof Pipeline.Constant constant && constant.value() > 0
-                        ? new Pipeline.Divide(left, right, type) : null;
+                if (left == null || right == null) return null;
+                return implementation == io.questdb.griffin.engine.functions.math.RemIntFunctionFactory.Func.class
+                        || implementation == io.questdb.griffin.engine.functions.math.RemLongFunctionFactory.Func.class
+                        ? new Pipeline.Remainder(left, right, type) : new Pipeline.Divide(left, right, type);
             }
             if (implementation == HourOfDayFunctionFactory.HourOfDayFunction.class
                     || implementation == MinuteOfHourFunctionFactory.MinuteFunction.class
                     || implementation == SecondOfMinuteFunctionFactory.SecondOfMinuteFunc.class
                     || implementation == io.questdb.griffin.engine.functions.date.YearFunctionFactory.YearFunction.class) {
                 var argument = ((UnaryFunction) function).getArg();
-                var input = timestampInput(argument);
+                var input = timestampInput(argument, depth + 1);
                 if (input == null) return null;
                 int timestampType = ColumnType.getTimestampType(argument.getType());
                 if (implementation == io.questdb.griffin.engine.functions.date.YearFunctionFactory.YearFunction.class)
@@ -471,49 +586,132 @@ final class ResolvedInputs {
         this.strings = strings;
     }
 
-    private Pipeline.Scalar timestampInput(Function function) {
-        if (function.getClass() == TimestampColumn.class) {
-            return column(((TimestampColumn) function).getColumnIndex(), function.getType());
-        }
-        long scale = 1_000;
-        if (function.getClass() == CastDateToTimestampFunctionFactory.Func.class) {
-            scale = function.getType() == ColumnType.TIMESTAMP_NANO ? 1_000_000 : 1_000;
-            function = ((UnaryFunction) function).getArg();
-        }
-        if (function.getClass() == io.questdb.griffin.engine.functions.columns.DateColumn.class) {
-            var input = column(((io.questdb.griffin.engine.functions.columns.DateColumn) function).getColumnIndex(), ColumnType.DATE);
-            // DateFunction.getTimestamp and explicit DATE casts preserve NULL and wrap on overflow.
-            return input == null ? null : new Pipeline.Multiply(input, new Pipeline.Constant(scale), ColumnType.LONG);
-        }
+    private Pipeline.Scalar timestampInput(Function function, int depth) {
+        int type = function.getType();
+        // getTimestamp() scales DATE milliseconds, retains each timestamp's precision,
+        // and exposes the nullable integer value for INT/LONG functions.
+        if (type == ColumnType.DATE) return scalar(function, ColumnType.TIMESTAMP, depth);
+        if (ColumnType.isTimestamp(type)) return scalar(function, type, depth);
+        if (type == ColumnType.INT || type == ColumnType.LONG) return scalar(function, ColumnType.LONG, depth);
         return null;
     }
 
-    private Pipeline.Scalar floating(Function function, int depth) {
+    private Pipeline.Scalar booleanValue(Function function, int depth) {
+        if (depth > 64) return null;
+        if (function.getClass() == BooleanConstant.class) return new Pipeline.Constant(function.getBool(null) ? 1 : 0);
+        if (function.getClass() == io.questdb.griffin.engine.functions.columns.BooleanColumn.class)
+            return column(function, ColumnType.BOOLEAN);
+        if (!options.expressions()) return null;
+        if (function instanceof CaseFunction conditional) return conditional(conditional.getPicker(), ColumnType.BOOLEAN, depth);
+        var predicate = predicateNode(function, depth + 1);
+        return predicate == null ? null : new Pipeline.Conditional(predicate, new Pipeline.Constant(1), new Pipeline.Constant(0));
+    }
+
+    private Pipeline.Scalar temporal(Function function, int depth) {
+        Class<?> implementation = function.getClass();
+        int type = function.getType();
+        if (implementation == DateConstant.class || implementation == TimestampConstant.class)
+            return new Pipeline.Constant(function.getLong(null));
+        if (options.expressions()) {
+            if (function instanceof CaseFunction conditional) return conditional(conditional.getPicker(), type, depth);
+            if (implementation == CastBooleanToDateFunctionFactory.Func.class || implementation == CastBooleanToTimestampFunctionFactory.Func.class)
+                return scalar(((UnaryFunction) function).getArg(), type, depth + 1);
+            if (implementation == CastLongToDateFunctionFactory.CastLongToDateFunction.class
+                    || implementation == CastLongToTimestampFunctionFactory.Func.class)
+                return scalar(((UnaryFunction) function).getArg(), ColumnType.LONG, depth + 1);
+            if (implementation == CastTimestampToDateFunctionFactory.Func.class)
+                return scalar(((UnaryFunction) function).getArg(), ColumnType.DATE, depth + 1);
+            if (implementation == CastTimestampToTimestampFunctionFactory.Func.class)
+                return scalar(((UnaryFunction) function).getArg(), type, depth + 1);
+            if (implementation == CastDateToTimestampFunctionFactory.Func.class) {
+                var value = scalar(((UnaryFunction) function).getArg(), ColumnType.DATE, depth + 1);
+                // Explicit DATE casts use fromDate(), which wraps instead of throwing.
+                return value == null ? null : new Pipeline.Multiply(value,
+                        new Pipeline.Constant(ColumnType.isTimestampNano(type) ? 1_000_000 : 1_000), ColumnType.LONG);
+            }
+        }
+        return column(function, type);
+    }
+
+    private static Pipeline.Scalar temporalGetter(Pipeline.Scalar value, int type, int readType) {
+        if (readType == ColumnType.LONG || readType == type) return value;
+        if (readType == ColumnType.FLOAT || readType == ColumnType.DOUBLE)
+            return new Pipeline.ToFloating(value, readType);
+        if (type == ColumnType.DATE && readType == ColumnType.TIMESTAMP)
+            return new Pipeline.Multiply(value, new Pipeline.Constant(1_000), ColumnType.LONG);
+        if (readType == ColumnType.DATE && ColumnType.isTimestamp(type))
+            return new Pipeline.Divide(value, new Pipeline.Constant(ColumnType.isTimestampNano(type) ? 1_000_000 : 1_000), ColumnType.LONG);
+        if (ColumnType.isTimestampNano(type) && readType == ColumnType.TIMESTAMP)
+            return new Pipeline.Divide(value, new Pipeline.Constant(1_000), ColumnType.LONG);
+        // TimestampCaseFunction and micro -> nano casts can throw on overflow.
+        // Keep those on the ordinary path until scalar lowering models that effect.
+        return null;
+    }
+
+    private static int floatingIntegerSource(Class<?> implementation) {
+        if (implementation == CastFloatToByteFunctionFactory.Func.class || implementation == CastFloatToShortFunctionFactory.Func.class
+                || implementation == CastFloatToIntFunctionFactory.Func.class || implementation == CastFloatToLongFunctionFactory.Func.class)
+            return ColumnType.FLOAT;
+        if (implementation == CastDoubleToByteFunctionFactory.Func.class || implementation == CastDoubleToShortFunctionFactory.Func.class
+                || implementation == CastDoubleToIntFunctionFactory.Func.class || implementation == CastDoubleToLongFunctionFactory.Func.class)
+            return ColumnType.DOUBLE;
+        return ColumnType.UNDEFINED;
+    }
+
+    private Pipeline.Scalar floating(Function function, int readType, int depth) {
         int type = function.getType();
         if (type != ColumnType.DOUBLE && type != ColumnType.FLOAT) {
             if (type != ColumnType.BYTE && type != ColumnType.SHORT && type != ColumnType.INT && type != ColumnType.LONG) return null;
             var value = scalar(function, type, depth + 1);
-            return value == null ? null : new Pipeline.ToFloating(value);
+            return value == null ? null : new Pipeline.ToFloating(value, readType);
         }
+        var value = floatingValue(function, depth);
+        return value == null || readType == type ? value : new Pipeline.ToFloating(value, readType);
+    }
+
+    private Pipeline.Scalar floatingValue(Function function, int depth) {
+        int type = function.getType();
         Class<?> implementation = function.getClass();
-        if (implementation == DoubleConstant.class || implementation == FloatConstant.class)
-            return new Pipeline.FloatingConstant(function.getDouble(null));
-        if (Boolean.parseBoolean(System.getProperty("query.codegen.expressions", "true"))) {
-            if (function instanceof CaseFunction conditional) return conditional(conditional.getPicker(), ColumnType.DOUBLE, depth);
+        if (implementation == DoubleConstant.class) return new Pipeline.FloatingConstant(function.getDouble(null));
+        if (implementation == FloatConstant.class) return Pipeline.FloatingConstant.ofFloat(function.getFloat(null));
+        if (options.expressions()) {
+            if (implementation == NegFloatFunctionFactory.Func.class || implementation == NegDoubleFunctionFactory.Func.class) {
+                var argument = scalar(((UnaryFunction) function).getArg(), type, depth + 1);
+                return argument == null ? null : new Pipeline.Negate(argument, type);
+            }
+            if (function instanceof CaseFunction conditional) return conditional(conditional.getPicker(), type, depth);
             if (implementation == CastByteToDoubleFunctionFactory.Func.class || implementation == CastShortToDoubleFunctionFactory.Func.class
                     || implementation == CastIntToDoubleFunctionFactory.Func.class || implementation == CastLongToDoubleFunctionFactory.Func.class
-                    || implementation == CastFloatToDoubleFunctionFactory.Func.class)
+                    || implementation == CastFloatToDoubleFunctionFactory.Func.class || implementation == CastDateToDoubleFunctionFactory.Func.class
+                    || implementation == CastTimestampToDoubleFunctionFactory.Func.class || implementation == CastBooleanToDoubleFunctionFactory.Func.class)
                 return scalar(((UnaryFunction) function).getArg(), ColumnType.DOUBLE, depth + 1);
+            if (implementation == CastByteToFloatFunctionFactory.Func.class || implementation == CastShortToFloatFunctionFactory.Func.class
+                    || implementation == CastIntToFloatFunctionFactory.Func.class || implementation == CastLongToFloatFunctionFactory.Func.class
+                    || implementation == CastDateToFloatFunctionFactory.Func.class || implementation == CastTimestampToFloatFunctionFactory.Func.class
+                    || implementation == CastBooleanToFloatFunctionFactory.Func.class)
+                return scalar(((UnaryFunction) function).getArg(), ColumnType.FLOAT, depth + 1);
+            if (implementation == CastDoubleToFloatFunctionFactory.CastDoubleToFloatFunction.class) {
+                var argument = scalar(((UnaryFunction) function).getArg(), ColumnType.DOUBLE, depth + 1);
+                return argument == null ? null : new Pipeline.FloatCast(argument);
+            }
             if (implementation == AddDoubleFunctionFactory.Func.class || implementation == SubDoubleFunctionFactory.Func.class
-                    || implementation == MulDoubleFunctionFactory.Func.class || implementation == DivDoubleFunctionFactory.Func.class) {
+                    || implementation == MulDoubleFunctionFactory.Func.class || implementation == DivDoubleFunctionFactory.Func.class
+                    || implementation == AddFloatFunctionFactory.Func.class || implementation == SubFloatFunctionFactory.Func.class
+                    || implementation == MulFloatFunctionFactory.Func.class || implementation == DivFloatFunctionFactory.Func.class
+                    || implementation == RemFloatFunctionFactory.Func.class || implementation == RemDoubleFunctionFactory.Func.class) {
                 var binary = (BinaryFunction) function;
-                var left = scalar(binary.getLeft(), ColumnType.DOUBLE, depth + 1);
-                var right = scalar(binary.getRight(), ColumnType.DOUBLE, depth + 1);
+                var left = scalar(binary.getLeft(), type, depth + 1);
+                var right = scalar(binary.getRight(), type, depth + 1);
                 if (left == null || right == null) return null;
-                if (implementation == AddDoubleFunctionFactory.Func.class) return new Pipeline.Add(left, right, ColumnType.DOUBLE);
-                if (implementation == SubDoubleFunctionFactory.Func.class) return new Pipeline.Subtract(left, right, ColumnType.DOUBLE);
-                if (implementation == MulDoubleFunctionFactory.Func.class) return new Pipeline.Multiply(left, right, ColumnType.DOUBLE);
-                return new Pipeline.Divide(left, right);
+                if (implementation == AddDoubleFunctionFactory.Func.class || implementation == AddFloatFunctionFactory.Func.class)
+                    return new Pipeline.Add(left, right, type);
+                if (implementation == SubDoubleFunctionFactory.Func.class || implementation == SubFloatFunctionFactory.Func.class)
+                    return new Pipeline.Subtract(left, right, type);
+                if (implementation == MulDoubleFunctionFactory.Func.class || implementation == MulFloatFunctionFactory.Func.class)
+                    return new Pipeline.Multiply(left, right, type);
+                if (implementation == RemFloatFunctionFactory.Func.class || implementation == RemDoubleFunctionFactory.Func.class)
+                    return new Pipeline.Remainder(left, right, type);
+                return new Pipeline.Divide(left, right, type);
             }
         }
         return column(function, ColumnType.DOUBLE);
@@ -524,25 +722,13 @@ final class ResolvedInputs {
             int count = picker.getBranchCount();
             // Larger switches keep the ordinary constant-time lookup, like large IN sets.
             if (count > 16 || count > 64 - depth) return null;
-            Function selector = picker.getKeyFunction();
-            int type = selector.getType();
-            if (type == ColumnType.SYMBOL ? parameters == null
-                    : type != ColumnType.BYTE && type != ColumnType.SHORT && type != ColumnType.INT && type != ColumnType.LONG) return null;
-            var key = scalar(selector, type, depth + 1);
             var result = scalar(picker.getElseBranch(), readType, depth + count);
-            if (key == null || result == null) return null;
+            if (result == null) return null;
             for (int i = count - 1; i >= 0; i--) {
+                var condition = switchCondition(picker, i, depth + 1);
                 var value = scalar(picker.getValue(i), readType, depth + i + 1);
-                if (value == null) return null;
-                Pipeline.Scalar branchKey;
-                if (type == ColumnType.SYMBOL) {
-                    int index = i;
-                    branchKey = parameter(() -> (int) picker.getKey(index));
-                } else {
-                    long literal = picker.getKey(i);
-                    branchKey = new Pipeline.Constant(type == ColumnType.INT && literal == Integer.MIN_VALUE ? Long.MIN_VALUE : literal);
-                }
-                result = new Pipeline.Conditional(new Pipeline.SqlCompare(Ir.Op.EQ, key, branchKey), value, result);
+                if (condition == null || value == null) return null;
+                result = new Pipeline.Conditional(condition, value, result);
             }
             return result;
         }
@@ -559,5 +745,28 @@ final class ResolvedInputs {
             result = new Pipeline.Conditional(condition, value, result);
         }
         return result;
+    }
+
+    /** Numeric and VARCHAR results use the same resolved switch-key contract. */
+    Pipeline.Predicate switchCondition(CaseFunctionPicker.Integral picker, int index, int depth) {
+        Function selector = picker.getKeyFunction();
+        int type = selector.getType();
+        if (type == ColumnType.SYMBOL ? parameters == null
+                : type != ColumnType.BOOLEAN && type != ColumnType.BYTE && type != ColumnType.SHORT
+                && type != ColumnType.INT && type != ColumnType.LONG && type != ColumnType.FLOAT
+                && type != ColumnType.DOUBLE && type != ColumnType.DATE && type != ColumnType.CHAR && type != ColumnType.IPv4
+                && !ColumnType.isTimestamp(type)) return null;
+        var key = scalar(selector, type, depth);
+        if (key == null) return null;
+        if (type == ColumnType.FLOAT || type == ColumnType.DOUBLE)
+            return new Pipeline.FloatingCompare(Ir.Op.EQ, key, new Pipeline.FloatingConstant(picker.getKey(index), type), true);
+        Pipeline.Scalar branchKey;
+        if (type == ColumnType.SYMBOL) branchKey = parameter(() -> (int) picker.getKey(index));
+        else {
+            long literal = picker.getKey(index);
+            branchKey = new Pipeline.Constant((type == ColumnType.INT && literal == Integer.MIN_VALUE)
+                    || ((type == ColumnType.IPv4 || type == ColumnType.CHAR) && literal == 0) ? Long.MIN_VALUE : literal);
+        }
+        return new Pipeline.SqlCompare(Ir.Op.EQ, key, branchKey);
     }
 }

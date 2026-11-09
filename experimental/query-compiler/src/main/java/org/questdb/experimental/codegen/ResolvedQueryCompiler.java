@@ -56,17 +56,32 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     private final boolean fuseFilter;
 
     public ResolvedQueryCompiler(Backend backend, Path artifacts) {
-        this(backend, artifacts, false);
+        this(backend, artifacts, CompilerOptions.fromSystemProperties());
+    }
+
+    public ResolvedQueryCompiler(Backend backend, Path artifacts, CompilerOptions options) {
+        this(backend, artifacts, options, false);
+    }
+
+    /** Loaded once per engine; query factories retain ownership of all generated code and scratch. */
+    public static ResolvedQueryCompiler forServer(CairoConfiguration configuration) throws IOException {
+        LlvmBackend.checkPlatform();
+        LlvmBackend.liveFunctions(); // Resolve the bridge at startup, before accepting queries.
+        return new ResolvedQueryCompiler(new LlvmBackend(), Path.of(configuration.getDbRoot().toString()).resolveSibling("codegen"));
     }
 
     /** Harness-only alternative; no global setting or automatic admission policy. */
     static ResolvedQueryCompiler filterFusionExperiment(Backend backend, Path artifacts) {
-        return new ResolvedQueryCompiler(backend, artifacts, true);
+        return filterFusionExperiment(backend, artifacts, CompilerOptions.fromSystemProperties());
     }
 
-    private ResolvedQueryCompiler(Backend backend, Path artifacts, boolean fuseFilter) {
+    static ResolvedQueryCompiler filterFusionExperiment(Backend backend, Path artifacts, CompilerOptions options) {
+        return new ResolvedQueryCompiler(backend, artifacts, options, true);
+    }
+
+    private ResolvedQueryCompiler(Backend backend, Path artifacts, CompilerOptions options, boolean fuseFilter) {
         this.fuseFilter = fuseFilter;
-        this.backend = backend;
+        this.backend = backend.withOptions(options);
         this.artifacts = artifacts;
     }
 
@@ -100,7 +115,7 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     }
 
     static long[] profileCounters(Updater updater) {
-        return updater instanceof AggregateSlot slot ? slot.profileCounters() : new long[4];
+        return updater instanceof AggregateSlot slot ? slot.profileCounters() : new long[6];
     }
 
     static long[] filterCounters(Updater updater) {
@@ -122,9 +137,9 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
     @Override
     public io.questdb.griffin.engine.join.CompiledAsOfJoin compileAsOfJoin(
             io.questdb.griffin.engine.join.CompiledAsOfJoin.Input input, Map layout, Function filter,
-            ColumnTypes values, ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue value) {
+            ColumnTypes values, ObjList<GroupByFunction> functions, io.questdb.cairo.map.MapValue value, GroupByAllocator allocator) {
         try {
-            return ResolvedAsOfJoin.compile(input, layout, filter, values, functions, value, backend, artifacts);
+            return ResolvedAsOfJoin.compile(input, layout, filter, values, functions, value, allocator, backend, artifacts);
         } catch (IOException failure) {
             throw CairoException.nonCritical().put("ASOF aggregate compilation failed: ").put(failure.getMessage());
         }
@@ -195,14 +210,14 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
 
     @Override
     public GroupByKernel compile(ColumnTypes inputTypes, ColumnTypes valueTypes, ObjList<GroupByFunction> functions) {
-        return compileBound(ResolvedAggregateKernel.bind(inputTypes, valueTypes, functions));
+        return compileBound(ResolvedAggregateKernel.bind(inputTypes, valueTypes, functions, null, backend.options()));
     }
 
     @Override
     public GroupByKernel compile(ColumnTypes inputs, ColumnTypes values, ObjList<GroupByFunction> functions,
                             int keyColumn, int keyType, Map layout) {
         QuestMapProbe probe = QuestMapProbe.bind(keyColumn, keyType, layout);
-        return compileBound(ResolvedAggregateKernel.bind(inputs, values, functions, probe));
+        return compileBound(ResolvedAggregateKernel.bind(inputs, values, functions, probe, backend.options()));
     }
 
     @Override
@@ -218,16 +233,16 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
         boolean computed = keyFunctions != null && keyFunctions.size() > 0;
         boolean ordered = layout instanceof io.questdb.cairo.map.OrderedMap;
         if (computed) {
-            var key = QuestVarchar.Key.bind(inputs, keyTypes, keyColumns, keyFunctions, layout);
-            if (key != null) return compileBound(ResolvedAggregateKernel.bind(inputs, values, functions, QuestMapProbe.varchar(key)));
+            var key = QuestVarchar.Key.bind(inputs, keyTypes, keyColumns, keyFunctions, layout, backend.options());
+            if (key != null) return compileBound(ResolvedAggregateKernel.bind(inputs, values, functions, QuestMapProbe.varchar(key), backend.options()));
         }
         if (ordered || computed) {
-            var variable = QuestVariableKey.bind(inputs, keyTypes, keyColumns, keyFunctions, layout);
+            var variable = QuestVariableKey.bind(new ResolvedInputs(inputs, backend.options()), inputs, keyTypes, keyColumns, keyFunctions, layout);
             if (variable != null) return compileBound(ResolvedAggregateKernel.bind(inputs, values, functions,
-                    QuestMapProbe.variable(variable)));
-            var key = QuestFixedKey.bind(inputs, keyTypes, keyColumns, keyFunctions, layout);
+                    QuestMapProbe.variable(variable), backend.options()));
+            var key = QuestFixedKey.bind(new ResolvedInputs(inputs, backend.options()), keyTypes, keyColumns, keyFunctions, layout);
             if (key != null) return compileBound(ResolvedAggregateKernel.bind(inputs, values, functions,
-                    QuestMapProbe.fixed(key, ordered ? -1 : keyTypes.getColumnType(0), ordered)));
+                    QuestMapProbe.fixed(key, ordered ? -1 : keyTypes.getColumnType(0), ordered), backend.options()));
         }
         if (computed) return compile(inputs, values, functions, -1, -1, layout);
         return QueryCodeGenerator.super.compile(inputs, values, functions, keyTypes, keyColumns, layout);
@@ -324,9 +339,17 @@ public final class ResolvedQueryCompiler implements QueryCodeGenerator {
 
         @Override
         public void clearExecution() {
+            if (prepared.sharedMaps != null) prepared.sharedMaps.clear();
             if (prepared.dictionaryAggregate != null) prepared.dictionaryAggregate.clear();
             if (prepared.filter != null) prepared.filter.clearExecution();
             if (prepared.probe != null && prepared.probe.fixedKey() != null) prepared.probe.fixedKey().clearExecution();
+        }
+
+        @Override
+        public boolean initSharedMaps(java.util.function.IntFunction<Map> maps) {
+            if (prepared.sharedMaps == null) return false;
+            prepared.sharedMaps.init(maps);
+            return true;
         }
 
         @Override

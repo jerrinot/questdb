@@ -35,19 +35,17 @@ import static org.questdb.experimental.codegen.Ir.*;
 
 /** Effect-aware simplification of the shared structured IR, before any target lowering. */
 public final class IrOptimizer {
-    private static final boolean ENABLED = !Boolean.getBoolean("questdb.codegen.disableOptimization");
-
     private IrOptimizer() { }
 
     record Prepared(Program structured, SsaProgram ssa) {
         String dump() { return ssa == null ? SourceEmitter.dump(structured) : ssa.dump(); }
     }
 
-    static Prepared prepare(Program program) {
-        Program structured = ENABLED ? optimize(program) : program;
-        if (!Boolean.getBoolean("questdb.codegen.ssa")) return new Prepared(structured, null);
+    static Prepared prepare(Program program, CompilerOptions.Process options) {
+        Program structured = options.optimize() ? optimize(program) : program;
+        if (!options.ssa()) return new Prepared(structured, null);
         SsaProgram graph = SsaProgram.lower(structured);
-        if (ENABLED && !Boolean.getBoolean("questdb.codegen.disableSsaOptimization")) SsaOptimizer.optimize(graph);
+        if (options.optimize() && options.optimizeSsa()) SsaOptimizer.optimize(graph);
         SsaOptimizer.verify(graph);
         return new Prepared(structured, graph);
     }
@@ -141,12 +139,27 @@ public final class IrOptimizer {
             case Reallocate r -> new Reallocate(simplify(r.address(), facts), simplify(r.oldBytes(), facts), simplify(r.newBytes(), facts));
             case ToDouble c -> {
                 Expr value = simplify(c.value(), facts);
-                yield value instanceof Literal l ? f64((double) l.value()) : new ToDouble(value);
+                yield value instanceof Literal l ? f64(l.type() == Type.F32 ? Float.intBitsToFloat((int) l.value()) : (double) l.value()) : new ToDouble(value);
+            }
+            case ToInteger c -> {
+                Expr value = simplify(c.value(), facts);
+                yield value instanceof Literal l ? i64(c.bits() == 32 ? (int) floating(l) : (long) floating(l))
+                        : new ToInteger(value, c.bits());
+            }
+            case ToFloat c -> {
+                Expr value = simplify(c.value(), facts);
+                yield value instanceof Literal l ? f32(l.type() == Type.I64
+                        ? (float) l.value() : (float) Double.longBitsToDouble(l.value())) : new ToFloat(value);
+            }
+            case Sqrt c -> {
+                Expr value = simplify(c.value(), facts);
+                yield value instanceof Literal l ? f64(Math.sqrt(Double.longBitsToDouble(l.value()))) : new Sqrt(value);
             }
             case BitCast c -> {
                 Expr value = simplify(c.value(), facts);
-                yield value instanceof Literal l ? new Literal(l.value(), c.type())
-                        : value instanceof BitCast inner ? inner.value() : new BitCast(value);
+                yield value instanceof Literal l ? new Literal(c.type() == Type.F32 || l.type() == Type.F32 ? (int) l.value() : l.value(), c.type())
+                        : value instanceof BitCast inner && c.type() == inner.value().type()
+                        && (c.type() != Type.I64 || inner.type() == Type.F64) ? inner.value() : new BitCast(value, c.type());
             }
             case VectorMask m -> new VectorMask(m.lanes(), simplify(m.predicate(), facts));
             case SelectRows s -> new SelectRows(s.lanes(), simplify(s.mask(), facts), simplify(s.base(), facts), simplify(s.destination(), facts));
@@ -182,16 +195,17 @@ public final class IrOptimizer {
         if (left instanceof Literal a && right instanceof Literal b) {
             long x = a.value(), y = b.value();
             return switch (op) {
-                case FEQ -> bool(Double.longBitsToDouble(x) == Double.longBitsToDouble(y));
-                case FNE -> bool(Double.longBitsToDouble(x) != Double.longBitsToDouble(y));
-                case FLT -> bool(Double.longBitsToDouble(x) < Double.longBitsToDouble(y));
-                case FGE -> bool(Double.longBitsToDouble(x) >= Double.longBitsToDouble(y));
-                case FADD -> f64(Double.longBitsToDouble(x) + Double.longBitsToDouble(y));
-                case FSUB -> f64(Double.longBitsToDouble(x) - Double.longBitsToDouble(y));
-                case FMUL -> f64(Double.longBitsToDouble(x) * Double.longBitsToDouble(y));
-                case FDIV -> f64(Double.longBitsToDouble(x) / Double.longBitsToDouble(y));
+                case FEQ -> bool(floating(a) == floating(b));
+                case FNE -> bool(floating(a) != floating(b));
+                case FLT -> bool(floating(a) < floating(b));
+                case FGE -> bool(floating(a) >= floating(b));
+                case FADD -> a.type() == Type.F32 ? f32((float) floating(a) + (float) floating(b)) : f64(floating(a) + floating(b));
+                case FSUB -> a.type() == Type.F32 ? f32((float) floating(a) - (float) floating(b)) : f64(floating(a) - floating(b));
+                case FMUL -> a.type() == Type.F32 ? f32((float) floating(a) * (float) floating(b)) : f64(floating(a) * floating(b));
+                case FREM -> a.type() == Type.F32 ? f32((float) floating(a) % (float) floating(b)) : f64(floating(a) % floating(b));
+                case FDIV -> a.type() == Type.F32 ? f32((float) floating(a) / (float) floating(b)) : f64(floating(a) / floating(b));
                 case ADD -> i64(x + y); case SUB -> i64(x - y); case MUL -> i64(x * y); case SDIV -> i64(x / y);
-                case AND -> i64(x & y); case XOR -> i64(x ^ y); case USHR -> i64(x >>> y);
+                case AND -> i64(x & y); case OR -> i64(x | y); case XOR -> i64(x ^ y); case USHR -> i64(x >>> y);
                 case EQ -> bool(x == y); case NE -> bool(x != y); case LT -> bool(x < y); case GE -> bool(x >= y);
                 case BOTH -> bool(x != 0 && y != 0); case EITHER -> bool(x != 0 || y != 0);
             };
@@ -209,20 +223,20 @@ public final class IrOptimizer {
             if (comparison != null) return comparison;
         }
         if (right instanceof Literal r) {
-            if (r.value() == 0 && (op == Op.ADD || op == Op.SUB || op == Op.XOR)) return left;
+            if (r.value() == 0 && (op == Op.ADD || op == Op.SUB || op == Op.XOR || op == Op.OR)) return left;
             if ((r.value() == 1 && (op == Op.MUL || op == Op.SDIV)) || (r.value() == -1 && op == Op.AND)) return left;
             if (op == Op.USHR && (r.value() & 63) == 0) return left;
             if (r.value() == 0 && (op == Op.MUL || op == Op.AND) && discardable(left)) return i64(0);
         }
         if (left instanceof Literal l) {
-            if (l.value() == 0 && (op == Op.ADD || op == Op.XOR)) return right;
+            if (l.value() == 0 && (op == Op.ADD || op == Op.XOR || op == Op.OR)) return right;
             if ((l.value() == 1 && op == Op.MUL) || (l.value() == -1 && op == Op.AND)) return right;
             if (l.value() == 0 && (op == Op.MUL || op == Op.AND) && discardable(right)) return i64(0);
         }
         if (left.equals(right) && discardable(left)) {
             switch (op) {
                 case SUB, XOR: return i64(0);
-                case AND, BOTH, EITHER: return left;
+                case AND, OR, BOTH, EITHER: return left;
                 case EQ, GE: return bool(true);
                 case NE, LT: return bool(false);
                 default: break;
@@ -261,6 +275,10 @@ public final class IrOptimizer {
         return switch (op) {case LT -> 1; case EQ -> 2; case NE -> 5; case GE -> 6; default -> -1;};
     }
 
+    private static double floating(Literal value) {
+        return value.type() == Type.F32 ? Float.intBitsToFloat((int) value.value()) : Double.longBitsToDouble(value.value());
+    }
+
     /** Loads may fault and allocations have side effects. Do not duplicate, move or discard either. */
     private static boolean discardable(Expr expression) {
         return switch (expression) {
@@ -279,6 +297,9 @@ public final class IrOptimizer {
             case Allocate ignored -> false;
             case Reallocate ignored -> false;
             case ToDouble c -> discardable(c.value());
+            case ToInteger c -> discardable(c.value());
+            case ToFloat c -> discardable(c.value());
+            case Sqrt c -> discardable(c.value());
             case BitCast c -> discardable(c.value());
             case Binary b -> discardable(b.left()) && discardable(b.right());
             case Offset o -> discardable(o.address()) && discardable(o.bytes());

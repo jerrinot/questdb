@@ -33,13 +33,15 @@ import java.nio.file.Path;
 /** Shared typed IR -> register/label stream -> in-process AsmJit Compiler. No per-query source compiler. */
 public final class AsmJitBackend implements Backend {
     private final boolean dump;
+    private final CompilerOptions.Process lowering;
     public AsmJitBackend(){this(false);}
-    public AsmJitBackend(boolean dump){this.dump=dump;}
+    public AsmJitBackend(boolean dump){this(dump, CompilerOptions.PROCESS);}
+    AsmJitBackend(boolean dump, CompilerOptions.Process lowering) { this.dump = dump; this.lowering = lowering; }
     @Override public String name(){return "asmjit";}
 
     @Override public CompiledKernel compile(Ir.Program program,Path artifacts)throws IOException {
         long started=System.nanoTime();
-        var prepared=IrOptimizer.prepare(PortableVectorLowering.lower(HelperInlining.expand(program), MachineCode::supportsByteMask));
+        var prepared=IrOptimizer.prepare(PortableVectorLowering.lower(HelperInlining.expand(program), MachineCode::supportsByteMask), lowering);
         if(!System.getProperty("os.name").equals("Linux")||!System.getProperty("os.arch").equals("amd64"))
             throw new IOException("The experimental AsmJit lowering currently supports Linux x86-64");
         byte[] wire=prepared.ssa()==null?MachineCode.lower(prepared.structured()):MachineCode.lower(prepared.ssa());

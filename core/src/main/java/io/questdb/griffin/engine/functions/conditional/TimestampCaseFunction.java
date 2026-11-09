@@ -47,6 +47,11 @@ class TimestampCaseFunction extends TimestampFunction implements CaseFunction {
     }
 
     @Override
+    public CaseFunctionPicker getPicker() {
+        return picker;
+    }
+
+    @Override
     public long getTimestamp(Record rec) {
         Function f = picker.pick(rec);
         return timestampDriver.from(f.getTimestamp(rec), ColumnType.getTimestampType(f.getType()));

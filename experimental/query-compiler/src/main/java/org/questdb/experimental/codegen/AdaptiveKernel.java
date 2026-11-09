@@ -33,7 +33,9 @@ import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
-/** Query-local choice at a serial chunk or joined parallel-frame boundary. */
+/** Per-kernel, per-thread choice at a serial chunk or joined parallel-frame boundary.
+ * Learning survives executions that reuse this kernel; independent kernels do not share it.
+ */
 final class AdaptiveKernel implements Kernel {
     static final int EXPLOIT_CALLS = 128;
     static final int SAMPLES = 5;

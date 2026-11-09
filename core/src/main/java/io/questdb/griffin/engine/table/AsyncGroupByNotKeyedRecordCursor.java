@@ -148,7 +148,7 @@ class AsyncGroupByNotKeyedRecordCursor implements NoRandomAccessRecordCursor {
                 continue;
             }
 
-            atom.merge(srcValue, destValue);
+            atom.merge(srcValue, destValue, circuitBreaker);
             destValue.setNew(false);
         }
 

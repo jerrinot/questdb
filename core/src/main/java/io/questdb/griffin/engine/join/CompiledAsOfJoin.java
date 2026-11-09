@@ -47,7 +47,9 @@ public interface CompiledAsOfJoin extends QuietCloseable {
 
     /**
      * Consume a prefix of the borrowed master span. The latest-row map and aggregate state are
-     * the ordinary operator states. Publish progress even on map refusal; only completed master
+     * the ordinary operator states. The cursor must consume the first row through Java updateNew
+     * before entering a compiled region; the aggregate state is never fresh here.
+     * Publish progress even on map refusal; only completed master
      * rows have contributed to the aggregate. No master navigation is allowed during the call.
      * Historical RHS payload frames may be borrowed with recordAt() between native calls;
      * the current TimeFrame must remain unchanged.
@@ -57,7 +59,8 @@ public interface CompiledAsOfJoin extends QuietCloseable {
 
     /**
      * Consume a prefix within the current master and RHS frames, without maps or navigation
-     * across frames. Publish only completed probes. History, indexed/memoized lookup and
+     * across frames. The same Java-first-row precondition as aggregate() applies.
+     * Publish only completed probes. History, indexed/memoized lookup and
      * the work-limit boundary remain with the cursor; an unfinished probe has no aggregate effects.
      */
     default void aggregateLookup(PageFrameMemoryRecord master, TimeFrameCursor slave, MapValue value,

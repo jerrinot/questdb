@@ -136,6 +136,7 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
         this.cairoEngine = cairoEngine;
 
         cairoConfiguration = cairoEngine.getConfiguration();
+        queryCodeGenerator = cairoEngine.getQueryCodeGenerator();
         microClock = cairoConfiguration.getMicrosecondClock();
         nanoClock = cairoConfiguration.getNanosecondClock();
         executionState = cairoEngine.createExecutionState();

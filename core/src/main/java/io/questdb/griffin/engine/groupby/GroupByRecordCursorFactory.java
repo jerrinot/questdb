@@ -96,7 +96,6 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             // sink will be storing record columns to map key
             this.mapSink = RecordSinkFactory.getInstance(configuration, asm, base.getMetadata(), listColumnFilter, keyFunctions, null);
             final GroupByFunctionsUpdater updater = GroupByFunctionsUpdaterFactory.getInstance(asm, groupByFunctions);
-            this.cursor = new GroupByRecordCursor(configuration, recordFunctions, groupByFunctions, updater, keyTypes, valueTypes);
             RecordCursorFactory sourceFactory = base;
             ObjList<RecordCursorFactory> projections = new ObjList<>();
             while (sourceFactory.getClass() == VirtualRecordCursorFactory.class
@@ -104,9 +103,19 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 projections.add(sourceFactory);
                 sourceFactory = sourceFactory.getBaseFactory();
             }
+            // Keep owning functions intact when a compiled consumer replaces result readers.
+            final ObjList<Function> cursorFunctions = sourceFactory instanceof AsyncGroupByRecordCursorFactory
+                    ? new ObjList<>(recordFunctions) : recordFunctions;
+            this.cursor = new GroupByRecordCursor(configuration, cursorFunctions, groupByFunctions, updater, keyTypes, valueTypes);
             if (sourceFactory instanceof AsyncGroupByRecordCursorFactory source) {
                 compiledInput = source.compileMapAggregate(projections, keyTypes, listColumnFilter, keyFunctions,
                         valueTypes, groupByFunctions, cursor.dataMap);
+                if (compiledInput != null) {
+                    final ObjList<Function> outputFunctions = compiledInput.outputFunctions(recordFunctions);
+                    for (int i = 0, n = cursorFunctions.size(); i < n; i++) {
+                        cursorFunctions.setQuick(i, outputFunctions.getQuick(i));
+                    }
+                }
             }
         } catch (Throwable e) {
             Misc.free(this, e);
@@ -212,7 +221,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         if (shared == null) {
             assert sharedRecordFunctions != null;
             assert idx < sharedRecordFunctions.size();
-            shared = new GroupBySharedCursor(cursor, sharedRecordFunctions.getQuick(idx));
+            final ObjList<Function> functions = sharedRecordFunctions.getQuick(idx);
+            shared = new GroupBySharedCursor(cursor, compiledInput != null ? compiledInput.outputFunctions(functions) : functions);
             sharedCursors.extendAndSet(idx, shared);
         }
         shared.of(cursor.dataMap);
@@ -419,7 +429,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         @Override
         public void longTopK(DirectLongLongSortedList list, int columnIndex) {
             buildMapConditionally();
-            Function function = recordFunctions.getQuick(columnIndex);
+            Function function = getFunctions().getQuick(columnIndex);
             if (!compiledLongTopK(dataMap, list, function)) {
                 ((MapRecordCursor) baseCursor).longTopK(list, SortKeyEncoder.longTopKFunction(function));
             }

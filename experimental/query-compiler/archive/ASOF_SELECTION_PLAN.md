@@ -1,5 +1,8 @@
 # Automatic ASOF selection and generated execution
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 2026-11-04. Initial code baseline: `baf86ae4fc`; integrated ASOF baseline: `958842eb46`. Status: bounded unfiltered selection, filter-aware scan/lookup, LLVM forward scan/aggregate fusion and bounded INT/LONG/SYMBOL backward lookup through ordinary SQL are implemented. Broader generated regions, consumer admission and parallel temporal execution remain open. Compilation cost remains a measured property rather than the next optimization milestone. Execute one milestone at a time and revise the next milestone when
 measurements contradict its assumptions.
 
@@ -16,9 +19,9 @@ LLVM; the generated path uses the existing query-code-generator integration.
 ## Code facts at the initial baseline
 
 The selection entry point is
-[`SqlCodeGenerator.generateJoinAsof()`](../../core/src/main/java/io/questdb/griffin/SqlCodeGenerator.java).
+[`SqlCodeGenerator.generateJoinAsof()`](../../../core/src/main/java/io/questdb/griffin/SqlCodeGenerator.java).
 The existing adaptive lookup is
-[`HorizonJoinTimeFrameHelper`](../../core/src/main/java/io/questdb/griffin/engine/table/HorizonJoinTimeFrameHelper.java).
+[`HorizonJoinTimeFrameHelper`](../../../core/src/main/java/io/questdb/griffin/engine/table/HorizonJoinTimeFrameHelper.java).
 
 | Code | Verified behavior | Consequence |
 | --- | --- | --- |

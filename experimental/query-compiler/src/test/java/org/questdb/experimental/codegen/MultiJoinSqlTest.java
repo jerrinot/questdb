@@ -44,6 +44,7 @@ import org.junit.rules.TemporaryFolder;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.Assert.*;
@@ -570,6 +571,53 @@ public class MultiJoinSqlTest {
         }
     }
 
+    @Test public void momentsShareNumericGettersAcrossDependentJoins() throws Exception {
+        engine.execute("create table moment_p as (select cast(x%31 as int) k,cast(x%7 as int) j,"
+                + "cast(x%31 as symbol) s,cast(x%251-125 as byte) b,cast(x%1003-501 as short) h,"
+                + "cast(case when x%13=0 then null else x%31-15 end as int) i,"
+                + "case when x%13=0 then null else x%31-15 end l,"
+                + "cast(case when x%13=0 then null else (x%31-15)*0.25 end as float) f,"
+                + "case when x%13=0 then null else (x%31-15)*0.25 end d from long_sequence(5003))", context);
+        engine.execute("create table moment_a as (select * from moment_p limit 93)", context);
+        engine.execute("create table moment_b as (select cast(x%7 as int) j from long_sequence(21))", context);
+        shardThreshold = 4;
+        for (String column : new String[]{"b", "h", "i", "l", "f", "d"}) {
+            String from = " from moment_p p join moment_a a on p.k=a.k join moment_b b on a.j=b.j";
+            String aggregates = "count(p." + column + "),sum(cast(p." + column + " as float)%cast(a." + column + " as float)),sum(cast(p." + column + " as double)%cast(a." + column + " as double)),nsum(p." + column + ") ,nsum(a." + column + "),weighted_avg(p." + column + ",a." + column + "),var_pop(p." + column + "),"
+                    + "var_samp(a." + column + "),stddev_pop(p." + column + "),"
+                    + "stddev(a." + column + "),var_pop(p." + column + "+a." + column + "),"
+                    + "covar_pop(p." + column + ",a." + column + "),"
+                    + "covar_samp(a." + column + ",p." + column + "),"
+                    + "corr(p."+column+",a."+column+"),regr_slope(p."+column+",a."+column+"),"
+                    + "regr_intercept(p."+column+",a."+column+"),regr_r2(p."+column+",a."+column+")";
+            matches("select " + aggregates + from, "select " + aggregates + from, 0, true, compiler, 11);
+            matches("select p.s," + aggregates + from + " group by p.s",
+                    "select p.s," + aggregates + from + " group by p.s", 1, true, compiler, 11);
+        }
+    }
+
+    @Test public void floatPayloadsPreserveAggregateWidthsAcrossDependentJoins() throws Exception {
+        engine.execute("create table floats as (select cast(x%31-15 as int) k,cast(x%7 as int) j,"
+                + "cast(case when x%13=0 then null else (x%31-15)*0.25 end as float) f "
+                + "from long_sequence(2003))", context);
+        engine.execute("create table float_build as (select cast(x%31-15 as int) k,cast(x%7 as int) j "
+                + "from long_sequence(93))", context);
+        engine.execute("alter table float_build add column f float", context);
+        engine.execute("insert into float_build values (1,2,0.25),(2,3,-0.5)", context);
+        shardThreshold = 4;
+        String from = " from floats p join float_build a on p.k=a.k join floats b on a.j=b.j";
+        String aggregates = "count(p.f),sum(p.f),avg(-p.f),min(a.f),max(a.f),sum(b.f),"
+                + "avg(p.f+b.f),min(a.f/cast(3 as float)),max(b.f*cast(p.k as float)),"
+                + "sum(case when p.k>0 then -b.f else null::float end)";
+        for (long copy : new long[]{0, 128L << 20}) {
+            payloadCopyLimit = copy; buildThreshold = copy == 0 ? Long.MAX_VALUE : 1;
+            matches("select " + aggregates + from, 0, true, compiler);
+            matches("select p.j," + aggregates + from + " group by p.j", 1, true, compiler);
+            matches("select p.f,count(),sum(b.f),avg(a.f)" + from + " group by p.f", 1, true, compiler);
+            matches("select p.j,-b.f f,count(),sum(p.f)" + from + " group by p.j,f", 2, true, compiler);
+        }
+    }
+
     @Test public void temporalPayloadsPreserveUnitsNullsAndColumnTops() throws Exception {
         shardThreshold = 4;
         for (String type : new String[]{"date", "timestamp", "timestamp_ns"}) {
@@ -589,6 +637,297 @@ public class MultiJoinSqlTest {
                 matches("select count(),sum(p.v),sum(a.v),min(b.v),max(b.v)" + from, 0, true, compiler);
                 matches("select a.t,p.j,count(),sum(p.v),sum(a.v),min(b.v),max(b.v)" + from
                         + " group by a.t,p.j", 2, true, compiler);
+                matches("select count(a.t),min(a.t),max(a.t),min(b.t),max(case when p.v>0 then b.t end)" + from,
+                        0, true, compiler);
+                matches("select p.j,count(a.t),min(a.t),max(a.t),min(b.t),max(b.t),"
+                        + "min(a.t::double),max(b.t::float),avg(a.t)" + from
+                        + " group by p.j", 1, true, compiler);
+            }
+        }
+    }
+
+    @Test public void integerDivisionAndRemainderComposeAcrossDependentTypedJoins() throws Exception {
+        engine.execute("create table div_parent as (select cast(x%64 as int) k,(x%64-32)*4294967297 l,"
+                +"cast('K'||x%64 as symbol) s,case when x%13=0 then null else x%127-64 end v "
+                +"from long_sequence(129))",context);
+        engine.execute("create table div_child as (select * from div_parent)",context);
+        for(long copy:new long[]{0,128L<<20}) {
+            payloadCopyLimit=copy;buildThreshold=copy==0?Long.MAX_VALUE:1;
+            for(String key:new String[]{"k","l","s"}) {
+                String from=" from div_parent p join div_parent a on p."+key+"=a."+key
+                        +" join div_child b on a."+key+"=b."+key;
+                String aggregates="count(),count(a.v/b.v),min(a.v/(b.k-1)),max(b.k%(p.k-1)),"
+                        +"sum(case p.s when 'K1' then b.v%(-3) end)";
+                matches("select "+aggregates+from,0,true,compiler);
+                matches("select a.v%b.v r,p.k,"+aggregates+from+" group by r,p.k",2,true,compiler);
+            }
+        }
+    }
+
+    @Test public void narrowedPayloadsAndKeysComposeAcrossDependentJoins() throws Exception {
+        engine.execute("create table narrow_parent as (select cast(x%64 as int) k,(x%64-32)*4294967297 l,"
+                + "cast('K'||x%64 as symbol) s,case when x%13=0 then null else (x%127-64)*4294967297 end v "
+                + "from long_sequence(129))",context);
+        engine.execute("create table narrow_child as (select * from narrow_parent)",context);
+        for (long copy : new long[]{0,128L<<20}) {
+            payloadCopyLimit=copy; buildThreshold=copy==0?Long.MAX_VALUE:1;
+            for (String key : new String[]{"k","l","s"}) {
+                String from=" from narrow_parent p join narrow_parent a on p."+key+"=a."+key
+                        +" join narrow_child b on a."+key+"=b."+key;
+                String aggregates="count(a.v::byte),min(a.v::byte),max(b.v::short),bit_and(a.v::byte),bit_or(b.v::short),"
+                        +"count(a.v::int),bit_and(b.v::int),count(cast(a.v::int as long)),"
+                        +"bit_and(cast(case p.s when 'K1' then b.v end as byte)),bit_and(cast(a.v::float as byte)),"
+                        +"bit_or(cast(b.v::double as short)),count(cast(a.v::float as int)),max(cast(b.v::double as long))";
+                matches("select "+aggregates+from,0,true,compiler);
+                matches("select b.v::byte address,p.k,"+aggregates+from+" group by address,p.k",2,true,compiler);
+            }
+        }
+    }
+
+    @Test public void bitwisePayloadsComposeAcrossDependentTypedJoins() throws Exception {
+        engine.execute("create table bit_parent as (select cast(x%64 as int) k,(x%64-32)*4294967297 l,"
+                + "cast('K'||x%64 as symbol) s,cast(x%127+1 as byte) b,cast(x%32767+1 as short) h,"
+                + "cast(case when x%13=0 then null else x%65535+1 end as int) i,"
+                + "case when x%13=0 then null else x%65535+1 end n,cast('"+"x".repeat(257)+"'||x%7 as varchar) label from long_sequence(129))",context);
+        engine.execute("create table bit_child as (select * from bit_parent)",context);
+        for (long copy : new long[]{0,128L<<20}) {
+            payloadCopyLimit=copy; buildThreshold=copy==0?Long.MAX_VALUE:1;
+            for (String key : new String[]{"k","l","s"}) {
+                String from=" from bit_parent p join bit_parent a on p."+key+"=a."+key
+                        +" join bit_child b on a."+key+"=b."+key;
+                String aggregates="count(),bit_and(a.b),bit_or(b.b),bit_xor(b.b),bit_and(a.h),bit_or(b.h),bit_xor(b.h),"
+                        +"bit_and(a.i),bit_or(b.i),bit_xor(b.i),bit_and(a.n),bit_or(b.n),bit_xor(b.n),"
+                        +"bit_and(case p.s when 'K1' then b.b else cast(127 as byte) end)";
+                matches("select "+aggregates+from,0,true,compiler);
+                matches("select p.k,"+aggregates+from+" group by p.k",1,true,compiler);
+                matches("select b.label,p.k,"+aggregates+from+" group by b.label,p.k",2,true,compiler);
+                matches("select "+aggregates+from+" where p.b>b.b and p.b<b.b",0,true,compiler);
+            }
+        }
+    }
+
+    @Test public void distinctAggregatesComposeAcrossTypedJoinsAndSharedWorkerStates() throws Exception {
+        for (String name : new String[]{"dp", "da", "db"}) {
+            int rows = name.equals("dp") ? 8195 : name.equals("da") ? 93 : 51;
+            engine.execute("create table " + name + " as (select cast(x%31 as int) k,(x%31-15)*4294967297 l,"
+                    + "cast('K'||(x%31) as symbol) s,cast((x%31-15)*0.25 as float) f,"
+                    + "case when x%13=0 then null else x end v,cast(x%5 as int) g,"
+                    + "cast('V'||(x%7) as varchar) label,cast(cast(case when x%17=0 then null else x end as int) as ipv4) ip "
+                    + "from long_sequence(" + rows + "))", context);
+        }
+        shardThreshold = 4;
+        for (long copy : new long[]{0, 128L << 20}) {
+            payloadCopyLimit = copy;
+            buildThreshold = copy == 0 ? Long.MAX_VALUE : 1;
+            for (String key : new String[]{"k", "l", "s", "f"}) {
+                String from = " from dp p join da a on p." + key + "=a." + key
+                        + " join db b on a." + key + "=b." + key;
+                String aggregates = "count(),count_distinct(p.v),count_distinct(a.k),count_distinct(b.s),"
+                        + "count_distinct(b.ip),count_distinct(case p.s when 'K1' then a.v end),"
+                        + "sum(p.v),min(a.v),max(b.v),avg(p.v),bit_and(cast(b.v as byte))";
+                matches("select " + aggregates + from, 0, true, compiler);
+                matches("select p.g," + aggregates + from + " where b.v<40 group by p.g", 1, true, compiler);
+                matches("select b.label,p.g," + aggregates + from + " group by b.label,p.g", 2, true, compiler);
+                matches("select " + aggregates + from + " where p.v>b.v and p.v<b.v", 0, true, compiler);
+            }
+        }
+    }
+
+    @Test public void distinctJoinSharesSetsAcrossColumnTopFallbackAndDictionaryReopen() throws Exception {
+        engine.execute("create table mixed_distinct as (select timestamp_sequence(0,1000000) ts,"
+                + "cast(x%3 as int) g,x v from long_sequence(1024)) timestamp(ts) partition by day", context);
+        engine.execute("alter table mixed_distinct add column k symbol", context);
+        engine.execute("insert into mixed_distinct select timestamp_sequence(2000000000,1000000),"
+                + "cast(x%3 as int),x+1024,cast('K'||(x%17) as symbol) from long_sequence(4099)", context);
+        engine.execute("create table distinct_symbols as (select cast(case when x%11=0 then null else 'K'||(x%17) end as symbol) k,"
+                + "cast('V'||(x%7) as symbol) s,x v from long_sequence(51))", context);
+        String sql = "select p.g,count(),count_distinct(p.v),count_distinct(b.s),sum(b.v) "
+                + "from mixed_distinct p join distinct_symbols b on p.k=b.k group by p.g";
+        context.setQueryCodeGenerator(compiler);
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            RecordCursorFactory base = factory;
+            while (!(base instanceof AsyncHashJoinGroupByRecordCursorFactory)) base = base.getBaseFactory();
+            var atom = ((AsyncHashJoinGroupByRecordCursorFactory) base).getAtom();
+            for (int reopen = 0; reopen < 3; reopen++) {
+                context.setQueryCodeGenerator(null);
+                try (var reference = Demo.compileSql(engine, context, sql, true)) {
+                    var expected = Demo.readSql(reference, context, 1);
+                    long before = atom.getCompiledJoinNativeRows();
+                    assertEquals(expected, Demo.readSql(factory, context, 1));
+                    long generated = atom.getCompiledJoinNativeRows() - before;
+                    assertTrue("Column-top prefix must fall back, with generated rows after it", generated > 0 && generated < 5123);
+                }
+                engine.execute("truncate table distinct_symbols", context);
+                engine.execute("insert into distinct_symbols select cast(case when x%11=0 then null else 'K'||((51-x)%17) end as symbol),"
+                        + "cast('replacement-'||(x%13) as symbol),x*3 from long_sequence(51)", context);
+            }
+        } finally { context.setQueryCodeGenerator(null); }
+    }
+
+    @Test public void distinctJoinStateTriggersShardingAndReopensAfterMemoryLimit() throws Exception {
+        engine.execute("create table distinct_memory as (select cast(x%17-8 as int) k,cast(x%2 as int) g,x v "
+                + "from long_sequence(16385))", context);
+        shardThreshold = 64;
+        String sql = "select p.g,count_distinct(p.v),count_distinct(a.v),sum(p.v) from distinct_memory p "
+                + "join a a on p.k=a.k group by p.g";
+        List<CompiledGroupBy.ResultRow> expected;
+        try (var reference = Demo.compileSql(engine, context, sql, true)) {
+            expected = Demo.readSql(reference, context, 1);
+        }
+        for (var generator : new QueryCodeGenerator[]{null, compiler}) {
+            context.setQueryCodeGenerator(generator);
+            try (var factory = Demo.compileSql(engine, context, sql, true);
+                 var tracker = new io.questdb.test.tools.LimitedMemoryTracker(0)) {
+                RecordCursorFactory base = factory;
+                while (!(base instanceof AsyncHashJoinGroupByRecordCursorFactory)) base = base.getBaseFactory();
+                var atom = ((AsyncHashJoinGroupByRecordCursorFactory) base).getAtom();
+                var owner = factory instanceof io.questdb.griffin.engine.QueryProgress ? factory.getBaseFactory() : factory;
+                context.setMemoryTracker(tracker);
+                boolean failed = false;
+                for (long limit = 4096; limit <= (4 << 20) && !failed; limit *= 2) {
+                    tracker.setLimit(limit);
+                    long before = atom.getCompiledJoinNativeRows();
+                    try { Demo.readSql(owner, context, 1); }
+                    catch (CairoException failure) {
+                        assertTrue(failure.isOutOfMemory());
+                        failed = generator == null || atom.getCompiledJoinNativeRows() > before;
+                    }
+                    assertEquals(0, tracker.getUsed());
+                }
+                assertTrue("Exercise tracked state allocation failure", failed);
+                tracker.setLimit(0);
+                for (int reopen = 0; reopen < 2; reopen++) {
+                    try (var cursor = owner.getCursor(context)) {
+                        assertTrue(cursor.hasNext());
+                        assertTrue("Distinct cardinality must drive sharding with only two groups", atom.isSharded());
+                    }
+                    assertEquals(0, tracker.getUsed());
+                    assertEquals(expected, Demo.readSql(owner, context, 1));
+                    assertEquals(0, tracker.getUsed());
+                }
+            } finally { context.setMemoryTracker(null); context.setQueryCodeGenerator(null); }
+        }
+    }
+
+    @Test public void primitiveKeysComposeThroughDependentJoinsAndMixedAggregates() throws Exception {
+        String[] expressions = {
+                "x%2=0", "cast(x%17-8 as byte)", "cast(x%17-8 as short)",
+                "cast(cast(x%17+65520 as int) as char)",
+                "cast(case when x%17=0 then null else (x%17-8)*0.25 end as float)",
+                "case when x%17=0 then null else (x%17-8)*0.25 end",
+                "cast(cast(case when x%17=0 then null else x%17-2147483647 end as int) as ipv4)"
+        };
+        for (int type = 0; type < expressions.length; type++) {
+            String prefix = "primitive" + type;
+            for (String suffix : new String[]{"p", "a", "b"}) {
+                int rows = suffix.equals("p") ? 4099 : suffix.equals("a") ? 35 : 9;
+                engine.execute("create table " + prefix + suffix + " as (select " + expressions[type]
+                        + " k,cast('K'||(x%3) as symbol) s,x v,cast(x%5 as int) g from long_sequence(" + rows + "))", context);
+            }
+            for (long copy : new long[]{0, 128L << 20}) {
+                payloadCopyLimit = copy;
+                buildThreshold = copy == 0 ? Long.MAX_VALUE : 1;
+                for (boolean composite : new boolean[]{false, true}) {
+                    String from = " from " + prefix + "p p join " + prefix + "a a on p.k=a.k"
+                            + (composite ? " and p.s=a.s" : "") + " join " + prefix + "b b on a.k=b.k"
+                            + (composite ? " and a.s=b.s" : "") + " where b.v<7";
+                    String aggregates = "count(),sum(p.v),min(a.v),max(b.v),avg(p.v),bit_and(cast(b.v as byte))"
+                            + (type == 3 ? ",count(a.k),min(a.k),max(b.k),min(case p.s when 'K1' then b.k end)" : "");
+                    matches("select " + aggregates + from, 0, true, compiler);
+                    matches("select p.g," + aggregates + from + " group by p.g", 1, true, compiler);
+                }
+            }
+        }
+    }
+
+    @Test public void primitiveJoinKeysPreserveRawBitsTopsAndDecodedPayloads() throws Exception {
+        int[] floats = {0, 0x80000000, 0x7fc00000, 0x7fc00001, 0xffc00001,
+                0x7f800000, 0xff800000, 1, 0x80000001, 0x7f7fffff, 0xff7fffff};
+        long[] doubles = {0, Long.MIN_VALUE, 0x7ff8000000000000L, 0x7ff8000000000001L,
+                0xfff8000000000001L, 0x7ff0000000000000L, 0xfff0000000000000L,
+                1, Long.MIN_VALUE + 1, 0x7fefffffffffffffL, 0xffefffffffffffffL};
+        int[] addresses = {0, Integer.MIN_VALUE, Integer.MAX_VALUE, -1, 1, -2};
+        char[] chars = {0, 1, 32767, 32768, 65535};
+        for (String table : new String[]{"raw_p", "raw_a", "raw_b"}) {
+            engine.execute("create table " + table + " (ts timestamp,f float,d double,ip ipv4,c char,v long) "
+                    + "timestamp(ts) partition by day", context);
+            int rows = table.equals("raw_p") ? 4099 : table.equals("raw_a") ? 23 : 13;
+            try (var writer = engine.getWriter(engine.verifyTableName(table), "test")) {
+                for (int i = 0; i < rows; i++) {
+                    var row = writer.newRow(i);
+                    row.putFloat(1, Float.intBitsToFloat(floats[i % floats.length]));
+                    row.putDouble(2, Double.longBitsToDouble(doubles[i % doubles.length]));
+                    row.putIPv4(3, addresses[i % addresses.length]);
+                    row.putChar(4, chars[i % chars.length]);
+                    row.putLong(5, i);
+                    row.append();
+                }
+                writer.commit();
+            }
+        }
+        for (long copy : new long[]{0, 128L << 20}) {
+            payloadCopyLimit = copy;
+            buildThreshold = copy == 0 ? Long.MAX_VALUE : 1;
+            for (String key : new String[]{"f", "d", "ip", "c"}) {
+                String from = " from raw_p p join raw_a a on p." + key + "=a." + key
+                        + " join raw_b b on a." + key + "=b." + key + " where b.v<9";
+                matches("select count(),sum(p.v),min(a.v),max(b.v),avg(p.v),count(a.c),min(a.c),max(b.c)" + from, 0, true, compiler);
+            }
+        }
+        for (String table : new String[]{"raw_p", "raw_a", "raw_b"}) {
+            engine.execute("alter table " + table + " add column late float", context);
+        }
+        String tops = "select count(),sum(p.v),min(a.v),max(b.v) from raw_p p "
+                + "join raw_a a on p.f=a.f join raw_b b on a.late=b.late where b.v<9";
+        for (long copy : new long[]{0, 128L << 20}) {
+            payloadCopyLimit = copy;
+            matches(tops, 0, true, compiler);
+        }
+        engine.execute("alter table raw_a convert partition to parquet where ts<'1970-01-02'", context);
+        payloadCopyLimit = 128L << 20;
+        matches(tops, 0, true, compiler);
+        matches("select a.c,count(),count(a.c),min(p.c),max(a.c),sum(p.v) from raw_p p join raw_a a on p.f=a.f group by a.c",
+                1, true, compiler);
+    }
+
+    @Test public void ipv4PayloadsPreserveUnsignedExtremaAndComputedGroups() throws Exception {
+        engine.execute("create table ip_parent as (select cast(x%64 as int) k,(x%64-32)*4294967297 l,"
+                + "cast('K'||x%64 as symbol) s,cast(case when x%13=0 then null when x%5=0 then -1 "
+                + "when x%5=1 then -2147483647 else x%991 end as int)::ipv4 ip from long_sequence(128))",context);
+        engine.execute("create table ip_child as (select * from ip_parent)",context);
+        engine.execute("insert into ip_child values (1,1,'K1','128.0.0.0')",context);
+        for (long copy : new long[]{0,128L<<20}) {
+            payloadCopyLimit=copy; buildThreshold=copy==0?Long.MAX_VALUE:1;
+            for (String key : new String[]{"k","l","s"}) {
+                String from=" from ip_parent p join ip_parent a on p."+key+"=a."+key
+                        +" join ip_child b on a."+key+"=b."+key;
+                String aggregates="count(a.ip),min(a.ip),max(b.ip),min(b.ip-1),max(b.ip-1),count(cast(a.ip as int)),"
+                        +"min(case p.s when 'K1' then b.ip end)";
+                matches("select "+aggregates+from,0,true,compiler);
+                matches("select p.k,"+aggregates+from+" group by p.k",1,true,compiler);
+                matches("select b.ip-1 address,p.k,"+aggregates+from+" group by address,p.k",2,true,compiler);
+            }
+        }
+    }
+
+    @Test public void booleanPayloadsComposeAcrossDependentTypedJoins() throws Exception {
+        engine.execute("create table bp as (select cast(x%64 as int) k,(x%64-32)*4294967297 l,"
+                + "cast('K'||x%64 as symbol) s,cast(x%4 as int) j,x%3=0 flag from long_sequence(2003))",context);
+        engine.execute("create table ba as (select cast(x%64 as int) k,(x%64-32)*4294967297 l,"
+                + "cast('K'||x%64 as symbol) s,x%5=0 flag,false late from long_sequence(128))",context);
+        engine.execute("create table bb as (select cast(x%64 as int) k,(x%64-32)*4294967297 l,"
+                + "cast('K'||x%64 as symbol) s,x%7=0 flag from long_sequence(129))",context);
+        for (long copy : new long[]{0,128L<<20}) {
+            payloadCopyLimit=copy; buildThreshold=copy==0 ? Long.MAX_VALUE : 1;
+            for (String key : new String[]{"k","l","s"}) {
+                String from = " from bp p join ba a on p." + key + "=a." + key
+                        + " join bb b on a." + key + "=b." + key;
+                String aggregates = "count(),bool_and(a.flag),bool_or(b.flag),bool_and(p.flag or a.flag),"
+                        + "avg(a.flag),min(b.flag),max(a.flag),sum(cast(b.flag as long)),bool_or(a.late),"
+                        + "bool_or(case p.s when 'K1' then b.flag end)";
+                matches("select " + aggregates + from,0,true,compiler);
+                matches("select p.j," + aggregates + from + " group by p.j",1,true,compiler);
+                matches("select b.flag," + aggregates + from + " group by b.flag",1,true,compiler);
             }
         }
     }
@@ -704,7 +1043,8 @@ public class MultiJoinSqlTest {
         matches("select count(),sum(p.v) from p join a on p.k=a.k join b on a.k=b.k", 0, true, compiler);
         matches("select count(),sum(p.v) from p join a on p.k=a.k and p.v=a.v join b on p.j=b.k", 0, true, compiler);
         matches("select count(),sum(p.v) from p left join a on p.k=a.k join b on p.j=b.k", 0, false, compiler);
-        matches("select count_distinct(p.v) from p join a on p.k=a.k join b on p.j=b.k where a.v>20", 0, false, compiler);
+        matches("select count_distinct(p.v) from p join a on p.k=a.k join b on p.j=b.k where a.v>20", 0, true, compiler);
+        matches("select count_distinct(p.v::varchar) from p join a on p.k=a.k join b on p.j=b.k where a.v>20", 0, false, compiler);
     }
 
     @Test public void compositeGroupsShareTheExistingKeyEncoding() throws Exception {
@@ -919,7 +1259,7 @@ public class MultiJoinSqlTest {
     @Test public void nativeFailureDrainsAndReopensWithChangedAndEmptyBuilds() throws Exception {
         buildThreshold = 1;
         AtomicBoolean fail = new AtomicBoolean(true);
-        String sql = "select count(),sum(p.v),sum(b.v) from p join a on p.k=a.k join b on p.j=b.k";
+        String sql = "select count(),count_distinct(p.v),count_distinct(b.v),sum(p.v),sum(b.v) from p join a on p.k=a.k join b on p.j=b.k";
         context.setQueryCodeGenerator(intercepted(false, fail));
         try (var factory = Demo.compileSql(engine, context, sql, true)) {
             assertTrue(plan(factory).contains("compiledJoinPipeline"));
@@ -1030,6 +1370,10 @@ public class MultiJoinSqlTest {
     }
 
     private void matches(String sql, String controlSql, int keyCount, boolean compiled, QueryCodeGenerator generator) throws Exception {
+        matches(sql, controlSql, keyCount, compiled, generator, 0);
+    }
+
+    private void matches(String sql, String controlSql, int keyCount, boolean compiled, QueryCodeGenerator generator, int statisticalColumns) throws Exception {
         context.setQueryCodeGenerator(null);
         try (var baseline = Demo.compileSql(engine, context, controlSql, true)) {
             var expected = Demo.readSql(baseline, context, keyCount);
@@ -1039,8 +1383,11 @@ public class MultiJoinSqlTest {
                 assertEquals(sql + " / " + plan, compiled, plan.contains("compiledJoinPipeline"));
                 if (compiled && sql.indexOf(" join ") != sql.lastIndexOf(" join ")) assertTrue(plan, plan.contains("buildCount:"));
                 try (var ignored = candidate.getCursor(context)) { }
-                assertEquals(sql, expected, Demo.readSql(candidate, context, keyCount));
-                assertEquals(sql, expected, Demo.readSql(candidate, context, keyCount));
+                for (int repeat = 0; repeat < 2; repeat++) {
+                    var actual = Demo.readSql(candidate, context, keyCount);
+                    if (statisticalColumns == 0) assertEquals(sql, expected, actual);
+                    else AggregateTypeTest.assertApproximateTail(sql, expected, actual, statisticalColumns);
+                }
                 if (compiled && generator == compiler) {
                     RecordCursorFactory base = candidate;
                     while (!(base instanceof AsyncHashJoinGroupByRecordCursorFactory)) base = base.getBaseFactory();

@@ -1500,6 +1500,8 @@ public interface CairoConfiguration {
 
     boolean isSqlLatestByJitEnabled();
 
+    boolean isSqlLlvmEnabled();
+
     boolean isSqlOrderBySortEnabled();
 
     boolean isSqlParallelFilterEnabled();

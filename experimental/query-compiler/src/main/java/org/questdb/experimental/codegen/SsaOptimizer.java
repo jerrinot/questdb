@@ -149,7 +149,7 @@ final class SsaOptimizer {
             if (s instanceof Define d && effect != Effect.CALL) {
                 Expr value = IrOptimizer.simplify(d.value(), Map.of());
                 // Canonicalize commutative values; literals on the right also enable immediates.
-                if (value instanceof Binary x && switch (x.op()) { case ADD, MUL, AND, XOR, EQ, NE -> true; default -> false; }) {
+                if (value instanceof Binary x && switch (x.op()) { case ADD, MUL, AND, OR, XOR, EQ, NE -> true; default -> false; }) {
                     if (x.left() instanceof Literal && x.right() instanceof Var
                             || x.left() instanceof Var a && x.right() instanceof Var c && a.id() > c.id())
                         value = new Binary(x.op(), x.right(), x.left());

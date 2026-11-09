@@ -231,12 +231,10 @@ final class QuestPartitions {
             Var key = probe.varchar() || probe.orderedNative() ? row : loop.let(new Load(probe.keyBytes() == 4 ? MemoryType.I32 : MemoryType.I64, row));
             Var inserted = loop.let(bool(false));
             Var destination = probe.find(loop, key, index, i64(0), null, (init, value) -> {
-                if (initialization == null) QuestMapMutation.copy(init, at(row, keyBytes), value, valueBytes);
-                else initialization.initialize(init, value);
+                adopt(init, at(row, keyBytes), value, valueBytes, updates, initialization);
                 init.assign(inserted, bool(true));
             });
-            if (initialization != null) updates.merge(loop, at(row, keyBytes), destination);
-            else loop.when(eq(inserted, bool(false)), existing -> updates.merge(existing, at(row, keyBytes), destination));
+            loop.when(eq(inserted, bool(false)), existing -> updates.merge(existing, at(row, keyBytes), destination));
             loop.assign(index, add(index, i64(1)));
         });
         b.exit(0);
@@ -303,10 +301,21 @@ final class QuestPartitions {
         return new Program(b.block());
     }
 
+    private static void adopt(Builder b, Expr source, Expr destination, long bytes,
+                              AggregateUpdates updates, AggregateUpdates initialization) {
+        QuestMapMutation.copy(b, source, destination, bytes);
+        // Delayed result columns are populated by replay, after ranking. The active
+        // aggregates adopt their complete first partial state without arithmetic.
+        if (initialization != null) for (var update : initialization.updates()) {
+            if (!updates.updates().contains(update)) update.initialize(b, destination);
+        }
+    }
+
     /** Stage source keys and hashes before dependent destination probes. */
     static Program mergeStaged(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, int batchRows,
                                AggregateUpdates initialization, boolean inputs) {
         Builder b = new Builder();
+        var parameters = inputs ? updates.loadMapParameters(b) : java.util.List.<Expr>of();
         int window = Math.max(1, batchRows);
         Var index = b.let(load(STATE));
         Var batches = b.let(i64(0));
@@ -355,13 +364,11 @@ final class QuestPartitions {
                 Var destination = probe.finishOrdered(consume, key, consume.let(new Load(MemoryType.ADDRESS, at(scratch, 16))),
                         consume.let(load(at(scratch, 24))), consume.let(load(at(scratch, 32))), index, (init, value) -> {
                             if (inputs) updates.initialize(init, value);
-                            else if (initialization == null) QuestMapMutation.copy(init, source, value, valueBytes);
-                            else initialization.initialize(init, value);
+                            else adopt(init, source, value, valueBytes, updates, initialization);
                             init.assign(inserted, bool(true));
                         });
-                if (inputs) updates.emit(consume, QuestPartitionInputs.loadFrame(consume, updates, source,
-                        QuestPartitionInputs.numericBytes(updates)), destination, nil());
-                else if (initialization != null) updates.merge(consume, source, destination);
+                if (inputs) updates.emitInitialized(consume, QuestPartitionInputs.loadFrame(consume, updates, source,
+                        QuestPartitionInputs.numericBytes(updates), parameters), destination, nil(), inserted);
                 else consume.when(eq(inserted, bool(false)), existing -> updates.merge(existing, source, destination));
                 consume.assign(scratch, at(scratch, probe.prefetchRowBytes()));
                 consume.assign(index, add(index, i64(1)));

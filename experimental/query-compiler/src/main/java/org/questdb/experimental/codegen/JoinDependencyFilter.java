@@ -62,16 +62,16 @@ final class JoinDependencyFilter {
              DirectLongList keys = new DirectLongList(0, MemoryTag.NATIVE_JIT, true)) {
             keys.setMemoryTracker(tracker);
             keys.ensureCapacity(producer.getKeyCount());
-            boolean visited;
+            boolean visited = false;
             if (types.length == 1) {
                 visited = producer.forEachIntegralKey(key -> {
                     parent.findKey(key);
                     if (parent.survives(children, breaker)) keys.add(key);
                 }, breaker);
-            } else {
+            }
+            if (!visited) {
                 visited = producer.forEachRecordKey((record, column) -> {
-                    for (int i = 0; i < types.length; i++) parent.values[i] = types[i] == ColumnType.INT || types[i] == ColumnType.SYMBOL
-                            ? record.getInt(column + i) : record.getLong(column + i);
+                    for (int i = 0; i < types.length; i++) parent.values[i] = readKey(record, column + i, types[i]);
                     parent.findKey(parent.values[0]);
                     if (parent.survives(children, breaker)) keys.add(parent.membershipKey());
                 }, breaker);
@@ -80,6 +80,25 @@ final class JoinDependencyFilter {
             result.prepareReducedKeys(keys, tracker, breaker);
             return true;
         }
+    }
+
+    // Match signed I8/I16/I32 loads in generated key encoding. CHAR is unsigned as
+    // a SQL value, but its two raw bytes must hash identically on both sides.
+    private static long readKey(Record row, int column, int type) {
+        return switch (type) {
+            case ColumnType.BOOLEAN -> row.getBool(column) ? 1 : 0;
+            case ColumnType.BYTE -> row.getByte(column);
+            case ColumnType.SHORT -> row.getShort(column);
+            case ColumnType.CHAR -> (short) row.getChar(column);
+            case ColumnType.INT, ColumnType.SYMBOL -> row.getInt(column);
+            case ColumnType.IPv4 -> row.getIPv4(column);
+            case ColumnType.FLOAT -> Float.floatToRawIntBits(row.getFloat(column));
+            case ColumnType.DOUBLE -> Double.doubleToRawLongBits(row.getDouble(column));
+            case ColumnType.LONG -> row.getLong(column);
+            case ColumnType.DATE -> row.getDate(column);
+            case ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> row.getTimestamp(column);
+            default -> throw new IllegalArgumentException("Unsupported join key type: " + type);
+        };
     }
 
     /** One compressed child-chain head per producer row, without materializing duplicate products. */
@@ -229,8 +248,13 @@ final class JoinDependencyFilter {
                 probe = ((FrozenHashJoinBuild.RecordKeyed) build).newProbe(new RecordSink() {
                     @Override public void copy(Record record, RecordSinkSPI sink) {
                         for (int i = 0; i < values.length; i++) {
-                            if (types[i] == ColumnType.INT || types[i] == ColumnType.SYMBOL) sink.putInt((int) values[i]);
-                            else sink.putLong(values[i]);
+                            switch (QuestFixedKey.width(types[i])) {
+                                case I8 -> sink.putByte((byte) values[i]);
+                                case I16 -> sink.putShort((short) values[i]);
+                                case I32 -> sink.putInt((int) values[i]);
+                                case I64 -> sink.putLong(values[i]);
+                                default -> throw new IllegalArgumentException("Unsupported join key type: " + types[i]);
+                            }
                         }
                     }
                     @Override public void setFunctions(ObjList<Function> functions) { }
@@ -244,8 +268,7 @@ final class JoinDependencyFilter {
                 if (types[i] == ColumnType.SYMBOL) {
                     value = translators[i].translate(row.getInt(columns[i]));
                     if (value == SymbolTable.VALUE_NOT_FOUND) return false;
-                } else if (types[i] == ColumnType.INT) value = row.getInt(columns[i]);
-                else value = row.getLong(columns[i]);
+                } else value = readKey(row, columns[i], types[i]);
                 values[i] = value;
             }
             if (membership != null && !membership.isUniversal() && !membership.contains(membershipKey())) return false;

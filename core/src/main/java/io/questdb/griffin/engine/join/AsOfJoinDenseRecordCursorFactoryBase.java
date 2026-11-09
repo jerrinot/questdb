@@ -700,7 +700,9 @@ public abstract class AsOfJoinDenseRecordCursorFactoryBase extends AbstractJoinR
                         }
                         return true;
                     }
-                } else {
+                } else if (forwardRowId < frameRowHi) {
+                    // A compiled aggregate may have consumed exactly to the frame boundary.
+                    // If the optional batch scan declines, advance frames without reading a row.
                     do {
                         long slaveTimestamp = scaleTimestamp(slaveRecB.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
                         if (slaveTimestamp > masterTimestamp) {

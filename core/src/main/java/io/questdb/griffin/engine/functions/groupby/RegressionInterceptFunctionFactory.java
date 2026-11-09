@@ -49,7 +49,7 @@ public class RegressionInterceptFunctionFactory implements FunctionFactory {
         return new RegressionInterceptFunction(args.getQuick(0), args.getQuick(1));
     }
 
-    static class RegressionInterceptFunction extends AbstractRegressionGroupByFunction {
+    public static class RegressionInterceptFunction extends AbstractRegressionGroupByFunction {
 
         public RegressionInterceptFunction(@NotNull Function arg0, @NotNull Function arg1) {
             super(arg0, arg1);

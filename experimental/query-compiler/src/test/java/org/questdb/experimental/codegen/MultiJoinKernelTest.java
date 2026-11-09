@@ -232,7 +232,7 @@ public class MultiJoinKernelTest {
             var polls = new java.util.concurrent.atomic.AtomicInteger();
             try (var value = new SimpleMapValue(types.getColumnCount());
                  var code = compile(p, functions, types, 2, value, null, -1, false);
-                 var slot = code.newUpdater(() -> {
+                 var slot = code.newUpdater(null, () -> {
                      if (polls.incrementAndGet() == 3) throw new IllegalStateException("cancelled");
                  })) {
                 for (int i = 0; i < functions.size(); i++) functions.getQuick(i).setEmpty(value);
@@ -242,7 +242,7 @@ public class MultiJoinKernelTest {
                         () -> slot.updateMulti(p.record, p.frames.getFrameRowCount(0), 0, builds, value)).getMessage());
                 assertTrue(value.getLong(0) > 0);
                 assertTrue(value.getLong(0) < 1_002_001);
-                try (var retry = code.newUpdater(() -> { })) {
+                try (var retry = code.newUpdater(null, () -> { })) {
                     for (int i = 0; i < functions.size(); i++) functions.getQuick(i).setEmpty(value);
                     assertTrue(retry.updateMulti(p.record, p.frames.getFrameRowCount(0), 0, builds, value));
                     assertEquals(1_002_001, value.getLong(0));
@@ -256,7 +256,7 @@ public class MultiJoinKernelTest {
             var functions = functions(2); var types = valueTypes(functions);
             try (var value = new SimpleMapValue(types.getColumnCount());
                  var code = compile(p, functions, types, 2, value, null, -1, false);
-                 var slot = code.newUpdater(() -> { })) {
+                 var slot = code.newUpdater(null, () -> { })) {
                 value.putLong(0, 42);
                 p.record.init(p.pool.navigateTo(0));
                 assertFalse(slot.updateMulti(p.record, 1, 0, new FrozenHashJoinBuild.IntKeyed[]{a.frozen}, value));
@@ -421,7 +421,7 @@ public class MultiJoinKernelTest {
             var functions = functions(2); var types = valueTypes(functions);
             try (var value = new SimpleMapValue(types.getColumnCount());
                  var code = compile(p, functions, types, 2, value, null, -1, false);
-                 var slot = code.newUpdater(() -> { })) {
+                 var slot = code.newUpdater(null, () -> { })) {
                 var failing = (FrozenHashJoinBuild.IntKeyed) java.lang.reflect.Proxy.newProxyInstance(
                         getClass().getClassLoader(), new Class<?>[]{FrozenHashJoinBuild.IntKeyed.class}, (proxy, method, args) -> {
                             if ((method.getName().equals("forEachKey") || method.getName().equals("forEachIntegralKey"))) throw new IllegalStateException("cancel preparation");
@@ -527,7 +527,7 @@ public class MultiJoinKernelTest {
                 // These direct bindings retain payload rows even though COUNT observes no payload.
                 // Their sixteen-byte heap stride must still index dense eight-byte counts correctly.
                 functions.getQuick(0).setEmpty(value);
-                try (var slot = code.newUpdater(() -> { })) {
+                try (var slot = code.newUpdater(null, () -> { })) {
                     for (int frame = 0; frame < p.frames.getFrameCount(); frame++) {
                         p.record.init(p.pool.navigateTo(frame));
                         assertTrue(slot.updateMulti(p.record, p.frames.getFrameRowCount(frame), 0, builds, value));
@@ -683,8 +683,14 @@ public class MultiJoinKernelTest {
             try (var value = new SimpleMapValue(types.getColumnCount());
                  var map = keyed ? new Unordered8Map(ColumnType.LONG, types, 4, .5, 32) : null;
                  var code = compile(p, functions, types, count, value, map, groupKey, selected);
-                 var slot = code.newUpdater(() -> { });
+                 var slot = code.newUpdater(null, () -> { });
                  var rows = new DirectLongList(65, MemoryTag.NATIVE_JIT)) {
+                // Start with stale statistics deliberately; bind must establish this frame's descriptor.
+                var reopen = slot.getClass().getDeclaredMethod("reopen"); reopen.setAccessible(true); reopen.invoke(slot);
+                var addressField = slot.getClass().getDeclaredField("arguments"); addressField.setAccessible(true);
+                var sizeField = slot.getClass().getDeclaredField("argumentBytes"); sizeField.setAccessible(true);
+                long counter = addressField.getLong(slot) + sizeField.getLong(slot) - 8;
+                Unsafe.putLong(counter, 12345);
                 long probeRows = 0;
                 for (int f = 0; f < p.frames.getFrameCount(); f++) probeRows += p.frames.getFrameRowCount(f);
                 code.prepareBuilds(builds, selected ? -1 : probeRows, context.getMemoryTracker(), context.getCircuitBreaker());
@@ -704,6 +710,7 @@ public class MultiJoinKernelTest {
                     visited += input;
                     assertTrue(keyed ? slot.updateKeyedMulti(p.record, input, selected ? rows.getAddress() : 0, builds, map, null, updater)
                             : slot.updateMulti(p.record, input, selected ? rows.getAddress() : 0, builds, value));
+                    assertEquals("COUNT/SUM frames have no DISTINCT cardinality", 0, slot.getFunctionCardinality());
                 }
                 if (a.frozen.getRowCount() > 0 && b.frozen.getRowCount() > 0) assertEquals(visited, slot.getNativeRows());
                 if (keyed) {

@@ -96,7 +96,7 @@ public class ResolvedSymbolAggregateTest {
                 + "case when x%31=0 then null else x*17 end w,"
                 + "case when x%31=0 then null else (x%97-48)*0.25 end d from long_sequence(30001))", context);
         String sql = "select k,min(s),avg(s),max(s),sum(s),sum(v),sum(w),avg(v),avg(w),count(v),count(w),min(v),max(v),min(w),max(w),"
-                + "count(d),sum(d),avg(d),min(d),max(d),count() from t group by k";
+                + "count(d),sum(d),avg(d),min(d),max(d),ksum(d),nsum(d),count() from t group by k";
         long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);
         context.setQueryCodeGenerator(compiler);
         try (var candidate = engine.select(sql, context)) {
@@ -108,6 +108,33 @@ public class ResolvedSymbolAggregateTest {
             }
         }
         assertEquals(memory, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
+    }
+
+    @Test public void temporalInputsUseOrdinaryVectorStatesAndUnits() throws Exception {
+        engine.execute("create table times as (select cast(case when x%19=0 then null else cast(x%31 as string) end as symbol) k,"
+                + "cast(case when x%31=0 then null else x%1001-500 end as date) d,"
+                + "cast(case when x%31=0 then null else (x%1001-500)*1001 end as timestamp) u,"
+                + "cast(case when x%31=0 then null else (x%1001-500)*1000001 end as timestamp_ns) n "
+                + "from long_sequence(30001))", context);
+        String sql = "select k,count(d),min(d),max(d),count(u),min(u),max(u),count(n),min(n),max(n) from times group by k";
+        context.setQueryCodeGenerator(compiler);
+        try (var candidate = engine.select(sql, context)) {
+            var kernel = vector(candidate).getCompiledAggregate();
+            assertNotNull(kernel);
+            assertMatches(sql, candidate);
+            assertEquals(30001, kernel.getNativeRows());
+            assertMatches(sql, candidate);
+            assertEquals(60002, kernel.getNativeRows());
+        }
+        engine.execute("alter table times add column late timestamp_ns", context);
+        engine.execute("insert into times values ('new',-5,-1001,-1000001,-5000001)", context);
+        sql = "select k,count(late),min(late),max(late),min(d),max(u) from times group by k";
+        try (var candidate = engine.select(sql, context)) {
+            assertMatches(sql, candidate);
+            assertEquals(30002, vector(candidate).getCompiledAggregate().getNativeRows());
+            engine.execute("truncate table times", context);
+            assertMatches(sql, candidate);
+        }
     }
 
     @Test public void vectorDoublesKeepNonfiniteSignedZeroAndMissingKeyContracts() throws Exception {
@@ -139,7 +166,7 @@ public class ResolvedSymbolAggregateTest {
         }
         engine.execute("alter table doubles convert partition to parquet list '1970-01-01'", context);
         try (var candidate = engine.select(sql, context)) { assertMatchesVector(sql, candidate); }
-        for (String aggregate : List.of("sum(d)", "avg(d)")) {
+        for (String aggregate : List.of("sum(d)", "avg(d)", "ksum(d)", "nsum(d)")) {
             String single = "select k," + aggregate + " from doubles group by k";
             try (var candidate = engine.select(single, context)) {
                 assertMatchesVector(single, candidate);
@@ -207,7 +234,7 @@ public class ResolvedSymbolAggregateTest {
         engine.execute("alter table mixed add column k symbol", context);
         engine.execute("insert into mixed select cast(x as int),x*11,x*0.25,timestamp_sequence('2024-01-02',1000000L),"
                 + "cast(case when x%7=0 then null else cast(x%17 as string) end as symbol) from long_sequence(1003)", context);
-        String sql = "select k,avg(i),avg(l),sum(d),count() from mixed group by k";
+        String sql = "select k,avg(i),avg(l),sum(d),ksum(d),nsum(d),count() from mixed group by k";
         context.setQueryCodeGenerator(compiler);
         try (var candidate = engine.select(sql, context)) {
             assertMatches(sql, candidate);

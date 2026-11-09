@@ -56,7 +56,7 @@ public class EqCharCharFunctionFactory implements FunctionFactory {
         return new Func(chrFunc1, chrFunc2);
     }
 
-    private static class Func extends AbstractEqBinaryFunction {
+    public static class Func extends AbstractEqBinaryFunction {
         public Func(Function chrFunc1, Function chrFunc2) {
             super(chrFunc1, chrFunc2);
         }

@@ -38,9 +38,12 @@ import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.columns.ByteColumn;
 import io.questdb.griffin.engine.functions.columns.ColumnFunction;
 import io.questdb.griffin.engine.functions.columns.DoubleColumn;
+import io.questdb.griffin.engine.functions.columns.FloatColumn;
+import io.questdb.griffin.engine.functions.columns.DateColumn;
 import io.questdb.griffin.engine.functions.columns.IntColumn;
 import io.questdb.griffin.engine.functions.columns.LongColumn;
 import io.questdb.griffin.engine.functions.columns.ShortColumn;
+import io.questdb.griffin.engine.functions.columns.TimestampColumn;
 import io.questdb.griffin.engine.functions.memoization.MemoizerFunction;
 import io.questdb.griffin.engine.groupby.CompiledMapAggregate;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
@@ -84,18 +87,17 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
             if (!(sourceSlots.getQuick(i) instanceof AggregateSlot slot) || slot.mapConsumer != null) return null;
         }
         ColumnTypes inputs = projections.size() == 0 ? sourceInputs : projections.getQuick(0).getMetadata();
-        QuestFixedKey key = QuestFixedKey.bind(inputs, keys, keyColumns, keyFunctions, layout);
+        QuestFixedKey key = QuestFixedKey.bind(new ResolvedInputs(inputs, source.binding.options), keys, keyColumns, keyFunctions, layout);
         if (key == null) return null;
         QuestMapProbe probe = QuestMapProbe.fixed(key, layout instanceof OrderedMap ? -1 : keys.getColumnType(0),
                 layout instanceof OrderedMap).mutating();
-        var binding = ResolvedAggregateKernel.bind(inputs, values, functions, probe);
-        if (binding == null || binding.allocates
-                || binding.updates.updates().stream().anyMatch(AggregateUpdates.Update::finalizesResult)) return null;
+        var binding = ResolvedAggregateKernel.bind(inputs, values, functions, probe, source.binding.options);
+        if (binding == null || binding.allocates) return null;
 
         Read[] sourceReads = new Read[sourceInputs.getColumnCount()];
         for (int i = 0; i < sourceReads.length; i++) sourceReads[i] = read(source, sourceFunctions.getQuick(i));
         for (int i = projections.size() - 1; i >= 0; i--) {
-            sourceReads = project(projections.getQuick(i), sourceReads);
+            sourceReads = project(projections.getQuick(i), sourceReads, source.binding.options);
             if (sourceReads == null) return null;
         }
         final Read[] reads = sourceReads;
@@ -110,6 +112,7 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
         ResolvedMapAggregate result = null;
         try {
             Builder b = new Builder();
+            var parameters = binding.updates.loadMapParameters(b);
             Var position = b.let(i64(0)), begin = b.let(load(STATE));
             QuestMapScan.emit(b, source.probe, COLUMNS, (loop, entry) -> {
                 // Growth resumes at the first uncommitted source row, in ordinary map cursor order.
@@ -118,9 +121,11 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
                     Var packed = probe.orderedNative()
                             ? key.stage(emit, keyRow, at(STATE, ResolvedAggregateKernel.prefetchScratch(probe)))
                             : key.scalar(emit, keyRow);
-                    Var destination = probe.find(emit, packed, position, i64(0), null, binding.updates::initialize);
-                    binding.updates.emit(emit, row(emit, entry, reads, binding.updates.sourceIndexes(), binding.updates.columns()),
-                            destination, at(STATE, 40));
+                    Var first = binding.updates.firstRowFlag(emit);
+                    Var destination = probe.find(emit, packed, position, i64(0), null, binding.updates.initializer(first));
+                    var arguments = row(emit, entry, reads, binding.updates.sourceIndexes(), binding.updates.columns());
+                    binding.updates.emitInitialized(emit, new Pipeline.Row(arguments.columns(), arguments.values(), parameters),
+                            destination, at(STATE, 40), first);
                 });
                 loop.assign(position, add(position, i64(1)));
             });
@@ -177,14 +182,21 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
     public void finish(Map destination, GroupByAllocator allocator, Runnable checkpoint) {
         if (!active) throw new IllegalStateException("Map consumer is not open");
         if (merger == null) merger = output.newSlot(allocator);
+        merger.prepareParameters();
         for (Slot slot : slots) {
             if (!merger.merge(destination, slot.map, checkpoint)) throw new IllegalStateException("Map consumer merge declined");
         }
+        merger.finalizeMap(destination, checkpoint);
     }
 
     @Override
     public CharSequence getName() {
         return "generated finalized maps";
+    }
+
+    @Override
+    public ObjList<Function> outputFunctions(ObjList<Function> functions) {
+        return output.outputFunctions(functions);
     }
 
     @Override
@@ -218,6 +230,7 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
                 slot.map.reopen();
                 slot.allocator.setMemoryTracker(tracker);
                 slot.allocator.reopen();
+                slot.updater.prepareParameters();
             }
             active = true;
         } catch (Throwable failure) {
@@ -226,7 +239,7 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
         }
     }
 
-    private static Read[] project(RecordCursorFactory factory, Read[] source) {
+    private static Read[] project(RecordCursorFactory factory, Read[] source, CompilerOptions options) {
         Read[] result = new Read[factory.getMetadata().getColumnCount()];
         if (factory instanceof SelectedRecordCursorFactory selected) {
             for (int i = 0; i < result.length; i++) result[i] = source[selected.getColumnCrossIndex().getQuick(i)];
@@ -235,7 +248,7 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
             for (int i = 0; i < result.length; i++) {
                 Function function = virtual.getFunctions().getQuick(i);
                 while (function instanceof MemoizerFunction memo) function = memo.getArg();
-                ResolvedInputs inputs = new ResolvedInputs(factory.getBaseFactory().getMetadata(), offset);
+                ResolvedInputs inputs = new ResolvedInputs(factory.getBaseFactory().getMetadata(), offset, options);
                 Pipeline.Scalar expression = inputs.scalar(function, function.getType());
                 if (expression == null) return null;
                 int[] indexes = inputs.indexes();
@@ -254,17 +267,19 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
     private static Read read(ResolvedAggregateKernel.Prepared source, Function function) {
         int type = function.getType();
         MemoryType width = switch (type) {
-            case ColumnType.BYTE -> MemoryType.I8;
-            case ColumnType.SHORT -> MemoryType.I16;
-            case ColumnType.INT, ColumnType.SYMBOL -> MemoryType.I32;
-            case ColumnType.LONG -> MemoryType.I64;
+            case ColumnType.BOOLEAN, ColumnType.BYTE -> MemoryType.I8;
+            case ColumnType.SHORT, ColumnType.CHAR -> MemoryType.I16;
+            case ColumnType.INT, ColumnType.SYMBOL, ColumnType.IPv4 -> MemoryType.I32;
+            case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> MemoryType.I64;
             case ColumnType.DOUBLE -> MemoryType.F64;
+            case ColumnType.FLOAT -> MemoryType.F32;
             default -> null;
         };
         if (width == null) return null;
         if (function instanceof GroupByFunction) {
             long offset = source.numericResultOffset(function);
-            return offset < 0 || (type != ColumnType.INT && type != ColumnType.LONG && type != ColumnType.DOUBLE)
+            return offset < 0 || (type != ColumnType.BYTE && type != ColumnType.SHORT && type != ColumnType.CHAR && type != ColumnType.BOOLEAN && type != ColumnType.IPv4 && type != ColumnType.INT && type != ColumnType.LONG && type != ColumnType.DOUBLE && type != ColumnType.FLOAT
+                    && type != ColumnType.DATE && !ColumnType.isTimestamp(type))
                     ? null : new Stored(width, source.probe.keyBytes() + offset, type);
         }
         Class<?> implementation = function.getClass();
@@ -272,15 +287,19 @@ final class ResolvedMapAggregate implements CompiledMapAggregate {
         if (implementation == MapSymbolColumn.class && ((MapSymbolColumn) function).isSymbolTableStatic()) {
             // The ordinary function retains its dictionary cursor index and ownership.
             column = ((MapSymbolColumn) function).getMapColumnIndex();
-        } else if (implementation == ByteColumn.class || implementation == ShortColumn.class
-                || implementation == IntColumn.class || implementation == LongColumn.class || implementation == DoubleColumn.class) {
+        } else if (implementation == io.questdb.griffin.engine.functions.columns.BooleanColumn.class
+                || implementation == io.questdb.griffin.engine.functions.columns.IPv4Column.class
+                || implementation == io.questdb.griffin.engine.functions.columns.CharColumn.class
+                || implementation == ByteColumn.class || implementation == ShortColumn.class
+                || implementation == IntColumn.class || implementation == LongColumn.class || implementation == DoubleColumn.class || implementation == FloatColumn.class
+                || implementation == DateColumn.class || implementation == TimestampColumn.class) {
             column = ((ColumnFunction) function).getColumnIndex();
         } else return null;
         int key = column - source.binding.valueColumnCount;
         if (key < 0) return null;
         QuestFixedKey fixed = source.probe.fixedKey();
         if (fixed == null) return key == 0 && width.bytes == source.probe.keyBytes() ? new Stored(width, 0, type) : null;
-        MemoryType storedWidth = type == ColumnType.DOUBLE ? MemoryType.I64 : width;
+        MemoryType storedWidth = type == ColumnType.DOUBLE ? MemoryType.I64 : type == ColumnType.FLOAT ? MemoryType.I32 : width;
         if (key >= fixed.widths().length || storedWidth != fixed.widths()[key]) return null;
         long offset = 0;
         for (int i = 0; i < key; i++) offset += fixed.widths()[i].bytes;

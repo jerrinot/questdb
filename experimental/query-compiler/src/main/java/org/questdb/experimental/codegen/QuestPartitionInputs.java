@@ -74,10 +74,7 @@ final class QuestPartitionInputs {
         Var partitions = b.let(new Load(MemoryType.ADDRESS, COLUMNS));
         Var sketch = b.let(new Load(MemoryType.ADDRESS, at(partitions, QuestPartitions.SKETCH_OFFSET)));
         Var rowIds = b.let(new Load(MemoryType.ADDRESS, at(STATE, SELECTION)));
-        var addresses = new ArrayList<Var>();
-        for (int i = 0; i < updates.columns().size(); i++) {
-            addresses.add(b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, (i + 1L) * 8))));
-        }
+        var addresses = updates.loadFrameInputs(b);
         Var index = b.let(load(STATE));
         b.loop(binary(Op.LT, index, ROWS), entry -> {
             entry.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
@@ -142,13 +139,14 @@ final class QuestPartitionInputs {
 
     static Program replay(QuestMapProbe probe, AggregateUpdates layout, AggregateUpdates updates) {
         Builder b = new Builder();
+        var parameters = layout.loadMapParameters(b);
         Var index = b.let(load(STATE));
         b.loop(binary(Op.LT, index, ROWS), loop -> {
             loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
             Var row = loop.let(new Offset(COLUMNS, binary(Op.MUL, index, i64(rowBytes(probe, layout)))));
             Var key = probe.orderedNative() ? row : loop.let(new Load(probe.keyBytes() == 4 ? MemoryType.I32 : MemoryType.I64, row));
             Var destination = probe.findExisting(loop, key);
-            loop.when(ne(destination, nil()), hit -> emitValues(hit, layout, updates, probe, row, destination));
+            loop.when(ne(destination, nil()), hit -> emitValues(hit, layout, updates, probe, row, destination, parameters));
             loop.assign(index, add(index, i64(1)));
         });
         b.exit(0);
@@ -159,6 +157,7 @@ final class QuestPartitionInputs {
         if (probe.variable()) return QuestPartitions.mergeInputs(probe, updates, valueBytes, batchRows);
         if (batchRows == 0) return mergeScalar(probe, layout, updates);
         Builder b = new Builder();
+        var parameters = layout.loadMapParameters(b);
         Var index = b.let(load(STATE));
         Var batches = b.let(i64(0));
         b.loop(binary(Op.LT, index, ROWS), batch -> {
@@ -207,12 +206,13 @@ final class QuestPartitionInputs {
             batch.loop(binary(Op.LT, index, limit), consume -> {
                 Var key = consume.let(new Load(probe.stagedKeyType(), at(scratch, 8)));
                 Var entry = consume.let(new Load(MemoryType.ADDRESS, at(scratch, 16)));
+                Var first = updates.firstRowFlag(consume);
                 Var destination = probe.orderedNative()
                         ? probe.finishOrdered(consume, key, entry, consume.let(load(at(scratch, 24))),
-                                consume.let(load(at(scratch, 32))), index, layout::initialize)
-                        : probe.finish(consume, key, entry, index, layout::initialize);
+                                consume.let(load(at(scratch, 32))), index, layout.initializer(first))
+                        : probe.finish(consume, key, entry, index, layout.initializer(first));
                 Var row = consume.let(new Offset(COLUMNS, binary(Op.MUL, index, i64(rowBytes(probe, layout)))));
-                emitValues(consume, layout, updates, probe, row, destination);
+                emitValues(consume, layout, updates, probe, row, destination, parameters, first);
                 consume.assign(scratch, at(scratch, probe.prefetchRowBytes()));
                 consume.assign(index, add(index, i64(1)));
             });
@@ -221,7 +221,7 @@ final class QuestPartitionInputs {
         return new Program(b.block());
     }
 
-    static Pipeline.Row loadValues(Builder b, AggregateUpdates layout, Expr address) {
+    static Pipeline.Row loadValues(Builder b, AggregateUpdates layout, Expr address, List<Expr> parameters) {
         var values = new ArrayList<Pipeline.Value>();
         long offset = 0;
         for (var column : layout.columns()) {
@@ -235,7 +235,7 @@ final class QuestPartitionInputs {
             computed.put(expression, column.value(b.let(new Load(column.width(), at(address, offset)))));
             offset += column.width().bytes;
         }
-        return new Pipeline.Row(layout.columns(), values, List.of(), expression -> {
+        return new Pipeline.Row(layout.columns(), values, parameters, expression -> {
             var value = computed.get(expression);
             if (value == null) throw new IllegalArgumentException("Unmaterialized numeric expression");
             return value;
@@ -247,8 +247,8 @@ final class QuestPartitionInputs {
         return probe.variable() ? numeric : ((probe.keyBytes() + numeric + 7) & ~7L) - probe.keyBytes();
     }
 
-    static ResolvedVarchar.Frame loadFrame(Builder b, AggregateUpdates layout, Expr address, long offset) {
-        var values = loadValues(b, layout, address);
+    static ResolvedVarchar.Frame loadFrame(Builder b, AggregateUpdates layout, Expr address, long offset, List<Expr> parameters) {
+        var values = loadValues(b, layout, address, parameters);
         var strings = new LinkedHashMap<ResolvedVarchar.Expression, Pipeline.Utf8Value>();
         for (var argument : stringArguments(layout)) {
             Var header = b.let(load(at(address, offset)));
@@ -261,19 +261,25 @@ final class QuestPartitionInputs {
         return new ResolvedVarchar.Frame(values, i64(0), nil(), nil(), strings);
     }
 
-    private static void emitValues(Builder b, AggregateUpdates layout, AggregateUpdates updates, QuestMapProbe probe, Var row, Var destination) {
-        updates.emit(b, loadFrame(b, layout, at(row, probe.keyBytes()), stringOffset(probe, layout)), destination, nil());
+    private static void emitValues(Builder b, AggregateUpdates layout, AggregateUpdates updates, QuestMapProbe probe, Var row, Var destination, List<Expr> parameters) {
+        emitValues(b, layout, updates, probe, row, destination, parameters, null);
+    }
+
+    private static void emitValues(Builder b, AggregateUpdates layout, AggregateUpdates updates, QuestMapProbe probe, Var row, Var destination, List<Expr> parameters, Expr first) {
+        updates.emitInitialized(b, loadFrame(b, layout, at(row, probe.keyBytes()), stringOffset(probe, layout), parameters), destination, nil(), first);
     }
 
     private static Program mergeScalar(QuestMapProbe probe, AggregateUpdates layout, AggregateUpdates updates) {
         Builder b = new Builder();
+        var parameters = layout.loadMapParameters(b);
         Var index = b.let(load(STATE));
         b.loop(binary(Op.LT, index, ROWS), loop -> {
             loop.when(eq(binary(Op.AND, index, i64(1023)), i64(0)), Builder::poll);
             Var row = loop.let(new Offset(COLUMNS, binary(Op.MUL, index, i64(rowBytes(probe, layout)))));
             Var key = probe.orderedNative() ? row : loop.let(new Load(probe.keyBytes() == 4 ? MemoryType.I32 : MemoryType.I64, row));
-            Var destination = probe.find(loop, key, index, i64(0), null, layout::initialize);
-            emitValues(loop, layout, updates, probe, row, destination);
+            Var first = updates.firstRowFlag(loop);
+            Var destination = probe.find(loop, key, index, i64(0), null, layout.initializer(first));
+            emitValues(loop, layout, updates, probe, row, destination, parameters, first);
             loop.assign(index, add(index, i64(1)));
         });
         b.exit(0);

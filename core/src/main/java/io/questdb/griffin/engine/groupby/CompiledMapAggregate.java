@@ -28,6 +28,7 @@ import io.questdb.cairo.map.Map;
 import io.questdb.cairo.sql.Function;
 import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.MemoryTracker;
+import io.questdb.std.ObjList;
 import io.questdb.std.QuietCloseable;
 
 /** A consumer of finalized maps in the producer's acquired worker slots.
@@ -39,6 +40,9 @@ public interface CompiledMapAggregate extends QuietCloseable {
     void reopen(MemoryTracker tracker);
     void finish(Map destination, GroupByAllocator allocator, Runnable checkpoint);
     void clear();
+
+    /** Borrowed readers for finalized state; the original list retains function ownership. */
+    default ObjList<Function> outputFunctions(ObjList<Function> functions) { return functions; }
 
     boolean supportsLongTopK(Function function);
 

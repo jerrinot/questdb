@@ -52,9 +52,12 @@ public class SwitchFunctionFactory implements FunctionFactory {
     private static final IntMethod GET_BYTE = SwitchFunctionFactory::getByte;
     private static final IntMethod GET_CHAR = SwitchFunctionFactory::getChar;
     private static final LongMethod GET_DATE = SwitchFunctionFactory::getDate;
+    private static final LongMethod GET_DOUBLE_BITS = (function, record) -> Double.doubleToLongBits(getDouble(function, record));
+    private static final IntMethod GET_FLOAT_BITS = (function, record) -> Float.floatToIntBits(getFloat(function, record));
     private static final IntMethod GET_INT = SwitchFunctionFactory::getInt;
     private static final LongMethod GET_LONG = SwitchFunctionFactory::getLong;
     private static final IntMethod GET_SHORT = SwitchFunctionFactory::getShort;
+    private static final LongMethod GET_TIMESTAMP = Function::getTimestamp;
 
     @Override
     public String getSignature() {
@@ -152,9 +155,9 @@ public class SwitchFunctionFactory implements FunctionFactory {
             case ColumnType.LONG ->
                     getLongKeyedFunction(args, argPositions, position, n, keyFunction, returnType, elseBranch, GET_LONG);
             case ColumnType.FLOAT ->
-                    getFloatKeyedFunction(args, argPositions, position, n, keyFunction, returnType, elseBranch);
+                    getIntKeyedFunction(args, argPositions, position, n, keyFunction, returnType, elseBranch, GET_FLOAT_BITS);
             case ColumnType.DOUBLE ->
-                    getDoubleKeyedFunction(args, argPositions, position, n, keyFunction, returnType, elseBranch);
+                    getLongKeyedFunction(args, argPositions, position, n, keyFunction, returnType, elseBranch, GET_DOUBLE_BITS);
             case ColumnType.DATE ->
                     getLongKeyedFunction(args, argPositions, position, n, keyFunction, returnType, elseBranch, GET_DATE);
             case ColumnType.TIMESTAMP ->
@@ -282,81 +285,8 @@ public class SwitchFunctionFactory implements FunctionFactory {
         return CaseCommon.getCaseFunction(position, valueType, picker, argsToPoke);
     }
 
-    private Function getDoubleKeyedFunction(
-            ObjList<Function> args,
-            IntList argPositions,
-            int position,
-            int n,
-            Function keyFunction,
-            int valueType,
-            Function elseBranch
-    ) throws SqlException {
-        final LongObjHashMap<Function> map = new LongObjHashMap<>();
-        final ObjList<Function> argsToPoke = new ObjList<>();
-        for (int i = 1; i < n; i += 2) {
-            final Function fun = args.getQuick(i);
-            final long key = Double.doubleToLongBits(getDouble(fun, null));
-            final int index = map.keyIndex(key);
-            if (index < 0) {
-                throw SqlException.$(argPositions.getQuick(i), "duplicate branch");
-            }
-            map.putAt(index, key, args.getQuick(i + 1));
-            argsToPoke.add(args.getQuick(i + 1));
-        }
-
-        final Function elseB = getElseFunction(valueType, elseBranch);
-        final CaseFunctionPicker picker = record -> {
-            final int index = map.keyIndex(Double.doubleToLongBits(getDouble(keyFunction, record)));
-            if (index < 0) {
-                return map.valueAtQuick(index);
-            }
-            return elseB;
-        };
-        argsToPoke.add(elseB);
-        argsToPoke.add(keyFunction);
-
-        return CaseCommon.getCaseFunction(position, valueType, picker, argsToPoke);
-    }
-
     private Function getElseFunction(int valueType, Function elseBranch) {
         return elseBranch != null ? elseBranch : Constants.getNullConstant(valueType);
-    }
-
-    private Function getFloatKeyedFunction(
-            ObjList<Function> args,
-            IntList argPositions,
-            int position,
-            int n,
-            Function keyFunction,
-            int valueType,
-            Function elseBranch
-    ) throws SqlException {
-        final IntObjHashMap<Function> map = new IntObjHashMap<>();
-        final ObjList<Function> argsToPoke = new ObjList<>();
-        for (int i = 1; i < n; i += 2) {
-            final Function fun = args.getQuick(i);
-            final int key = Float.floatToIntBits(getFloat(fun, null));
-            final int index = map.keyIndex(key);
-            if (index < 0) {
-                throw SqlException.$(argPositions.getQuick(i), "duplicate branch");
-            }
-            map.putAt(index, key, args.getQuick(i + 1));
-            argsToPoke.add(args.getQuick(i + 1));
-        }
-
-        final Function elseB = getElseFunction(valueType, elseBranch);
-        final CaseFunctionPicker picker = record -> {
-            final int index = map.keyIndex(Float.floatToIntBits(getFloat(keyFunction, record)));
-            if (index < 0) {
-                return map.valueAtQuick(index);
-            }
-            return elseB;
-        };
-
-        argsToPoke.add(elseB);
-        argsToPoke.add(keyFunction);
-
-        return CaseCommon.getCaseFunction(position, valueType, picker, argsToPoke);
     }
 
     private Function getIfElseFunction(
@@ -378,9 +308,9 @@ public class SwitchFunctionFactory implements FunctionFactory {
             final Function elseB = getElseFunction(returnType, elseBranch);
 
             if (value) {
-                picker = record -> keyFunction.getBool(record) ? branch : elseB;
+                picker = new BooleanSwitchPicker(keyFunction, branch, elseB);
             } else {
-                picker = record -> keyFunction.getBool(record) ? elseB : branch;
+                picker = new BooleanSwitchPicker(keyFunction, elseB, branch);
             }
 
             argsToPoke = new ObjList<>();
@@ -399,9 +329,9 @@ public class SwitchFunctionFactory implements FunctionFactory {
             }
 
             if (a) {
-                picker = record -> keyFunction.getBool(record) ? branchA : branchB;
+                picker = new BooleanSwitchPicker(keyFunction, branchA, branchB);
             } else {
-                picker = record -> keyFunction.getBool(record) ? branchB : branchA;
+                picker = new BooleanSwitchPicker(keyFunction, branchB, branchA);
             }
 
             argsToPoke = new ObjList<>();
@@ -504,13 +434,27 @@ public class SwitchFunctionFactory implements FunctionFactory {
             Function elseBranch,
             LongMethod longMethod
     ) throws SqlException {
+        return getLongKeyedFunction(args, argPositions, position, n, keyFunction, valueType, elseBranch, longMethod, longMethod);
+    }
+
+    private Function getLongKeyedFunction(
+            ObjList<Function> args,
+            IntList argPositions,
+            int position,
+            int n,
+            Function keyFunction,
+            int valueType,
+            Function elseBranch,
+            LongMethod constantMethod,
+            LongMethod longMethod
+    ) throws SqlException {
         final LongObjHashMap<Function> map = new LongObjHashMap<>();
         final ObjList<Function> argsToPoke = new ObjList<>();
         final long[] branchKeys = new long[n / 2];
         Function sentinelBranch = null;
         for (int i = 1; i < n; i += 2) {
             final Function fun = args.getQuick(i);
-            final long key = longMethod.getKey(fun, null);
+            final long key = constantMethod.getKey(fun, null);
             branchKeys[i / 2] = key;
             // The map's empty-key marker is a legal SQL value, kept outside the map.
             if (key == map.getNoEntryKey()) {
@@ -657,34 +601,10 @@ public class SwitchFunctionFactory implements FunctionFactory {
             Function elseBranch,
             int timestampType
     ) throws SqlException {
-        final LongObjHashMap<Function> map = new LongObjHashMap<>();
-        final ObjList<Function> argsToPoke = new ObjList<>();
         TimestampDriver driver = ColumnType.getTimestampDriver(timestampType);
-        long key;
-        for (int i = 1; i < n; i += 2) {
-            final Function fun = args.getQuick(i);
-            int funType = fun.getType();
-            key = driver.from(fun.getTimestamp(null), ColumnType.getTimestampType(funType));
-            final int index = map.keyIndex(key);
-            if (index < 0) {
-                throw SqlException.$(argPositions.getQuick(i), "duplicate branch");
-            }
-            map.putAt(index, key, args.getQuick(i + 1));
-            argsToPoke.add(args.getQuick(i + 1));
-        }
-
-        final Function elseB = getElseFunction(valueType, elseBranch);
-        final CaseFunctionPicker picker = record -> {
-            final int index = map.keyIndex(keyFunction.getTimestamp(record));
-            if (index < 0) {
-                return map.valueAtQuick(index);
-            }
-            return elseB;
-        };
-        argsToPoke.add(elseB);
-        argsToPoke.add(keyFunction);
-
-        return CaseCommon.getCaseFunction(position, valueType, picker, argsToPoke);
+        return getLongKeyedFunction(args, argPositions, position, n, keyFunction, valueType, elseBranch,
+                (function, record) -> driver.from(function.getTimestamp(record), ColumnType.getTimestampType(function.getType())),
+                GET_TIMESTAMP);
     }
 
     @FunctionalInterface
@@ -695,6 +615,48 @@ public class SwitchFunctionFactory implements FunctionFactory {
     @FunctionalInterface
     private interface LongMethod {
         long getKey(Function function, Record record);
+    }
+
+    private static final class BooleanSwitchPicker implements CaseFunctionPicker.Integral {
+        private final Function keyFunction;
+        private final Function whenTrue;
+        private final Function whenFalse;
+
+        private BooleanSwitchPicker(Function keyFunction, Function whenTrue, Function whenFalse) {
+            this.keyFunction = keyFunction;
+            this.whenTrue = whenTrue;
+            this.whenFalse = whenFalse;
+        }
+
+        @Override
+        public int getBranchCount() {
+            return 1;
+        }
+
+        @Override
+        public Function getElseBranch() {
+            return whenFalse;
+        }
+
+        @Override
+        public long getKey(int index) {
+            return 1;
+        }
+
+        @Override
+        public Function getKeyFunction() {
+            return keyFunction;
+        }
+
+        @Override
+        public Function getValue(int index) {
+            return whenTrue;
+        }
+
+        @Override
+        public Function pick(Record record) {
+            return keyFunction.getBool(record) ? whenTrue : whenFalse;
+        }
     }
 
     /**

@@ -59,12 +59,17 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private static final int FILTER_STAGE_ROWS = 16 * 1024;
     // Rehash arguments, map views and sort/selection controls reuse this region by phase.
     private static final int PHASE_SCRATCH_BYTES = Math.max(128, GroupAdmission.SCRATCH_BYTES);
-    private static final boolean PROFILE = Boolean.getBoolean("query.codegen.profile");
+    private static final boolean PROFILE = CompilerOptions.PROCESS.profile();
     private final Prepared prepared;
     private final long addressBytes;
+    private final long columnBytes;
+    private final long scratchOffset;
+    private final long sharedBytes;
+    private long probeCount;
+    private long keyComparisons;
     private final KernelMemory memory;
-    private final long addresses;
-    private final long stateAddress;
+    private long addresses;
+    private long stateAddress;
     ResolvedMapAggregate.Slot mapConsumer;
     private boolean closed;
     private long updatedRows;
@@ -92,6 +97,8 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private long rankScratchCapacity;
     private long mapRows;
     private long mapCalls;
+    private long adaptivePlainBatches;
+    private long adaptiveStagedBatches;
     private long newGroups;
     private long partitionRows;
     private long inputPartitionRows;
@@ -102,12 +109,12 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     private long topKRows;
     private long topKMergeRows;
     private final Map.NativeRehash rehash;
-    private final long scratchAddress;
-    private final long keyAddress;
+    private long scratchAddress;
+    private long keyAddress;
     private final ResolvedFilter.Slot filter;
-    private final long partitions;
-    private final long inputPartitions;
-    private final long sharedScratch;
+    private long partitions;
+    private long inputPartitions;
+    private long sharedScratch;
     private boolean partitioned;
     private boolean parallelMerge;
     private int mergePreparationStage;
@@ -124,9 +131,10 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         memory = prepared.binding.allocates || prepared.mapCode != null ? KernelMemory.reusable(allocator) : null;
         // Standalone kernels borrow the caller's arena. SQL execution binds a page arena below.
         partitionMemory = KernelMemory.reusable(allocator);
-        // Cardinality and deferred-merge words precede STATE; fusion adds an accepted-row count.
-        long columnBytes = prepared.binding.inputs.bytes() + 32 + (prepared.fusedFilterCode != null ? 8 : 0);
-        long scratchOffset = columnBytes + (prepared.mapCode != null
+        // Cardinality, parameter pointer and deferred-merge words precede STATE;
+        // fusion adds an accepted-row count.
+        columnBytes = prepared.binding.inputs.bytes() + 40 + (prepared.fusedFilterCode != null ? 8 : 0);
+        scratchOffset = columnBytes + (prepared.mapCode != null
                 ? prefetchScratch(prepared.probe) + (long) Math.max(1, prepared.binding.prefetchRows) * prepared.probe.prefetchRowBytes() : 0);
         long keyBytes = 0;
         if (prepared.probe != null) {
@@ -134,18 +142,11 @@ public final class AggregateSlot implements GroupByKernel.Updater {
             else if (prepared.probe.varchar()) keyBytes = prepared.probe.varcharKey() != null ? prepared.probe.varcharKey().inputs().bytes() : 48;
             else if (prepared.probe.fixedKey() != null) keyBytes = prepared.probe.fixedKey().descriptorBytes();
         }
-        long sharedBytes = prepared.sharedMaps != null ? QuestSharedVarchar.SCRATCH_BYTES : 0;
+        sharedBytes = prepared.sharedMaps != null ? QuestSharedVarchar.SCRATCH_BYTES : 0;
         addressBytes = scratchOffset + PHASE_SCRATCH_BYTES + keyBytes
                 + (prepared.localCapacity > 0 ? QuestPartitions.STATE_BYTES : 0)
                 + (prepared.inputPartitionCode != null ? QuestPartitions.STATE_BYTES : 0) + sharedBytes;
-        addresses = Unsafe.malloc(addressBytes, MemoryTag.NATIVE_JIT);
-        stateAddress = addresses + columnBytes;
-        scratchAddress = addresses + scratchOffset;
-        keyAddress = scratchAddress + PHASE_SCRATCH_BYTES;
-        sharedScratch = sharedBytes != 0 ? addresses + addressBytes - sharedBytes : 0;
-        partitions = prepared.localCapacity > 0 ? addresses + addressBytes - sharedBytes - QuestPartitions.STATE_BYTES : 0;
-        inputPartitions = prepared.inputPartitionCode != null ? partitions - QuestPartitions.STATE_BYTES : 0;
-        clear();
+        allocateScratch();
         ResolvedFilter.Slot slotFilter = null;
         ResolvedVarchar.Slot arguments = null, keys = null;
         try {
@@ -157,7 +158,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         } catch (Throwable failure) {
             try (var closeArguments = arguments; var closeKeys = keys; var closeFilter = slotFilter) { }
             catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
-            finally { Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); }
+            finally { if (addresses != 0) addresses = Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); }
             throw failure;
         }
         argumentHelpers = arguments;
@@ -180,6 +181,32 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         resetStats();
     }
 
+    private void allocateScratch() {
+        addresses = Unsafe.malloc(addressBytes, MemoryTag.NATIVE_JIT);
+        stateAddress = addresses + columnBytes;
+        Unsafe.putLong(stateAddress + ARGUMENT_PARAMETERS, addresses + 8 + prepared.binding.inputs.parameterOffset());
+        scratchAddress = addresses + scratchOffset;
+        keyAddress = scratchAddress + PHASE_SCRATCH_BYTES;
+        sharedScratch = sharedBytes != 0 ? addresses + addressBytes - sharedBytes : 0;
+        partitions = prepared.localCapacity > 0 ? addresses + addressBytes - sharedBytes - QuestPartitions.STATE_BYTES : 0;
+        inputPartitions = prepared.inputPartitionCode != null ? partitions - QuestPartitions.STATE_BYTES : 0;
+        resetState();
+        if (prepared.mapCode != null) {
+            Unsafe.putLong(stateAddress + PROBE_COUNT, probeCount);
+            Unsafe.putLong(stateAddress + KEY_COMPARISONS, keyComparisons);
+        }
+        resetStats();
+    }
+
+    private void reopenScratch() {
+        if (closed) throw new IllegalStateException("Aggregate slot is closed");
+        if (addresses != 0) return;
+        allocateScratch();
+        if (argumentHelpers != null) argumentHelpers.bind(addresses + 8 + prepared.binding.inputs.helperOffset());
+        if (keyHelpers != null) keyHelpers.bind(keyAddress + prepared.probe.keyInputs().helperOffset());
+        if (dictionary != null) dictionary.bindScratch(scratchAddress);
+    }
+
     @Override
     public void close() {
         if (!closed) {
@@ -187,13 +214,14 @@ public final class AggregateSlot implements GroupByKernel.Updater {
             try (argumentHelpers; keyHelpers; filter) { if (dictionary != null) dictionary.close(); }
             finally {
                 try { if (partitionAllocator != null) partitionAllocator.close(); }
-                finally { Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); }
+                finally { if (addresses != 0) addresses = Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT); }
             }
         }
     }
 
     @Override
     public void prepareExecution(CairoConfiguration configuration, MemoryTracker tracker) {
+        prepareParameters();
         if (prepared.localCapacity == 0) return;
         if (partitionAllocator == null) {
             // Each page must be an entire allocation: the ordinary slot arena can pack
@@ -212,13 +240,6 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     public boolean hasPartitions() { return partitioned; }
 
     @Override
-    public boolean initSharedMaps(java.util.function.IntFunction<Map> maps) {
-        if (prepared.sharedMaps == null) return false;
-        prepared.sharedMaps.init(maps);
-        return true;
-    }
-
-    @Override
     public void finishSharedMap(int shard, Runnable checkpoint) {
         memory.enterCheckpoint(checkpoint);
         try { prepared.sharedMaps.finish(shard, rehash, checkpoint); }
@@ -227,11 +248,24 @@ public final class AggregateSlot implements GroupByKernel.Updater {
 
     @Override
     public void clear() {
+        try { resetState(); }
+        finally {
+            if (addresses != 0) {
+                if (prepared.mapCode != null) {
+                    probeCount = Unsafe.getLong(stateAddress + PROBE_COUNT);
+                    keyComparisons = Unsafe.getLong(stateAddress + KEY_COMPARISONS);
+                }
+                addresses = Unsafe.free(addresses, addressBytes, MemoryTag.NATIVE_JIT);
+                stateAddress = scratchAddress = keyAddress = partitions = inputPartitions = sharedScratch = 0;
+            }
+        }
+    }
+
+    private void resetState() {
         if (partitionAllocator != null) {
             partitionAllocator.clear();
             partitionAllocator.setMemoryTracker(null);
         }
-        if (prepared.sharedMaps != null) prepared.sharedMaps.clear();
         keyFilterAddress = 0;
         rankScratch = 0;
         partitionTopK = 0;
@@ -244,6 +278,7 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         parallelMerge = false;
         mergePreparationStage = 0;
         finalizeDeferred = false;
+        if (addresses == 0) return;
         Unsafe.putLong(stateAddress + DeferredDistinct.CONTROL, 0);
         Unsafe.putLong(stateAddress + DeferredDistinct.CONTROL + 8, 0);
         if (partitions != 0) io.questdb.std.Vect.memset(partitions, QuestPartitions.STATE_BYTES, 0);
@@ -251,6 +286,11 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     }
 
     long dictionaryRows() { return dictionary != null ? dictionary.rows() : 0; }
+
+    void prepareParameters() {
+        reopenScratch();
+        prepared.binding.inputs.prepareParameters(addresses + 8 + prepared.binding.inputs.parameterOffset());
+    }
 
     @Override
     public void partition(Map source, Runnable checkpoint) {
@@ -638,8 +678,9 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     long inputPartitionRows() { return inputPartitionRows; }
 
     long[] profileCounters() {
-        return new long[]{mapCalls, newGroups, prepared.mapCode == null ? 0 : Unsafe.getLong(stateAddress + PROBE_COUNT),
-                prepared.mapCode == null ? 0 : Unsafe.getLong(stateAddress + KEY_COMPARISONS)};
+        return new long[]{mapCalls, newGroups, prepared.mapCode == null ? 0 : addresses == 0 ? probeCount : Unsafe.getLong(stateAddress + PROBE_COUNT),
+                prepared.mapCode == null ? 0 : addresses == 0 ? keyComparisons : Unsafe.getLong(stateAddress + KEY_COMPARISONS),
+                adaptivePlainBatches, adaptiveStagedBatches};
     }
 
     long[] topKCounters() { return new long[]{topKRows, topKMergeRows}; }
@@ -1232,8 +1273,13 @@ public final class AggregateSlot implements GroupByKernel.Updater {
                 AdaptiveKernel choice = kernel == prepared.mapCode ? prepared.mapChoice : prepared.filterChoice;
                 // Allocated DISTINCT states never use bounded partition collection. Time the
                 // complete invocation, including growth, rather than train on partial retries.
-                choice.runBatch(rows - begin, selected ->
-                        runMutableLoop(kernel, selected, input, rows, map, shards, update, begin, frameHasRows));
+                choice.runBatch(rows - begin, selected -> {
+                    if (PROFILE) {
+                        if (selected == prepared.stagedMapCode || selected == prepared.stagedFilterCode) adaptiveStagedBatches++;
+                        else adaptivePlainBatches++;
+                    }
+                    runMutableLoop(kernel, selected, input, rows, map, shards, update, begin, frameHasRows);
+                });
                 return;
             }
         }
@@ -1341,13 +1387,13 @@ public final class AggregateSlot implements GroupByKernel.Updater {
     @Override
     public long getCardinalityStat() {
         if (closed) throw new IllegalStateException("Aggregate slot is closed");
-        return Unsafe.getLong(addresses + 8 + prepared.binding.inputs.bytes());
+        return addresses == 0 ? 0 : Unsafe.getLong(addresses + 8 + prepared.binding.inputs.bytes());
     }
 
     @Override
     public void resetStats() {
         if (closed) throw new IllegalStateException("Aggregate slot is closed");
-        Unsafe.putLong(addresses + 8 + prepared.binding.inputs.bytes(), 0);
+        if (addresses != 0) Unsafe.putLong(addresses + 8 + prepared.binding.inputs.bytes(), 0);
     }
 
     public boolean canUpdate(PageFrameMemoryRecord record) {

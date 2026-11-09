@@ -229,6 +229,45 @@ public class BackendTest {
     }
 
     @Test
+    public void nullableIntegerDivisionAndRemainderProtectScalarAndVectorOperands() throws Exception {
+        for(int type:new int[]{ColumnType.INT,ColumnType.LONG}) {
+            var columns=List.of(new Pipeline.Column(0,"a",type),new Pipeline.Column(1,"b",type));
+            var width=Pipeline.widthOf(type);
+            var left=columns.get(0).value(new Load(width,COLUMNS));
+            var right=columns.get(1).value(new Load(width,at(COLUMNS,64)));
+            var row=new Pipeline.Row(columns,List.of(left,right));
+            var division=new Pipeline.Divide(columns.get(0),columns.get(1),type);
+            var remainder=new Pipeline.Remainder(columns.get(0),columns.get(1),type);
+            Builder b=new Builder();
+            var q=division.emit(row);var r=remainder.emit(row);
+            b.store(STATE,new Select(q.isNull(),i64(Long.MIN_VALUE),q.data()));
+            b.store(at(STATE,8),new Select(r.isNull(),i64(Long.MIN_VALUE),r.data()));
+            b.store(at(STATE,16),new VectorMask(8,new Pipeline.SqlCompare(Op.EQ,remainder,new Pipeline.Constant(0)).emit(row)));
+            b.exit(0);
+            long nil=Pipeline.nullValueOf(type);
+            long[] values=type==ColumnType.INT?new long[]{nil,nil+1,Integer.MAX_VALUE,-97,-3,-1,0,1,3,97}
+                    :new long[]{nil,nil+1,Long.MAX_VALUE,-97,-3,-1,0,1,3,97};
+            try(var code=backend.compile(new Program(b.block()),temporary.newFolder().toPath());var arena=Arena.ofConfined()) {
+                long input=arena.allocate(128,8).address(),out=arena.allocate(24,8).address();
+                for(int a=0;a<values.length;a++) for(int d=0;d<values.length;d++) {
+                    long mask=0;
+                    for(int lane=0;lane<8;lane++) {
+                        long x=values[(a+lane)%values.length],y=values[(d+lane/2)%values.length];
+                        if(type==ColumnType.INT) {Unsafe.putInt(input+lane*4L,(int)x);Unsafe.putInt(input+64+lane*4L,(int)y);}
+                        else {Unsafe.putLong(input+lane*8L,x);Unsafe.putLong(input+64+lane*8L,y);}
+                        if(x!=nil && y!=nil && y!=0 && x%y==0) mask|=1L<<lane;
+                    }
+                    assertEquals(0,code.run(input,8,out));
+                    boolean absent=values[a]==nil||values[d]==nil||values[d]==0;
+                    assertEquals(absent?Long.MIN_VALUE:values[a]/values[d],Unsafe.getLong(out));
+                    assertEquals(absent?Long.MIN_VALUE:values[a]%values[d],Unsafe.getLong(out+8));
+                    assertEquals(mask,Unsafe.getLong(out+16));
+                }
+            }
+        }
+    }
+
+    @Test
     public void positiveConstantDivisionPreservesSignedExtremes() throws Exception {
         long[] divisors = {1, 2, 3, 60, 60_000_000L, 60_000_000_000L, Long.MAX_VALUE};
         Builder b = new Builder();
@@ -245,8 +284,7 @@ public class BackendTest {
             }
         }
         assertThrows(IllegalArgumentException.class, () -> binary(Op.SDIV, ROWS, i64(0)));
-        assertThrows(IllegalArgumentException.class, () -> binary(Op.SDIV, ROWS, i64(-1)));
-        assertThrows(IllegalArgumentException.class, () -> binary(Op.SDIV, ROWS, ROWS));
+
     }
 
     @Test

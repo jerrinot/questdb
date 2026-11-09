@@ -37,6 +37,7 @@ import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.TimeFrameCursor;
 import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.join.CompiledAsOfJoin;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.MemoryTag;
@@ -49,6 +50,7 @@ import io.questdb.std.Unsafe;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.List;
 
 import static org.questdb.experimental.codegen.Ir.*;
 import static org.questdb.experimental.codegen.MapKernelState.*;
@@ -69,19 +71,20 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
     private final QuestMapProbe probe;
     private final CompiledKernel code, lookupCode;
     private final String name;
-    private final int masterData, slaveData, historyData, filterData, symbolData, backwardWork, forwardWork, vectorData, selectedRows;
+    private final int masterData, slaveData, historyData, parameterData, filterData, symbolData, backwardWork, forwardWork, vectorData, selectedRows;
     private final long bytes;
     private final int keyType;
     private final boolean vectorFilter;
     private final DirectLongList buffer = new DirectLongList(0, MemoryTag.NATIVE_JIT, true);
-    private final KernelMemory memory = KernelMemory.reusable((Runnable) null);
+    private final KernelMemory memory;
     private long nativeRows;
     private int filterFrame = -1;
     private long filterConsumedTo;
 
     private ResolvedAsOfJoin(Input input, AggregateUpdates updates, ResolvedFilter.Binding filter,
-                             QuestMapProbe probe, Backend backend, Path artifacts) throws IOException {
+                             QuestMapProbe probe, GroupByAllocator allocator, Backend backend, Path artifacts) throws IOException {
         this.input = input;
+        this.memory = KernelMemory.reusable(allocator);
         this.updates = updates;
         this.filter = filter;
         this.probe = probe;
@@ -90,7 +93,8 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
         masterData = 224;
         slaveData = masterData + input.master().getColumnCount() * 8;
         historyData = slaveData + input.slave().getColumnCount() * 8;
-        filterData = historyData + input.slave().getColumnCount() * 8;
+        parameterData = historyData + input.slave().getColumnCount() * 8;
+        filterData = parameterData + updates.inputs().parameters().size() * 8;
         symbolData = (int) (filterData + filter.bytes() + 7) & ~7;
         backwardWork = symbolData + State.CAPACITY * 8;
         forwardWork = backwardWork + State.CAPACITY * 8;
@@ -104,7 +108,7 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
     }
 
     static CompiledAsOfJoin compile(Input input, Map map, Function predicate, ColumnTypes values,
-                                    ObjList<GroupByFunction> functions, MapValue layout,
+                                    ObjList<GroupByFunction> functions, MapValue layout, GroupByAllocator allocator,
                                     Backend backend, Path artifacts) throws IOException {
         if (input.masterKey() < 0 || input.slaveKey() < 0 || !predicate.isStableWithinExecution()) return null;
         int keyType = input.master().getColumnType(input.masterKey());
@@ -114,20 +118,17 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
                 || keyType != ColumnType.LONG && !(map instanceof Unordered4Map)) return null;
         if (input.master().getTimestampIndex() < 0 || input.slave().getTimestampIndex() < 0) return null;
         long base = layout.getAddress(0);
-        var updates = AggregateUpdates.bind(input.aggregateInputs(), values, functions, i -> layout.getAddress(i) - base, false);
+        var updates = AggregateUpdates.bind(values, functions, i -> layout.getAddress(i) - base, true,
+                new ResolvedInputs(input.aggregateInputs(), new ArrayList<>(), backend.options()));
         if (updates == null || updates.inputs().varcharColumns().length != 0
                 || updates.inputs().literals().length != 0 || !updates.inputs().captures().isEmpty()
                 || !updates.inputs().expressions().isEmpty()) return null;
-        for (var update : updates.updates()) if (update.allocates() || update.scalarState().isEmpty()) return null;
-        for (var column : updates.columns()) {
-            if (column.width() != MemoryType.I32 && column.width() != MemoryType.I64 && column.width() != MemoryType.F64)
-                return null;
-        }
-        var filter = ResolvedFilter.bind(input.slave(), predicate);
+        for (var update : updates.updates()) if (update.scalarState().isEmpty()) return null;
+        var filter = ResolvedFilter.bind(input.slave(), predicate, backend.options());
         if (filter == null) return null;
         var probe = QuestMapProbe.direct(-1, keyType == ColumnType.SYMBOL ? ColumnType.INT : keyType, false);
         try {
-            return new ResolvedAsOfJoin(input, updates, filter, probe, backend, artifacts);
+            return new ResolvedAsOfJoin(input, updates, filter, probe, allocator, backend, artifacts);
         } catch (Throwable failure) {
             try { filter.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
@@ -137,6 +138,7 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
     private Program emit() {
         Helper selection = selectionHelper();
         Builder b = new Builder();
+        var aggregateParameters = updates.inputs().loadParameters(b, at(COLUMNS, parameterData));
         Var left = b.let(load(at(COLUMNS, LEFT))), right = b.let(load(at(COLUMNS, RIGHT)));
         Var work = b.let(load(at(COLUMNS, PROBE_ROWS)));
         Var latest = b.let(load(at(COLUMNS, LATEST)));
@@ -222,7 +224,7 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
                             same.assign(backward, add(binary(Op.SUB, latest, rowId), i64(1))));
                 });
             });
-            emitUpdates(loop, left, match, matchedRow, payload);
+            emitUpdates(loop, left, match, matchedRow, payload, aggregateParameters);
             loop.store(new Offset(at(COLUMNS, backwardWork), offset), backward);
             loop.store(new Offset(at(COLUMNS, forwardWork), offset), work);
             loop.assign(left, add(left, i64(1)));
@@ -232,7 +234,7 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
         return new Program(b.block());
     }
 
-    private void emitUpdates(Builder loop, Expr left, Expr match, Expr matchedRow, Expr payload) {
+    private void emitUpdates(Builder loop, Expr left, Expr match, Expr matchedRow, Expr payload, List<Expr> parameters) {
         var inputs = new ArrayList<Pipeline.Value>();
         int split = input.master().getColumnCount();
         for (int i = 0; i < updates.sourceIndexes().length; i++) {
@@ -241,13 +243,14 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
             Var value;
             if (source < split) value = loop.let(column(column.width(), at(COLUMNS, masterData), source, left));
             else {
-                value = loop.let(column.width() == MemoryType.F64 ? f64(Double.NaN) : i64(column.nullValue()));
+                value = loop.let(column.nullLiteral());
                 int rhs = slaveColumn(source - split);
                 loop.when(match, present -> present.assign(value, column(column.width(), payload, rhs, matchedRow)));
             }
             inputs.add(column.value(value));
         }
-        updates.emit(loop, new Pipeline.Row(updates.columns(), inputs), new Load(MemoryType.ADDRESS, at(COLUMNS, AGG)), nil());
+        // The cursor consumes the first row through Java before either native strategy runs.
+        updates.emitExisting(loop, new Pipeline.Row(updates.columns(), inputs, parameters), new Load(MemoryType.ADDRESS, at(COLUMNS, AGG)), nil());
     }
 
     /** Mirrors AbstractAsOfJoinFastRecordCursor's bounded linear/binary timestamp search. */
@@ -312,6 +315,7 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
 
     private Program emitLookup() {
         Builder b = new Builder();
+        var aggregateParameters = updates.inputs().loadParameters(b, at(COLUMNS, parameterData));
         Var left = b.let(load(at(COLUMNS, LEFT))), predecessor = b.let(load(at(COLUMNS, RIGHT)));
         Var navigation = b.let(load(at(COLUMNS, NAV_ROW))), lookahead = b.let(load(at(COLUMNS, NAV_TS)));
         Var previous = b.let(load(at(COLUMNS, PREVIOUS)));
@@ -366,7 +370,7 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
                     scan.when(eq(binary(Op.AND, row, i64(1023)), i64(0)), Builder::poll);
                 });
             });
-            emitUpdates(loop, left, match, add(row, i64(1)), at(COLUMNS, slaveData));
+            emitUpdates(loop, left, match, add(row, i64(1)), at(COLUMNS, slaveData), aggregateParameters);
             loop.store(new Offset(at(COLUMNS, backwardWork), offset), new Select(known, binary(Op.SUB, binary(Op.SUB, predecessor, row),
                     new Select(match, i64(0), i64(1))), i64(-1)));
             loop.store(new Offset(at(COLUMNS, forwardWork), offset), binary(Op.SUB, predecessor, previous));
@@ -522,33 +526,27 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
                           State progress, SqlExecutionCircuitBreaker breaker) {
         if (master instanceof PageFrameFilteredMemoryRecord || !(slave.getRecord() instanceof PageFrameMemoryRecord rhs)
                 || rhs instanceof PageFrameFilteredMemoryRecord) return;
+        validateSpan(progress);
         buffer.clearAndEnsureCapacity((bytes + 7) / 8);
         long state = buffer.getAddress(), args = state + STATE_BYTES;
         long prefix = Rows.toRowID(Rows.toPartitionIndex(progress.forwardRowId), 0);
         long right = Rows.toLocalRowID(progress.forwardRowId);
         if (progress.forwardRowId == progress.slaveHi) return;
         slave.recordAt(rhs, progress.forwardRowId);
-        if (!prepare(master, rhs, args) || !filter.prepare(rhs, args + filterData)) return;
+        if (!prepareRegion(master, rhs, value, progress, args)) return;
         if (filterFrame != rhs.getFrameIndex() || right < filterConsumedTo) {
             Unsafe.putLong(args + CACHE_LO, right);
             Unsafe.putLong(args + CACHE_HI, right);
             Unsafe.putLong(args + CACHE_POS, 0);
             Unsafe.putLong(args + CACHE_COUNT, 0);
         }
-        Unsafe.putLong(args + LEFT, progress.masterLo);
-        Unsafe.putLong(args + LEFT_LO, progress.masterLo);
         Unsafe.putLong(args + RIGHT, right);
         Unsafe.putLong(args + RIGHT_HI, progress.slaveHi - prefix);
         Unsafe.putLong(args + PREFIX, prefix);
         Unsafe.putLong(args + PROBE_ROWS, 0);
         Unsafe.putLong(args + LIMIT, progress.forwardLimit);
         Unsafe.putLong(args + LATEST, progress.latestRowId);
-        Unsafe.putLong(args + AGG, value.getAddress(0));
         Unsafe.putLong(args + HISTORY_PREFIX, -1);
-        if (keyType == ColumnType.SYMBOL) {
-            for (int i = 0; i < progress.masterHi - progress.masterLo; i++)
-                Unsafe.putLong(args + symbolData + i * 8L, progress.symbolKeys[i]);
-        }
         map.writeNativeProbeView(state + CONTROL_BYTES);
         memory.enter(breaker);
         try {
@@ -575,18 +573,19 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
                 } else throw new IllegalStateException("Invalid ASOF aggregate status: " + status);
             }
         } finally {
-            filterFrame = rhs.getFrameIndex();
-            filterConsumedTo = Unsafe.getLong(args + RIGHT);
-            progress.nextMaster = Unsafe.getLong(args + LEFT);
-            progress.forwardRowId = prefix + Unsafe.getLong(args + RIGHT);
-            progress.forwardRows = Unsafe.getLong(args + PROBE_ROWS);
-            progress.latestRowId = Unsafe.getLong(args + LATEST);
-            for (int i = 0; i < progress.nextMaster - progress.masterLo; i++) {
-                progress.backwardWork[i] = Unsafe.getLong(args + backwardWork + i * 8L);
-                progress.forwardWork[i] = Unsafe.getLong(args + forwardWork + i * 8L);
-            }
-            nativeRows += progress.nextMaster - progress.masterLo;
-            memory.close();
+            try {
+                filterFrame = rhs.getFrameIndex();
+                filterConsumedTo = Unsafe.getLong(args + RIGHT);
+                progress.nextMaster = completedPosition(args, progress);
+                progress.forwardRowId = prefix + Unsafe.getLong(args + RIGHT);
+                progress.forwardRows = Unsafe.getLong(args + PROBE_ROWS);
+                progress.latestRowId = Unsafe.getLong(args + LATEST);
+                for (int i = 0; i < progress.nextMaster - progress.masterLo; i++) {
+                    progress.backwardWork[i] = Unsafe.getLong(args + backwardWork + i * 8L);
+                    progress.forwardWork[i] = Unsafe.getLong(args + forwardWork + i * 8L);
+                }
+                nativeRows += progress.nextMaster - progress.masterLo;
+            } finally { memory.close(); }
         }
     }
 
@@ -595,12 +594,11 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
                                 State progress, SqlExecutionCircuitBreaker breaker) {
         if (master instanceof PageFrameFilteredMemoryRecord || !(slave.getRecord() instanceof PageFrameMemoryRecord rhs)
                 || rhs instanceof PageFrameFilteredMemoryRecord) return;
+        validateSpan(progress);
         buffer.clearAndEnsureCapacity((STATE_BYTES + vectorData + 7) / 8);
         long state = buffer.getAddress(), args = state + STATE_BYTES;
         slave.recordAt(rhs, Rows.toRowID(slave.getTimeFrame().getFrameIndex(), progress.lookupRow));
-        if (!prepare(master, rhs, args) || !filter.prepare(rhs, args + filterData)) return;
-        Unsafe.putLong(args + LEFT, progress.masterLo);
-        Unsafe.putLong(args + LEFT_LO, progress.masterLo);
+        if (!prepareRegion(master, rhs, value, progress, args)) return;
         Unsafe.putLong(args + RIGHT, progress.lookupRow);
         Unsafe.putLong(args + RIGHT_LO, progress.lookupLo);
         Unsafe.putLong(args + RIGHT_HI, progress.lookupHi);
@@ -609,33 +607,56 @@ final class ResolvedAsOfJoin implements CompiledAsOfJoin {
         Unsafe.putLong(args + PREVIOUS, progress.previousLookupRow);
         Unsafe.putLong(args + LOOKAHEAD, progress.lookahead);
         Unsafe.putLong(args + LIMIT, progress.lookupLimit);
-        Unsafe.putLong(args + AGG, value.getAddress(0));
-        if (keyType == ColumnType.SYMBOL) {
-            for (int i = 0; i < progress.masterHi - progress.masterLo; i++)
-                Unsafe.putLong(args + symbolData + i * 8L, progress.symbolKeys[i]);
-        }
         memory.enter(breaker);
         try {
             long status = lookupCode.run(args, progress.masterHi, state);
             memory.throwIfFailed();
             if (status != 0 && status != STOP) throw new IllegalStateException("Invalid ASOF lookup aggregate status: " + status);
         } finally {
-            progress.nextMaster = Unsafe.getLong(args + LEFT);
-            progress.lookupRow = Unsafe.getLong(args + RIGHT);
-            progress.lookupFrameRow = Unsafe.getLong(args + NAV_ROW);
-            progress.lookupTimestamp = Unsafe.getLong(args + NAV_TS);
-            progress.previousLookupRow = Unsafe.getLong(args + PREVIOUS);
-            for (int i = 0; i < progress.nextMaster - progress.masterLo; i++) {
-                progress.backwardWork[i] = Unsafe.getLong(args + backwardWork + i * 8L);
-                progress.forwardWork[i] = Unsafe.getLong(args + forwardWork + i * 8L);
-            }
-            nativeRows += progress.nextMaster - progress.masterLo;
-            filterFrame = -1;
-            memory.close();
+            try {
+                progress.nextMaster = completedPosition(args, progress);
+                progress.lookupRow = Unsafe.getLong(args + RIGHT);
+                progress.lookupFrameRow = Unsafe.getLong(args + NAV_ROW);
+                progress.lookupTimestamp = Unsafe.getLong(args + NAV_TS);
+                progress.previousLookupRow = Unsafe.getLong(args + PREVIOUS);
+                for (int i = 0; i < progress.nextMaster - progress.masterLo; i++) {
+                    progress.backwardWork[i] = Unsafe.getLong(args + backwardWork + i * 8L);
+                    progress.forwardWork[i] = Unsafe.getLong(args + forwardWork + i * 8L);
+                }
+                nativeRows += progress.nextMaster - progress.masterLo;
+                filterFrame = -1;
+            } finally { memory.close(); }
         }
     }
 
+    private static void validateSpan(State progress) {
+        if (progress.masterLo < 0 || progress.masterHi < progress.masterLo
+                || progress.masterHi - progress.masterLo > State.CAPACITY)
+            throw new IllegalArgumentException("Invalid ASOF aggregate span");
+    }
+
+    private static long completedPosition(long args, State progress) {
+        long next = Unsafe.getLong(args + LEFT);
+        if (next < progress.masterLo || next > progress.masterHi)
+            throw new IllegalStateException("Invalid ASOF aggregate progress: " + next);
+        return next;
+    }
+
+    private boolean prepareRegion(PageFrameMemoryRecord master, PageFrameMemoryRecord rhs, MapValue value,
+                                  State progress, long args) {
+        if (!prepare(master, rhs, args) || !filter.prepare(rhs, args + filterData)) return false;
+        Unsafe.putLong(args + LEFT, progress.masterLo);
+        Unsafe.putLong(args + LEFT_LO, progress.masterLo);
+        Unsafe.putLong(args + AGG, value.getAddress(0));
+        if (keyType == ColumnType.SYMBOL) {
+            for (int i = 0; i < progress.masterHi - progress.masterLo; i++)
+                Unsafe.putLong(args + symbolData + i * 8L, progress.symbolKeys[i]);
+        }
+        return true;
+    }
+
     private boolean prepare(PageFrameMemoryRecord master, PageFrameMemoryRecord rhs, long args) {
+        updates.inputs().prepareParameters(args + parameterData);
         long timestamp = master.getPageAddress(input.master().getTimestampIndex());
         if (timestamp == 0 || master.getPageAddress(input.masterKey()) == 0) return false;
         Unsafe.putLong(args + MASTER_TS, timestamp);

@@ -46,8 +46,7 @@ public final class LlvmBackend implements Backend {
 
     @Override public CompiledKernel compile(Ir.Program program, Path artifacts) throws IOException {
         long started = System.nanoTime();
-        if (!System.getProperty("os.name").equals("Linux") || ValueLayout.ADDRESS.byteSize() != 8)
-            throw new IOException("The experimental LLVM backend requires 64-bit Linux");
+        checkPlatform();
         // Preserve SSA. Our scalar passes and out-of-SSA lowering are deliberately bypassed.
         var graph = SsaProgram.lower(program); SsaOptimizer.verify(graph);
         String source = LlvmEmitter.emit(graph);
@@ -59,6 +58,11 @@ public final class LlvmBackend implements Backend {
             Files.writeString(directory.resolve("query.ll"), source);
         }
         return compileSource(source, directory, started);
+    }
+
+    static void checkPlatform() throws IOException {
+        if (!System.getProperty("os.name").equals("Linux") || ValueLayout.ADDRESS.byteSize() != 8)
+            throw new IOException("The experimental LLVM backend requires 64-bit Linux");
     }
 
     /** Shares optimization, JIT, callbacks and ownership with the handwritten C reference. */

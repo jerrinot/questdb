@@ -33,8 +33,27 @@ import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** Fixed-width RecordSink encoding; direct columns followed by resolved computed keys. */
 record QuestFixedKey(ResolvedVarchar.Binding frameInputs,
-                     java.util.List<Pipeline.Scalar> expressions, MemoryType[] widths, int bytes,
+                     java.util.List<Pipeline.Scalar> expressions, MemoryType[] widths, long[] nullValues, int bytes,
                      java.util.List<SymbolExpression> dictionaries) {
+    /** Raw RecordSink bytes, including floating-point payload bits. */
+    static MemoryType width(int type) {
+        return switch (type) {
+            case ColumnType.BOOLEAN, ColumnType.BYTE -> MemoryType.I8;
+            case ColumnType.SHORT, ColumnType.CHAR -> MemoryType.I16;
+            case ColumnType.INT, ColumnType.SYMBOL, ColumnType.IPv4, ColumnType.FLOAT -> MemoryType.I32;
+            case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO, ColumnType.DOUBLE -> MemoryType.I64;
+            default -> null;
+        };
+    }
+
+    static long nullValue(int type) {
+        return switch (type) {
+            case ColumnType.FLOAT -> Float.floatToRawIntBits(Float.NaN);
+            case ColumnType.DOUBLE -> Double.doubleToRawLongBits(Double.NaN);
+            default -> Pipeline.nullValueOf(type);
+        };
+    }
+
     static QuestFixedKey bind(ColumnTypes inputs, ColumnTypes types, ListColumnFilter columns, OrderedMap map) {
         return bind(inputs, types, columns, null, map);
     }
@@ -54,16 +73,12 @@ record QuestFixedKey(ResolvedVarchar.Binding frameInputs,
         var dictionaries = new java.util.ArrayList<SymbolExpression>();
         var dictionaryPositions = new java.util.ArrayList<Integer>();
         MemoryType[] widths = new MemoryType[count];
+        long[] nullValues = new long[count];
         int bytes = 0;
         for (int i = 0; i < count; i++) {
             int type = types.getColumnType(i);
-            widths[i] = switch (type) {
-                case ColumnType.BYTE -> MemoryType.I8;
-                case ColumnType.SHORT -> MemoryType.I16;
-                case ColumnType.INT, ColumnType.SYMBOL, ColumnType.IPv4 -> MemoryType.I32;
-                case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO, ColumnType.DOUBLE -> MemoryType.I64;
-                default -> null;
-            };
+            nullValues[i] = nullValue(type);
+            widths[i] = width(type);
             if (widths[i] == null) return null;
             Pipeline.Scalar expression;
             if (i < columns.size()) {
@@ -83,20 +98,22 @@ record QuestFixedKey(ResolvedVarchar.Binding frameInputs,
                     dictionaryPositions.add(i);
                 }
             }
+            if (expression == null) return null;
             expressions.add(expression);
             bytes += widths[i].bytes;
         }
         if (map instanceof OrderedMap ordered) {
             if (bytes != ordered.getFixedKeySize()) return null;
-        } else if (!(count == 1 && ((types.getColumnType(0) == ColumnType.INT || types.getColumnType(0) == ColumnType.SYMBOL) && map instanceof io.questdb.cairo.map.Unordered4Map
-                || types.getColumnType(0) == ColumnType.LONG && map instanceof io.questdb.cairo.map.Unordered8Map))) return null;
+        } else if (!(count == 1 && (io.questdb.cairo.map.Unordered4Map.isSupportedKeyType(types.getColumnType(0)) && map instanceof io.questdb.cairo.map.Unordered4Map
+                || io.questdb.cairo.map.Unordered8Map.isSupportedKeyType(types.getColumnType(0))
+                && map instanceof io.questdb.cairo.map.Unordered8Map))) return null;
         for (int i = 0; i < dictionaries.size(); i++) {
             int position = dictionaryPositions.get(i);
             Expr pointers = new Load(MemoryType.ADDRESS, at(STATE, KEY_COLUMNS));
             Expr table = new Load(MemoryType.ADDRESS, at(pointers, strings.binding().bytes() + i * 8L));
             expressions.set(position, new Pipeline.DictionaryLookup(expressions.get(position), table));
         }
-        return new QuestFixedKey(strings.binding(), java.util.List.copyOf(expressions), widths, bytes,
+        return new QuestFixedKey(strings.binding(), java.util.List.copyOf(expressions), widths, nullValues, bytes,
                 java.util.List.copyOf(dictionaries));
     }
 
@@ -131,14 +148,12 @@ record QuestFixedKey(ResolvedVarchar.Binding frameInputs,
 
     private Expr storedKey(Pipeline.Row row, int index) {
         var value = expressions.get(index).emit(row);
-        // RecordSink.putDouble stores raw IEEE bits, including NaN payloads and zero's sign.
-        if (value.data().type() == Type.F64) return new BitCast(value.data());
+        // RecordSink stores raw IEEE bits, including NaN payloads and zero's sign.
+        if (value.data().type() == Type.F64 || value.data().type() == Type.F32) return new BitCast(value.data());
         // Widening casts retain the input expression's NULL flag, but the packed key
         // must use the result width's sentinel (INT NULL is not LONG NULL).
-        long nullValue = widths[index] == MemoryType.I64 ? Long.MIN_VALUE
-                : expressions.get(index) instanceof Pipeline.Column column ? column.nullValue() : Integer.MIN_VALUE;
         return widths[index] == MemoryType.I32 || widths[index] == MemoryType.I64
-                ? new Select(value.isNull(), i64(nullValue), value.data()) : value.data();
+                ? new Select(value.isNull(), i64(nullValues[index]), value.data()) : value.data();
     }
 
     Var scalar(Builder b, Expr index) { return scalar(b, loadRow(b, index)); }

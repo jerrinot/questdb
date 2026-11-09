@@ -346,6 +346,7 @@ public class SymbolFilterTest {
                 "s like '%a%' or s ilike '%X%'",
                 "s like '%a%' or k>2",
                 "s like '%a%' or id*1.25>700.5",
+                "s like '%a%' or length(v)>3",
                 "s like '%a%' or s='X'",
                 "v like 'value-1%' or v like '%3'",
                 "s like '%a%' or v like 'value-1%'",
@@ -362,7 +363,7 @@ public class SymbolFilterTest {
                 assertEquals(predicate, 1003, filtered.getCompiledCountOnlyFilter().getNativeInputRows());
             }
         }
-        String unsupported = "select count() from symbols where s like '%a%' or length(v)>3";
+        String unsupported = "select count() from symbols where s like '%a%' or abs(id)>3";
         try (var factory = candidate(unsupported)) {
             check(factory, unsupported);
             for (var input = factory; input != null; input = input.getBaseFactory()) {

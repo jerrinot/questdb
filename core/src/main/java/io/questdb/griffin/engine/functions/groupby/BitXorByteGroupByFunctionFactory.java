@@ -28,7 +28,6 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.constants.ByteConstant;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 
@@ -53,9 +52,6 @@ public class BitXorByteGroupByFunctionFactory implements FunctionFactory {
             SqlExecutionContext sqlExecutionContext
     ) {
         Function arg = args.getQuick(0);
-        if (arg.isConstant()) {
-            return new ByteConstant(arg.getByte(null));
-        }
         return new BitXorByteGroupByFunction(arg);
     }
 }

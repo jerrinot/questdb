@@ -87,13 +87,13 @@ public class HashJoinGroupByCandidateTest extends AbstractCairoTest {
             FunctionParser parser = new FunctionParser(configuration, engine.getFunctionFactoryCache());
             try (SqlCompiler compiler = engine.getSqlCompiler()) {
                 for (String expression : new String[]{"sum(d)", "avg(d)", "count()", "count(i)", "count(l)", "count(d)", "count(s)",
-                        "sum(coalesce(d, 0.0))", "sum(i)", "avg(l)", "min(d)", "ksum(d)", "stddev(d)", "corr(d, l)", "weighted_avg(i, l)"}) {
+                        "sum(coalesce(d, 0.0))", "sum(i)", "avg(l)", "min(d)", "ksum(d)", "stddev(d)", "corr(d, l)", "weighted_avg(i, l)", "count(i::short)", "count_distinct(i)", "count_distinct(l)", "count_distinct(s)", "count_distinct(i::ipv4)"}) {
                     try (Function function = parser.parseFunction(compiler.testParseExpression(expression, QueryModel.FACTORY.newInstance()), metadata, sqlExecutionContext)) {
                         Assert.assertTrue(expression, HashJoinGroupByCandidate.isSupportedAggregate(function));
                     }
                 }
-                for (String expression : new String[]{"first(d)", "last(d)", "count_distinct(i)", "sum(rnd_double())", "mode(d)",
-                        "arg_min(d, l)", "corr(d, rnd_double())", "count(i::short)"}) {
+                for (String expression : new String[]{"first(d)", "last(d)", "count_distinct(s::varchar)", "sum(rnd_double())", "mode(d)",
+                        "arg_min(d, l)", "corr(d, rnd_double())"}) {
                     try (Function function = parser.parseFunction(compiler.testParseExpression(expression, QueryModel.FACTORY.newInstance()), metadata, sqlExecutionContext)) {
                         Assert.assertFalse(expression, HashJoinGroupByCandidate.isSupportedAggregate(function));
                     }
@@ -143,9 +143,9 @@ public class HashJoinGroupByCandidateTest extends AbstractCairoTest {
             }
             // The joined record reads a variable-size build column as a payload: as an aggregate
             // argument, a grouping key, a post-join filter, or an ON condition that reads the probe too.
-            assertCandidate("select r.plant_id, count(p.name) from r left join p on r.plant_id=p.plant_id and p.name ~ 'x'", false);
+            assertCandidate("select r.plant_id, count(p.name) from r left join p on r.plant_id=p.plant_id and p.name ~ 'x'", true);
             assertCandidate("select p.tag, sum(r.energy_kwh) from r left join p on r.plant_id=p.plant_id and p.tag = 't'", false);
-            assertCandidate("select r.plant_id, sum(r.energy_kwh) from r left join p on r.plant_id=p.plant_id where p.name ~ 'x'", false);
+            assertCandidate("select r.plant_id, sum(r.energy_kwh) from r left join p on r.plant_id=p.plant_id where p.name ~ 'x'", true);
             assertCandidate("select r.plant_id, sum(r.energy_kwh) from r left join p on r.plant_id=p.plant_id and length(p.name) > r.plant_id", false);
             assertCandidate("select p.country, sum(r.energy_kwh) from p right join r on r.plant_id=p.plant_id and r.energy_kwh > 0", false);
             assertCandidate("select p.country, sum(r.energy_kwh) from r left join p on r.plant_id=p.plant_id and (p.installed_kwp > 0 or r.energy_kwh > 0)", false);
@@ -396,7 +396,9 @@ public class HashJoinGroupByCandidateTest extends AbstractCairoTest {
             assertCandidate(sql, true);
             bindVariableService.setDouble(0, 2.0);
             assertCandidate(sql, true);
-            execute("alter table p add column unsupported varchar");
+            execute("alter table p add column payload varchar");
+            execute("alter table p add column unsupported binary");
+            assertCandidate("select p.payload, sum(r.energy_kwh)" + JOIN, true);
             assertCandidate("select p.country, sum(r.energy_kwh)" + JOIN, true);
             assertCandidate("select p.unsupported, sum(r.energy_kwh)" + JOIN, false);
             // Key type changes rebind the analysis: INT to SYMBOL on both sides and back.
@@ -430,7 +432,7 @@ public class HashJoinGroupByCandidateTest extends AbstractCairoTest {
                     "select p.country, last(r.energy_kwh)" + JOIN,
                     "select p.country, mode(r.energy_kwh)" + JOIN,
                     "select p.country, arg_min(r.energy_kwh, r.plant_id)" + JOIN,
-                    "select p.country, count_distinct(r.plant_id)" + JOIN,
+                    "select p.country, count_distinct(r.plant_id::varchar)" + JOIN,
                     "select p.country, sum(rnd_double())" + JOIN
             }) {
                 assertCandidate(sql, false);

@@ -27,6 +27,7 @@ package io.questdb.griffin.engine;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.std.QuietCloseable;
 
 /** Query-owned unkeyed reduction code; existing acquired slots own state and scratch. */
@@ -38,10 +39,11 @@ public interface CompiledScalarAggregate extends QuietCloseable {
 
     CharSequence getName();
 
-    Updater newUpdater();
+    /** Borrows the acquired slot allocator; the atom owns its lifetime. */
+    Updater newUpdater(GroupByAllocator allocator);
 
     /** Source is nonempty. Copy on first contribution, otherwise merge into the destination. */
-    void merge(MapValue source, MapValue destination);
+    void merge(MapValue source, MapValue destination, GroupByAllocator allocator, SqlExecutionCircuitBreaker circuitBreaker);
 
     interface Updater extends QuietCloseable {
         /** Read after the frame sequence drains. */

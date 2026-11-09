@@ -34,8 +34,9 @@ public interface CaseFunctionPicker {
     Function pick(Record record);
 
     /**
-     * A resolved switch over integral keys. Keys use the selector's native getter
-     * representation, including its NULL sentinel. SYMBOL keys are cursor-bound.
+     * A resolved switch over integral key encodings. Floating keys use canonical IEEE
+     * bits; other keys use the native getter representation and NULL sentinel.
+     * Timestamp constants use the selector's resolution. SYMBOL keys are cursor-bound.
      * Branch functions include the ordinary return-type casts and remain borrowed.
      */
     interface Integral extends CaseFunctionPicker {

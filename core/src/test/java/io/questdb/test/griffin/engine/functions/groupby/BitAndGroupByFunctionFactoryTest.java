@@ -156,6 +156,7 @@ public class BitAndGroupByFunctionFactoryTest extends AbstractCairoTest {
     public void testBitAndConstant() throws Exception {
         assertQuery("select bit_and(42::long) from tab")
                 .ddl("create table tab as (select x from long_sequence(5))")
+                .noRandomAccess()
                 .expectSize()
                 .returns("""
                         bit_and

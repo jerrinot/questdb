@@ -214,7 +214,8 @@ public class ResolvedSqlJoinTest {
             matches("select p.v,count(),sum(d.v) from p join d on p.k=d.k group by p.v", true, 1);
             matches("select d.v,count(),sum(p.w) from p join d on p.k=d.k where p.v>d.v group by d.v", true, 1);
         }
-        matches("select p.k,count_distinct(d.v) from p join d on p.k=d.k group by p.k", false, 1);
+        matches("select p.k,count_distinct(d.v) from p join d on p.k=d.k group by p.k", true, 1);
+        matches("select p.k,count_distinct(d.v::varchar) from p join d on p.k=d.k group by p.k", false, 1);
         pool.halt();
         matches("select d.v,count(),sum(p.v) from p join d on p.k=d.k group by d.v", true, 1);
         assertEquals(before, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT));
@@ -259,8 +260,8 @@ public class ResolvedSqlJoinTest {
                         code.preparePayloads(builds, rows, tracker, breaker);
                     }
                     @Override public void close() { code.close(); }
-                    @Override public CompiledJoin.Updater newUpdater(Runnable checkpoint) {
-                        return code.newUpdater(() -> {
+                    @Override public CompiledJoin.Updater newUpdater(io.questdb.griffin.engine.groupby.GroupByAllocator allocator, Runnable checkpoint) {
+                        return code.newUpdater(allocator, () -> {
                             checkpoint.run();
                             if (fail.get() && polls.incrementAndGet() >= 3)
                                 throw CairoException.nonCritical().put("native join checkpoint failure");

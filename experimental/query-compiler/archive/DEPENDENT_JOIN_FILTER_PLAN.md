@@ -1,7 +1,10 @@
 # Selective filter transfer through dependent joins
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 Implementation checkpoint, 2026-11-07. Results and evidence are in
-[PROGRESS.md](PROGRESS.md); this file keeps the contract and remaining decisions.
+[PROGRESS.md](../PROGRESS.md); this file keeps the contract and remaining decisions.
 
 ## Objective
 

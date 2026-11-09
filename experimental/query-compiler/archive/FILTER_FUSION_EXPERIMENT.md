@@ -1,5 +1,8 @@
 # Filter and aggregation fusion experiment
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 Exploratory, explicitly selected by the harness; ordinary compiler policy stays
 unchanged. The experiment uses resolved types/functions, never query names or
 fixture constants for eligibility. Existing map algorithms, allocation, bounded

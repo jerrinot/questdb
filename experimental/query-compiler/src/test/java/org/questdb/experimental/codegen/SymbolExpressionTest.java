@@ -184,7 +184,7 @@ public class SymbolExpressionTest {
                 + "case when x%7=0 then null else x*17 end l,"
                 + "case when x%7=0 then null else (x%97-48)*0.25 end d from long_sequence(1003))", context);
         String sql = "select length(s) k,count(),count(i),count(l),count(d),"
-                + "sum(i),sum(l),sum(d),min(i),max(i),min(l),max(l),min(d),max(d),avg(i),avg(l),avg(d) "
+                + "sum(i),sum(l),sum(d),min(i),max(i),min(l),max(l),min(d),max(d),avg(i),avg(l),avg(d),weighted_avg(d,i) "
                 + "from numbers group by k";
         try (var factory = candidate(sql)) {
             check(factory, sql);

@@ -74,7 +74,7 @@ final class ResolvedTopK implements CompiledTopK {
         if (order.size() != 1) return null;
         int key = order.getQuick(0), column = Math.abs(key) - 1;
         if (column < 0 || column >= inputs.getColumnCount() || inputs.getColumnType(column) != ColumnType.VARCHAR) return null;
-        var filter = predicate == null ? null : ResolvedFilter.bind(inputs, predicate);
+        var filter = predicate == null ? null : ResolvedFilter.bind(inputs, predicate, backend.options());
         var code = filter == null ? backend.compile(QuestVarcharTopK.program(key < 0), artifacts)
                 : CompiledKernel.defer(backend, () -> QuestVarcharTopK.program(key < 0), artifacts);
         CompiledKernel filtered = null;

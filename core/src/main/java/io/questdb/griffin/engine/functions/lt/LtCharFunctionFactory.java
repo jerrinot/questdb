@@ -59,7 +59,7 @@ public class LtCharFunctionFactory implements FunctionFactory {
         return new LtCharFunction(args.getQuick(0), args.getQuick(1));
     }
 
-    private static class LtCharFunction extends NegatableBooleanFunction implements BinaryFunction {
+    public static class LtCharFunction extends NegatableBooleanFunction implements BinaryFunction {
 
         private final Function left;
         private final Function right;

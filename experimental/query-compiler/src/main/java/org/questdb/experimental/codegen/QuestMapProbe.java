@@ -71,7 +71,7 @@ final class QuestMapProbe {
 
     static QuestMapProbe fixed(QuestFixedKey key, int type, boolean ordered) {
         java.util.Objects.requireNonNull(key);
-        if (type == ColumnType.SYMBOL) type = ColumnType.INT;
+        type = keyStorageType(type);
         if (!ordered && type != ColumnType.INT && type != ColumnType.LONG) {
             throw new IllegalArgumentException("Unsupported fixed map key type: " + type);
         }
@@ -116,13 +116,12 @@ final class QuestMapProbe {
     }
 
     static final int VIEW_BYTES = NativeMapView.PROBE_BYTES;
-    private static final boolean PROFILE_PROBES = Boolean.getBoolean("query.codegen.probeCounters");
+    private static final boolean PROFILE_PROBES = CompilerOptions.PROCESS.probeCounters();
 
     static QuestMapProbe bind(int column, int type, Map map) {
         // A direct SYMBOL key is the table's stable 32-bit dictionary ID. The map
         // and result cursor retain the existing symbol table and NULL contract.
-        if (type == ColumnType.SYMBOL || type == ColumnType.IPv4) type = ColumnType.INT;
-        else if (type == ColumnType.DATE || ColumnType.isTimestamp(type)) type = ColumnType.LONG;
+        type = keyStorageType(type);
         if (column >= 0 && type == ColumnType.VARCHAR && map instanceof io.questdb.cairo.map.UnorderedVarcharMap) {
             return direct(column, type, false);
         }
@@ -132,6 +131,11 @@ final class QuestMapProbe {
             return direct(column, type, map instanceof OrderedMap);
         }
         return null;
+    }
+
+    private static int keyStorageType(int type) {
+        if (type == ColumnType.SYMBOL || type == ColumnType.IPv4) return ColumnType.INT;
+        return type == ColumnType.DATE || ColumnType.isTimestamp(type) ? ColumnType.LONG : type;
     }
 
     Var loadFrameKey(Builder b, Var row) { return loadFrameKey(b, row, null); }

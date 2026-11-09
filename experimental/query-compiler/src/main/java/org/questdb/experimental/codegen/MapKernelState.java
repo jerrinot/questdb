@@ -52,8 +52,10 @@ final class MapKernelState {
     static final int SHARD_MASK = 56;
     static final int CONTROL_BYTES = 64;
 
-    /** Present only for fused filters, before the deferred-DISTINCT control words. */
-    static final int FILTERED_ROWS = -24;
+    /** Cursor constants, also available when COLUMNS is a captured input page. */
+    static final int ARGUMENT_PARAMETERS = -24;
+    /** Present only for fused filters, before the aggregate descriptor and deferred-DISTINCT words. */
+    static final int FILTERED_ROWS = -32;
 
     /** Insert a missing key through Java, or grow a mutating map; SHARD identifies it. */
     static final int NEED_KEY = 4;

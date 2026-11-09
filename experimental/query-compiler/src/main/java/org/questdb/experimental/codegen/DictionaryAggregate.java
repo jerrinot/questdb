@@ -152,17 +152,16 @@ final class DictionaryAggregate {
         Var minimum = b.let(load(state));
         Var nullIndex = b.let(load(at(state, 8)));
         Var seen = b.let(new Load(MemoryType.ADDRESS, at(state, 16)));
-        var addresses = new ArrayList<Var>();
-        for (int i = 0; i < updates.columns().size(); i++)
-            addresses.add(b.let(new Load(MemoryType.ADDRESS, at(COLUMNS, (i + 1L) * 8))));
+        var addresses = updates.loadFrameInputs(b);
         Var row = b.let(i64(0));
         b.loop(binary(Op.LT, row, ROWS), loop -> {
             loop.when(eq(binary(Op.AND, row, i64(65535)), i64(0)), Builder::poll);
             Var value = key.scalar(loop, row);
             Var id = loop.let(new Select(eq(value, i64(Integer.MIN_VALUE)), nullIndex,
                     binary(Op.SUB, value, minimum)));
-            Var destination = DenseAggregate.entry(loop, updates, at(state, HEADER_BYTES), seen, id, stride);
-            updates.emitFrame(loop, row, addresses, destination, nil());
+            Var first = updates.firstRowFlag(loop);
+            Var destination = DenseAggregate.entry(loop, updates, at(state, HEADER_BYTES), seen, id, stride, first);
+            updates.emitFrame(loop, row, addresses, destination, nil(), first);
             loop.assign(row, add(row, i64(1)));
         });
         b.exit(0);
@@ -181,7 +180,7 @@ final class DictionaryAggregate {
     /** Borrows the acquired slot's allocator bridge and phase scratch until that slot closes. */
     final class Slot {
         private final KernelMemory memory;
-        private final long scratchAddress;
+        private long scratchAddress;
         private long state;
         private long rows;
 
@@ -189,6 +188,8 @@ final class DictionaryAggregate {
             this.memory = memory;
             this.scratchAddress = scratchAddress;
         }
+
+        void bindScratch(long address) { scratchAddress = address; }
 
         boolean update(long columns, long rowCount, long keyState, SqlExecutionCircuitBreaker breaker) {
             if (entries() == 0) return false;

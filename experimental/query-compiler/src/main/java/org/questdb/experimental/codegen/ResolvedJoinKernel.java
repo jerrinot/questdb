@@ -126,24 +126,18 @@ final class ResolvedJoinKernel {
             for (int i = 0; i < widths.length; i++) {
                 sources[i] = Source.bind(build.keyColumns()[i], probeColumns, builds, available);
                 if (sources[i] == null) return null;
-                widths[i] = switch (build.keyTypes()[i]) {
-                    case ColumnType.INT, ColumnType.SYMBOL -> MemoryType.I32;
-                    case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> MemoryType.I64;
-                    default -> null;
-                };
+                widths[i] = QuestFixedKey.width(build.keyTypes()[i]);
                 if (widths[i] == null) return null;
                 bytes += widths[i].bytes;
             }
+            long[] nullValues = java.util.Arrays.stream(build.keyTypes()).mapToLong(QuestFixedKey::nullValue).toArray();
             QuestMapProbe map = null;
-            if (widths.length > 1) {
-                var fixed = new QuestFixedKey(null, java.util.List.of(), widths, bytes, java.util.List.of());
+            int type = build.keyTypes()[0];
+            if (widths.length == 1 && io.questdb.cairo.map.Unordered8Map.isSupportedKeyType(type)) {
+                map = QuestMapProbe.direct(0, ColumnType.LONG, false);
+            } else if (widths.length > 1 || type != ColumnType.INT && type != ColumnType.SYMBOL) {
+                var fixed = new QuestFixedKey(null, java.util.List.of(), widths, nullValues, bytes, java.util.List.of());
                 map = QuestMapProbe.fixed(fixed, -1, true);
-            } else if (widths[0] == MemoryType.I64) {
-                // TIMESTAMP_NS uses OrderedMap in the ordinary builder.
-                if (build.keyTypes()[0] == ColumnType.TIMESTAMP_NANO) {
-                    var fixed = new QuestFixedKey(null, java.util.List.of(), widths, bytes, java.util.List.of());
-                    map = QuestMapProbe.fixed(fixed, -1, true);
-                } else map = QuestMapProbe.direct(0, ColumnType.LONG, false);
             }
             return new Key(widths, bytes, map, sources);
         }
@@ -202,6 +196,7 @@ final class ResolvedJoinKernel {
         // prevents a future write from overwriting the current row's slot.
         long ringOffset() { return parameterOffset() + parameters.size() * 8L; }
         long groupCacheOffset() { return ringOffset() + ringBytes(); }
+        long functionCardinalityOffset() { return groupCacheOffset() + 8; }
         long ringBytes() { return (long) LOOKAHEAD_SLOTS * (builds.length + 1) * 8; }
         Expr ring(Expr position) { return new Offset(at(COLUMNS, ringOffset()),
                 binary(Op.MUL, binary(Op.AND, position, i64(LOOKAHEAD_SLOTS - 1)), i64((builds.length + 1) * 8L))); }
@@ -272,7 +267,7 @@ final class ResolvedJoinKernel {
         }
         if (columns != joinedTypes.getColumnCount()) return null;
         var parameters = new ArrayList<IntSupplier>();
-        var inputs = new ResolvedInputs(joinedTypes, parameters);
+        var inputs = new ResolvedInputs(joinedTypes, parameters, backend.options());
         QuestMapProbe mapProbe = null;
         Pipeline.Column groupKey = null;
         ResolvedVarchar.Expression groupString = null;
@@ -312,7 +307,7 @@ final class ResolvedJoinKernel {
         var packed = new FlyweightPackedMapValue(valueTypes);
         long base = layout != null ? layout.getAddress(0) : 0;
         var updates = AggregateUpdates.bind(valueTypes, functions,
-                index -> groupLayout != null ? packed.getOffset(index) : layout.getAddress(index) - base, false, inputs);
+                index -> groupLayout != null ? packed.getOffset(index) : layout.getAddress(index) - base, true, inputs);
         if (updates == null) return null;
         // Capture helpers own separate per-slot state; leave those on the ordinary path.
         if (!updates.inputs().captures().isEmpty()) return null;
@@ -679,7 +674,7 @@ final class ResolvedJoinKernel {
         int offset = 0;
         for (int k = 0; k < shape.widths.length; k++) {
             int descriptor = layout.key(index, k);
-            Var key = loadValue(b, layout, shape.widths[k], i64(shape.widths[k] == MemoryType.I32 ? Integer.MIN_VALUE : Long.MIN_VALUE),
+            Var key = loadValue(b, layout, shape.widths[k], i64(QuestFixedKey.nullValue(layout.builds[index].keyTypes()[k])),
                     shape.sources[k], at(COLUMNS, descriptor), new Load(MemoryType.ADDRESS, at(COLUMNS, descriptor)),
                     row, lookups, links);
             if (layout.builds[index].keyTypes()[k] == ColumnType.SYMBOL) {
@@ -943,11 +938,19 @@ final class ResolvedJoinKernel {
                 destination = cached;
             } else destination = findGroup(b, target, frame, position, layout, links);
         }
+        // MATCHED distinguishes a fresh group from existing state, including NULL-only state.
+        Var firstUpdate = updates.firstUpdateFlag(b, binary(Op.LT, matched, i64(0)));
+        updates.initializeEmptyState(b, target.state == null ? destination : STATE, binary(Op.LT, matched, i64(0)),
+                (first, seeds) -> {
+                    first.append(target.state == null ? seeds : target.state.promote(seeds));
+                    // Staging and symbol-resolution exits may resume this kernel.
+                    first.store(at(COLUMNS, MATCHED), i64(1));
+                });
         b.assign(matched, i64(1));
-        if (target.state == null) updates.emitRepeated(b, frame, destination, repetitions);
+        if (target.state == null) updates.emitRepeated(b, frame, destination, repetitions, at(COLUMNS, layout.functionCardinalityOffset()), firstUpdate);
         else {
             Builder emitted = b.fork();
-            updates.emitRepeated(emitted, frame, STATE, repetitions);
+            updates.emitRepeated(emitted, frame, STATE, repetitions, nil(), firstUpdate);
             b.append(target.state.promote(emitted.block()));
         }
     }
@@ -1321,7 +1324,9 @@ final class ResolvedJoinKernel {
         }
 
         @Override
-        public CompiledJoin.Updater newUpdater(Runnable checkpoint) { return new Slot(this, checkpoint, updaterCount++); }
+        public CompiledJoin.Updater newUpdater(io.questdb.griffin.engine.groupby.GroupByAllocator allocator, Runnable checkpoint) {
+            return new Slot(this, allocator, checkpoint, updaterCount++);
+        }
 
         private void runBatch(long rows, long arguments, boolean prefetchGroups, java.util.function.Consumer<Kernel> work) {
             Programs active = specializationReady ? specializedPrograms : programs;
@@ -1422,17 +1427,18 @@ final class ResolvedJoinKernel {
         private final FrozenHashJoinBuild[] single = new FrozenHashJoinBuild[1];
         private long arguments;
         private long nativeRows;
+        private long functionCardinality;
         private long mapMisses;
         private final io.questdb.std.str.DirectUtf8String keyString = new io.questdb.std.str.DirectUtf8String();
         private final SymbolKeyTranslator.View[][] translators;
 
-        Slot(Prepared prepared, Runnable checkpoint, int slotIndex) {
+        Slot(Prepared prepared, io.questdb.griffin.engine.groupby.GroupByAllocator allocator, Runnable checkpoint, int slotIndex) {
             this.prepared = prepared;
             groupCache = prepared.target.groupBuild >= 0 ? prepared.groupCache.new Slot(slotIndex) : null;
             translators = new SymbolKeyTranslator.View[prepared.layout.builds.length][];
             for (int i = 0; i < translators.length; i++) translators[i] = new SymbolKeyTranslator.View[prepared.layout.keys[i].widths.length];
-            memory = KernelMemory.reusable(checkpoint);
-            argumentBytes = prepared.layout.groupCacheOffset() + 8;
+            memory = KernelMemory.reusable(allocator, checkpoint);
+            argumentBytes = prepared.layout.functionCardinalityOffset() + 8;
             bytes = argumentBytes + (prepared.probe == null ? 0
                     : groupKeyOffset(prepared.probe) + (prepared.probe.varchar() ? 24 : prepared.probe.orderedNative() ? prepared.probe.keyBytes() : 0));
         }
@@ -1447,7 +1453,7 @@ final class ResolvedJoinKernel {
         public void close() { clearExecution(); }
 
         private void reopen() {
-            if (arguments == 0) arguments = Unsafe.malloc(bytes, MemoryTag.NATIVE_JIT);
+            if (arguments == 0) arguments = Unsafe.calloc(bytes, MemoryTag.NATIVE_JIT);
         }
 
         @Override
@@ -1513,15 +1519,26 @@ final class ResolvedJoinKernel {
             return new JoinDependencyFilter.Lookup(build, columns, types, translators[child], prepared.sets[child]);
         }
 
+        private static long resumePosition(long address, long rows) {
+            long position = Unsafe.getLong(address);
+            if (position < 0 || position >= rows) throw new IllegalStateException("Invalid join resume position: " + position);
+            return position;
+        }
+
         private void resolveSymbol() {
             int build = (int) Unsafe.getLong(arguments + SYMBOL_BUILD);
             int key = (int) Unsafe.getLong(arguments + SYMBOL_KEY);
+            if (build < 0 || build >= translators.length || key < 0 || key >= translators[build].length
+                    || translators[build][key] == null) throw new IllegalStateException("Invalid join symbol request");
             long descriptor = arguments + prepared.layout.key(build, key);
             Unsafe.putLong(descriptor + SYMBOL_RESULT, translators[build][key].translate((int) Unsafe.getLong(descriptor + SYMBOL_INPUT)));
         }
 
         @Override
         public long getNativeRows() { return nativeRows; }
+
+        @Override
+        public long getFunctionCardinality() { return functionCardinality; }
 
         @Override
         public long getNativeMapMisses() { return mapMisses; }
@@ -1531,6 +1548,7 @@ final class ResolvedJoinKernel {
             if (builds.length != layout.builds.length) return false;
             Unsafe.putLong(arguments, rowIdsAddress);
             Unsafe.putLong(arguments + POSITION, 0);
+            Unsafe.putLong(arguments + layout.functionCardinalityOffset(), 0);
             boolean unique = true;
             for (int i = 0; i < builds.length; i++) {
                 if (prepared.subtreesReady && layout.keys[i].dependent()) continue;
@@ -1648,6 +1666,7 @@ final class ResolvedJoinKernel {
             reopen();
             try {
                 if (!bind(record, rowIdsAddress, builds)) return false;
+                Unsafe.putLong(arguments + MATCHED, value.isNew() ? -1 : 0);
                 memory.enter(null);
                 try {
                     prepared.runBatch(rowCount, arguments, false, kernel -> {
@@ -1656,13 +1675,14 @@ final class ResolvedJoinKernel {
                             memory.throwIfFailed();
                             if (status == 0) break;
                             if (status != NEED_SYMBOL) throw new IllegalStateException("Join kernel failed: " + status);
+                            resumePosition(arguments + POSITION, rowCount);
                             resolveSymbol();
                         }
                     });
                 } finally {
                     memory.close();
                 }
-                if (Unsafe.getLong(arguments + MATCHED) != 0) value.setNew(false);
+                if (Unsafe.getLong(arguments + MATCHED) > 0) value.setNew(false);
                 nativeRows += rowCount;
                 return true;
             } finally {
@@ -1674,6 +1694,7 @@ final class ResolvedJoinKernel {
         public boolean updateKeyedMulti(PageFrameMemoryRecord record, long rowCount, long rowIdsAddress,
                                    FrozenHashJoinBuild[] builds, Map map, ObjList<Map> shards,
                                    GroupByFunctionsUpdater functions) {
+            functionCardinality = 0;
             if (prepared.probe == null) return false;
             if (builds.length != prepared.layout.builds.length) return false;
             if (rowCount == 0 || empty(builds)) return true;
@@ -1706,18 +1727,19 @@ final class ResolvedJoinKernel {
                             long status = kernel.run(arguments, rowCount, state);
                             memory.throwIfFailed();
                             if (status == 0) break;
-                            if (status == NEED_SYMBOL) { resolveSymbol(); continue; }
+                            if (status == NEED_SYMBOL) { resumePosition(arguments + POSITION, rowCount); resolveSymbol(); continue; }
                             if (status == MapKernelState.NEED_STAGING && prepared.probe.variable()) {
+                                long resume = resumePosition(state + MapKernelState.RESUME_ROW, rowCount);
                                 ((io.questdb.cairo.map.OrderedMap) map).writeNativeKeyStagingView(
                                         state + MapKernelState.VariableKey.STAGING_ADDRESS,
                                         Unsafe.getLong(state + MapKernelState.VariableKey.REQUIRED_BYTES));
-                                Unsafe.putLong(arguments + POSITION, Unsafe.getLong(state + MapKernelState.RESUME_ROW));
+                                Unsafe.putLong(arguments + POSITION, resume);
                                 continue;
                             }
                             if (status != MapKernelState.NEED_KEY) throw new IllegalStateException("Join map kernel failed: " + status);
                             // A miss has not updated its match. Keep its probe and duplicate positions;
                             // the ordinary map remains the only owner of insertion and growth.
-                            Unsafe.putLong(arguments + POSITION, Unsafe.getLong(state + MapKernelState.RESUME_ROW));
+                            Unsafe.putLong(arguments + POSITION, resumePosition(state + MapKernelState.RESUME_ROW, rowCount));
                             long rawKey = Unsafe.getLong(arguments + MISSING_KEY);
                             MapKey key;
                             if (prepared.probe.orderedNative()) {
@@ -1749,6 +1771,8 @@ final class ResolvedJoinKernel {
                             MapValue value = key.createValue(hash);
                             if (!value.isNew()) throw new IllegalStateException("Join probe missed an existing group");
                             functions.updateEmpty(value);
+                            // Freshness belongs to the inserted group, independently of its aggregate family.
+                            Unsafe.putLong(arguments + MATCHED, -1);
                             mapMisses++;
                             // OrderedMap scratch-key writes may also move shard zero's heap.
                             map.writeNativeProbeView(state + prepared.probe.controlBytes());
@@ -1759,6 +1783,7 @@ final class ResolvedJoinKernel {
                 } finally {
                     memory.close();
                 }
+                functionCardinality = Unsafe.getLong(arguments + prepared.layout.functionCardinalityOffset());
                 nativeRows += rowCount;
                 return true;
             } finally {

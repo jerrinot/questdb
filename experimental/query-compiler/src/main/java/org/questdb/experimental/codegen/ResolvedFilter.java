@@ -64,7 +64,7 @@ final class ResolvedFilter implements AutoCloseable {
     }
 
     static ResolvedFilter compile(ColumnTypes types, Function function, Backend backend, Path artifacts) throws IOException {
-        Binding binding = bind(types, function);
+        Binding binding = bind(types, function, backend.options());
         if (binding == null) return null;
         var program = ScanLowering.selectionRange(binding.plan(), binding.residual(), binding.bytes());
         var code = backend.compile(program, artifacts);
@@ -72,9 +72,11 @@ final class ResolvedFilter implements AutoCloseable {
         catch (Throwable failure) { code.close(); throw failure; }
     }
 
-    static Binding bind(ColumnTypes types, Function function) {
+    static Binding bind(ColumnTypes types, Function function) { return bind(types, function, CompilerOptions.DEFAULT); }
+
+    static Binding bind(ColumnTypes types, Function function, CompilerOptions options) {
         var parameters = new java.util.ArrayList<IntSupplier>();
-        var inputs = new ResolvedInputs(types, parameters);
+        var inputs = new ResolvedInputs(types, parameters, options);
         var leaves = new java.util.ArrayList<Function>();
         if (!conjuncts(function, leaves, 0)) return null;
         var remaining = new java.util.ArrayList<Function>();

@@ -45,6 +45,7 @@ public enum PropertyKey implements ConfigPropertyKey {
     CAIRO_WRITER_TICK_ROWS_COUNT("cairo.writer.tick.rows.count"),
     CAIRO_WRITER_COMMAND_QUEUE_CAPACITY("cairo.writer.command.queue.capacity"),
     CAIRO_SQL_JIT_MODE("cairo.sql.jit.mode"),
+    CAIRO_SQL_LLVM_ENABLED("cairo.sql.llvm.enabled"),
     CAIRO_COMMIT_MODE("cairo.commit.mode"),
     CAIRO_CREATE_AS_SELECT_RETRY_COUNT("cairo.create.as.select.retry.count"),
     CAIRO_DEFAULT_MAP_TYPE("cairo.default.map.type"),

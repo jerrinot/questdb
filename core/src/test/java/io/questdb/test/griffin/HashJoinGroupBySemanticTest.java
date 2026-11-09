@@ -536,13 +536,14 @@ public class HashJoinGroupBySemanticTest extends AbstractCairoTest {
             try (SqlExecutionContextImpl context = context(engine, 4)) {
                 for (String join : JOINS) {
                     for (String side : new String[]{"r", "p"}) {
-                        for (String aggregate : new String[]{"count(" + side + ".t)", "first(" + side + ".d)",
-                                "last(" + side + ".d)", "count_distinct(" + side + ".s)", "count(" + side + ".i::short)"}) {
+                        for (String aggregate : new String[]{"first(" + side + ".d)",
+                                "last(" + side + ".d)", "count_distinct(" + side + ".s::varchar)"}) {
                             assertDifferential("select " + aggregate + from(join), context, false);
                             assertDifferential("select r.s,p.s," + aggregate + from(join) + " order by r.s,p.s", context, false);
                         }
                         // HashJoinGroupByAggregatesTest covers every admitted class; these flipped from excluded.
-                        for (String aggregate : new String[]{"sum(" + side + ".i)", "sum(" + side + ".l)",
+                        for (String aggregate : new String[]{"count(" + side + ".t)", "count(" + side + ".i::short)",
+                                "count_distinct(" + side + ".s)", "sum(" + side + ".i)", "sum(" + side + ".l)",
                                 "avg(" + side + ".i)", "avg(" + side + ".l)", "min(" + side + ".d)", "max(" + side + ".d)",
                                 "ksum(" + side + ".d)"}) {
                             assertDifferential("select " + aggregate + from(join), context, true);
@@ -581,7 +582,7 @@ public class HashJoinGroupBySemanticTest extends AbstractCairoTest {
                     for (String side : new String[]{"r", "p"}) {
                         // sum(FLOAT) is SumFloat; avg(FLOAT) passes the FLOAT argument to AvgDouble.
                         for (String aggregate : new String[]{"sum(" + side + ".v)", "avg(" + side + ".v)"}) {
-                            boolean isFused = aggregate.startsWith("sum");
+                            boolean isFused = true;
                             assertDifferential("select " + aggregate + " from a r" + join + "b p on r.id=p.id", context, isFused);
                             assertDifferential("select r.s,p.s," + aggregate + " from a r" + join
                                     + "b p on r.id=p.id order by r.s,p.s", context, isFused);

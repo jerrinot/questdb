@@ -610,6 +610,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final boolean sqlLatestByJitEnabled;
     private final long sqlLatestByRowCount;
     private final int sqlLexerPoolCapacity;
+    private final boolean sqlLlvmEnabled;
     private final int sqlMapMaxPages;
     private final int sqlMapMaxResizes;
     private final int sqlMaxArrayElementCount;
@@ -1974,6 +1975,7 @@ public class PropServerConfiguration implements ServerConfiguration {
             validatePageFrameRows(PropertyKey.CAIRO_SMALL_SQL_PAGE_FRAME_MAX_ROWS, this.sqlSmallPageFrameMaxRows);
 
             this.sqlJitMode = getSqlJitMode(properties, env);
+            this.sqlLlvmEnabled = getBoolean(properties, env, PropertyKey.CAIRO_SQL_LLVM_ENABLED, false);
             this.sqlJitIRMemoryPageSize = getIntSize(properties, env, PropertyKey.CAIRO_SQL_JIT_IR_MEMORY_PAGE_SIZE, 8 * 1024);
             this.sqlJitIRMemoryMaxPages = getInt(properties, env, PropertyKey.CAIRO_SQL_JIT_IR_MEMORY_MAX_PAGES, 8);
             this.sqlJitBindVarsMemoryPageSize = getIntSize(properties, env, PropertyKey.CAIRO_SQL_JIT_BIND_VARS_MEMORY_PAGE_SIZE, 4 * 1024);
@@ -6257,6 +6259,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public boolean isSqlLatestByJitEnabled() {
             return sqlLatestByJitEnabled;
+        }
+
+        @Override
+        public boolean isSqlLlvmEnabled() {
+            return sqlLlvmEnabled;
         }
 
         @Override

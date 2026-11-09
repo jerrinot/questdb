@@ -2,6 +2,7 @@
 #include <asmjit/x86.h>
 #include <atomic>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -14,7 +15,7 @@ namespace {
 struct Header { uint32_t magic,version,registers,labels,count,reserved; };
 struct Instruction { int32_t op,dst,a,b; int64_t immediate; };
 static_assert(sizeof(Header)==24 && sizeof(Instruction)==24);
-enum Opcode { Const=1,Move,Add,Sub,Mul,And,Xor,Ushr,Eq,Ne,Lt,Ge,Load,Store,Bind,Jump,BranchFalse,Allocate,Free,Poll,Return,CompareBranch,BranchTrue,Ctz,Prefetch,FAdd,FSub,FMul,FDiv,ToDouble,SDiv,AtomicLoad,CompareExchange,AtomicStore,AtomicAdd,ByteEqMask,Reallocate,FEq,FNe,FLt,FGe,NativeCall,LoadF32,StoreF32 };
+enum Opcode { Const=1,Move,Add,Sub,Mul,And,Xor,Ushr,Eq,Ne,Lt,Ge,Load,Store,Bind,Jump,BranchFalse,Allocate,Free,Poll,Return,CompareBranch,BranchTrue,Ctz,Prefetch,FAdd,FSub,FMul,FDiv,ToDouble,SDiv,AtomicLoad,CompareExchange,AtomicStore,AtomicAdd,ByteEqMask,Reallocate,FEq,FNe,FLt,FGe,NativeCall,ToFloat,Sqrt,Or,ToInteger,FRem };
 JitRuntime runtime;
 std::atomic<int64_t> live_functions{0};
 struct Errors : ErrorHandler {
@@ -23,7 +24,7 @@ struct Errors : ErrorHandler {
 };
 void require(bool condition,const char* message) { if(!condition)throw std::invalid_argument(message); }
 void validate(const Header& h,const Instruction* code) {
-    require(h.magic==0x51444952 && h.version==11 && h.reserved==0,"incompatible query IR ABI");
+    require(h.magic==0x51444952 && h.version==16 && h.reserved==0,"incompatible query IR ABI");
     require(h.registers>=3 && h.registers<=1000000 && h.labels<=1000000 && h.count>0 && h.count<=1000000,"invalid IR dimensions");
     std::vector<bool> bound(h.labels),referenced(h.labels);
     auto reg=[&](int id){require(id>=0 && uint32_t(id)<h.registers,"invalid register");};
@@ -36,8 +37,8 @@ void validate(const Header& h,const Instruction* code) {
                 require(i.b==8||i.b==16||i.b==32||i.b==64,"invalid byte mask lanes");
                 require(i.immediate>=0&&i.immediate<=255,"invalid byte mask constant");break;
             case Const:reg(i.dst);break;
-            case LoadF32:case AtomicLoad:case Move:case Load:case Allocate:case Ctz:case ToDouble:reg(i.dst);reg(i.a);break;
-            case FEq:case FNe:case FLt:case FGe:case AtomicAdd:case SDiv:case FAdd:case FSub:case FMul:case FDiv:case Add:case Sub:case Mul:case And:case Xor:case Ushr:case Eq:case Ne:case Lt:case Ge:reg(i.dst);reg(i.a);reg(i.b);break;
+            case ToInteger:case Sqrt:case ToFloat:case AtomicLoad:case Move:case Load:case Allocate:case Ctz:case ToDouble:reg(i.dst);reg(i.a);break;
+            case FRem:case FEq:case FNe:case FLt:case FGe:case AtomicAdd:case SDiv:case FAdd:case FSub:case FMul:case FDiv:case Add:case Sub:case Mul:case And:case Or:case Xor:case Ushr:case Eq:case Ne:case Lt:case Ge:reg(i.dst);reg(i.a);reg(i.b);break;
             case CompareExchange:reg(i.dst);reg(i.a);reg(i.b);require(i.immediate>=0&&uint64_t(i.immediate)<h.registers,"invalid CAS value");break;
             case NativeCall:
                 reg(i.dst);reg(i.a);
@@ -45,7 +46,7 @@ void validate(const Header& h,const Instruction* code) {
                 for(int n=0;n<i.immediate;n++)reg(i.b+n);
                 break;
             case Reallocate:reg(i.dst);reg(i.a);reg(i.b);require(i.immediate>=0&&uint64_t(i.immediate)<h.registers,"invalid reallocation size register");break;
-            case StoreF32:case AtomicStore:case Store:case Free:reg(i.a);reg(i.b);break;
+            case AtomicStore:case Store:case Free:reg(i.a);reg(i.b);break;
             case Bind:label(i.dst);require(!bound[i.dst],"duplicate label");bound[i.dst]=true;break;
             case CompareBranch:reg(i.b);require(i.immediate>=Eq&&i.immediate<=Ge,"invalid branch comparison");[[fallthrough]];
             case BranchTrue:case BranchFalse:reg(i.a);[[fallthrough]];
@@ -56,7 +57,9 @@ void validate(const Header& h,const Instruction* code) {
             default:throw std::invalid_argument("unknown IR instruction");
         }
         if(i.op==Load||i.op==Store)require(i.immediate==1||i.immediate==2||i.immediate==4||i.immediate==8,"invalid memory width");
-        if(i.op==LoadF32||i.op==StoreF32)require(i.immediate==4,"invalid FLOAT memory width");
+        if(i.op==FRem||(i.op>=FAdd&&i.op<=FDiv)||(i.op>=FEq&&i.op<=FGe))require(i.immediate==0||i.immediate==1,"invalid floating arithmetic width");
+        if(i.op==ToInteger)require(i.immediate>=0&&i.immediate<=3,"invalid integer conversion type");
+        if(i.op==ToFloat||i.op==ToDouble)require(i.immediate==0||i.immediate==1,"invalid FLOAT conversion input type");
     }
     for(uint32_t n=0;n<h.labels;n++)require(!referenced[n]||bound[n],"unbound label");
     require(code[h.count-1].op==Return,"IR must end in return");
@@ -82,7 +85,7 @@ void* compile(const Header& h,const Instruction* instructions) {
     definitions[0]=definitions[1]=definitions[2]=1;
     for(uint32_t n=0;n<h.count;n++) {
         const auto& i=instructions[n];
-        if((i.op>=Const&&i.op<=Load)||i.op==LoadF32||i.op==NativeCall||i.op==Allocate||i.op==Reallocate||i.op==Ctz||i.op==AtomicAdd||i.op==ByteEqMask||(i.op>=FEq&&i.op<=FGe)||(i.op>=FAdd&&i.op<=CompareExchange)) {
+        if((i.op>=Const&&i.op<=Load)||i.op==FRem||i.op==ToInteger||i.op==Sqrt||i.op==Or||i.op==ToFloat||i.op==NativeCall||i.op==Allocate||i.op==Reallocate||i.op==Ctz||i.op==AtomicAdd||i.op==ByteEqMask||(i.op>=FEq&&i.op<=FGe)||(i.op>=FAdd&&i.op<=CompareExchange)) {
             definitions[i.dst]++;if(i.op==Const){constant[i.dst]=true;value[i.dst]=i.immediate;}
         }
     }
@@ -101,20 +104,76 @@ void* compile(const Header& h,const Instruction* instructions) {
                 move(r[i.dst],i.a);auto divisor=source(i.b);
                 c.cqo(high,r[i.dst]);c.idiv(high,r[i.dst],divisor);break;
             }
+            case FRem: {
+                auto left=c.new_xmm(),right=c.new_xmm(),result=c.new_xmm();
+                c.movq(left,source(i.a));c.movq(right,source(i.b));
+                InvokeNode* call=nullptr;
+                if(i.immediate) {
+                    auto target=static_cast<float(*)(float,float)>(std::fmod);
+                    require(c.invoke(Out(call),Imm(reinterpret_cast<uint64_t>(target)),FuncSignature::build<float,float,float>())==Error::kOk && call,"could not emit FLOAT remainder");
+                } else {
+                    auto target=static_cast<double(*)(double,double)>(std::fmod);
+                    require(c.invoke(Out(call),Imm(reinterpret_cast<uint64_t>(target)),FuncSignature::build<double,double,double>())==Error::kOk && call,"could not emit DOUBLE remainder");
+                }
+                call->set_arg(0,left);call->set_arg(1,right);call->set_ret(0,result);
+                if(i.immediate) {c.movd(r[i.dst].r32(),result);c.movsxd(r[i.dst],r[i.dst].r32());}
+                else c.movq(r[i.dst],result);
+                break;
+            }
+            case Sqrt: {
+                auto value=c.new_xmm();
+                c.movq(value,source(i.a));c.sqrtsd(value,value);c.movq(r[i.dst],value);break;
+            }
+            case ToInteger: {
+                bool single=i.immediate&1, narrow=i.immediate&2;
+                auto value=c.new_xmm(),limit=c.new_xmm();auto bits=c.new_gp64();
+                auto done=c.new_label(),overflow=c.new_label();
+                c.movq(value,source(i.a));c.xor_(r[i.dst],r[i.dst]);
+                if(single)c.ucomiss(value,value);else c.ucomisd(value,value);
+                c.jp(done); // Java converts NaN to zero.
+                c.mov(bits,single?(narrow?0x4f000000LL:0x5f000000LL)
+                        :(narrow?0x41e0000000000000LL:0x43e0000000000000LL));
+                c.movq(limit,bits);
+                if(single)c.ucomiss(value,limit);else c.ucomisd(value,limit);
+                c.jae(overflow);
+                if(single)c.cvttss2si(narrow?r[i.dst].r32():r[i.dst],value);
+                else c.cvttsd2si(narrow?r[i.dst].r32():r[i.dst],value);
+                if(narrow)c.movsxd(r[i.dst],r[i.dst].r32());
+                // Negative overflow already yields the saturated minimum.
+                c.jmp(done);c.bind(overflow);c.mov(r[i.dst],narrow?INT32_MAX:INT64_MAX);
+                c.bind(done);break;
+            }
+            case ToFloat: {
+                auto value=c.new_xmm(),narrow=c.new_xmm();
+                if(i.immediate)c.cvtsi2ss(narrow,source(i.a));
+                else {c.movq(value,source(i.a));c.cvtsd2ss(narrow,value);}
+                c.movd(r[i.dst].r32(),narrow);c.movsxd(r[i.dst],r[i.dst].r32());break;
+            }
             case ToDouble: {
                 auto value=c.new_xmm();
-                c.cvtsi2sd(value,source(i.a));c.movq(r[i.dst],value);break;
+                if(i.immediate){c.movd(value,source(i.a).r32());c.cvtss2sd(value,value);}
+                else c.cvtsi2sd(value,source(i.a));
+                c.movq(r[i.dst],value);break;
             }
             case FAdd:case FSub:case FMul:case FDiv: {
                 auto left=c.new_xmm(),right=c.new_xmm();
                 c.movq(left,source(i.a));c.movq(right,source(i.b));
-                switch(i.op) {
-                    case FAdd:c.addsd(left,right);break;case FSub:c.subsd(left,right);break;
-                    case FMul:c.mulsd(left,right);break;case FDiv:c.divsd(left,right);break;
+                if(i.immediate) {
+                    switch(i.op) {
+                        case FAdd:c.addss(left,right);break;case FSub:c.subss(left,right);break;
+                        case FMul:c.mulss(left,right);break;case FDiv:c.divss(left,right);break;
+                    }
+                    c.movd(r[i.dst].r32(),left);c.movsxd(r[i.dst],r[i.dst].r32());
+                } else {
+                    switch(i.op) {
+                        case FAdd:c.addsd(left,right);break;case FSub:c.subsd(left,right);break;
+                        case FMul:c.mulsd(left,right);break;case FDiv:c.divsd(left,right);break;
+                    }
                 }
-                c.movq(r[i.dst],left);break;
+                if(!i.immediate)c.movq(r[i.dst],left);
+                break;
             }
-            case Add:case Sub:case Mul:case And:case Xor:case Ushr:
+            case Add:case Sub:case Mul:case And:case Or:case Xor:case Ushr:
                 move(r[i.dst],i.a);
                 if(i.op==Ushr) {
                     if(constant[i.b])c.shr(r[i.dst],Imm(uint64_t(value[i.b])&63));
@@ -123,19 +182,20 @@ void* compile(const Header& h,const Instruction* instructions) {
                     Imm right(value[i.b]);
                     switch(i.op) {
                         case Add:c.add(r[i.dst],right);break;case Sub:c.sub(r[i.dst],right);break;
-                        case Mul:c.imul(r[i.dst],r[i.dst],right);break;case And:c.and_(r[i.dst],right);break;case Xor:c.xor_(r[i.dst],right);break;
+                        case Mul:c.imul(r[i.dst],r[i.dst],right);break;case And:c.and_(r[i.dst],right);break;case Or:c.or_(r[i.dst],right);break;case Xor:c.xor_(r[i.dst],right);break;
                     }
                 }else {
                     auto right=source(i.b);
                     switch(i.op) {
                         case Add:c.add(r[i.dst],right);break;case Sub:c.sub(r[i.dst],right);break;
-                        case Mul:c.imul(r[i.dst],right);break;case And:c.and_(r[i.dst],right);break;case Xor:c.xor_(r[i.dst],right);break;
+                        case Mul:c.imul(r[i.dst],right);break;case And:c.and_(r[i.dst],right);break;case Or:c.or_(r[i.dst],right);break;case Xor:c.xor_(r[i.dst],right);break;
                     }
                 }break;
             case FEq:case FNe:case FLt:case FGe: {
                 auto left=c.new_xmm(),right=c.new_xmm();
                 auto ordered=c.new_gp32();
-                c.movq(left,source(i.a));c.movq(right,source(i.b));c.ucomisd(left,right);
+                c.movq(left,source(i.a));c.movq(right,source(i.b));
+                if(i.immediate)c.ucomiss(left,right);else c.ucomisd(left,right);
                 switch(i.op) {
                     case FEq:c.sete(r[i.dst].r8());c.setnp(ordered.r8());c.and_(r[i.dst].r8(),ordered.r8());break;
                     case FNe:c.setne(r[i.dst].r8());c.setp(ordered.r8());c.or_(r[i.dst].r8(),ordered.r8());break;
@@ -187,15 +247,6 @@ void* compile(const Header& h,const Instruction* instructions) {
                 move(observed,i.b);
                 c.lock().cmpxchg(x86::qword_ptr(address),value,observed);
                 c.mov(r[i.dst],observed);break;
-            }
-            case LoadF32: {
-                auto value=c.new_xmm();
-                c.cvtss2sd(value,x86::dword_ptr(source(i.a),i.b));c.movq(r[i.dst],value);break;
-            }
-            case StoreF32: {
-                auto value=c.new_xmm(),narrow=c.new_xmm();
-                c.movq(value,source(i.b));c.cvtsd2ss(narrow,value);
-                c.movss(x86::dword_ptr(source(i.a),i.dst),narrow);break;
             }
             case Load: {
                 auto base=source(i.a);

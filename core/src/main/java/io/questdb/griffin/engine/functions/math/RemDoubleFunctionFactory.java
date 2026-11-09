@@ -45,7 +45,7 @@ public class RemDoubleFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0), args.getQuick(1));
     }
 
-    private static class Func extends DoubleFunction implements ArithmeticBinaryFunction {
+    public static class Func extends DoubleFunction implements ArithmeticBinaryFunction {
         private final Function left;
         private final Function right;
 

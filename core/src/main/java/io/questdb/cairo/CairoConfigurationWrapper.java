@@ -2040,6 +2040,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public boolean isSqlLlvmEnabled() {
+        return getDelegate().isSqlLlvmEnabled();
+    }
+
+    @Override
     public boolean isSqlOrderBySortEnabled() {
         return getDelegate().isSqlOrderBySortEnabled();
     }

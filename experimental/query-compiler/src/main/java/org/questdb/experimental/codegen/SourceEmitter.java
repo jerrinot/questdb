@@ -107,7 +107,9 @@ abstract class SourceEmitter {
         return switch (expression) {
             case Var v -> v.name();
             case Literal l -> literal(l);
-            case Binary b -> binary(b.op(), expression(b.left()), expression(b.right()));
+            case Binary b -> b.op() == Op.FREM
+                    ? (b.type() == Type.F32 ? "fmodf(" : "fmod(") + expression(b.left()) + ", " + expression(b.right()) + ")"
+                    : binary(b.op(), expression(b.left()), expression(b.right()));
             case Load l -> load(l.width(), expression(l.address()));
             case Gather g -> load(g.width(), offset(expression(g.base()), expression(g.bytes())));
             case AtomicLoad l -> atomicLoad(expression(l.address()), l.acquire());
@@ -116,8 +118,11 @@ abstract class SourceEmitter {
             case NativeCall c -> nativeCall(expression(c.function()), c.arguments().stream().map(this::expression).toList());
             case Allocate a -> allocate(expression(a.bytes()));
             case Reallocate r -> reallocate(expression(r.address()), expression(r.oldBytes()), expression(r.newBytes()));
+            case ToInteger c -> "cast_i" + c.bits() + "(" + expression(c.value()) + ")";
             case ToDouble c -> "((double)(" + expression(c.value()) + "))";
-            case BitCast c -> (c.type() == Type.F64 ? "query_f64(" : "query_i64(") + expression(c.value()) + ")";
+            case ToFloat c -> "((float)(" + expression(c.value()) + "))";
+            case Sqrt c -> "sqrt(" + expression(c.value()) + ")";
+            case BitCast c -> (c.type() == Type.F64 ? "query_f64(" : c.type() == Type.F32 ? "query_f32(" : c.value().type() == Type.F32 ? "query_i32(" : "query_i64(") + expression(c.value()) + ")";
             case SelectRows s -> "selectRows[" + s.lanes() + "](" + expression(s.mask()) + ", " + expression(s.base()) + ", " + expression(s.destination()) + ")";
             case VectorMask m -> "mask[" + m.lanes() + "](" + expression(m.predicate()) + ")";
             case PopulationCount z -> "__builtin_popcountll((uint64_t)(" + expression(z.value()) + "))";
@@ -135,7 +140,9 @@ abstract class SourceEmitter {
             case SUB, FSUB -> "-";
             case MUL, FMUL -> "*";
             case FDIV, SDIV -> "/";
+            case FREM -> throw new IllegalArgumentException("Floating remainder requires operand precision");
             case AND -> "&";
+            case OR -> "|";
             case XOR -> "^";
             case USHR -> ">>>";
             case EQ, FEQ -> "==";

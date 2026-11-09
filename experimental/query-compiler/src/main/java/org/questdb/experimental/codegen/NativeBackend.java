@@ -38,11 +38,17 @@ import static org.questdb.experimental.codegen.Ir.*;
 /** IR -> portable C -> shared library, called through the JDK foreign-function API. */
 public final class NativeBackend implements Backend {
     private final String compiler;
+    private final CompilerOptions.Process lowering;
 
     public NativeBackend() { this("cc"); }
 
     /** One executable path, not a shell command. */
-    public NativeBackend(String compiler) { this.compiler = compiler; }
+    public NativeBackend(String compiler) { this(compiler, CompilerOptions.PROCESS); }
+
+    NativeBackend(String compiler, CompilerOptions.Process lowering) {
+        this.compiler = compiler;
+        this.lowering = lowering;
+    }
 
     @Override
     public String name() { return "native"; }
@@ -50,7 +56,7 @@ public final class NativeBackend implements Backend {
     @Override
     public CompiledKernel compile(Program program, Path artifactRoot) throws IOException {
         long start = System.nanoTime();
-        var prepared = IrOptimizer.prepare(PortableVectorLowering.lower(HelperInlining.expand(program)));
+        var prepared = IrOptimizer.prepare(PortableVectorLowering.lower(HelperInlining.expand(program)), lowering);
         if (!System.getProperty("os.name").equals("Linux") || ValueLayout.ADDRESS.byteSize() != 8) {
             throw new IOException("The native prototype currently supports 64-bit Linux");
         }
@@ -64,7 +70,7 @@ public final class NativeBackend implements Backend {
                 + (prepared.ssa() == null ? new Emitter().body(prepared.structured()) : new Emitter().body(prepared.ssa())) + "}\n");
         Files.writeString(directory.resolve("query.ir"), prepared.dump());
         List<String> command = List.of(compiler, "-std=c11", "-O3", "-ffp-contract=off", "-fwrapv", "-fPIC", "-shared",
-                "-Wall", "-Wextra", source.toString(), "-o", library.toString());
+                "-Wall", "-Wextra", source.toString(), "-lm", "-o", library.toString());
         Files.writeString(directory.resolve("command.txt"), String.join("\n", command) + "\n");
         Process process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(log.toFile()).start();
         try {
@@ -100,6 +106,15 @@ public final class NativeBackend implements Backend {
                 #include <stdint.h>
                 #include <stdbool.h>
                 #include <string.h>
+                #include <math.h>
+                static inline int64_t cast_i32(double x) {
+                    return isnan(x) ? 0 : x >= 0x1p31 ? INT32_MAX : x <= -0x1p31 ? INT32_MIN : (int32_t)x;
+                }
+                static inline int64_t cast_i64(double x) {
+                    return isnan(x) ? 0 : x >= 0x1p63 ? INT64_MAX : x <= -0x1p63 ? INT64_MIN : (int64_t)x;
+                }
+                static inline float query_f32(uint32_t bits) { float v; memcpy(&v, &bits, 4); return v; }
+                static inline int64_t query_i32(float v) { int32_t bits; memcpy(&bits, &v, 4); return bits; }
                 static inline double query_f64(uint64_t bits) { double v; memcpy(&v, &bits, 8); return v; }
                 static inline int64_t query_i64(double v) { int64_t bits; memcpy(&bits, &v, 8); return bits; }
                 static inline int64_t query_ctz(uint64_t v) { return v ? __builtin_ctzll(v) : 64; }
@@ -116,7 +131,7 @@ public final class NativeBackend implements Backend {
                     .append("(uint64_t p) { ").append(cType)
                     .append(" v; memcpy(&v, (const void*)(uintptr_t)p, sizeof(v)); return v; }\n");
             source.append("static inline void store_").append(width).append("(uint64_t p, ")
-                    .append(width.resultType == Type.F64 ? "double" : width == MemoryType.ADDRESS ? "uint64_t" : "int64_t").append(" value) { ")
+                    .append(width.resultType == Type.F64 ? "double" : width.resultType == Type.F32 ? "float" : width == MemoryType.ADDRESS ? "uint64_t" : "int64_t").append(" value) { ")
                     .append(cType).append(" v = (").append(cType)
                     .append(")value; memcpy((void*)(uintptr_t)p, &v, sizeof(v)); }\n");
         }
@@ -142,6 +157,7 @@ public final class NativeBackend implements Backend {
 
         @Override
         String literal(Literal l) {
+            if (l.type() == Type.F32) return "query_f32(UINT32_C(0x" + Integer.toHexString((int) l.value()) + "))";
             if (l.type() == Type.F64) return "query_f64(UINT64_C(0x" + Long.toHexString(l.value()) + "))";
             if (l.type() == Type.BOOL) { return Boolean.toString(l.value() != 0); }
             if (l.type() == Type.ADDRESS) { return "UINT64_C(0)"; }
@@ -181,6 +197,7 @@ public final class NativeBackend implements Backend {
                 case BOOL -> "bool";
                 case I64 -> "int64_t";
                 case F64 -> "double";
+                case F32 -> "float";
                 case ADDRESS -> "uint64_t";
             };
         }

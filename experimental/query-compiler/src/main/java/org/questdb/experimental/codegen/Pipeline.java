@@ -68,7 +68,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
 
     public record Value(Expr data, Expr isNull) {
         public Value {
-            if ((data.type() != Type.I64 && data.type() != Type.F64) || isNull.type() != Type.BOOL) {
+            if ((data.type() != Type.I64 && data.type() != Type.F64 && data.type() != Type.F32) || isNull.type() != Type.BOOL) {
                 throw new IllegalArgumentException("Expected a numeric value and null flag");
             }
         }
@@ -84,7 +84,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    public sealed interface Scalar permits Column, Constant, FloatingConstant, ToFloating, Conditional, Parameter, Add, Subtract, Multiply, Divide, TimestampPart, TimestampYear, IPv4Subtract, DictionaryLookup, FrameScalar {
+    public sealed interface Scalar permits Column, Constant, FloatingConstant, ToFloating, FloatCast, FloatingIntegerCast, IntegerCast, IPv4Cast, Negate, Conditional, Parameter, Add, Subtract, Multiply, Divide, Remainder, TimestampPart, TimestampYear, IPv4Subtract, DictionaryLookup, FrameScalar {
         Value emit(Row row);
     }
 
@@ -117,9 +117,10 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
 
         public long nullValue() { return nullValueOf(columnType); }
-        public Expr nullLiteral() { return width().resultType == Type.F64 ? f64(Double.NaN) : i64(nullValue()); }
+        public Expr nullLiteral() { return columnType == ColumnType.FLOAT ? f32(Float.NaN) : columnType == ColumnType.DOUBLE ? f64(Double.NaN) : i64(nullValue()); }
         public Value value(Expr data) {
-            return new Value(data, width().resultType == Type.F64 ? doubleNull(data)
+            if (columnType == ColumnType.CHAR) data = binary(Op.AND, data, i64(0xffff));
+            return new Value(data, (columnType == ColumnType.DOUBLE || columnType == ColumnType.FLOAT) ? nonFinite(data)
                     : nullable() ? eq(data, i64(nullValue())) : bool(false));
         }
         public boolean nullable() { return isNullable(columnType); }
@@ -145,8 +146,17 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    public record FloatingConstant(double value) implements Scalar {
-        @Override public Value emit(Row row) { return new Value(f64(value), bool(!Double.isFinite(value))); }
+    public record FloatingConstant(long bits, int columnType) implements Scalar {
+        public FloatingConstant(double value) { this(Double.doubleToRawLongBits(value), ColumnType.DOUBLE); }
+        public static FloatingConstant ofFloat(float value) { return new FloatingConstant(Float.floatToRawIntBits(value), ColumnType.FLOAT); }
+        public FloatingConstant {
+            if (columnType != ColumnType.FLOAT && columnType != ColumnType.DOUBLE)
+                throw new IllegalArgumentException("Floating constant type required");
+        }
+        @Override public Value emit(Row row) {
+            Expr value = new Literal(bits, columnType == ColumnType.FLOAT ? Type.F32 : Type.F64);
+            return new Value(value, nonFinite(value));
+        }
     }
 
     /** Both admitted branches must be total and side-effect-free: Select may evaluate both. */
@@ -158,11 +168,50 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    /** Integer getters widen their already wrapped value, replacing the source NULL with NaN. */
-    public record ToFloating(Scalar argument) implements Scalar {
+    /** Apply the numeric getter's precision and sentinel conversion. */
+    public record ToFloating(Scalar argument, int columnType) implements Scalar {
+        public ToFloating(Scalar argument) { this(argument, ColumnType.DOUBLE); }
+        public ToFloating {
+            if (columnType != ColumnType.FLOAT && columnType != ColumnType.DOUBLE)
+                throw new IllegalArgumentException("Floating getter requires FLOAT or DOUBLE");
+        }
         @Override public Value emit(Row row) {
             Value value = argument.emit(row);
-            return new Value(new Select(value.isNull(), f64(Double.NaN), new ToDouble(value.data())), value.isNull());
+            Type target = columnType == ColumnType.FLOAT ? Type.F32 : Type.F64;
+            if (value.data().type() == target) return value;
+            Expr converted = columnType == ColumnType.FLOAT ? new ToFloat(value.data()) : new ToDouble(value.data());
+            if (value.data().type() == Type.I64)
+                return new Value(new Select(value.isNull(), target == Type.F32 ? f32(Float.NaN) : f64(Double.NaN), converted), value.isNull());
+            return new Value(converted, nonFinite(converted));
+        }
+    }
+
+    /** QuestDB's explicit DOUBLE-to-FLOAT cast rejects values outside the finite FLOAT range. */
+    public record FloatCast(Scalar argument) implements Scalar {
+        @Override public Value emit(Row row) {
+            Expr value = argument.emit(row).data();
+            Expr valid = binary(Op.BOTH, binary(Op.FGE, value, f64(-Float.MAX_VALUE)),
+                    binary(Op.FGE, f64(Float.MAX_VALUE), value));
+            return new Value(new Select(valid, new ToFloat(value), f32(Float.NaN)), eq(valid, bool(false)));
+        }
+    }
+
+    /** Unary negation uses the resolved width, including narrow wrap and IEEE signed zero. */
+    public record Negate(Scalar argument, int columnType) implements Scalar {
+        public Negate {
+            switch (columnType) {
+                case ColumnType.BYTE, ColumnType.SHORT, ColumnType.INT, ColumnType.LONG,
+                        ColumnType.FLOAT, ColumnType.DOUBLE -> { }
+                default -> throw new IllegalArgumentException("Numeric negation type required");
+            }
+        }
+        @Override public Value emit(Row row) {
+            Value value = argument.emit(row);
+            Expr data = value.data().type() == Type.F64 || value.data().type() == Type.F32
+                    ? new BitCast(binary(Op.XOR, new BitCast(value.data()),
+                            i64(value.data().type() == Type.F32 ? Integer.MIN_VALUE : Long.MIN_VALUE)), value.data().type())
+                    : narrowInteger(binary(Op.SUB, i64(0), value.data()), columnType);
+            return new Value(data, value.isNull());
         }
     }
 
@@ -180,7 +229,7 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         public MemoryType width() { return widthOf(columnType); }
     }
 
-    private static long nullValueOf(int type) {
+    static long nullValueOf(int type) {
         return switch (type) {
             case ColumnType.INT -> Integer.MIN_VALUE;
             case ColumnType.SYMBOL -> io.questdb.cairo.sql.SymbolTable.VALUE_IS_NULL;
@@ -192,12 +241,13 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
 
     private static boolean isNullable(int type) {
         return type == ColumnType.INT || type == ColumnType.LONG || type == ColumnType.SYMBOL
-                || type == ColumnType.IPv4 || type == ColumnType.DATE || type == ColumnType.FLOAT || type == ColumnType.DOUBLE || ColumnType.isTimestamp(type);
+                || type == ColumnType.CHAR || type == ColumnType.IPv4 || type == ColumnType.DATE || type == ColumnType.FLOAT || type == ColumnType.DOUBLE || ColumnType.isTimestamp(type);
     }
 
-    /** Numbers.isNull(double): NaNs and both infinities have an all-ones exponent. */
-    static Expr doubleNull(Expr value) {
-        return eq(binary(Op.AND, new BitCast(value), i64(0x7ff0000000000000L)), i64(0x7ff0000000000000L));
+    /** Numbers.isNull(float/double): NaNs and both infinities have an all-ones exponent. */
+    static Expr nonFinite(Expr value) {
+        long exponent = value.type() == Type.F32 ? 0x7f800000L : 0x7ff0000000000000L;
+        return eq(binary(Op.AND, new BitCast(value), i64(exponent)), i64(exponent));
     }
 
     private static int storageType(Scalar value) {
@@ -280,22 +330,95 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    /** Floating division normalizes nonfinite results; integral divisors use the existing positive-constant IR. */
+    /** Floating division normalizes nonfinite results; integer division follows SQL NULL rules. */
     public record Divide(Scalar left, Scalar right, int columnType) implements Scalar {
         public Divide(Scalar left, Scalar right) { this(left, right, ColumnType.DOUBLE); }
-        public Divide {
-            checkArithmeticType(columnType);
-            if (columnType != ColumnType.DOUBLE && (!(right instanceof Constant constant) || constant.value() <= 0))
-                throw new IllegalArgumentException("Positive constant integral divisor required");
+        public Divide { checkArithmeticType(columnType); }
+        @Override public Value emit(Row row) {
+            Value a = left.emit(row), b = right.emit(row);
+            if (columnType != ColumnType.DOUBLE && columnType != ColumnType.FLOAT) {
+                return integerDivision(a, b, false);
+            }
+            Expr result = binary(Op.FDIV, a.data(), b.data());
+            Expr absent = nonFinite(result);
+            return new Value(new Select(absent, columnType == ColumnType.FLOAT ? f32(Float.NaN) : f64(Double.NaN), result), absent);
+        }
+    }
+
+    public record Remainder(Scalar left, Scalar right, int columnType) implements Scalar {
+        public Remainder { checkArithmeticType(columnType); }
+        @Override public Value emit(Row row) {
+            Value a = left.emit(row), b = right.emit(row);
+            if (columnType != ColumnType.DOUBLE && columnType != ColumnType.FLOAT) return integerDivision(a, b, true);
+            Expr result = binary(Op.FREM, a.data(), b.data());
+            return new Value(result, nonFinite(result));
+        }
+    }
+
+    private static Value integerDivision(Value a, Value b, boolean remainder) {
+        Expr absent = binary(Op.EITHER, a.isNull(), binary(Op.EITHER, b.isNull(), eq(b.data(), i64(0))));
+        // SQL's MIN sentinel excludes the only signed overflow. Protect the operands,
+        // not only the result: Select and vector masks may evaluate both arms.
+        boolean positiveConstant = b.data() instanceof Literal divisor && divisor.value() > 0;
+        Expr numerator = positiveConstant ? a.data() : new Select(absent, i64(0), a.data());
+        Expr denominator = positiveConstant ? b.data() : new Select(absent, i64(1), b.data());
+        Expr quotient = binary(Op.SDIV, numerator, denominator);
+        Expr result = remainder ? binary(Op.SUB, numerator, binary(Op.MUL, quotient, denominator)) : quotient;
+        return new Value(result, absent);
+    }
+
+    /** Ordinary checked floating cast. Bounds are compared in the input's precision. */
+    public record FloatingIntegerCast(Scalar argument, int columnType) implements Scalar {
+        public FloatingIntegerCast {
+            if (columnType != ColumnType.BYTE && columnType != ColumnType.SHORT && columnType != ColumnType.INT && columnType != ColumnType.LONG)
+                throw new IllegalArgumentException("BYTE, SHORT, INT or LONG cast target required");
         }
         @Override public Value emit(Row row) {
-            if (columnType != ColumnType.DOUBLE) {
-                Value value = left.emit(row);
-                return new Value(binary(Op.SDIV, value.data(), i64(((Constant) right).value())), value.isNull());
-            }
-            Expr result = binary(Op.FDIV, left.emit(row).data(), right.emit(row).data());
-            Expr absent = doubleNull(result);
-            return new Value(new Select(absent, f64(Double.NaN), result), absent);
+            Value value = argument.emit(row);
+            long minimum = switch (columnType) {
+                case ColumnType.BYTE -> Byte.MIN_VALUE; case ColumnType.SHORT -> Short.MIN_VALUE;
+                case ColumnType.INT -> Integer.MIN_VALUE; default -> Long.MIN_VALUE;
+            };
+            long maximum = switch (columnType) {
+                case ColumnType.BYTE -> Byte.MAX_VALUE; case ColumnType.SHORT -> Short.MAX_VALUE;
+                case ColumnType.INT -> Integer.MAX_VALUE; default -> Long.MAX_VALUE;
+            };
+            Expr lo = value.data().type() == Type.F32 ? f32((float) minimum) : f64((double) minimum);
+            Expr hi = value.data().type() == Type.F32 ? f32((float) maximum) : f64((double) maximum);
+            Expr outside = binary(Op.EITHER, value.isNull(), binary(Op.EITHER,
+                    binary(Op.FLT, value.data(), lo), binary(Op.FLT, hi, value.data())));
+            // FLOAT's INT_MAX and both precisions' LONG_MAX round up. Equality
+            // passes the ordinary range check, then Java saturates the conversion.
+            Expr converted = new ToInteger(value.data(), columnType == ColumnType.LONG ? 64 : 32);
+            Expr data = new Select(outside, i64(nullValueOf(columnType)), converted);
+            return new Value(data, isNullable(columnType) ? eq(data, i64(nullValueOf(columnType))) : bool(false));
+        }
+    }
+
+    /** Narrowing uses the low bits; CHAR is unsigned and has a zero NULL sentinel. */
+    public record IntegerCast(Scalar argument, int columnType) implements Scalar {
+        public IntegerCast {
+            if (columnType != ColumnType.BYTE && columnType != ColumnType.SHORT && columnType != ColumnType.INT && columnType != ColumnType.CHAR)
+                throw new IllegalArgumentException("BYTE, SHORT, INT or CHAR cast target required");
+        }
+        @Override public Value emit(Row row) {
+            Value value = argument.emit(row);
+            Expr narrowed = columnType == ColumnType.CHAR ? binary(Op.AND, value.data(), i64(0xffff)) : narrowInteger(value.data(), columnType);
+            Expr data = new Select(value.isNull(), i64(nullValueOf(columnType)), narrowed);
+            return new Value(data, isNullable(columnType) ? eq(data, i64(nullValueOf(columnType))) : bool(false));
+        }
+    }
+
+    /** INT/IPv4 casts reinterpret the same bits but translate their different NULL sentinels. */
+    public record IPv4Cast(Scalar argument, int columnType) implements Scalar {
+        public IPv4Cast {
+            if (columnType != ColumnType.INT && columnType != ColumnType.IPv4)
+                throw new IllegalArgumentException("INT or IPv4 cast target required");
+        }
+        @Override public Value emit(Row row) {
+            Value value = argument.emit(row);
+            Expr data = new Select(value.isNull(), i64(nullValueOf(columnType)), value.data());
+            return new Value(data, eq(data, i64(nullValueOf(columnType))));
         }
     }
 
@@ -313,24 +436,32 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
     }
 
     private static void checkArithmeticType(int type) {
-        if (type != ColumnType.INT && type != ColumnType.LONG && type != ColumnType.DOUBLE)
-            throw new IllegalArgumentException("INT, LONG or DOUBLE arithmetic type required");
+        if (type != ColumnType.INT && type != ColumnType.LONG && type != ColumnType.FLOAT && type != ColumnType.DOUBLE)
+            throw new IllegalArgumentException("INT, LONG, FLOAT or DOUBLE arithmetic type required");
     }
 
     private static Value arithmetic(Op op, Value left, Value right, int type) {
-        if (type == ColumnType.DOUBLE) {
-            Expr result = binary(switch (op) { case ADD -> Op.FADD; case SUB -> Op.FSUB; case MUL -> Op.FMUL;
+        if (type == ColumnType.DOUBLE || type == ColumnType.FLOAT) {
+            Expr result = binary(switch (op) {
+                case ADD -> Op.FADD;
+                case SUB -> Op.FSUB;
+                case MUL -> Op.FMUL;
                 default -> throw new IllegalArgumentException("Not floating arithmetic: " + op); }, left.data(), right.data());
-            return new Value(result, doubleNull(result));
+            return new Value(result, nonFinite(result));
         }
         Expr result = binary(op, left.data(), right.data());
         // IntFunction.getLong sign-extends the already wrapped INT result. Preserve that
         // width at every expression node, including when its parent reads LONG.
-        if (type == ColumnType.INT) {
-            result = binary(Op.SUB, binary(Op.XOR, binary(Op.AND, result, i64(0xffff_ffffL)), i64(0x8000_0000L)), i64(0x8000_0000L));
-        }
+        if (type == ColumnType.INT) result = narrowInteger(result, type);
         return new Value(result, binary(Op.EITHER, binary(Op.EITHER, left.isNull(), right.isNull()),
                 eq(result, i64(type == ColumnType.INT ? Integer.MIN_VALUE : Long.MIN_VALUE))));
+    }
+
+    private static Expr narrowInteger(Expr value, int type) {
+        int bits = widthOf(type).bytes * 8;
+        if (bits == 64) return value;
+        long sign = 1L << (bits - 1);
+        return binary(Op.SUB, binary(Op.XOR, binary(Op.AND, value, i64((sign << 1) - 1)), i64(sign)), i64(sign));
     }
 
     public sealed interface Predicate permits All, Compare, SqlCompare, FloatingCompare, IsNotNull, And, Or, Not {
@@ -384,11 +515,16 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
         }
     }
 
-    /** Numbers.equals and LtDoubleVV's tolerance-aware order, including nonfinite NULLs. */
-    public record FloatingCompare(Op op, Scalar left, Scalar right) implements Predicate {
-        public FloatingCompare { new Compare(op, left, right); }
+    /** Ordinary tolerance-aware predicates, or canonical IEEE key equality for simple CASE. */
+    public record FloatingCompare(Op op, Scalar left, Scalar right, boolean canonicalKeys) implements Predicate {
+        public FloatingCompare(Op op, Scalar left, Scalar right) { this(op, left, right, false); }
+        public FloatingCompare {
+            new Compare(op, left, right);
+            if (canonicalKeys && op != Op.EQ) throw new IllegalArgumentException("Switch keys require equality");
+        }
         @Override public Expr emit(Row row) {
             Value a = left.emit(row), b = right.emit(row);
+            if (canonicalKeys) return eq(canonicalBits(a.data()), canonicalBits(b.data()));
             Expr distance = new BitCast(binary(Op.AND, new BitCast(binary(Op.FSUB, a.data(), b.data())), i64(Long.MAX_VALUE)));
             Expr equal = binary(Op.EITHER, binary(Op.BOTH, a.isNull(), b.isNull()),
                     binary(Op.FGE, f64(io.questdb.std.Numbers.DOUBLE_TOLERANCE), distance));
@@ -399,6 +535,11 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
                 case GE -> binary(Op.EITHER, equal, binary(Op.FLT, b.data(), a.data()));
                 default -> throw new IllegalArgumentException("Not a floating comparison: " + op);
             };
+        }
+
+        private static Expr canonicalBits(Expr value) {
+            long nan = value.type() == Type.F32 ? Float.floatToIntBits(Float.NaN) : Double.doubleToLongBits(Double.NaN);
+            return new Select(binary(Op.FNE, value, value), i64(nan), new BitCast(value));
         }
     }
 
@@ -678,8 +819,8 @@ public record Pipeline(List<Column> columns, Predicate filter, List<Scalar> keys
 
     static MemoryType widthOf(int columnType) {
         return switch (columnType) {
-            case ColumnType.BYTE -> MemoryType.I8;
-            case ColumnType.SHORT -> MemoryType.I16;
+            case ColumnType.BOOLEAN, ColumnType.BYTE -> MemoryType.I8;
+            case ColumnType.SHORT, ColumnType.CHAR -> MemoryType.I16;
             case ColumnType.INT, ColumnType.SYMBOL, ColumnType.IPv4 -> MemoryType.I32;
             case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> MemoryType.I64;
             case ColumnType.FLOAT -> MemoryType.F32;

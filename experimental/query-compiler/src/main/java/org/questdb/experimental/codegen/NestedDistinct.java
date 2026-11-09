@@ -35,12 +35,24 @@ import static org.questdb.experimental.codegen.Ir.*;
 final class NestedDistinct {
     static final NestedDistinct LONG = new NestedDistinct(MemoryType.I64, Long.MIN_VALUE);
     static final NestedDistinct INT = new NestedDistinct(MemoryType.I32, Integer.MIN_VALUE);
+    static final NestedDistinct IPV4 = new NestedDistinct(MemoryType.I32, Numbers.IPv4_NULL);
     private final MemoryType width;
     private final long noKeyValue;
+    final long payloadOffset;
 
     private NestedDistinct(MemoryType width, long noKeyValue) {
+        this(width, noKeyValue, 8);
+    }
+
+    private NestedDistinct(MemoryType width, long noKeyValue, long payloadOffset) {
         this.width = width;
         this.noKeyValue = noKeyValue;
+        this.payloadOffset = payloadOffset;
+    }
+
+    NestedDistinct withPayloadOffset(long offset) {
+        if (offset < 8) throw new IllegalArgumentException("Overlapping DISTINCT state cells");
+        return offset == payloadOffset ? this : new NestedDistinct(width, noKeyValue, offset);
     }
 
     static int initialCapacity(int requested, double loadFactor) {
@@ -61,7 +73,7 @@ final class NestedDistinct {
                 || !Double.isFinite(loadFactor) || loadFactor <= 0 || loadFactor >= 1) {
             throw new IllegalArgumentException("Invalid resolved distinct set sizing");
         }
-        Expr payload = at(countAddress, 8);
+        Expr payload = at(countAddress, payloadOffset);
         builder.when(eq(value.isNull(), bool(false)), present -> {
             Var count = present.let(load(countAddress));
             Var key = present.let(value.data());
@@ -93,7 +105,7 @@ final class NestedDistinct {
     /** Hint the first set slot only; the real update always reloads state after any intervening growth. */
     void prefetch(Builder b, Pipeline.Value value, Expr countAddress) {
         b.when(binary(Op.BOTH, eq(value.isNull(), bool(false)), binary(Op.GE, load(countAddress), i64(2))), existing -> {
-            Var set = existing.let(new Load(MemoryType.ADDRESS, at(countAddress, 8)));
+            Var set = existing.let(new Load(MemoryType.ADDRESS, at(countAddress, payloadOffset)));
             Var capacity = existing.let(intAt(set, 0));
             Var hash = hash(existing, value.data());
             Var index = existing.let(binary(Op.AND, hash, binary(Op.SUB, capacity, i64(1))));
@@ -108,9 +120,9 @@ final class NestedDistinct {
         Var count = b.let(load(countAddress));
         b.when(binary(Op.BOTH, binary(Op.LT, count, i64(0)), ne(count, i64(Long.MIN_VALUE))),
                 unfinished -> unfinished.exit(3));
-        b.when(eq(count, i64(1)), singleton -> consumer.accept(singleton, load(at(countAddress, 8))));
+        b.when(eq(count, i64(1)), singleton -> consumer.accept(singleton, load(at(countAddress, payloadOffset))));
         b.when(binary(Op.GE, count, i64(2)), multiple -> {
-            Var set = multiple.let(new Load(MemoryType.ADDRESS, at(countAddress, 8)));
+            Var set = multiple.let(new Load(MemoryType.ADDRESS, at(countAddress, payloadOffset)));
             forEachSet(multiple, set, consumer);
         });
     }
@@ -144,19 +156,19 @@ final class NestedDistinct {
             Var empty = valid.let(binary(Op.EITHER, eq(dstCount, i64(0)), eq(dstCount, i64(Long.MIN_VALUE))));
             valid.when(empty, adopt -> {
                 adopt.store(destination, srcCount);
-                adopt.store(at(destination, 8), load(at(source, 8)));
+                adopt.store(at(destination, payloadOffset), load(at(source, payloadOffset)));
             });
             valid.when(eq(empty, bool(false)), occupied -> {
                 occupied.when(eq(srcCount, i64(1)), singleton ->
-                        emitWithCapacity(singleton, new Pipeline.Value(load(at(source, 8)), bool(false)), destination, capacity, loadFactor));
+                        emitWithCapacity(singleton, new Pipeline.Value(load(at(source, payloadOffset)), bool(false)), destination, capacity, loadFactor));
                 occupied.when(ne(srcCount, i64(1)), multiple -> {
-                    Var srcSet = multiple.let(new Load(MemoryType.ADDRESS, at(source, 8)));
+                    Var srcSet = multiple.let(new Load(MemoryType.ADDRESS, at(source, payloadOffset)));
                     multiple.when(eq(dstCount, i64(1)), singleton -> {
-                        addKey(singleton, srcSet, load(at(destination, 8)));
+                        addKey(singleton, srcSet, load(at(destination, payloadOffset)));
                         writeSet(singleton, destination, srcSet);
                     });
                     multiple.when(ne(dstCount, i64(1)), sets -> {
-                        Var dstSet = sets.let(new Load(MemoryType.ADDRESS, at(destination, 8)));
+                        Var dstSet = sets.let(new Load(MemoryType.ADDRESS, at(destination, payloadOffset)));
                         Var intoDestination = sets.let(binary(Op.LT, binary(Op.USHR, intAt(srcSet, 4), i64(1)), intAt(dstSet, 4)));
                         // Select ownership before lowering the union, so its probe/grow loops
                         // occur once in the generated program. Growth updates the chosen target.
@@ -183,7 +195,7 @@ final class NestedDistinct {
 
     private void writeSet(Builder b, Expr destination, Var set) {
         b.store(destination, intAt(set, 4));
-        b.store(MemoryType.ADDRESS, at(destination, 8), set);
+        b.store(MemoryType.ADDRESS, at(destination, payloadOffset), set);
     }
 
     /** Slot order and addAt growth rules are preserved. */

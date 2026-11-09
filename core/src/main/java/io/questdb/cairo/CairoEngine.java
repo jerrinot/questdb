@@ -128,6 +128,7 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.SqlExecutionLease;
 import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.MultiArgFunction;
@@ -254,6 +255,7 @@ public class CairoEngine implements Closeable, WriterSource {
     private final Metrics metrics;
     private final PartitionCompactionRequestQueue partitionCompactionRequestQueue = new PartitionCompactionRequestQueue(PARTITION_COMPACTION_REQUEST_QUEUE_CAPACITY);
     private final PartitionOverwriteControl partitionOverwriteControl = new PartitionOverwriteControl();
+    private final QueryCodeGenerator queryCodeGenerator;
     private final QueryRegistry queryRegistry;
     private final ReaderPool readerPool;
     private final RecentWriteTracker recentWriteTracker;
@@ -363,6 +365,7 @@ public class CairoEngine implements Closeable, WriterSource {
             this.ffCache = new FunctionFactoryCache(configuration, getFunctionFactories());
             this.tableFlagResolver = newTableFlagResolver(configuration);
             this.configuration = configuration;
+            this.queryCodeGenerator = loadQueryCodeGenerator(configuration);
             this.copyImportContext = new CopyImportContext(this, configuration);
             this.copyExportContext = new CopyExportContext(this);
             this.tableSequencerAPI = new TableSequencerAPI(this, configuration);
@@ -2256,6 +2259,10 @@ public class CairoEngine implements Closeable, WriterSource {
     @TestOnly
     public PoolListener getPoolListener() {
         return this.writerPool.getPoolListener();
+    }
+
+    public @Nullable QueryCodeGenerator getQueryCodeGenerator() {
+        return queryCodeGenerator;
     }
 
     public QueryRegistry getQueryRegistry() {
@@ -4535,6 +4542,24 @@ public class CairoEngine implements Closeable, WriterSource {
                 th.addSuppressed(rollbackEx);
             }
             throw th;
+        }
+    }
+
+    private static @Nullable QueryCodeGenerator loadQueryCodeGenerator(CairoConfiguration configuration) {
+        if (!configuration.isSqlLlvmEnabled()) {
+            return null;
+        }
+        try {
+            // Keep the normal server independent of the optional compiler module and LLVM.
+            QueryCodeGenerator generator = (QueryCodeGenerator) Class.forName("org.questdb.experimental.codegen.ResolvedQueryCompiler")
+                    .getMethod("forServer", CairoConfiguration.class)
+                    .invoke(null, configuration);
+            LOG.advisory().$("experimental LLVM query compiler enabled").$();
+            return generator;
+        } catch (ReflectiveOperationException | LinkageError e) {
+            Throwable cause = e instanceof java.lang.reflect.InvocationTargetException ? e.getCause() : e;
+            throw new IllegalStateException("Cannot enable cairo.sql.llvm.enabled: the experimental query compiler module "
+                    + "and its LLVM native library must be available", cause);
         }
     }
 

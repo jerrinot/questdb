@@ -44,7 +44,7 @@ final class ResolvedStandaloneFilter {
 
     static QueryCodeGenerator.CompiledFilters compile(ColumnTypes types, Function function,
                                                         Backend backend, Path artifacts) throws IOException {
-        var binding = ResolvedFilter.bind(types, function);
+        var binding = ResolvedFilter.bind(types, function, backend.options());
         if (binding == null) return null;
         boolean descriptors = binding.residual() != null || !binding.parameters().isEmpty();
         CompiledKernel rows = backend.compile(descriptors

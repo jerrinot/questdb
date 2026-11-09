@@ -46,6 +46,7 @@ import static org.junit.Assert.*;
 
 public class FilterFusionTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
+    private CompilerOptions options = CompilerOptions.DEFAULT;
     private CairoEngine engine;
     private SqlExecutionContextImpl context;
     private WorkerPool pool;
@@ -113,26 +114,24 @@ public class FilterFusionTest {
             assertMatches("select k,count() from times where " + column + " between " + bounds + " group by k", true);
             assertMatches("select k,count() from times where not (" + column + " between " + bounds + ") group by k", true);
         }
-        assertMatches("select k,count() from times where cast(ts as date) between "
-                + "cast('2025-01-01T00:01:00Z' as timestamp) and cast('2025-01-01T00:02:00Z' as timestamp) group by k", false);
+        for (String value : new String[]{"cast(ts as date)", "cast(ns as date)",
+                "case when k<8 then cast(ts as date) else cast(ns as date) end",
+                "cast(cast(ts as date) as timestamp_ns)"}) {
+            assertMatches("select k,count() from times where " + value + " between "
+                    + "cast('2025-01-01T00:01:00Z' as timestamp) and cast('2025-01-01T00:02:00Z' as timestamp) group by k", true);
+        }
     }
 
     @Test
     public void masksTailsGrowthAndFlushPreserveResultsOnReopen() throws Exception {
-        String old = System.getProperty("query.codegen.localCapacity");
-        System.setProperty("query.codegen.localCapacity", "64");
-        try {
-            for (String predicate : new String[]{"p<0", "p<1", "p<50", "p<100"}) {
-                assertMatches("select k,count(),sum(v) from t where " + predicate + " group by k", true);
-            }
-            assertMatches("select k+1,count(),count(v),sum(v),avg(a),count_distinct(v) "
-                    + "from t where p<50 or p=null group by k+1", true);
-            assertMatches("select s,k,count(),sum(v) from t where p<50 group by s,k", true);
-            assertMatches("select s,count(),sum(v) from t where p<50 group by s", true);
-        } finally {
-            if (old == null) System.clearProperty("query.codegen.localCapacity");
-            else System.setProperty("query.codegen.localCapacity", old);
+        options = options.withLocalCapacity(64);
+        for (String predicate : new String[]{"p<0", "p<1", "p<50", "p<100"}) {
+            assertMatches("select k,count(),sum(v) from t where " + predicate + " group by k", true);
         }
+        assertMatches("select k+1,count(),count(v),sum(v),avg(a),count_distinct(v) "
+                + "from t where p<50 or p=null group by k+1", true);
+        assertMatches("select s,k,count(),sum(v) from t where p<50 group by s,k", true);
+        assertMatches("select s,count(),sum(v) from t where p<50 group by s", true);
     }
 
     @Test
@@ -160,7 +159,7 @@ public class FilterFusionTest {
         };
         try (var baseline = Demo.compileSql(engine, context, sql, true)) {
             var expected = Demo.readSql(baseline, context, 1);
-            context.setQueryCodeGenerator(ResolvedQueryCompiler.filterFusionExperiment(failing, temporary.newFolder().toPath()));
+            context.setQueryCodeGenerator(ResolvedQueryCompiler.filterFusionExperiment(failing, temporary.newFolder().toPath(), options));
             try (var candidate = Demo.compileSql(engine, context, sql, true)) {
                 calls.set(5);
                 var failure = assertThrows(CairoException.class, () -> Demo.readSql(candidate, context, 1));
@@ -180,7 +179,7 @@ public class FilterFusionTest {
             int columns = baseline.getMetadata().getColumnCount();
             var expected = Demo.readSql(baseline, context, columns);
             context.setQueryCodeGenerator(ResolvedQueryCompiler.filterFusionExperiment(
-                    new LlvmBackend(), temporary.newFolder().toPath()));
+                    new LlvmBackend(), temporary.newFolder().toPath(), options));
             try (var candidate = Demo.compileSql(engine, context, sql, true)) {
                 long before = fusedRows(candidate);
                 for (int i = 0; i < 2; i++) assertEquals(sql, expected, Demo.readSql(candidate, context, columns));

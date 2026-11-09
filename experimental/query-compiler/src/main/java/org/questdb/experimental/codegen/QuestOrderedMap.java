@@ -121,8 +121,12 @@ final class QuestOrderedMap {
     // Source: heap, offsets, capacity, stride, size, merge flag. Merge follows hash-slot
     // order; redistribution follows the ordinary cursor's insertion order.
     static Program entries(QuestMapProbe probe, AggregateUpdates updates, long valueBytes) {
-        int batchRows = Integer.getInteger("query.codegen.prefetchRows", 32);
-        if (Boolean.parseBoolean(System.getProperty("query.codegen.orderedPipeline", "true")) && batchRows > 0) {
+        return entries(probe, updates, valueBytes, CompilerOptions.DEFAULT);
+    }
+
+    static Program entries(QuestMapProbe probe, AggregateUpdates updates, long valueBytes, CompilerOptions options) {
+        int batchRows = options.prefetchRows();
+        if (options.orderedPipeline() && batchRows > 0) {
             return stagedEntries(probe, updates, valueBytes, batchRows);
         }
         Builder b = new Builder();

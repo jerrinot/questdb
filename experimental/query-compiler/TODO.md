@@ -1,11 +1,112 @@
-# Deferred aggregation performance work
+# Generated pipeline generality and deferred performance work
 
-Join-filter checkpoint (2026-11-07): [selective transfer through dependent joins](DEPENDENT_JOIN_FILTER_PLAN.md).
-Typed ordinary membership, transfer through existing build inputs and fused
-composite-producer reduction are implemented with focused correctness validation.
-Fresh hardware evidence, 500M-row controls and cost-driven admission/scheduling
-remain pending: the user requested avoiding the competing desktop benchmark.
-No speedup claim, new scheduler or configuration switch accompanies this change.
+Current priority (2026-11-08): extend SQL contracts across existing consumers,
+independently of benchmark shapes. Completed coverage belongs in the
+[README](README.md#supported-scope); retained findings and counterexamples belong
+in [PROGRESS](PROGRESS.md). Reuse ordinary state, maps, scheduling, allocation and
+fallback. No new configuration switches or capability framework.
+
+Architecture milestones 1–5 are implemented: execution ownership, shared state
+transitions/specifications, descriptor binding checks, immutable options and
+harness isolation. Keep two boundary gaps explicit: the delegating protocol checks
+cover selected SPI calls, and default core CI does not execute a compiled path.
+Any capability regrouping must replace the existing API rather than layer a second
+framework over it. Scope decisions and acceptance criteria are in
+[ARCHITECTURE](ARCHITECTURE.md#recommended-architectural-sequence).
+
+The typed-value, aggregate-family and shared-consumer milestones are implemented:
+explicit F32; static-SYMBOL conditions; temporal, Boolean, IPv4 and CHAR values;
+primitive/composite join keys; numeric casts and remainder; statistical,
+compensated, weighted, Boolean and bitwise aggregates; scalar/join/ASOF DISTINCT.
+First/next-state, ordinary-key fallback and scratch-reopen contracts now compose.
+See the README for overload-specific limits rather than assuming blanket support.
+
+Next semantic gaps, one contract at a time:
+
+- Checked temporal conversions need effect-aware lowering and lazy CASE branches.
+  Preserve ordinary exceptions and which rows/branches evaluate the conversion.
+- Standalone floating and CHAR projections need their actual result getter
+  contracts; numeric representation alone does not establish projection support.
+- VARCHAR DISTINCT and unkeyed/non-SYMBOL vector families need separate state and
+  lifecycle proofs. CountDistinctVarcharGroupByFunction stores a LONG count and
+  INT index into Java CompactUtf8SequenceHashSet objects; it has no merge and
+  disables parallelism. Establish an ordinary parallel ownership/merge contract
+  before native lowering, with NULL/empty/Unicode keys, transient input bytes,
+  growth, memory limits and reopening. The fixed-width DISTINCT pointer ABI does
+  not represent these sets. Direct static-SYMBOL vector arguments remain direct columns;
+  expressions already use the ordinary map planner with generated updates.
+- Broader decimal/128-bit value and aggregate families remain ordinary. Audit
+  resolved overloads and all consumers before choosing the next family.
+
+Performance follow-up: independent flush ceilings have now been tested while
+preserving initial map sizing and sharding. Corrected-observer 500M-row controls
+retain roughly 2.5x moderate-state gains across key and aggregate types, with small
+maps unchanged, but million-group and changing-distribution cases regress.
+The larger ceiling spends more work building states that combine few input rows
+before compact input partitioning. The follow-up retry experiment removes most
+repeated trials on stable high-cardinality data, but retained learning remains
+frame-dependent and fails on changing locality. Fixed-work retries stabilize trial
+counts but are not a general win. A bounded always-aggregate ablation substantially
+shrinks the ceiling-dependent wall gap, while a roughly 5% cycle difference remains.
+Next, profile that pair with load/cache/TLB counters, generated symbols and actual
+map footprints before designing another retry or growth policy. Do not infer its
+cause from wall time or miss counts alone. See the
+[retry experiment](target/state-backoff-20261109/REPORT.md).
+
+Any later reversible growth needs both byte and exploration-work budgets. Account
+for retained partition buffers: on M1 a smaller local table creates a much larger
+total query footprint and causes paging. A cache-fit rule alone misses this
+tradeoff.
+
+Reuse ordinary owners, the query memory tracker and `Map.restoreInitialCapacity()`
+for rollback; `clear()` retains the grown offset table. Republish native views after
+shrinking. Preserve initial allocation density, both physical paths and aggregate
+lifetimes. Test random and periodic keys, skew, narrow/wide state and distribution
+changes; no query recognition, CPU-model gates or new production toggle. Keep
+compiler defaults until the negative controls qualify. See the
+[corrected experiment](target/state-growth-20261109/REPORT.md) and
+[earlier sizing/sharding controls](target/state-layout-20261109/REPORT.md).
+M1 controller measurements and Intel/NUMA qualification remain absent. Avoid hot
+`numa_maps`/`smaps` sampling; page-table walks perturb query allocation timings.
+
+Native-admission follow-up from that experiment: a GROUP BY CASE with
+`t is null OR cast(t as long)<0` on TIMESTAMP_NS has zero native scan/map rows
+despite EXPLAIN advertising compiled aggregate batches. An equivalent CASE using
+`cast(t as long)>=0` executes all 500M rows natively and has the identical complete
+ordinary result. Audit the resolved null-check function and key-admission contract
+before extending support; do not infer full native execution from the plan label.
+
+Another measured-code opportunity is shared aggregate computation. The regression
+control's optimized scan has eight floating divisions per row; slope/intercept/R²
+repeat the same six-cell update for equal arguments. First test sharing computation
+while preserving the ordinary physical state layout and fallback writers. Admission
+must prove equal initialization, first/next updates, merge and argument semantics;
+different finalizers alone need not duplicate updates. CORR is a negative control:
+its count-product overflow differs. SUM/AVG and row/vector compensated sums must
+also retain their distinct contracts. Predict fewer arithmetic instructions with
+similar state-store traffic, then measure; no speedup or sharing rule is retained.
+
+For every milestone, compare ordinary results and prove generated execution in
+applicable scalar/keyed, nested-map, inner-join and ASOF consumers. Include first
+state, merge, NULL/empty input, column tops, Parquet and failure/reopen where
+relevant. Reuse focused differential tests and the expanded existing fuzzer;
+exact ordered state and bounded parallel numerical comparisons serve different
+purposes. Measure complete-query performance after correctness, without promising
+that every generated path is faster.
+
+Chooser experiments remain deferred. Four scratch policies did not establish
+reliable ranking across AMD and M1; retain the current policy. Evidence and the
+next measurement experiment: [chooser report](target/exploration-budget/REPORT.md).
+
+Portability checkpoint (2026-11-07): the unchanged pipeline builds on Apple M1
+and passes the same 79 focused tests as AMD. Two independent 500M-row families
+retain gains on both machines. Natural multi-build grouping correctly declines
+destination reuse; extreme skew disproves a universal group-lookahead default.
+M1 aggregation's effective-clock discrepancy remains a measurement limitation.
+Fresh RTAB, SF100 Q1/Q3/Q5 and [ClickBench](target/generality/clickbench/clickbench.html)
+controls are complete. H2O and SYMBOL 1BRC sentinels await their missing datasets;
+Intel/NUMA and broad ARM typed-key performance remain unverified. See
+[the remaining milestones](archive/JOIN_GENERALIZATION_PLAN.md#next-milestones-validate-generality-and-portability).
 
 Current milestone (2026-11-06): multiway root selection now makes connected inner
 join plans reachable independently of FROM order. Original SF100 Q3 improves
@@ -81,7 +182,7 @@ recognizes numeric LT/EQ classes but not LtDate/EqDate and timestamp variants. A
 extension must preserve resolved units, mixed-precision conversion, NULLs and
 cached/runtime constants rather than treating every temporal value as raw LONG.
 
-Active experiment order (2026-11-03): [whole-query plan](WHOLE_QUERY_PLAN.md).
+Active experiment order (2026-11-03): [whole-query plan](archive/WHOLE_QUERY_PLAN.md).
 Join and multiway-join acceleration remain goals through a general architecture.
 SSB supplies controls and opportunities, not query-count targets or distribution
 assumptions. Require property-based admission and independent join controls for each
@@ -95,7 +196,7 @@ generation 0/13. See [representation-choice evidence](target/runtime-filter-choi
 Next selection experiment: separate noisy frame timing/hysteresis from shared resource
 coupling before testing query-wide strategy windows. Sixteen-core selection still
 misses a faster forced path; no CPU-count gate or scheduler change was retained.
-The current implementation slice is [typed join generalization](JOIN_GENERALIZATION_PLAN.md).
+The current implementation slice is [typed join generalization](archive/JOIN_GENERALIZATION_PLAN.md).
 INT, full-width LONG, SYMBOL and fixed composite probing now execute natively across
 single, independent and dependent multiway joins, with engine-owned maps and translation caches.
 Measured limits: sparse LONG retains about one branch miss/input; composite exact probes
@@ -141,7 +242,7 @@ results before measuring 500M-row controls.
 - [x] Static SYMBOL literal equality and bounded IN, including initialized runtime values.
 - [x] Static SYMBOL COUNT in keyed and unkeyed generated aggregates.
 - [x] Keyed SYMBOL/INT DISTINCT using the ordinary integer-set ABI; retain static-dictionary scope.
-  Scalar DISTINCT and parallel deferred INT-set union remain separate gaps.
+  Scalar DISTINCT is now integrated; parallel deferred INT-set union remains separate.
 - [x] Ordinary INT/LONG AVG and scalar SHORT/INT/LONG AVG, including join consumers.
 - [x] Add SUM(LONG), AVG(INT) and 128-bit AVG(LONG) to the existing SYMBOL array path.
 - [x] Direct DOUBLE ordinary COUNT/SUM/MIN/MAX/AVG, scalar and join consumers.
@@ -269,7 +370,7 @@ Evidence and limits:
   Existing sharding does not by itself bound the working set while every worker
   updates groups across all shards.
 
-References: [experiment log](PROGRESS.md), [current coverage plan](FOUNDATIONS_PLAN.md),
+References: [experiment log](PROGRESS.md), [current coverage plan](archive/FOUNDATIONS_PLAN.md),
 [DuckDB bounded pre-aggregation](https://duckdb.org/2024%2F03%2F29/external-aggregation),
 [shared versus partitioned aggregation study](https://www.vldb.org/pvldb/vol19/p523-marcus.pdf).
 Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-profile`.
@@ -808,6 +909,13 @@ ordinary AVG controls retain ~3-4% costs. Do not hide these behind duplicate-hea
 
 
 ## Joined variable grouping after destination reuse
+
+- Fix chooser measurement before adding progressive elimination. Short screening
+  saved first-use time but excluded the faster direct-cache kernel on an M1 control
+  (8.64 -> 10.30 s warm). Compare sampled rankings with warmed alternating-kernel
+  trials; instrument phase overlap, compilation and state growth. A remaining-work
+  budget must preserve `knownProbeRows=-1` behind residual filters. Four scratch
+  policies remain unretained; see `target/exploration-budget/REPORT.md`.
 
 - Resolve the remaining 5–11% small-state fresh-process variance before claiming
   parity. Identical emitted loops and differing adaptive choices explain only

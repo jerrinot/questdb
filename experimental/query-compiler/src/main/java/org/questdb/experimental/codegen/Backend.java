@@ -29,6 +29,20 @@ import java.nio.file.Path;
 import java.util.List;
 
 public interface Backend {
+    default CompilerOptions options() { return CompilerOptions.DEFAULT; }
+    /** Keep deferred lowering and any subsequently bound filter on the same planning snapshot. */
+    default Backend withOptions(CompilerOptions options) {
+        java.util.Objects.requireNonNull(options);
+        if (options.equals(options())) return this;
+        Backend delegate = this;
+        return new Backend() {
+            @Override public CompilerOptions options() { return options; }
+            @Override public String name() { return delegate.name(); }
+            @Override public CompiledKernel compile(Ir.Program program, Path path) throws IOException {
+                return delegate.compile(program, path);
+            }
+        };
+    }
     CompiledKernel compile(Ir.Program program, Path artifactRoot) throws IOException;
     /** Alternatives must implement exactly the same state transition and ABI. */
     default CompiledKernel compileAlternatives(Ir.Program fused, Ir.Program masked, Path artifactRoot) throws IOException {

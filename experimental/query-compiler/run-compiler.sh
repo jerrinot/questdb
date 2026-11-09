@@ -9,5 +9,5 @@ exec java \
   --add-opens=java.base/java.nio=ALL-UNNAMED \
   --add-opens=java.base/java.time.zone=ALL-UNNAMED \
   --add-exports=java.base/jdk.internal.vm=ALL-UNNAMED \
-  -cp experimental/query-compiler/target/classes:core/target/classes \
+  -cp experimental/query-compiler/target/test-classes:experimental/query-compiler/target/classes:core/target/classes \
   org.questdb.experimental.codegen.CompilerDemo "$@"

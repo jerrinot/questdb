@@ -347,6 +347,7 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
                 }
                 final Map map = fragment == null ? null
                         : fragment.isNotSharded() ? fragment.reopenMap() : fragment.getShards().getQuick(0);
+                atom.getFunctions().resetStats(slotId);
                 final long rowCount = sequence.getFrameRowCount(frameIndex);
                 if (!frameMemory.hasColumnTypeCasts() && atom.aggregateCompiled(slot, slotId, fragment, map, probeRecord, rowCount, 0, breaker)) {
                     return;
@@ -397,7 +398,7 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
                     }
                 }
                 if (fragment != null) {
-                    atom.getShardingContext().maybeEnableSharding(fragment, 0);
+                    atom.getShardingContext().maybeEnableSharding(fragment, atom.getFunctions().getCardinalityStat(slotId));
                 }
             } finally {
                 pool.releaseParquetBuffers();
@@ -2023,6 +2024,7 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
                 }
                 final Map map = fragment == null ? null
                         : fragment.isNotSharded() ? fragment.reopenMap() : fragment.getShards().getQuick(0);
+                atom.getFunctions().resetStats(slotId);
                 if (!frameMemory.hasColumnTypeCasts() && atom.aggregateCompiled(slot, slotId, fragment, map, probeRecord, rows.size(), rows.getAddress(), breaker)) {
                     return;
                 }
@@ -2072,7 +2074,7 @@ public final class AsyncHashJoinGroupByRecordCursorFactory extends AbstractRecor
                     }
                 }
                 if (fragment != null) {
-                    atom.getShardingContext().maybeEnableSharding(fragment, 0);
+                    atom.getShardingContext().maybeEnableSharding(fragment, atom.getFunctions().getCardinalityStat(slotId));
                 }
             } finally {
                 pool.releaseParquetBuffers();

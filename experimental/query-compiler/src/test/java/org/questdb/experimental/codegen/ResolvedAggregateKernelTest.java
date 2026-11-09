@@ -93,7 +93,7 @@ public class ResolvedAggregateKernelTest {
              var expected = new SimpleMapValue(types.getColumnCount());
              var merged = new SimpleMapValue(types.getColumnCount());
              var code = ResolvedScalarAggregate.compile(inputs, types, functions, nativeValue, null, backend, temporary.newFolder().toPath());
-             var slot = code.newUpdater(); var arena = Arena.ofConfined()) {
+             var slot = code.newUpdater(null); var arena = Arena.ofConfined()) {
             var noop = io.questdb.cairo.sql.SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER;
             for (int i = 0; i < functions.size(); i++) {
                 functions.getQuick(i).setEmpty(nativeValue);
@@ -117,8 +117,10 @@ public class ResolvedAggregateKernelTest {
             assertTrue(slot.update(record, 0, 0, nativeValue, noop));
             assertTrue(nativeValue.isNew());
             assertFalse(slot.update(new PageFrameFilteredMemoryRecord(), rows, selection, nativeValue, noop));
+            assertScalarValues(types, expected, nativeValue);
             assertFalse(slot.update(new TestRecord(0, ints, shorts), rows, selection, nativeValue, noop));
             assertTrue(nativeValue.isNew());
+            assertScalarValues(types, expected, nativeValue);
             for (long selected : new long[]{0, selection}) {
                 assertTrue(slot.update(record, rows, selected, nativeValue, noop));
                 assertFalse(nativeValue.isNew());
@@ -128,10 +130,13 @@ public class ResolvedAggregateKernelTest {
                 }
                 assertScalarValues(types, expected, nativeValue);
             }
-            code.merge(nativeValue, merged);
+            assertFalse(slot.update(new TestRecord(0, ints, shorts), rows, selection, nativeValue, noop));
+            assertFalse(nativeValue.isNew());
+            assertScalarValues(types, expected, nativeValue);
+            code.merge(nativeValue, merged, null, noop);
             assertScalarValues(types, expected, merged);
             merged.setNew(false);
-            code.merge(nativeValue, merged);
+            code.merge(nativeValue, merged, null, noop);
             for (int f = 0; f < functions.size(); f++) functions.getQuick(f).merge(expected, nativeValue);
             assertScalarValues(types, expected, merged);
             var breaker = new AtomicBooleanCircuitBreaker(engine) {
@@ -146,6 +151,56 @@ public class ResolvedAggregateKernelTest {
             assertTrue(slot.update(record, rows, 0, nativeValue, noop));
             assertEquals(3L * rows, slot.getNativeRows());
         }
+    }
+
+    @Test
+    public void scalarDistinctMergeBorrowsOrdinarySetsAndObservesCancellation() throws Exception {
+        var function=new CountDistinctLongGroupByFunction(LongColumn.newInstance(0),4,0.6);
+        var functions=new ObjList<GroupByFunction>();functions.add(function);
+        var types=new ArrayColumnTypes();function.initValueTypes(types);
+        var inputs=new ArrayColumnTypes().add(ColumnType.LONG);
+        var noop=io.questdb.cairo.sql.SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER;
+        try(var engine=new CairoEngine(new DefaultCairoConfiguration(temporary.newFolder().toString()));
+            var source=new SimpleMapValue(types.getColumnCount());
+            var destination=new SimpleMapValue(types.getColumnCount());
+            var expected=new SimpleMapValue(types.getColumnCount());
+            var sourceAllocator=new FastGroupByAllocator(64,1<<20);
+            var destinationAllocator=new FastGroupByAllocator(64,1<<20);
+            var expectedAllocator=new FastGroupByAllocator(64,1<<20);
+            var code=ResolvedScalarAggregate.compile(inputs,types,functions,source,null,backend,temporary.newFolder().toPath());
+            var sourceSlot=code.newUpdater(sourceAllocator);
+            var destinationSlot=code.newUpdater(destinationAllocator);
+            var arena=Arena.ofConfined()) {
+            int rows=4099;
+            long data=arena.allocate(rows*8L,8).address();
+            var record=new TestRecord(data,0,0);
+            function.setEmpty(source);source.setNew(true);
+            function.setEmpty(destination);destination.setNew(true);
+            function.setEmpty(expected);
+            for(int pass=0;pass<2;pass++) {
+                for(int r=0;r<rows;r++) Unsafe.putLong(data+r*8L,r%23==0?Long.MIN_VALUE:r+pass*2048L);
+                function.setAllocator(expectedAllocator);
+                for(int r=0;r<rows;r++) {record.setRowIndex(r);function.computeNext(expected,record,r);}
+                if(pass==0) {
+                    // An ordinary prefix and native suffix share the same worker set.
+                    function.setAllocator(sourceAllocator);
+                    for(int r=0;r<17;r++) {record.setRowIndex(r);function.computeNext(source,record,r);}
+                    source.setNew(false);
+                    assertTrue(sourceSlot.update(new TestRecord(data+17*8L,0,0),rows-17,0,source,noop));
+                } else assertTrue(destinationSlot.update(record,rows,0,destination,noop));
+            }
+            code.merge(source,destination,destinationAllocator,noop);
+            assertEquals(expected.getLong(0),destination.getLong(0));
+            // Source sets stay owned by their original allocator even when a union adopts them.
+            var breaker=new AtomicBooleanCircuitBreaker(engine) {
+                int polls;
+                @Override public void statefulThrowExceptionIfTrippedNoThrottle() {
+                    if(++polls==3) cancel();
+                    super.statefulThrowExceptionIfTrippedNoThrottle();
+                }
+            };
+            assertThrows(CairoException.class,()->code.merge(source,destination,destinationAllocator,breaker));
+        } finally {function.close();}
     }
 
     private static void assertScalarValues(ArrayColumnTypes types, SimpleMapValue expected, SimpleMapValue actual) {
@@ -174,7 +229,7 @@ public class ResolvedAggregateKernelTest {
         b.loop(binary(Op.LT, index, ROWS), loop -> {
             // An upstream operator supplies an expression and null flag, not a column address.
             var value = new Pipeline.Value(add(index, i64(7)), eq(binary(Op.AND, index, i64(1)), i64(0)));
-            updates.emit(loop, new Pipeline.Row(updates.columns(), List.of(value)), STATE, nil());
+            updates.emitInitialized(loop, new Pipeline.Row(updates.columns(), List.of(value)), STATE, nil());
             loop.assign(index, add(index, i64(1)));
         });
         b.exit(0);
@@ -207,6 +262,7 @@ public class ResolvedAggregateKernelTest {
         functions.add(new MaxLongGroupByFunction(LongColumn.newInstance(0)));
         functions.add(new MinShortGroupByFunction(ShortColumn.newInstance(2)));
         functions.add(new MaxIntGroupByFunction(IntColumn.newInstance(1)));
+        functions.add(new WeightedAvgDoubleGroupByFunction(LongColumn.newInstance(0), IntColumn.newInstance(1)));
         // A preceding INT makes the LONG value slots unaligned: offsets must come from core.
         var types = new ArrayColumnTypes().add(ColumnType.INT);
         for (int i = 0; i < functions.size(); i++) functions.getQuick(i).initValueTypes(types);
@@ -272,6 +328,26 @@ public class ResolvedAggregateKernelTest {
             equalValues(javaValues, nativeValues, stride);
             slot.close();
             assertThrows(IllegalStateException.class, () -> slot.update(record, nativeValues, batch, 1));
+        }
+    }
+
+    @Test
+    public void clearingWorkerScratchPreservesSharedExecution() throws Exception {
+        var types = new ArrayColumnTypes();
+        var functions = new ObjList<GroupByFunction>();
+        functions.add(new CountLongConstGroupByFunction());
+        functions.getQuick(0).initValueTypes(types);
+        try (var map = new io.questdb.cairo.map.UnorderedVarcharMap(types, 16, 0.7, 16, 4096, 1L << 20);
+             var code = ResolvedAggregateKernel.bind(new ArrayColumnTypes().add(ColumnType.VARCHAR), types,
+                     functions, QuestMapProbe.bind(0, ColumnType.VARCHAR, map), CompilerOptions.DEFAULT.withSharedVarchar(true))
+                     .compile(backend, temporary.newFolder().toPath(), true);
+             var slot = code.newSlot()) {
+            assertNotNull(code.sharedMaps);
+            code.sharedMaps.init(shard -> map);
+            slot.clear();
+            assertTrue("Worker scratch cleanup must not reset shared execution", code.sharedMaps.isActive());
+            slot.prepareParameters();
+            assertTrue("Worker scratch reopen must not reset shared execution", code.sharedMaps.isActive());
         }
     }
 
@@ -977,7 +1053,7 @@ public class ResolvedAggregateKernelTest {
     private static QuestFixedKey fixedKey(int type) {
         var column = new Pipeline.Column(0, "key", type);
         return new QuestFixedKey(new ResolvedVarchar.Binding(new int[]{0}, List.of(column), new int[0], new byte[0]), List.of(column),
-                new Ir.MemoryType[]{column.width()}, ColumnType.sizeOf(type), List.of());
+                new Ir.MemoryType[]{column.width()}, new long[]{column.nullValue()}, ColumnType.sizeOf(type), List.of());
     }
 
 }

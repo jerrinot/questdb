@@ -68,7 +68,7 @@ public class DivFloatFunctionFactory implements FunctionFactory {
         return new Func(left, right);
     }
 
-    private static class Func extends FloatFunction implements ArithmeticBinaryFunction {
+    public static class Func extends FloatFunction implements ArithmeticBinaryFunction {
         private final Function left;
         private final Function right;
 

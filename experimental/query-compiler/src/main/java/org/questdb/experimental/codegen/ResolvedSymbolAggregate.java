@@ -68,7 +68,7 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
     static ResolvedSymbolAggregate bind(RecordMetadata inputs, int keyColumn,
             ObjList<VectorAggregateFunction> functions, long rosti, int workers, Backend backend, Path artifacts) {
         if (inputs.getColumnType(keyColumn) != ColumnType.SYMBOL || !inputs.isSymbolTableStatic(keyColumn)) return null;
-        var resolved = new ResolvedInputs(inputs);
+        var resolved = new ResolvedInputs(inputs, backend.options());
         var operations = new ArrayList<AggregateUpdates.Update>();
         long offsets = Rosti.getValueOffsets(rosti);
         for (int i = 0; i < functions.size(); i++) {
@@ -80,27 +80,31 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
                 continue;
             }
             boolean min = type == MinShortVectorAggregateFunction.class || type == MinIntVectorAggregateFunction.class
-                    || type == MinLongVectorAggregateFunction.class || type == MinDoubleVectorAggregateFunction.class;
+                    || type == MinLongVectorAggregateFunction.class || type == MinDoubleVectorAggregateFunction.class
+                    || type == MinDateVectorAggregateFunction.class || type == MinTimestampVectorAggregateFunction.class;
             boolean max = type == MaxShortVectorAggregateFunction.class || type == MaxIntVectorAggregateFunction.class
-                    || type == MaxLongVectorAggregateFunction.class || type == MaxDoubleVectorAggregateFunction.class;
+                    || type == MaxLongVectorAggregateFunction.class || type == MaxDoubleVectorAggregateFunction.class
+                    || type == MaxDateVectorAggregateFunction.class || type == MaxTimestampVectorAggregateFunction.class;
             boolean sum = type == SumShortVectorAggregateFunction.class || type == SumIntVectorAggregateFunction.class
                     || type == SumLongVectorAggregateFunction.class || type == AvgShortVectorAggregateFunction.class
                     || type == AvgIntVectorAggregateFunction.class || type == SumDoubleVectorAggregateFunction.class
                     || type == AvgDoubleVectorAggregateFunction.class;
+            boolean compensated = type == NSumDoubleVectorAggregateFunction.class || type == KSumDoubleVectorAggregateFunction.class;
             boolean wideSum = type == AvgLongVectorAggregateFunction.class;
             boolean count = type == CountIntVectorAggregateFunction.class || type == CountLongVectorAggregateFunction.class
                     || type == CountDoubleVectorAggregateFunction.class;
-            if (!min && !max && !sum && !wideSum && !count) return null;
+            if (!min && !max && !sum && !wideSum && !count && !compensated) return null;
             int index = function.getColumnIndex();
             int inputType = inputs.getColumnType(index);
             if (inputType != ColumnType.SHORT && inputType != ColumnType.INT && inputType != ColumnType.LONG
-                    && inputType != ColumnType.DOUBLE) return null;
+                    && inputType != ColumnType.DOUBLE && inputType != ColumnType.DATE && !ColumnType.isTimestamp(inputType)) return null;
             var column = resolved.column(index, inputType);
             if (min || max) {
-                var width = inputType == ColumnType.INT ? MemoryType.I32 : MemoryType.I64;
+                int stateType = inputType == ColumnType.INT ? ColumnType.INT : ColumnType.LONG;
                 operations.add(inputType == ColumnType.DOUBLE ? new AggregateUpdates.VectorDoubleExtremum(column, offset, min)
-                        : new AggregateUpdates.IntegerExtremum(column, offset, width, min));
-            } else if (wideSum) operations.add(new AggregateUpdates.VectorLongAverageUpdate(column, offset));
+                        : new AggregateUpdates.IntegerExtremum(column, offset, stateType, min));
+            } else if (compensated) operations.add(new VectorCompensatedSum(column, offset, type == NSumDoubleVectorAggregateFunction.class));
+            else if (wideSum) operations.add(new AggregateUpdates.VectorLongAverageUpdate(column, offset));
             else if (sum) operations.add(new AggregateUpdates.VectorSumUpdate(column, offset,
                     inputType == ColumnType.DOUBLE ? MemoryType.F64 : MemoryType.I64));
             else if (inputType == ColumnType.DOUBLE) operations.add(new AggregateUpdates.VectorDoubleCount(column, offset));
@@ -258,7 +262,8 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
             Var id = loop.let(new Select(eq(key, i64(SymbolTable.VALUE_IS_NULL)), count, key));
             loop.when(binary(Op.BOTH, ne(key, i64(SymbolTable.VALUE_IS_NULL)),
                     binary(Op.EITHER, binary(Op.LT, key, i64(0)), binary(Op.GE, key, count))), invalid -> invalid.exit(1));
-            Var destination = DenseAggregate.entry(loop, updates, STATE, seen, id, stride);
+            Var first = updates.rostiFirstRowFlag(loop);
+            Var destination = DenseAggregate.entry(loop, updates, STATE, seen, id, stride, first);
             var values = new ArrayList<Pipeline.Value>();
             for (int i = 0; i < indexes.length; i++) {
                 var column = updates.columns().get(i);
@@ -269,7 +274,10 @@ final class ResolvedSymbolAggregate implements CompiledVectorAggregate {
                 // SHORT has no NULL representation: a column top reads as zero.
                 values.add(column.value(value));
             }
-            updates.emit(loop, new Pipeline.Row(updates.columns(), values), destination, nil());
+            var frame = new ResolvedVarchar.Frame(new Pipeline.Row(updates.columns(), values), row, nil(), nil());
+            // Use function-list order for key creation. Later aggregates see the
+            // initialized slots, matching a Rosti task encountering a precreated key.
+            updates.emitRosti(loop, frame, destination, first);
             loop.assign(row, add(row, i64(1)));
         });
         b.exit(0);

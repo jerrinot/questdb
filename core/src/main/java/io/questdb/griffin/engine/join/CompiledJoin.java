@@ -67,7 +67,7 @@ public interface CompiledJoin extends QuietCloseable {
     CharSequence getName();
 
     /** A cached slot-local check of the existing sequence's cancellation and breaker state. */
-    Updater newUpdater(Runnable checkpoint);
+    Updater newUpdater(io.questdb.griffin.engine.groupby.GroupByAllocator allocator, Runnable checkpoint);
 
     interface Updater extends QuietCloseable {
         /** Releases slot scratch after the owning frame sequence has drained; the updater can reopen. */
@@ -85,6 +85,9 @@ public interface CompiledJoin extends QuietCloseable {
 
         /** Diagnostics read only after the frame sequence has drained. */
         long getNativeRows();
+
+        /** Distinct-state growth in the last completed keyed batch, for ordinary sharding policy. */
+        default long getFunctionCardinality() { return 0; }
 
         /** Native keyed misses serviced by the ordinary map insertion path. */
         default long getNativeMapMisses() {

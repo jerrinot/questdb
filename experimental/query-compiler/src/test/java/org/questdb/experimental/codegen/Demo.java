@@ -294,8 +294,10 @@ public final class Demo {
                         continue;
                     }
                     Long value = switch (factory.getMetadata().getColumnType(i)) {
+                        case ColumnType.BOOLEAN -> record.getBool(i) ? 1L : 0L;
                         case ColumnType.BYTE -> (long) record.getByte(i);
                         case ColumnType.SHORT -> (long) record.getShort(i);
+                        case ColumnType.CHAR -> (long) record.getChar(i);
                         case ColumnType.INT -> record.getInt(i) == Integer.MIN_VALUE ? null : (long) record.getInt(i);
                         case ColumnType.LONG -> record.getLong(i) == Long.MIN_VALUE ? null : record.getLong(i);
                         case ColumnType.IPv4 -> (long) record.getIPv4(i);

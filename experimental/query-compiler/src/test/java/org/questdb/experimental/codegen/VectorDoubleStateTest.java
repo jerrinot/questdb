@@ -58,6 +58,8 @@ public class VectorDoubleStateTest {
         for (VectorAggregateFunction function : List.of(new CountDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1),
                 new SumDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1),
                 new AvgDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1),
+                new KSumDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1),
+                new NSumDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1),
                 new MinDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1),
                 new MaxDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1))) {
             try (function; var arena = Arena.ofConfined()) {
@@ -74,11 +76,7 @@ public class VectorDoubleStateTest {
                     long expectedState = entry(expected), actualState = entry(actual), sourceState = entry(source);
                     long offset = Unsafe.getInt(Rosti.getValueOffsets(actual) + function.getValueOffset() * 4L);
                     var column = new Pipeline.Column(0, "d", ColumnType.DOUBLE);
-                    AggregateUpdates.Update update = function instanceof CountDoubleVectorAggregateFunction
-                            ? new AggregateUpdates.VectorDoubleCount(column, offset)
-                            : function instanceof MinDoubleVectorAggregateFunction || function instanceof MaxDoubleVectorAggregateFunction
-                            ? new AggregateUpdates.VectorDoubleExtremum(column, offset, function instanceof MinDoubleVectorAggregateFunction)
-                            : new AggregateUpdates.VectorSumUpdate(column, offset, MemoryType.F64);
+                    var update = update(function, column, offset);
                     var row = new Pipeline.Row(List.of(column), List.of(column.value(new Load(MemoryType.F64, COLUMNS))));
                     var b = new Builder(); update.emit(b, new ResolvedVarchar.Frame(row, i64(0), nil(), nil()), STATE, nil()); b.exit(0);
                     var merge = new Builder(); update.merge(merge, COLUMNS, STATE); merge.exit(0);
@@ -102,6 +100,64 @@ public class VectorDoubleStateTest {
                 } finally { Rosti.free(source); Rosti.free(actual); Rosti.free(expected); }
             }
         }
+    }
+
+    @Test public void firstRowsAndFirstPartialCopiesMatchRosti() throws Exception {
+        for (VectorAggregateFunction function : List.of(new SumDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1),
+                new KSumDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1),
+                new NSumDoubleVectorAggregateFunction(GKK_VANILLA_INT, 0, -1, 1))) {
+            try (function; var arena = Arena.ofConfined()) {
+                var types = new ArrayColumnTypes(); types.add(ColumnType.INT); function.pushValueTypes(types);
+                long expected = Rosti.alloc(types, 64), actual = Rosti.alloc(types, 64);
+                try {
+                    long key = arena.allocate(4, 4).address(), input = arena.allocate(8, 8).address();
+                    Unsafe.putInt(key, 1);
+                    long offset = Unsafe.getInt(Rosti.getValueOffsets(actual) + function.getValueOffset() * 4L);
+                    var column = new Pipeline.Column(0, "d", ColumnType.DOUBLE);
+                    var update = update(function, column, offset);
+                    var row = new Pipeline.Row(List.of(column), List.of(column.value(new Load(MemoryType.F64, COLUMNS))));
+                    var frame = new ResolvedVarchar.Frame(row, i64(0), nil(), nil());
+                    var first = new Builder(); update.emitFirst(first, frame, STATE, nil()); first.exit(0);
+                    var next = new Builder(); update.emit(next, frame, STATE, nil()); next.exit(0);
+                    var updates = new AggregateUpdates(new ResolvedVarchar.Binding(new int[]{0}, List.of(column), new int[0], new byte[0]), List.of(update));
+                    long stride = Rosti.getSlotSize(actual);
+                    try (var firstCode = backend.compile(new Program(first.block()), temporary.newFolder().toPath());
+                         var nextCode = backend.compile(new Program(next.block()), temporary.newFolder().toPath());
+                         var dense = backend.compile(DenseAggregate.merge(updates, stride), temporary.newFolder().toPath())) {
+                        long copy = arena.allocate(stride, 8).address(), args = arena.allocate(24, 8).address(), seen = arena.allocate(2).address();
+                        for (double initial : new double[]{-0.0, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, 1e16}) {
+                            Rosti.clear(expected); Rosti.clear(actual); function.initRosti(expected); function.initRosti(actual);
+                            assertTrue(Rosti.keyedIntDistinct(actual, key, 1));
+                            Unsafe.putDouble(input, initial);
+                            assertTrue(function.aggregate(expected, key, input, 1));
+                            long expectedState = entry(expected), actualState = entry(actual);
+                            assertEquals(0, firstCode.run(input, 1, actualState));
+                            assertState(types, expected, expectedState, actualState);
+                            Unsafe.putDouble(input, 1);
+                            assertTrue(function.aggregate(expected, key, input, 1));
+                            assertEquals(0, nextCode.run(input, 1, actualState));
+                            assertState(types, expected, expectedState, actualState);
+                            Unsafe.putLong(args, actualState); Unsafe.putLong(args+8, seen); Unsafe.putLong(args+16, seen+1);
+                            Unsafe.putByte(seen, (byte) 1); Unsafe.putByte(seen+1, (byte) 0);
+                            assertEquals(0, dense.run(args, 1, copy));
+                            assertState(types, expected, expectedState, copy);
+                            assertTrue(function.merge(expected, actual));
+                            assertEquals(0, dense.run(args, 1, copy));
+                            assertState(types, expected, expectedState, copy);
+                        }
+                    }
+                } finally { Rosti.free(actual); Rosti.free(expected); }
+            }
+        }
+    }
+
+    private static AggregateUpdates.Update update(VectorAggregateFunction function, Pipeline.Column column, long offset) {
+        if (function instanceof CountDoubleVectorAggregateFunction) return new AggregateUpdates.VectorDoubleCount(column, offset);
+        if (function instanceof MinDoubleVectorAggregateFunction || function instanceof MaxDoubleVectorAggregateFunction)
+            return new AggregateUpdates.VectorDoubleExtremum(column, offset, function instanceof MinDoubleVectorAggregateFunction);
+        if (function instanceof KSumDoubleVectorAggregateFunction || function instanceof NSumDoubleVectorAggregateFunction)
+            return new VectorCompensatedSum(column, offset, function instanceof NSumDoubleVectorAggregateFunction);
+        return new AggregateUpdates.VectorSumUpdate(column, offset, MemoryType.F64);
     }
 
     private static long entry(long map) {

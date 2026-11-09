@@ -58,6 +58,10 @@ final class QuestLongTopK {
     }
 
     static Program program(QuestMapProbe probe, int sortOrder, int capacityClass, int type) {
+        return program(probe, sortOrder, capacityClass, type, CompilerOptions.DEFAULT);
+    }
+
+    static Program program(QuestMapProbe probe, int sortOrder, int capacityClass, int type, CompilerOptions options) {
         if (capacityClass < -1 || capacityClass > 1) throw new IllegalArgumentException("Invalid Top-K capacity class");
         if (sortOrder < -1 || sortOrder > 1) throw new IllegalArgumentException("Invalid Top-K order");
         Builder b = new Builder();
@@ -68,7 +72,7 @@ final class QuestLongTopK {
             // Retain the range information supplied by generic algorithm dispatch.
             b.when(eq(binary(Op.LT, i64(64), capacity), bool(capacityClass == 0)), invalid -> invalid.exit(1));
         }
-        if (capacityClass != 0 && Boolean.parseBoolean(System.getProperty("query.codegen.largeTopK", "true"))) {
+        if (capacityClass != 0 && options.largeTopK()) {
             if (capacityClass == 1) {
                 QuestLargeTopK.emit(b, probe, destination, size, capacity, sortOrder, type);
                 return new Program(b.block());

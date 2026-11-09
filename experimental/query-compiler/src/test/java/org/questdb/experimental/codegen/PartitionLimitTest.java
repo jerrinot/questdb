@@ -58,11 +58,11 @@ public class PartitionLimitTest {
     private static final String SQL = "select k,label,count() n,sum(v) from t group by k,label";
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
     private final WorkerPoolMode mode;
+    private CompilerOptions options = CompilerOptions.DEFAULT.withLocalCapacity(128);
     private CairoEngine engine;
     private SqlExecutionContextImpl context;
     private WorkerPool pool;
     private ResolvedQueryCompiler compiler;
-    private String previousCapacity;
 
     public PartitionLimitTest(WorkerPoolMode mode) { this.mode = mode; }
 
@@ -72,7 +72,6 @@ public class PartitionLimitTest {
     }
 
     @Before public void setUp() throws Exception {
-        previousCapacity = System.setProperty("query.codegen.localCapacity", "128");
         var config = new DefaultCairoConfiguration(temporary.newFolder().toString()) {
             @Override public int getSqlPageFrameMaxRows() { return 2048; }
             @Override public int getSqlPageFrameMinRows() { return 256; }
@@ -87,7 +86,7 @@ public class PartitionLimitTest {
         pool.start();
         context = new SqlExecutionContextImpl(engine, 2).with(
                 config.getFactoryProvider().getSecurityContextFactory().getRootContext(), null, null, -1, null);
-        compiler = new ResolvedQueryCompiler(new LlvmBackend(), temporary.newFolder().toPath());
+        compiler = new ResolvedQueryCompiler(new LlvmBackend(), temporary.newFolder().toPath(), options);
         engine.execute("create table t as (select x%10007 k,"
                 + "cast(case when (x%10007)%17=0 then null else 'ž-'||cast((x%10007)%31 as string) end as varchar) label,"
                 + "case when x%13=0 then null else x*3 end v from long_sequence(" + INPUT_ROWS + "))", context);
@@ -97,8 +96,6 @@ public class PartitionLimitTest {
         if (pool != null) pool.halt();
         if (context != null) context.close();
         if (engine != null) engine.close();
-        if (previousCapacity == null) System.clearProperty("query.codegen.localCapacity");
-        else System.setProperty("query.codegen.localCapacity", previousCapacity);
     }
 
     @Test public void selectionCanGrowWithoutRescanningAndPreservesRowIds() throws Exception {
@@ -244,7 +241,7 @@ public class PartitionLimitTest {
                 return llvm.compile(program, artifacts);
             }
             @Override public String name() { return llvm.name(); }
-        }, temporary.newFolder().toPath());
+        }, temporary.newFolder().toPath(), options);
         Set<Row> expected = reference();
         context.setQueryCodeGenerator(compiler);
         try (var factory = Demo.compileSql(engine, context, SQL + " limit 10", true)) {

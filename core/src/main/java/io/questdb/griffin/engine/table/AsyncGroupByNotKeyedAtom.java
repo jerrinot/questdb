@@ -249,7 +249,8 @@ public class AsyncGroupByNotKeyedAtom implements StatefulAtom, PerWorkerLockOwne
         if (compiledAggregate != null) {
             compiledUpdaters = new ObjList<>(perWorkerMapValues.size() + 1);
             for (int i = -1; i < perWorkerMapValues.size(); i++) {
-                compiledUpdaters.add(compiledAggregate.newUpdater());
+                compiledUpdaters.add(compiledAggregate.newUpdater(i == -1 || perWorkerAllocators == null
+                        ? ownerAllocator : perWorkerAllocators.getQuick(i)));
             }
         }
     }
@@ -271,9 +272,9 @@ public class AsyncGroupByNotKeyedAtom implements StatefulAtom, PerWorkerLockOwne
         return compiledUpdaters != null ? compiledUpdaters.getQuick(slotId + 1) : null;
     }
 
-    void merge(SimpleMapValue source, SimpleMapValue destination) {
+    void merge(SimpleMapValue source, SimpleMapValue destination, SqlExecutionCircuitBreaker circuitBreaker) {
         if (compiledAggregate != null) {
-            compiledAggregate.merge(source, destination);
+            compiledAggregate.merge(source, destination, ownerAllocator, circuitBreaker);
         } else if (destination.isNew()) {
             destination.copy(source);
         } else {

@@ -64,7 +64,8 @@ final class ScalarAggregateState {
             case While loop -> new While(promote(loop.condition(), registers), promote(loop.body(), registers));
             case Poll poll -> poll;
             case Define d -> new Define(d.variable(), promote(d.value(), registers));
-            case Store s -> new Assign(register(registers, new Load(s.width(), s.address())), promote(s.value(), registers));
+            case Store s -> new Assign(register(registers, new Load(s.width(), s.address())),
+                    promote(s.value(), registers));
             case If branch -> new If(promote(branch.condition(), registers), promote(branch.body(), registers));
             default -> throw new IllegalArgumentException("Unsupported scalar aggregate effect: " + statement);
         });
@@ -79,7 +80,10 @@ final class ScalarAggregateState {
             case Binary binary -> new Binary(binary.op(), promote(binary.left(), registers), promote(binary.right(), registers));
             case Select select -> new Select(promote(select.condition(), registers), promote(select.yes(), registers), promote(select.no(), registers));
             case ToDouble cast -> new ToDouble(promote(cast.value(), registers));
-            case BitCast cast -> new BitCast(promote(cast.value(), registers));
+            case ToInteger cast -> new ToInteger(promote(cast.value(), registers), cast.bits());
+            case ToFloat cast -> new ToFloat(promote(cast.value(), registers));
+            case Sqrt cast -> new Sqrt(promote(cast.value(), registers));
+            case BitCast cast -> new BitCast(promote(cast.value(), registers), cast.type());
             default -> throw new IllegalArgumentException("Unsupported scalar aggregate expression: " + expression);
         };
     }

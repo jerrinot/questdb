@@ -53,6 +53,14 @@ public interface GroupByKernel extends QuietCloseable {
     /** Releases execution state only after workers drain; cached code remains reusable. */
     default void clearExecution() { }
 
+    /**
+     * Owner-only, before frame dispatch: opt into shared final maps after the query
+     * tracker is bound. Callers serialize initialization of each shard, and maps
+     * retain their ordinary owner. False leaves worker-local aggregation intact.
+     * clearExecution() releases the borrowed binding after all users drain.
+     */
+    default boolean initSharedMaps(java.util.function.IntFunction<Map> maps) { return false; }
+
     /** Owner-only, after all scan tasks drain: publish private partial state before map merging. */
     default void finishScan(java.util.function.Supplier<Map> destination, Runnable checkpoint) { }
 
@@ -117,13 +125,6 @@ public interface GroupByKernel extends QuietCloseable {
         /** Restrict a full frame or compact existing row IDs in place. -1 leaves the input unchanged. */
         default long filterGroups(PageFrameMemoryRecord record, long rowCount, boolean filtered,
                                   DirectLongList rows, SqlExecutionCircuitBreaker circuitBreaker) { return -1; }
-
-        /**
-         * Opt into shared final maps before frame dispatch. The supplier opens a map under
-         * the existing query tracker; callers serialize initialization of each shard.
-         * Maps retain their ordinary owner. False leaves worker-local aggregation intact.
-         */
-        default boolean initSharedMaps(java.util.function.IntFunction<Map> maps) { return false; }
 
         /** All scans have joined. Publish native state before merging ordinary fallback rows. */
         default void finishSharedMap(int shard, Runnable checkpoint) { throw new UnsupportedOperationException(); }

@@ -1,11 +1,215 @@
 # General generated joins
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 Follow-up plan (2026-11-07): [selective transfer through dependent joins](DEPENDENT_JOIN_FILTER_PLAN.md)
 connects the typed fused machinery below to ordinary runtime filters and closes
 composite-producer membership reduction. The completed milestones below remain
 the implementation baseline, not a request to rebuild their infrastructure.
 
-2026-11-02. This is the active execution slice of WHOLE_QUERY_PLAN.md. SSB is a
+## Next milestones: validate generality and portability
+
+Plan, 2026-11-07; implementation baseline `9100ce3eb6`. Goal: establish which
+properties make the retained optimizations profitable across types, distributions
+and machines, then fix the largest demonstrated failure. Start with the latest
+inner-join/filter/grouping work. Wider benchmark and ASOF controls follow; do not
+infer that all earlier results apply to this commit. Finish one milestone and
+reassess its assumptions before starting the next.
+
+Execution update (2026-11-07): G0 is complete. G1/G2 establish an applicability
+envelope with 500M-row controls on AMD and the supplied Apple M1 `fedora` host.
+The unchanged native module builds on ARM; the same 79 focused tests pass on both.
+The high-group same-plan control gains at least 9.2x AMD / 7.5x M1; independent
+no-join aggregation gains at least 2.00x / 1.74x across process median ranges.
+Skew, small-state, scalar, typed-key, scaling and natural admission boundaries are
+recorded in [the evidence report](../target/generality/REPORT.md). M1 aggregation has
+an unresolved effective-clock accounting discrepancy; do not present it as a
+fixed-frequency comparison. ARM large-run typed-key coverage remains narrower
+than AMD; Intel/NUMA hardware is unavailable.
+
+G3 remains open after a bounded exploration experiment. Short waves improve AMD
+uniform first use by about 27%, with lower load-wait cycles at similar memory
+traffic, but scalar/skew regressions reject blanket shortening. Initial-minimum,
+CPU-clock and finalist-confirmation overlays do not establish reliable choices.
+Confirmation can discard the eventual faster kernel: one M1 uniform pair regresses
+19% warm with 16% more instructions/row. No production chooser change is retained.
+[The new experiment](../target/exploration-budget/REPORT.md) includes cumulative
+1/2/5/10 costs, full-output checks, hardware evidence and warmed alternating-kernel
+controls. First validate sampled ranking under matched concurrency; only then add
+remaining-work/compilation budgeting. Preserve unknown probe counts behind
+residual filters and do not assume query-cache reuse.
+
+G4 refresh completed the 20-query RTAB control, original SF100 Q1/Q3/Q5 and the
+full official ClickBench protocol. All complete responses validate within the
+previously documented cross-engine semantic boundaries. The fresh
+[ClickBench HTML](../target/generality/clickbench/clickbench.html) gives 22.007 ->
+7.767 s best-hot totals, 28/43 queries at least 1.5x faster, and 34 fully generated
+plus four partial queries. Historical H2O/SYMBOL 1BRC datasets are missing; those
+sentinels remain unrun. ASOF is unchanged and no shared policy was retained.
+This validation pass establishes transfer and counterexamples, not completion
+of the remaining admission/first-use work.
+
+### G0. Make the existing measurement path trustworthy
+
+Reuse `target/dependent-transfer/run.py`, the RTABench `RtaMain`/`java.py` harness,
+existing SQL/oracles and `run-griffin-tests.sh`. Keep one small reusable runner;
+do not build another benchmark framework. Before transferring it:
+
+- Replace scratch assumptions about CPUs `0..N-1`, `nvme0n1`, cpufreq availability,
+  absolute paths and AMD events with explicit host inputs or discovered metadata.
+  Capture actual allowed CPUs, sockets/cache sharing, NUMA placement, SMT, memory,
+  quotas, JVM/LLVM versions, frequency and competing work. Establish affinity before
+  `CacheSizing` initializes; it reads the process's allowed CPUs once.
+- Update existing diagnostic chooser inspection for `Programs.choices[][]`.
+  Scratch telemetry still reflects the deleted `exactChoices`/`expandedChoices`
+  fields. Verify diagnostics against known alternatives before trusting profiles.
+  Keep forced choices in the diagnostic harness, with no new production toggles.
+- Freeze source and binary identities for stock `df37676583`, current branch Java,
+  current LLVM, and only the mechanism counterfactual needed for the case.
+  Disabling the compiler can change planning: an attribution control must verify
+  the same factory/worker/layout path, or explicitly include the plan difference.
+  Old class overlays are evidence, not portable builds; reconstruct source for
+  any retained counterfactual and rebuild it on each architecture.
+- Verify complete results, native input rows, selected paths and compilation
+  counts. Plan labels and native call counts alone do not prove row/operator
+  coverage. Exercise the existing focused lifecycle checks before large runs.
+
+Exit: one known 500M-row control runs with correct output and explained execution
+coverage under each applicable arm. The harness identifies missing host metrics
+without inventing zeroes. Reproduce the committed cleanup baseline before using
+older performance numbers as its score.
+
+### G1. Find the workload boundaries on the current host
+
+First repeat the existing 262K-group control, isolating destination reuse and
+prefetch from parallel-plan admission. Then examine one no-rejection transfer
+case and one cache-resident grouping case. Extend only the factor that explains
+a loss or uncertainty; avoid a Cartesian product of every option.
+
+| Mechanism | Prediction and falsifier | Controls to cover across the sequence |
+| --- | --- | --- |
+| Selective transfer | Avoided exact probes/build insertions must repay preparation and membership checks. All-match/no-match cases expose overhead and empty-state behavior. | INT, high-bit LONG, differently numbered SYMBOL dictionaries, mixed tuples; chains and duplicate-bearing branches; 0%, selective, 50% and 100% survival. |
+| Destination reuse | Expensive group lookup approaches first encounters per build row per slot; updates still scale with surviving joined rows. Low reuse can lose. | Mixed COUNT/SUM/MIN/MAX/AVG and DOUBLE state; VARCHAR/Unicode/NULL groups; uniform, shuffled and hot-key inputs; reuse just below/above the existing admission bound. |
+| Group prefetch | At unchanged results, additional instructions should reduce load-wait cycles for larger states; cache-local states may gain nothing. | Actual state footprints below/near/above the discovered cache budget; one versus several workers; plain and join-only alternatives retained. |
+
+Include a deliberately ineligible case: grouping inputs from multiple builds,
+probe-derived groups, an outer join or build-side Parquet VARCHAR. Verify correct
+fallback and its cost; do not count it as generated coverage. Existing correctness
+tests cover wider NULL/overflow/reopen combinations without another huge test suite.
+
+For each primary case use at least 500M input rows. Compare complete executions:
+preparation, scan/probe, aggregation, merge and result consumption. Record SQL
+compilation, lazy native compilation, the first ten cached executions and a
+separate settled series. The first process retains ten initial executions;
+subsequent portable repeat processes use three warmups and five measured runs
+after traces established that training completed within two executions. Extend
+this when a case has not settled. Preserve training executions rather than discarding
+their cost. Report cumulative cost at 1/2/5/10 reuses and the observed break-even;
+only use `(compile_candidate - compile_control)/(warm_control - warm_candidate)`
+as a rough model when warmed per-query costs are stable and the denominator is positive.
+
+Exit: a small coverage table with per-case gains/losses and an explanation for
+where each mechanism pays. Keep small-state variance and cold-use losses visible.
+No admission or scheduling change until a failing case and hardware evidence
+identify what needs changing.
+
+### G2. Transfer the unchanged workload to different hardware
+
+Run the bounded G1 control set on ARM64 using the supplied host; a different-vendor
+x86 control remains desirable but no such host is currently supplied.
+Prefer a server with meaningfully different cache/core/bandwidth balance. Build
+from the same source with JDK 25 and the CMake-required LLVM 21.1; use host-native
+LLVM targeting and record versions/features. Never copy native binaries across ISAs.
+
+ARM requires a build smoke test first: `LlvmBackend` accepts 64-bit Linux and
+`llvm_backend.cpp` detects the host, but `build-native.sh` builds all targets and
+`asmjit_backend.cpp` explicitly uses x86. Verify the LLVM/regex target build and
+QuestDB native dependencies; make only a necessary build separation if blocked.
+An AVX2 target on the current AMD CPU remains an instruction-set control, not
+another machine's result.
+
+Use 1, up to 8 physical cores, and all physical cores with fixed total work.
+Compare SMT separately. On a NUMA host, compare a node-local placement first,
+then multiple nodes with explicit, equal memory policy and measured locality.
+The M1's performance cores are CPUs 4–7 and efficiency cores are 0–3. Compare
+four performance cores first, then one performance core and the mixed clusters.
+Discover physical CPUs through sibling sets: core IDs alone repeat across M1
+clusters. Both hosts use the identical compact fixture in `bench/fixtures`,
+which reduces the probe table to 6 GB without changing keys or aggregate values.
+The original wider local control is a separate measurement, not a cross-host pair.
+
+Exit: per-machine correctness, first-use/warm distributions, generated coverage,
+normalized counters and resource limits. If the machine is unavailable, mark
+portability unverified; do not substitute another local affinity configuration.
+
+### G3. Fix one demonstrated portability or admission failure
+
+Pick the largest repeatable absolute-time loss. Possible targets are preparation
+that cannot amortize, poor candidate selection or an unsuitable prefetch schedule;
+none is a predetermined patch. Derive a hardware/workload explanation, state the
+predicted counter and elapsed-time changes, and test the smallest general change.
+Reuse current memory tracking, frame scheduling and chooser boundaries. Reject
+query-name rules, CPU-model thresholds and new user-facing switches. Keep a change
+only if the failing case improves and its nearest typed/distribution controls hold
+on both available machines; otherwise re-plan or retain the previous mechanism.
+
+The first local control exposes exploration cost, but does not justify fixing a
+choice globally: a forced group-lookahead alternative has lower cumulative cost
+through ten executions, while automatic selection sometimes has a better warm
+time. Relevant experiments, if this remains the largest loss after the boundary
+controls, are progressive elimination of slow alternatives and budgeting compilation
+against remaining work. The former is evaluated in Schmidt's
+[adaptive compiled execution study, section 6](https://db.in.tum.de/people/sites/schmidt/papers/master-thesis.pdf);
+the latter follows the decision problem in
+[Kohn, Leis and Neumann, ICDE 2018](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf).
+These are alternatives to test individually, not a request for another compiler
+backend or a reason to remove choices from this one query's result.
+
+### G4. Confirm transfer to real workloads
+
+Refresh the 20-query RTABench control and relevant original-query TPC-H cases;
+retain failed/unsupported cases with reasons. Use SYMBOL 1BRC and one H2O aggregate
+as independent sentinels. If shared chooser/runtime changes, include the existing
+ASOF runner with INT/LONG/SYMBOL, both forward and lookup regimes. Finally run the
+full stock/LLVM ClickBench repository protocol and standard HTML with generated
+coverage badges. Different machines receive separate reports, not a blended score.
+DuckDB is an optional fixed-version control after the primary comparison stabilizes.
+
+Report per-query and absolute-time-weighted effects, largest-case contribution,
+first-use costs, peak memory and regressions. Distinguish full generation, partial
+generation and fallback. A few large wins cannot establish whole-suite generality.
+For a portable breakthrough claim, target repeatable >=1.5x complete-query gains
+in more than one independent workload family on two hardware families. Keep the
+strongest applicable same-plan control beside stock to separate compiler effects
+from planning and parallel admission. Smaller gains remain useful but get that label.
+
+### Measurement and retention gates
+
+- Clear or control systemic USE concerns before interpreting CPU counters. Calibrate
+  read and mixed read/write ceilings on each host/placement; discover PMU events
+  locally, check scheduling/multiplexing and profile generated symbols. Use at least
+  two independent signals plus a counterfactual for a hardware bottleneck claim.
+  Classify CPU/off-CPU/I/O work for every case; detailed profiles must cover at
+  least 80% of baseline time and one representative of each operator family.
+  Validate the existing bottleneck-study format before any production optimization.
+- Use at least three balanced fresh-process pairs and five measured warm queries
+  per primary case; keep all first-use results. A repeatable >5% regression beyond
+  process variation triggers investigation; smaller unresolved differences remain
+  reported. This is an investigation threshold, not permission to accept regressions.
+- Preserve complete-result checks, including all warmups. Keep output serialization
+  inside the same timing boundary for every arm and canonical comparison outside it.
+  Reuse current data/oracles, estimate disk/memory needs before creating fixtures,
+  and remove only owned scratch data after validation. Retain commands, hashes,
+  counters and enough result evidence without duplicate full-output archives.
+- Write only accepted findings and explicit limits into PROGRESS.md. Completion
+  means a measured applicability envelope and resolved or clearly bounded failures,
+  not a promise that every query becomes faster. No new operators in this sequence
+  unless an observed correctness or portability prerequisite requires them.
+
+## Historical implementation milestones
+
+2026-11-02 implementation sequence from WHOLE_QUERY_PLAN.md. SSB is a
 control, not the specification. Narrow prototypes do not satisfy completion.
 
 ## 1. Generalize the existing join optimization
@@ -61,7 +265,7 @@ workers. Integral membership bounds/bitmaps use full-width arithmetic and bounde
 construction; composite keys use exact map probes. All-composite plans compile no
 unused membership alternative.
 
-Validation and performance, including limits: [typed-join evidence](target/join-generalization.md).
+Validation and performance, including limits: [typed-join evidence](../target/join-generalization.md).
 No new setting or hash table. This completes representation generalization, not
 arbitrary join graphs, generated build/merge/order, or the next two milestones.
 
@@ -112,7 +316,7 @@ Eight-core 500M-row chains improve 12.2-24.2x over the previous ordinary plans,
 including parallel admission, and 1.49-3.18x over the same fused Java factory.
 One/sixteen-core controls and native-symbol PMU attribution confirm the mechanism.
 Independent single/multiway regressions are not repeatable above the retention gate.
-See [dependency evidence](target/join-dependencies.md).
+See [dependency evidence](../target/join-dependencies.md).
 
 ## 3. Reduce unnecessary joined work
 
@@ -155,7 +359,7 @@ All-match SYMBOL showed a 7.3% loss in individual process pairs, but six further
 balanced process pairs average +0.5%; unchanged exact machine code itself varies.
 Forced alternatives and fixed code-address diagnostics do not establish a systematic
 regression or a layout cause. Preserve this uncertainty; do not tune to a lucky layout.
-See [membership-transfer evidence](target/join-dependency-filter.md).
+See [membership-transfer evidence](../target/join-dependency-filter.md).
 
 Bounded dependency-link experiment: retained. Each producer row can retain one
 four-byte compressed head into its child's existing duplicate chain. Ordinary typed
@@ -171,7 +375,7 @@ traffic stays near 8.5GB. Gains hold at one/sixteen cores and on mixed LONG+SYMB
 composite keys. Preparation takes 1.3-2.1ms and 1MiB for 262,144 producer rows.
 No-root-match input wastes ~1.8ms, averaging +2% over six process pairs; known scanned
 rows do not guarantee useful reuse. 64 compiler / 155 core tests and 752 complete
-large outputs pass. See [dependency-link evidence](target/join-dependency-links.md).
+large outputs pass. See [dependency-link evidence](../target/join-dependency-links.md).
 
 Multiplicity-aware COUNT experiment: implemented for unobserved leaves. A bounded,
 query-owned copy of the existing backward-link chain counts preserves ordinary
@@ -193,7 +397,7 @@ It was rejected. Frame-level dispatch now keeps executions without count arrays 
 the ordinary loop; this control gains 3%. Unique/thin controls remain stable in
 longer balanced runs. Compilation grows ~20-65ms in eligible examples; no-match
 compile-plus-first execution regresses ~12%. These are real costs, not hidden setup.
-67 compiler and 155 core checks pass. See [multiplicity evidence](target/join-multiplicities.md).
+67 compiler and 155 core checks pass. See [multiplicity evidence](../target/join-multiplicities.md).
 
 Closed COUNT forests: retained. The compiler proves that predicate/grouping inputs
 come only from the probe and every dependent key has one producer. Reverse-order
@@ -215,7 +419,7 @@ LONG loses 3.7%, with unchanged instructions/input). Main/deep compilation adds
 ~9-24ms, and no-root compile-plus-first loses 4.9%. Warm preparation varies ~2-13ms
 in diagnostics, with first preparation ~21-25ms. Build preparation remains Java.
 69 compiler / 155 core checks, 761 complete outputs and installed hashes pass.
-See [subtree evidence](target/join-subtrees.md).
+See [subtree evidence](../target/join-subtrees.md).
 
 Aggregate generality now extends beyond COUNT. Existing multiplicities feed weighted
 COUNT(value), idempotent MIN/MAX and ordered SUM/AVG replay, including mixed lists and
@@ -229,21 +433,21 @@ Three process pairs on the same 500M-row typed branches give SUM **2.86-3.21x** 
 AVG **2.52-2.67x** over the frozen COUNT-capable compiler. COUNT(value), extrema,
 mixed/grouped aggregates and DOUBLE SUM also benefit. No-match preparation and
 ordinary AVG retain small costs; compilation and generated code grow. See
-[repeated-input evidence](target/join-repeated-inputs.md) for controls and limits.
+[repeated-input evidence](../target/join-repeated-inputs.md) for controls and limits.
 
 MIN and MAX also pass independent primary comparisons: three 500M-row process pairs
 per INT/LONG/SYMBOL join key give MIN **4.99-6.67x** and MAX **4.91-7.10x**. INT and
 DOUBLE aggregate values, grouped/mixed lists and observed build values are controls.
 Exact state checks cross prior/current floating values, including replaceable infinite
 states and signed-zero ties. SYMBOL here describes join keys, not extrema over symbol
-text. See [extrema evidence](target/join-extrema.md); the compiler is unchanged.
+text. See [extrema evidence](../target/join-extrema.md); the compiler is unchanged.
 
 Aggregate integration now has explicit typed scalar state and result-access contracts.
 Ordinary KSUM validates a new three-cell family across scalar, grouped and typed
 joins without adding a backend or scalar-promotion class case. Its original getter
 remains required; vector/Rosti KSUM and native derived-result expressions are separate
 work. Generic first-update peeling also improves the existing mixed scalar control.
-See [KSUM evidence](target/aggregate-ksum.md) for exact-state and 500M-row checks.
+See [KSUM evidence](../target/aggregate-ksum.md) for exact-state and 500M-row checks.
 
 Next distinguish remaining root lookup from ordered aggregate arithmetic. Observed
 build values permit only safe suffix folding; mixed-source dependencies, DISTINCT,

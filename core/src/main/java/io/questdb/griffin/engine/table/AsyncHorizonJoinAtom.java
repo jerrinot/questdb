@@ -244,7 +244,7 @@ public class AsyncHorizonJoinAtom extends BaseAsyncHorizonJoinAtom {
         // their growth against the per-query limit. The base reopen() binds the allocators
         // and ASOF maps.
         shardingCtx.setMemoryTracker(memoryTracker);
-        shardingCtx.reopen();
+        shardingCtx.reopen(null);
         super.reopen();
     }
 

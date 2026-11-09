@@ -39,6 +39,8 @@ import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.PerWorkerFunctionList;
 import io.questdb.griffin.engine.functions.SymbolFunction;
+import io.questdb.griffin.engine.groupby.GroupByAllocator;
+import io.questdb.griffin.engine.groupby.GroupByAllocatorFactory;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdaterFactory;
 import io.questdb.griffin.engine.groupby.GroupByUtils;
@@ -53,8 +55,8 @@ import java.util.ArrayDeque;
 
 /**
  * Compiled grouping, aggregate and post-join functions, with one mutable instance
- * per execution slot where required. Owns functions only; it borrows joined
- * metadata and all execution symbol sources. Initialize once per execution, when the
+ * per execution slot where required. Owns functions and their slot allocators; borrows
+ * joined metadata and all execution symbol sources. Initialize once per execution, when the
  * cursor opens: before the build, dispatch or parent initialization. Initialization
  * needs both inputs' symbol tables and no frozen build. Drain workers and finish output
  * before releasing symbol backing. No model or expression nodes survive compilation.
@@ -77,6 +79,8 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
     private ObjList<Function> workerFilters;
     private ObjList<ObjList<GroupByFunction>> workerGroupByFunctions;
     private ObjList<ObjList<Function>> workerKeyFunctions;
+    private GroupByAllocator ownerAllocator;
+    private ObjList<GroupByAllocator> workerAllocators;
 
     HashJoinGroupByFunctions(
             SqlCodeGenerator generator,
@@ -136,6 +140,16 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
                         filter, workerCount, metadata.getPostJoinFilter(), joined);
             }
             final boolean isKeyed = isKeyed();
+            ownerAllocator = GroupByAllocatorFactory.createAllocator(configuration, false);
+            GroupByUtils.setAllocator(groupByFunctions, ownerAllocator);
+            if (workerGroupByFunctions != null) {
+                workerAllocators = new ObjList<>(workerCount);
+                for (int i = 0; i < workerCount; i++) {
+                    GroupByAllocator allocator = GroupByAllocatorFactory.createAllocator(configuration, false);
+                    workerAllocators.add(allocator);
+                    GroupByUtils.setAllocator(workerGroupByFunctions.getQuick(i), allocator);
+                }
+            }
             // A null class requests LoopingRecordSink, which getInstance() builds, so branch on isKeyed only.
             Class<RecordSink> sinkClass = isKeyed ? RecordSinkFactory.getInstanceClass(configuration, asm,
                     joined, columnFilter, keyFunctions, null, null, null, null) : null;
@@ -167,6 +181,12 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
         } catch (Throwable th) {
             failure = addFailure(failure, th);
         }
+        failure = Misc.freeBestEffort(failure, ownerAllocator);
+        ownerAllocator = null;
+        failure = Misc.freeObjListBestEffort(failure, workerAllocators);
+        if (workerAllocators != null) {
+            workerAllocators.clear();
+        }
         CairoException.rethrowCleanupFailure(failure);
     }
 
@@ -193,7 +213,32 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
                 failure = addFailure(failure, th);
             }
         }
+        // Partial states may borrow another slot's set during merge. Release all
+        // allocators only after probe workers, merge and result consumers drain.
+        for (int i = -1, n = workerAllocators == null ? 0 : workerAllocators.size(); i < n; i++) {
+            GroupByAllocator allocator = getAllocator(i);
+            try {
+                allocator.clear();
+            } catch (Throwable th) {
+                failure = addFailure(failure, th);
+            } finally {
+                allocator.setMemoryTracker(null);
+            }
+        }
         CairoException.rethrowCleanupFailure(failure);
+    }
+
+    public GroupByAllocator getAllocator(int slot) {
+        return slot < 0 || workerAllocators == null ? ownerAllocator : workerAllocators.getQuick(slot);
+    }
+
+    public long getCardinalityStat(int slot) {
+        long cardinality = 0;
+        ObjList<GroupByFunction> functions = getGroupByFunctions(slot);
+        for (int i = 0; i < functions.size(); i++) {
+            cardinality += functions.getQuick(i).getCardinalityStat();
+        }
+        return cardinality;
     }
 
     public Function getFilter(int slot) {
@@ -263,6 +308,11 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
      */
     public void init(ObjList<? extends SymbolTableSource> sources, SqlExecutionContext executionContext) throws SqlException {
         assert sources.size() == workerCount + 1;
+        for (int i = -1, n = workerAllocators == null ? 0 : workerAllocators.size(); i < n; i++) {
+            GroupByAllocator allocator = getAllocator(i);
+            allocator.setMemoryTracker(executionContext.getMemoryTracker());
+            allocator.reopen();
+        }
         SymbolTableSource ownerSource = sources.getQuick(0);
         Function.init(keyFunctions, ownerSource, executionContext, null);
         Function.init(groupByFunctions, ownerSource, executionContext, null);
@@ -292,6 +342,13 @@ public final class HashJoinGroupByFunctions implements Closeable, SymbolTableSou
         // Aggregate owners were initialized above. Initialize only the rewritten
         // output keys here, so parent projections/sorts can immediately resolve symbols.
         Function.init(outputOnlyFunctions, ownerSource, executionContext, null);
+    }
+
+    public void resetStats(int slot) {
+        ObjList<GroupByFunction> functions = getGroupByFunctions(slot);
+        for (int i = 0; i < functions.size(); i++) {
+            functions.getQuick(i).resetStats();
+        }
     }
 
     @Override

@@ -70,8 +70,8 @@ public class VectorMaskTest {
         for (int w = 0; w < widths.length; w++) {
             MemoryType width = widths[w];
             Expr read = new Gather(width, at(table, w * 512L), binary(Op.MUL, index, i64(width.bytes)));
-            Expr negative = binary(width.resultType == Type.F64 ? Op.FLT : Op.LT,
-                    read, width.resultType == Type.F64 ? f64(0) : i64(0));
+            Expr zero = width == MemoryType.F32 ? f32(0) : width == MemoryType.F64 ? f64(0) : i64(0);
+            Expr negative = binary(width.resultType == Type.I64 ? Op.LT : Op.FLT, read, zero);
             b.store(at(STATE, w * 8L), new VectorMask(63, negative));
         }
         b.exit(0);

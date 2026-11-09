@@ -29,10 +29,14 @@ import static org.questdb.experimental.codegen.Ir.*;
 /** Shared array-state initialization and merge; each caller retains its aggregate ABI. */
 final class DenseAggregate {
     static Var entry(Builder b, AggregateUpdates updates, Expr state, Expr seen, Expr id, long stride) {
+        return entry(b, updates, state, seen, id, stride, null);
+    }
+
+    static Var entry(Builder b, AggregateUpdates updates, Expr state, Expr seen, Expr id, long stride, Var firstRow) {
         Var destination = b.let(new Offset(state, binary(Op.MUL, id, i64(stride))));
         Expr visited = new Offset(seen, id);
         b.when(eq(new Load(MemoryType.I8, visited), i64(0)), first -> {
-            updates.initialize(first, destination);
+            updates.initializer(firstRow).accept(first, destination);
             first.store(MemoryType.I8, visited, i64(1));
         });
         return destination;
@@ -47,8 +51,16 @@ final class DenseAggregate {
         Var id = b.let(i64(0));
         b.loop(binary(Op.LT, id, ROWS), loop -> {
             loop.when(ne(new Load(MemoryType.I8, new Offset(sourceSeen, id)), i64(0)), present -> {
-                Var destination = entry(present, updates, STATE, destinationSeen, id, stride);
-                updates.merge(present, new Offset(source, binary(Op.MUL, id, i64(stride))), destination);
+                Var destination = present.let(new Offset(STATE, binary(Op.MUL, id, i64(stride))));
+                Var incoming = present.let(new Offset(source, binary(Op.MUL, id, i64(stride))));
+                Expr visited = new Offset(destinationSeen, id);
+                Var fresh = present.let(eq(new Load(MemoryType.I8, visited), i64(0)));
+                // A first partial state is adopted intact, just like a newly inserted map value.
+                present.when(fresh, first -> {
+                    QuestMapMutation.copy(first, incoming, destination, stride);
+                    first.store(MemoryType.I8, visited, i64(1));
+                });
+                present.when(eq(fresh, bool(false)), existing -> updates.merge(existing, incoming, destination));
             });
             loop.assign(id, add(id, i64(1)));
         });

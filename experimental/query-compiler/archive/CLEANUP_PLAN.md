@@ -1,5 +1,8 @@
 # Compiler cleanup
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 Preserve the measured algorithms, generated memory accesses and existing QuestDB
 ownership/scheduling. Validate structure changes with focused correctness checks
 and before/after generated IR; make no new performance claim. Add no runtime

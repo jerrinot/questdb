@@ -134,8 +134,8 @@ final class LlvmEmitter {
                 if (b.op() == Op.USHR) right = temp("and i64 " + right + ", 63");
                 String op = switch (b.op()) {
                     case ADD -> "add"; case SUB -> "sub"; case MUL -> "mul";
-                    case FADD -> "fadd"; case FSUB -> "fsub"; case FMUL -> "fmul"; case FDIV -> "fdiv"; case SDIV -> "sdiv";
-                    case AND, BOTH -> "and"; case XOR -> "xor"; case EITHER -> "or"; case USHR -> "lshr";
+                    case FADD -> "fadd"; case FSUB -> "fsub"; case FMUL -> "fmul"; case FDIV -> "fdiv"; case FREM -> "frem"; case SDIV -> "sdiv";
+                    case AND, BOTH -> "and"; case XOR -> "xor"; case OR, EITHER -> "or"; case USHR -> "lshr";
                     case FEQ -> "fcmp oeq"; case FNE -> "fcmp une"; case FLT -> "fcmp olt"; case FGE -> "fcmp oge";
                     case EQ -> "icmp eq"; case NE -> "icmp ne"; case LT -> "icmp slt"; case GE -> "icmp sge";
                 };
@@ -146,8 +146,7 @@ final class LlvmEmitter {
                 String pointer = temp("inttoptr i64 " + operand(l.address()) + " to ptr");
                 String memoryType = memoryType(l.width());
                 String load = "load " + memoryType + ", ptr " + pointer + ", align 1";
-                if (l.width() == MemoryType.F32) line(result + " = fpext float " + temp(load) + " to double");
-                else if (l.width().bytes < 8) line(result + " = sext " + memoryType + " " + temp(load) + " to i64");
+                if (l.width().bytes < 8 && l.width() != MemoryType.F32) line(result + " = sext " + memoryType + " " + temp(load) + " to i64");
                 else line(result + " = " + load);
             }
             case AtomicLoad l -> {
@@ -164,8 +163,25 @@ final class LlvmEmitter {
             case PopulationCount z -> line(result + " = call i64 @llvm.ctpop.i64(i64 " + operand(z.value()) + ")");
             case TrailingZeros z -> line(result + " = call i64 @llvm.cttz.i64(i64 " + operand(z.value()) + ", i1 false)");
             case SelectRows s -> selectRows(result, s);
-            case ToDouble c -> line(result + " = sitofp i64 " + operand(c.value()) + " to double");
-            case BitCast c -> line(result + " = bitcast " + type(c.value().type()) + " " + operand(c.value()) + " to " + type(c.type()));
+            case ToInteger c -> {
+                String integer = "i" + c.bits(), input = type(c.value().type());
+                String intrinsic = "@llvm.fptosi.sat." + integer + (c.value().type() == Type.F32 ? ".f32" : ".f64");
+                declarations.add("declare " + integer + " " + intrinsic + "(" + input + ")");
+                String call = "call " + integer + " " + intrinsic + "(" + input + " " + operand(c.value()) + ")";
+                line(result + " = " + (c.bits() == 32 ? "sext i32 " + temp(call) + " to i64" : call));
+            }
+            case ToDouble c -> line(result + " = " + (c.value().type() == Type.F32 ? "fpext float " : "sitofp i64 ") + operand(c.value()) + " to double");
+            case ToFloat c -> line(result + " = " + (c.value().type() == Type.I64 ? "sitofp i64 " : "fptrunc double ")
+                    + operand(c.value()) + " to float");
+            case Sqrt c -> {
+                declarations.add("declare double @llvm.sqrt.f64(double)");
+                line(result + " = call double @llvm.sqrt.f64(double " + operand(c.value()) + ")");
+            }
+            case BitCast c -> {
+                if (c.type() == Type.F32) line(result + " = bitcast i32 " + temp("trunc i64 " + operand(c.value()) + " to i32") + " to float");
+                else if (c.value().type() == Type.F32) line(result + " = sext i32 " + temp("bitcast float " + operand(c.value()) + " to i32") + " to i64");
+                else line(result + " = bitcast " + type(c.value().type()) + " " + operand(c.value()) + " to " + type(c.type()));
+            }
             case NativeCall c -> {
                 String function = temp("inttoptr i64 " + operand(c.function()) + " to ptr");
                 String arguments = c.arguments().stream().map(a -> "i64 " + operand(a)).collect(java.util.stream.Collectors.joining(", "));
@@ -198,8 +214,7 @@ final class LlvmEmitter {
     private void store(Store s) {
         String pointer = temp("inttoptr i64 " + operand(s.address()) + " to ptr");
         String memoryType = memoryType(s.width()), value = operand(s.value());
-        if (s.width() == MemoryType.F32) value = temp("fptrunc double " + value + " to float");
-        else if (s.width().bytes < 8) value = temp("trunc i64 " + value + " to " + memoryType);
+        if (s.width().bytes < 8 && s.width() != MemoryType.F32) value = temp("trunc i64 " + value + " to " + memoryType);
         line("store " + memoryType + " " + value + ", ptr " + pointer + ", align 1");
     }
     static String memoryType(MemoryType width) {
@@ -207,11 +222,11 @@ final class LlvmEmitter {
     }
     private String temp(String expression) { String name = "%t" + temporary++; line(name + " = " + expression); return name; }
     private void line(String text) { out.append("  ").append(text).append('\n'); }
-    private static String type(Type type) { return type == Type.F64 ? "double" : type == Type.BOOL ? "i1" : "i64"; }
+    private static String type(Type type) { return type == Type.F64 ? "double" : type == Type.F32 ? "float" : type == Type.BOOL ? "i1" : "i64"; }
     private static String operand(Expr e) {
         return switch (e) {
             case Var v -> "%" + v.name();
-            case Literal l -> l.type() == Type.F64 ? "0x" + String.format("%016X", l.value()) : l.type() == Type.BOOL ? Boolean.toString(l.value() != 0) : Long.toString(l.value());
+            case Literal l -> l.type() == Type.F32 ? "bitcast (i32 " + (int) l.value() + " to float)" : l.type() == Type.F64 ? "0x" + String.format("%016X", l.value()) : l.type() == Type.BOOL ? Boolean.toString(l.value() != 0) : Long.toString(l.value());
             default -> throw new IllegalArgumentException("SSA operand must be a value: " + e);
         };
     }

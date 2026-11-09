@@ -1,5 +1,8 @@
 # Query compilation pipeline: explicit stages and delayed lowering
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 Design written before implementation, 2026-10-25. This is an experimental
 architecture for the existing operators, not a claim that the prototype is a
 production competitor to Umbra. The north star is to compile QuestDB's proven
@@ -337,16 +340,16 @@ not inferred deficiencies from comparing feature lists:
 
 | Current implementation | Consequence for the next design |
 | --- | --- |
-| [`PlanCompiler`](src/main/java/org/questdb/experimental/codegen/PlanCompiler.java), `CompiledPlan` and [`ScanPlan`](src/main/java/org/questdb/experimental/codegen/ScanPlan.java) already describe dependency-ordered phases and scan/filter/project bindings in the standalone path. | Reuse this work. The missing step is a coherent integrated contract, not another standalone executor. |
-| [`ResolvedQueryCompiler`](src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java) binds resolved core operators through separate hooks. [`ResolvedAggregateKernel.prepareFilter`](src/main/java/org/questdb/experimental/codegen/ResolvedAggregateKernel.java) adds a fused variant explicitly for the experiment. | LLVM sees the emitted kernel, not the whole set of runtime boundaries. Cross-kernel materialization decisions must happen before lowering. |
+| [`PlanCompiler`](../src/test/java/org/questdb/experimental/codegen/PlanCompiler.java), `CompiledPlan` and [`ScanPlan`](../src/main/java/org/questdb/experimental/codegen/ScanPlan.java) already describe dependency-ordered phases and scan/filter/project bindings in the standalone path. | Reuse this work. The missing step is a coherent integrated contract, not another standalone executor. |
+| [`ResolvedQueryCompiler`](../src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java) binds resolved core operators through separate hooks. [`ResolvedAggregateKernel.prepareFilter`](../src/main/java/org/questdb/experimental/codegen/ResolvedAggregateKernel.java) adds a fused variant explicitly for the experiment. | LLVM sees the emitted kernel, not the whole set of runtime boundaries. Cross-kernel materialization decisions must happen before lowering. |
 | `AggregateSlot.updateFiltered` now consumes numeric selections in 16K-row stages for bounded fixed-width aggregates, using the executor's existing selection buffer. `ScanLowering.selectionRange` retains original frame row IDs. | Storage/task frames and cache working sets are separate. Adaptive compact-record mode persists until frame completion; a stage boundary must not restart the aggregation policy. Compacted Parquet coordinates still decline. |
-| [`ResolvedAggregateKernel.emitPrefetched`](src/main/java/org/questdb/experimental/codegen/ResolvedAggregateKernel.java) already stages keys and candidate entries. `QuestPartitions` already supplies bounded-state flush/merge kernels. | Staging and bounded aggregation are implemented. Improve their composition and admission; do not present them as new missing algorithms. |
-| [`AggregateUpdates`](src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java) binds exact core function implementations, state offsets and lifecycle operations. | Preserve these as the semantic source for compilation. General sharing/reordering needs additional proven contracts, especially for nulls, overflow, DISTINCT and floating reductions. |
-| [`AggregateSlot.canUpdate`](src/main/java/org/questdb/experimental/codegen/AggregateSlot.java) declines `PageFrameFilteredMemoryRecord`; ordinary filtering can use original row coordinates while decoded payloads are compacted. | A batch contract must identify each column's row coordinates and lifetime. Removing the guard without that contract is incorrect. |
-| [`AdaptiveKernel.compile`](src/main/java/org/questdb/experimental/codegen/AdaptiveKernel.java) eagerly compiles distinct alternatives before its execution-time policy selects them. | This explores execution strategies but does not hide compilation or budget it against remaining work. |
-| [`LlvmBackend.compile`](src/main/java/org/questdb/experimental/codegen/LlvmBackend.java) lowers structured IR to SSA, emits text, copies it through FFM, and the [native bridge](src/main/c/llvm_backend.cpp) parses, verifies and optimizes under a shared mutex. | Measure time and allocation by compilation stage. Text parsing and Java IR allocation are candidates, not established bottlenecks; backend optimization may dominate. |
-| [`LlvmEmitter`](src/main/java/org/questdb/experimental/codegen/LlvmEmitter.java) marks every IR helper `noinline`. Ordinary memory accesses carry `align 1` and integer-derived addresses. | Current helpers deliberately control code growth. Any richer inlining or memory policy must preserve that win and prove its facts; neither blanket inlining nor speculative `noalias` is justified. |
-| The [LLVM bridge](src/main/c/llvm_backend.cpp) dumps objects, optimized IR and numbered native symbols. | Instruction-level inspection exists. Operator lineage and time-aware code-lifetime registration remain missing from this path. |
+| [`ResolvedAggregateKernel.emitPrefetched`](../src/main/java/org/questdb/experimental/codegen/ResolvedAggregateKernel.java) already stages keys and candidate entries. `QuestPartitions` already supplies bounded-state flush/merge kernels. | Staging and bounded aggregation are implemented. Improve their composition and admission; do not present them as new missing algorithms. |
+| [`AggregateUpdates`](../src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java) binds exact core function implementations, state offsets and lifecycle operations. | Preserve these as the semantic source for compilation. General sharing/reordering needs additional proven contracts, especially for nulls, overflow, DISTINCT and floating reductions. |
+| [`AggregateSlot.canUpdate`](../src/main/java/org/questdb/experimental/codegen/AggregateSlot.java) declines `PageFrameFilteredMemoryRecord`; ordinary filtering can use original row coordinates while decoded payloads are compacted. | A batch contract must identify each column's row coordinates and lifetime. Removing the guard without that contract is incorrect. |
+| [`AdaptiveKernel.compile`](../src/main/java/org/questdb/experimental/codegen/AdaptiveKernel.java) eagerly compiles distinct alternatives before its execution-time policy selects them. | This explores execution strategies but does not hide compilation or budget it against remaining work. |
+| [`LlvmBackend.compile`](../src/main/java/org/questdb/experimental/codegen/LlvmBackend.java) lowers structured IR to SSA, emits text, copies it through FFM, and the [native bridge](../src/main/c/llvm_backend.cpp) parses, verifies and optimizes under a shared mutex. | Measure time and allocation by compilation stage. Text parsing and Java IR allocation are candidates, not established bottlenecks; backend optimization may dominate. |
+| [`LlvmEmitter`](../src/main/java/org/questdb/experimental/codegen/LlvmEmitter.java) marks every IR helper `noinline`. Ordinary memory accesses carry `align 1` and integer-derived addresses. | Current helpers deliberately control code growth. Any richer inlining or memory policy must preserve that win and prove its facts; neither blanket inlining nor speculative `noalias` is justified. |
+| The [LLVM bridge](../src/main/c/llvm_backend.cpp) dumps objects, optimized IR and numbered native symbols. | Instruction-level inspection exists. Operator lineage and time-aware code-lifetime registration remain missing from this path. |
 
 ### Proposed compiler boundary
 
@@ -590,4 +593,4 @@ operator semantics while omitting unused compiler work. Factory preparation time
 alone is no longer total compilation cost: first-result latency includes lazy
 compilation inside execution. This is demand-driven preparation, not background
 tiering or a prediction of future query benefit. The measured tradeoffs are in
-[PROGRESS.md](PROGRESS.md).
+[PROGRESS.md](../PROGRESS.md).

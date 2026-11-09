@@ -83,6 +83,11 @@ public class GroupByNotKeyedRecordCursorFactory extends AbstractRecordCursorFact
 
             final GroupByFunctionsUpdater updater = GroupByFunctionsUpdaterFactory.getInstance(asm, groupByFunctions);
             boolean earlyExitSupported = GroupByUtils.isEarlyExitSupported(groupByFunctions);
+            if (earlyExitSupported) {
+                this.cursor = new EarlyExitGroupByNotKeyedRecordCursor(configuration, groupByFunctions, updater);
+            } else {
+                this.cursor = new GroupByNotKeyedRecordCursor(configuration, groupByFunctions, updater);
+            }
             if (!earlyExitSupported) {
                 RecordCursorFactory source = base;
                 IntList columns = null;
@@ -98,15 +103,9 @@ public class GroupByNotKeyedRecordCursorFactory extends AbstractRecordCursorFact
                     source = source.getBaseFactory();
                 }
                 if (source instanceof FilteredAsOfJoinFastRecordCursorFactory asof
-                        && asof.bindAggregate(base.getMetadata(), columns, valueTypes, groupByFunctions, value)) {
+                        && asof.bindAggregate(base.getMetadata(), columns, valueTypes, groupByFunctions, value, cursor.allocator)) {
                     compiledAsOfAggregate = asof;
                 }
-            }
-
-            if (earlyExitSupported) {
-                this.cursor = new EarlyExitGroupByNotKeyedRecordCursor(configuration, groupByFunctions, updater);
-            } else {
-                this.cursor = new GroupByNotKeyedRecordCursor(configuration, groupByFunctions, updater);
             }
         } catch (Throwable e) {
             Misc.free(this, e);

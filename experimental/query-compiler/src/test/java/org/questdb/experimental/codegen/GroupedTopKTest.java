@@ -48,11 +48,11 @@ public class GroupedTopKTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
     private final Backend backend;
     private final WorkerPoolMode mode;
+    private CompilerOptions options = CompilerOptions.DEFAULT.withLocalCapacity(64);
     private CairoEngine engine;
     private SqlExecutionContextImpl context;
     private WorkerPool pool;
     private ResolvedQueryCompiler compiler;
-    private String previousCapacity;
     private long queryMemoryLimit;
 
     public GroupedTopKTest(String name, Backend backend, WorkerPoolMode mode) { this.backend = backend; this.mode = mode; }
@@ -66,8 +66,6 @@ public class GroupedTopKTest {
     }
 
     @Before public void setUp() throws Exception {
-        previousCapacity = System.getProperty("query.codegen.localCapacity");
-        System.setProperty("query.codegen.localCapacity", "64");
         var config = new DefaultCairoConfiguration(temporary.newFolder().toString()) {
             @Override public long getQueryMemoryLimitBytes() { return queryMemoryLimit; }
             @Override public int getSqlPageFrameMaxRows() { return 2048; }
@@ -82,15 +80,13 @@ public class GroupedTopKTest {
         pool.start();
         context = new SqlExecutionContextImpl(engine, 2).with(
                 config.getFactoryProvider().getSecurityContextFactory().getRootContext(), null, null, -1, null);
-        compiler = new ResolvedQueryCompiler(backend, temporary.newFolder().toPath());
+        compiler = new ResolvedQueryCompiler(backend, temporary.newFolder().toPath(), options);
     }
 
     @After public void tearDown() {
         if (pool != null) pool.halt();
         if (context != null) context.close();
         if (engine != null) engine.close();
-        if (previousCapacity == null) System.clearProperty("query.codegen.localCapacity");
-        else System.setProperty("query.codegen.localCapacity", previousCapacity);
     }
 
     @Test public void numericOrdersUseGeneratedAggregationAndMerge() throws Exception {

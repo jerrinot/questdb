@@ -52,10 +52,15 @@ final class QuestVarchar {
         static Key bind(ColumnTypes inputs, ColumnTypes keys,
                         ListColumnFilter columns, ObjList<Function> functions,
                         Map map) {
+            return bind(inputs, keys, columns, functions, map, CompilerOptions.DEFAULT);
+        }
+
+        static Key bind(ColumnTypes inputs, ColumnTypes keys, ListColumnFilter columns, ObjList<Function> functions,
+                        Map map, CompilerOptions options) {
             if (!(map instanceof UnorderedVarcharMap) || keys.getColumnCount() != 1
                     || keys.getColumnType(0) != ColumnType.VARCHAR || columns.size() != 0
                     || functions == null || functions.size() != 1) return null;
-            var strings = new ResolvedVarchar(inputs, new ResolvedInputs(inputs));
+            var strings = new ResolvedVarchar(inputs, new ResolvedInputs(inputs, options));
             var expression = strings.bind(functions.getQuick(0));
             return expression == null ? null : new Key(strings.binding(), expression);
         }

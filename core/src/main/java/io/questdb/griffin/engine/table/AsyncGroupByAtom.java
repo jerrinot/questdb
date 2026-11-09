@@ -607,7 +607,7 @@ public class AsyncGroupByAtom implements StatefulAtom, PerWorkerLockOwner, Close
         // and allocators before any backing is allocated. The maps are opened lazily by
         // worker threads via reopenMap()/reopenShards(); the allocators are reopened here.
         shardingCtx.setMemoryTracker(memoryTracker);
-        shardingCtx.reopen();
+        shardingCtx.reopen(compiledAggregates);
         ownerAllocator.setMemoryTracker(memoryTracker);
         ownerAllocator.reopen();
         if (perWorkerAllocators != null) {

@@ -489,7 +489,7 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
         if (compiledJoin != null) {
             for (int i = 0; i < slots.size(); i++) {
                 Slot slot = slots.getQuick(i);
-                slot.compiledUpdater = compiledJoin.newUpdater(() -> {
+                slot.compiledUpdater = compiledJoin.newUpdater(functions.getAllocator(i - 1), () -> {
                     if (!frameSequence.isActive()) {
                         throw frameSequence.buildInterruptionException();
                     }
@@ -526,7 +526,7 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
                 completed = slot.compiledUpdater.updateKeyedMulti(record, rowCount, rowIdsAddress, nativeBuilds,
                         map, fragment.isNotSharded() ? null : fragment.getShards(), functions.getUpdater(slotId));
                 if (completed) {
-                    shardingContext.maybeEnableSharding(fragment, 0);
+                    shardingContext.maybeEnableSharding(fragment, slot.compiledUpdater.getFunctionCardinality());
                 }
             } else {
                 completed = slot.compiledUpdater.updateMulti(record, rowCount, rowIdsAddress, nativeBuilds, slot.value);
@@ -674,7 +674,7 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
             pairsPerCheck = Math.max(1, executionContext.getPageFrameMaxRows());
             if (shardingContext != null) {
                 shardingContext.setMemoryTracker(executionContext.getMemoryTracker());
-                shardingContext.reopen();
+                shardingContext.reopen(null);
             }
             for (int i = 0; i < slots.size(); i++) {
                 Slot slot = slots.getQuick(i);

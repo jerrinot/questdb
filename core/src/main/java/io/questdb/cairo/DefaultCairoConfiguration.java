@@ -2006,6 +2006,11 @@ public class DefaultCairoConfiguration implements CairoConfiguration {
     }
 
     @Override
+    public boolean isSqlLlvmEnabled() {
+        return false;
+    }
+
+    @Override
     public boolean isSqlOrderBySortEnabled() {
         return true;
     }

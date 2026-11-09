@@ -47,6 +47,11 @@ public class IPv4CaseFunction extends IPv4Function implements CaseFunction {
     }
 
     @Override
+    public CaseFunctionPicker getPicker() {
+        return picker;
+    }
+
+    @Override
     public int getIPv4(Record rec) {
         return picker.pick(rec).getIPv4(rec);
     }

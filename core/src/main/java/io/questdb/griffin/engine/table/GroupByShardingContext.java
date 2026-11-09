@@ -677,8 +677,8 @@ public class GroupByShardingContext implements QuietCloseable, Mutable {
                 .I$();
     }
 
-    void reopen() {
-        shared = compiledUpdaters != null && compiledUpdaters.getQuick(0).initSharedMaps(this::reopenDestShard);
+    void reopen(@Nullable GroupByKernel compiled) {
+        shared = compiled != null && compiled.initSharedMaps(this::reopenDestShard);
         if (shardedHint && !bounded && !shared) {
             // Looks like we had to shard during previous execution, so let's do it ahead of time.
             sharded = true;

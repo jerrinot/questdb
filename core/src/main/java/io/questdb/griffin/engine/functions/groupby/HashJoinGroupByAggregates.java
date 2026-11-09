@@ -32,8 +32,8 @@ import org.jetbrains.annotations.TestOnly;
 
 /**
  * Exact aggregate implementations that the fused parallel hash join GROUP BY accepts. Each class
- * merges partial results, keeps its whole state in fixed-size map value columns, keeps no per-group
- * state outside the map (no allocator, sets, sinks or histograms), and returns a result that does not
+ * merges partial results, stores state in fixed-size map value columns or the slot-owned group-by
+ * allocator, and returns a result that does not
  * depend on the order of rows, because joined pairs have no order.
  * <p>
  * Lookups match exact classes, so a subclass or an aggregate added later keeps the ordinary plan
@@ -47,10 +47,8 @@ public final class HashJoinGroupByAggregates {
     private static final ObjHashSet<Class<?>> BINARY = new ObjHashSet<>();
     private static final ObjList<Class<?>> CLASSES = new ObjList<>();
     private static final int NO_TYPE = -2;
-    // Maps a class to the argument type tag it was reviewed and tested for. A class may serve
-    // other argument types as well: avg(boolean) returns AvgDoubleGroupByFunction, and the
-    // function parser passes a narrower numeric argument through without a cast. Those
-    // combinations keep the ordinary plan.
+    // Maps each reviewed class to the getter it uses. Numeric arguments may supply that getter
+    // through the conversions in ByteFunction through FloatFunction. Only the reviewed getter conversions below are admitted.
     private static final ObjIntHashMap<Class<?>> UNARY = new ObjIntHashMap<>(256, 0.5, NO_TYPE);
 
     private HashJoinGroupByAggregates() {
@@ -70,8 +68,32 @@ public final class HashJoinGroupByAggregates {
     }
 
     public static boolean isSupportedUnary(Class<?> type, int argType) {
-        final int tag = UNARY.get(type);
-        return tag != NO_TYPE && tag == ColumnType.tagOf(argType);
+        final int getter = UNARY.get(type);
+        final int argument = ColumnType.tagOf(argType);
+        if (getter == NO_TYPE) {
+            return false;
+        }
+        if (getter == argument) {
+            return true;
+        }
+        // These are the ordinary function getters, including INT/LONG NULL conversion.
+        // Batch implementations require an exact physical column type before reading pages.
+        return switch (argument) {
+            case ColumnType.BOOLEAN -> getter == ColumnType.BYTE || getter == ColumnType.SHORT || getter == ColumnType.INT
+                    || getter == ColumnType.LONG || getter == ColumnType.FLOAT || getter == ColumnType.DOUBLE;
+            case ColumnType.BYTE -> getter == ColumnType.SHORT || getter == ColumnType.INT
+                    || getter == ColumnType.LONG || getter == ColumnType.FLOAT || getter == ColumnType.DOUBLE;
+            case ColumnType.SHORT -> getter == ColumnType.INT || getter == ColumnType.LONG
+                    || getter == ColumnType.FLOAT || getter == ColumnType.DOUBLE;
+            case ColumnType.INT -> getter == ColumnType.LONG || getter == ColumnType.FLOAT || getter == ColumnType.DOUBLE;
+            case ColumnType.LONG -> getter == ColumnType.FLOAT || getter == ColumnType.DOUBLE;
+            case ColumnType.FLOAT -> getter == ColumnType.DOUBLE;
+            case ColumnType.CHAR -> getter == ColumnType.STRING;
+            // Temporal numeric getters expose raw stored units and convert LONG_NULL to NaN.
+            case ColumnType.DATE, ColumnType.TIMESTAMP -> getter == ColumnType.LONG
+                    || getter == ColumnType.FLOAT || getter == ColumnType.DOUBLE;
+            default -> false;
+        };
     }
 
     private static void binary(Class<?> type) {
@@ -179,6 +201,10 @@ public final class HashJoinGroupByAggregates {
         unary(CountStrGroupByFunction.class, ColumnType.STRING);
         unary(CountVarcharGroupByFunction.class, ColumnType.VARCHAR);
         unary(CountSymbolGroupByFunction.class, ColumnType.SYMBOL);
+        unary(CountDistinctIntGroupByFunction.class, ColumnType.INT);
+        unary(CountDistinctLongGroupByFunction.class, ColumnType.LONG);
+        unary(CountDistinctSymbolGroupByFunction.class, ColumnType.SYMBOL);
+        unary(CountDistinctIPv4GroupByFunction.class, ColumnType.IPv4);
         unary(CountGeoHashGroupByFunctionByte.class, ColumnType.GEOBYTE);
         unary(CountGeoHashGroupByFunctionShort.class, ColumnType.GEOSHORT);
         unary(CountGeoHashGroupByFunctionInt.class, ColumnType.GEOINT);

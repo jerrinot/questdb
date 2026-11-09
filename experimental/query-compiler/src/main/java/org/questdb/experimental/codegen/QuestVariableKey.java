@@ -40,7 +40,7 @@ import static org.questdb.experimental.codegen.MapKernelState.*;
 
 /** OrderedMap.VarSizeKey encoding: total byte length, then RecordSink-ordered fields. */
 record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
-    record Part(MemoryType width, Pipeline.Scalar scalar, ResolvedVarchar.Expression varchar) { }
+    record Part(MemoryType width, long nullValue, Pipeline.Scalar scalar, ResolvedVarchar.Expression varchar) { }
 
     static QuestVariableKey bind(ColumnTypes input, ColumnTypes types, ListColumnFilter columns,
                                  ObjList<Function> functions, io.questdb.cairo.map.Map map) {
@@ -61,15 +61,16 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
                 ResolvedVarchar.Expression expression = i < columns.size()
                         ? strings.column(columns.getQuick(i) - 1) : strings.bind(functions.getQuick(i - columns.size()));
                 if (expression == null) return null;
-                parts.add(new Part(null, null, expression));
+                parts.add(new Part(null, 0, null, expression));
                 variable = true;
             } else {
                 MemoryType width = switch (type) {
-                    case ColumnType.BYTE -> MemoryType.I8;
-                    case ColumnType.SHORT -> MemoryType.I16;
+                    case ColumnType.BOOLEAN, ColumnType.BYTE -> MemoryType.I8;
+                    case ColumnType.SHORT, ColumnType.CHAR -> MemoryType.I16;
                     case ColumnType.INT, ColumnType.SYMBOL, ColumnType.IPv4 -> MemoryType.I32;
                     case ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> MemoryType.I64;
                     case ColumnType.DOUBLE -> MemoryType.F64;
+                    case ColumnType.FLOAT -> MemoryType.F32;
                     default -> null;
                 };
                 if (width == null) return null;
@@ -84,7 +85,7 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
                     scalar = resolved.scalar(function, type);
                 }
                 if (scalar == null) return null;
-                parts.add(new Part(width, scalar, null));
+                parts.add(new Part(width, Pipeline.nullValueOf(type), scalar, null));
             }
         }
         if (!variable) return null;
@@ -132,10 +133,8 @@ record QuestVariableKey(ResolvedVarchar.Binding inputs, List<Part> parts) {
             Expr field = new Offset(key, offset);
             if (part.width != null) {
                 var value = part.scalar.emit(frame.numeric(b));
-                long nullValue = part.width == MemoryType.I64 ? Long.MIN_VALUE
-                        : part.scalar instanceof Pipeline.Column column ? column.nullValue() : Integer.MIN_VALUE;
                 Expr data = part.width == MemoryType.I32 || part.width == MemoryType.I64
-                        ? new Select(value.isNull(), i64(nullValue), value.data()) : value.data();
+                        ? new Select(value.isNull(), i64(part.nullValue), value.data()) : value.data();
                 b.store(part.width, field, data);
                 b.assign(offset, add(offset, i64(part.width.bytes)));
             } else {

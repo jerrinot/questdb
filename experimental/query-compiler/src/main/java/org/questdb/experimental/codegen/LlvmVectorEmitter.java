@@ -48,7 +48,7 @@ final class LlvmVectorEmitter {
         return lanes == 64 ? bits : temp.apply("zext i" + lanes + " " + bits + " to i64");
     }
     private String vector(Type type) { return "<" + lanes + " x " + scalarType(type) + ">"; }
-    private static String scalarType(Type type) { return type == Type.BOOL ? "i1" : type == Type.F64 ? "double" : "i64"; }
+    private static String scalarType(Type type) { return type == Type.BOOL ? "i1" : type == Type.F64 ? "double" : type == Type.F32 ? "float" : "i64"; }
     private String value(Expr e) {
         String old = values.get(e); if (old != null) return old;
         String result = switch (e) {
@@ -58,7 +58,7 @@ final class LlvmVectorEmitter {
                 String pointer = temp.apply("inttoptr i64 " + invariant(l.address()) + " to ptr");
                 String memoryType = "<" + lanes + " x " + LlvmEmitter.memoryType(l.width()) + ">";
                 String loaded = temp.apply("load " + memoryType + ", ptr " + pointer + ", align 1");
-                yield l.width().bytes == 8 ? loaded : temp.apply((l.width() == MemoryType.F32 ? "fpext " : "sext ")
+                yield l.width().bytes == 8 || l.width() == MemoryType.F32 ? loaded : temp.apply("sext "
                         + memoryType + " " + loaded + " to " + vector(l.type()));
             }
             case Gather g -> {
@@ -66,25 +66,48 @@ final class LlvmVectorEmitter {
                 String pointers = temp.apply("inttoptr " + vector(Type.I64) + " " + addresses + " to <" + lanes + " x ptr>");
                 String memoryType = "<" + lanes + " x " + LlvmEmitter.memoryType(g.width()) + ">";
                 String intrinsic = "@llvm.masked.gather.v" + lanes
-                        + (g.width().resultType == Type.F64 ? "f" : "i") + g.width().bytes * 8 + ".v" + lanes + "p0";
+                        + (g.width().resultType == Type.F64 || g.width().resultType == Type.F32 ? "f" : "i") + g.width().bytes * 8 + ".v" + lanes + "p0";
                 declaration.accept("declare " + memoryType + " " + intrinsic + "(<" + lanes + " x ptr>, i32 immarg, "
                         + vector(Type.BOOL) + ", " + memoryType + ")");
                 String loaded = temp.apply("call " + memoryType + " " + intrinsic + "(<" + lanes + " x ptr> "
                         + pointers + ", i32 1, " + vector(Type.BOOL) + " " + value(bool(true)) + ", " + memoryType + " poison)");
-                yield g.width().bytes == 8 ? loaded : temp.apply((g.width() == MemoryType.F32 ? "fpext " : "sext ")
+                yield g.width().bytes == 8 || g.width() == MemoryType.F32 ? loaded : temp.apply("sext "
                         + memoryType + " " + loaded + " to " + vector(g.type()));
             }
             case Binary b -> {
-                if (b.op() == Op.SDIV && Long.bitCount(((Literal) b.right()).value()) != 1)
-                    yield value(divide(b.left(), ((Literal) b.right()).value()));
+                if (b.op() == Op.SDIV && b.right() instanceof Literal divisor && divisor.value() > 0
+                        && Long.bitCount(divisor.value()) != 1)
+                    yield value(divide(b.left(), divisor.value()));
                 String left = value(b.left()), right = value(b.right());
                 if (b.op() == Op.USHR) right = temp.apply("and " + vector(Type.I64) + " " + right + ", " + value(i64(63)));
                 yield temp.apply(op(b.op()) + " " + vector(b.left().type()) + " " + left + ", " + right);
             }
             case Select s -> temp.apply("select " + vector(Type.BOOL) + " " + value(s.condition()) + ", "
                     + vector(s.type()) + " " + value(s.yes()) + ", " + vector(s.type()) + " " + value(s.no()));
-            case ToDouble c -> temp.apply("sitofp " + vector(Type.I64) + " " + value(c.value()) + " to " + vector(Type.F64));
-            case BitCast c -> temp.apply("bitcast " + vector(c.value().type()) + " " + value(c.value()) + " to " + vector(c.type()));
+            case ToInteger c -> {
+                String integer = "<" + lanes + " x i" + c.bits() + ">", input = vector(c.value().type());
+                String intrinsic = "@llvm.fptosi.sat.v" + lanes + "i" + c.bits() + ".v" + lanes
+                        + (c.value().type() == Type.F32 ? "f32" : "f64");
+                declaration.accept("declare " + integer + " " + intrinsic + "(" + input + ")");
+                String converted = temp.apply("call " + integer + " " + intrinsic + "(" + input + " " + value(c.value()) + ")");
+                yield c.bits() == 32 ? temp.apply("sext " + integer + " " + converted + " to " + vector(Type.I64)) : converted;
+            }
+            case ToDouble c -> temp.apply((c.value().type() == Type.F32 ? "fpext " : "sitofp ") + vector(c.value().type()) + " " + value(c.value()) + " to " + vector(Type.F64));
+            case ToFloat c -> temp.apply((c.value().type() == Type.I64 ? "sitofp " : "fptrunc ")
+                    + vector(c.value().type()) + " " + value(c.value()) + " to " + vector(Type.F32));
+            case Sqrt c -> {
+                String intrinsic = "@llvm.sqrt.v" + lanes + "f64";
+                declaration.accept("declare " + vector(Type.F64) + " " + intrinsic + "(" + vector(Type.F64) + ")");
+                yield temp.apply("call " + vector(Type.F64) + " " + intrinsic + "(" + vector(Type.F64) + " " + value(c.value()) + ")");
+            }
+            case BitCast c -> {
+                String i32 = "<" + lanes + " x i32>";
+                if (c.type() == Type.F32) yield temp.apply("bitcast " + i32 + " "
+                        + temp.apply("trunc " + vector(Type.I64) + " " + value(c.value()) + " to " + i32) + " to " + vector(Type.F32));
+                if (c.value().type() == Type.F32) yield temp.apply("sext " + i32 + " "
+                        + temp.apply("bitcast " + vector(Type.F32) + " " + value(c.value()) + " to " + i32) + " to " + vector(Type.I64));
+                yield temp.apply("bitcast " + vector(c.value().type()) + " " + value(c.value()) + " to " + vector(c.type()));
+            }
             default -> throw new IllegalArgumentException("Not a lane expression: " + e);
         };
         values.put(e, result); return result;
@@ -131,7 +154,7 @@ final class LlvmVectorEmitter {
         String result = switch (e) {
             case Var v -> "%" + v.name();
             case Literal l -> l.type() == Type.BOOL ? Boolean.toString(l.value() != 0)
-                    : l.type() == Type.F64 ? "0x" + String.format("%016X", l.value()) : Long.toString(l.value());
+                    : l.type() == Type.F32 ? "bitcast (i32 " + (int) l.value() + " to float)" : l.type() == Type.F64 ? "0x" + String.format("%016X", l.value()) : Long.toString(l.value());
             case Offset o -> temp.apply("add i64 " + invariant(o.address()) + ", " + invariant(o.bytes()));
             case Binary b -> {
                 String left = invariant(b.left()), right = invariant(b.right());
@@ -146,10 +169,10 @@ final class LlvmVectorEmitter {
     }
     private static String op(Op op) {
         return switch (op) {
-            case FADD -> "fadd"; case FSUB -> "fsub"; case FMUL -> "fmul"; case FDIV -> "fdiv";
+            case FADD -> "fadd"; case FSUB -> "fsub"; case FMUL -> "fmul"; case FDIV -> "fdiv"; case FREM -> "frem";
             case FEQ -> "fcmp oeq"; case FNE -> "fcmp une"; case FLT -> "fcmp olt"; case FGE -> "fcmp oge";
             case ADD -> "add"; case SUB -> "sub"; case MUL -> "mul"; case SDIV -> "sdiv";
-            case AND, BOTH -> "and"; case XOR -> "xor"; case EITHER -> "or"; case USHR -> "lshr";
+            case AND, BOTH -> "and"; case XOR -> "xor"; case OR, EITHER -> "or"; case USHR -> "lshr";
             case EQ -> "icmp eq"; case NE -> "icmp ne"; case LT -> "icmp slt"; case GE -> "icmp sge";
         };
     }

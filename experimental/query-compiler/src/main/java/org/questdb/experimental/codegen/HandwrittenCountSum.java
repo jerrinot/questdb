@@ -84,7 +84,7 @@ final class HandwrittenCountSum implements QueryCodeGenerator {
                 + "\n#define ROW_SHIFT " + Map.BATCH_ROW_INDEX_SHIFT
                 + "\n#define ROW_MASK " + Map.BATCH_ROW_INDEX_MASK
                 + "\n#define OFFSET_MASK " + Map.BATCH_OFFSET_MASK + "ULL"
-                + "\n#define HINTS " + (Boolean.getBoolean("query.codegen.disablePrefetchHints") ? 0 : 1)
+                + "\n#define HINTS " + (CompilerOptions.PROCESS.prefetchHints() ? 1 : 0)
                 + "\n" + Files.readString(source));
         // -O2 selects frontend attributes without optnone; LLVM passes run only in our existing JIT.
         List<String> command = List.of("clang-21", "-std=c11", "-O2", "-Xclang", "-disable-llvm-passes",

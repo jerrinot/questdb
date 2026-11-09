@@ -88,8 +88,14 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
     }
     private static int cost(Scalar s, Map<Scalar, Integer> memo) {
         Integer previous = memo.get(s); if (previous != null) return previous;
-        int value = s instanceof ToFloating a ? 2 + cost(a.argument(), memo)
+        int value = s instanceof FloatCast a ? 4 + cost(a.argument(), memo)
+                : s instanceof FloatingIntegerCast a ? 6 + cost(a.argument(), memo)
+                : s instanceof IntegerCast a ? 2 + cost(a.argument(), memo)
+                : s instanceof IPv4Cast a ? 2 + cost(a.argument(), memo)
+                : s instanceof Negate a ? 1 + cost(a.argument(), memo)
+                : s instanceof ToFloating a ? 2 + cost(a.argument(), memo)
                 : s instanceof Divide a ? 3 + cost(a.left(), memo) + cost(a.right(), memo)
+                : s instanceof Remainder a ? 5 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof Add a ? 1 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof Multiply a ? 1 + cost(a.left(), memo) + cost(a.right(), memo)
                 : s instanceof IPv4Subtract a ? 4 + cost(a.left(), memo) + cost(a.right(), memo)
@@ -124,8 +130,14 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case Conditional a -> { validate(a.condition(), schema, parameters, checked); validate(a.whenTrue(), schema, parameters, checked); validate(a.whenFalse(), schema, parameters, checked); }
             case DictionaryLookup a -> validate(a.symbol(), schema, parameters, checked);
             case FrameScalar ignored -> { }
+            case FloatCast a -> validate(a.argument(), schema, parameters, checked);
+            case FloatingIntegerCast a -> validate(a.argument(), schema, parameters, checked);
+            case IntegerCast a -> validate(a.argument(), schema, parameters, checked);
+            case IPv4Cast a -> validate(a.argument(), schema, parameters, checked);
+            case Negate a -> validate(a.argument(), schema, parameters, checked);
             case ToFloating a -> validate(a.argument(), schema, parameters, checked);
             case Divide a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
+            case Remainder a -> { validate(a.left(), schema, parameters, checked); validate(a.right(), schema, parameters, checked); }
             case Parameter p -> { if (p.index() >= parameters.size() || !p.equals(parameters.get(p.index()))) throw new IllegalArgumentException("Foreign parameter: " + p); }
             case Constant ignored -> { }
             case FloatingConstant ignored -> { }
@@ -152,8 +164,14 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             }
             case Constant c -> c;
             case FloatingConstant c -> c;
-            case ToFloating a -> new ToFloating(rewrite(a.argument(), schema, bindings));
+            case FloatCast a -> new FloatCast(rewrite(a.argument(), schema, bindings));
+            case FloatingIntegerCast a -> new FloatingIntegerCast(rewrite(a.argument(), schema, bindings), a.columnType());
+            case IntegerCast a -> new IntegerCast(rewrite(a.argument(), schema, bindings), a.columnType());
+            case IPv4Cast a -> new IPv4Cast(rewrite(a.argument(), schema, bindings), a.columnType());
+            case Negate a -> new Negate(rewrite(a.argument(), schema, bindings), a.columnType());
+            case ToFloating a -> new ToFloating(rewrite(a.argument(), schema, bindings), a.columnType());
             case Divide a -> new Divide(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
+            case Remainder a -> new Remainder(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings), a.columnType());
             case Parameter p -> p;
             case TimestampPart a -> new TimestampPart(rewrite(a.argument(), schema, bindings), a.unitTicks(), a.period());
             case TimestampYear a -> new TimestampYear(rewrite(a.argument(), schema, bindings), a.timestampType());
@@ -171,7 +189,7 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case All a -> a;
             case Compare c -> new Compare(c.op(), rewrite(c.left(), schema, bindings), rewrite(c.right(), schema, bindings));
             case SqlCompare c -> new SqlCompare(c.op(), rewrite(c.left(), schema, bindings), rewrite(c.right(), schema, bindings));
-            case FloatingCompare c -> new FloatingCompare(c.op(), rewrite(c.left(), schema, bindings), rewrite(c.right(), schema, bindings));
+            case FloatingCompare c -> new FloatingCompare(c.op(), rewrite(c.left(), schema, bindings), rewrite(c.right(), schema, bindings), c.canonicalKeys());
             case IsNotNull n -> new IsNotNull(rewrite(n.value(), schema, bindings));
             case Not n -> new Not(rewrite(n.value(), schema, bindings));
             case Or a -> new Or(rewrite(a.left(), schema, bindings), rewrite(a.right(), schema, bindings));
@@ -186,8 +204,14 @@ record ScanPlan(List<Column> input, Predicate predicate, List<Column> output, Li
             case Conditional a -> { collect(a.condition(), used); collect(a.whenTrue(), used); collect(a.whenFalse(), used); }
             case DictionaryLookup a -> collect(a.symbol(), used);
             case FrameScalar expression -> expression.collectColumns(used);
+            case FloatCast a -> collect(a.argument(), used);
+            case FloatingIntegerCast a -> collect(a.argument(), used);
+            case IntegerCast a -> collect(a.argument(), used);
+            case IPv4Cast a -> collect(a.argument(), used);
+            case Negate a -> collect(a.argument(), used);
             case ToFloating a -> collect(a.argument(), used);
             case Divide a -> { collect(a.left(), used); collect(a.right(), used); }
+            case Remainder a -> { collect(a.left(), used); collect(a.right(), used); }
             case Add a -> { collect(a.left(), used); collect(a.right(), used); }
             case Multiply a -> { collect(a.left(), used); collect(a.right(), used); }
             case IPv4Subtract a -> { collect(a.left(), used); collect(a.right(), used); }

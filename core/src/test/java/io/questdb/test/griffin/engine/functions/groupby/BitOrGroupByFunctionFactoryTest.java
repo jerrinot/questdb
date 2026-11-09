@@ -156,6 +156,7 @@ public class BitOrGroupByFunctionFactoryTest extends AbstractCairoTest {
     public void testBitOrConstant() throws Exception {
         assertQuery("select bit_or(42::long) from tab")
                 .ddl("create table tab as (select x from long_sequence(5))")
+                .noRandomAccess()
                 .expectSize()
                 .returns("""
                         bit_or

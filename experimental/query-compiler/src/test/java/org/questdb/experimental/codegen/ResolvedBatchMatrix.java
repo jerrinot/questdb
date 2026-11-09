@@ -366,9 +366,10 @@ final class ResolvedBatchMatrix {
                                 after.faults() - before.faults(), after.bytes() - before.bytes(), nativeRows, timing.shards, candidate != null ? Compilation.mapRows(candidate, context.getSharedQueryWorkerCount()) - mapRowsBefore : 0);
                         if (candidate != null && Boolean.getBoolean("query.codegen.profile")) {
                             long[] afterCounters = Compilation.profileCounters(candidate, context.getSharedQueryWorkerCount());
-                            System.out.printf(" kernel-calls=%d new-groups=%d probe-slots=%d key-comparisons=%d",
+                            System.out.printf(" kernel-calls=%d new-groups=%d probe-slots=%d key-comparisons=%d adaptive-plain-batches=%d adaptive-staged-batches=%d",
                                     afterCounters[0] - counters[0], afterCounters[1] - counters[1],
-                                    afterCounters[2] - counters[2], afterCounters[3] - counters[3]);
+                                    afterCounters[2] - counters[2], afterCounters[3] - counters[3],
+                                    afterCounters[4] - counters[4], afterCounters[5] - counters[5]);
                         }
                         if (candidate != null) {
                             long[] topKAfter = Compilation.topKCounters(candidate, context.getSharedQueryWorkerCount());
@@ -580,10 +581,10 @@ final class ResolvedBatchMatrix {
         static long[] profileCounters(RecordCursorFactory factory, int workerCount) {
             while (!(factory instanceof AsyncGroupByRecordCursorFactory)) {
                 factory = factory.getBaseFactory();
-                if (factory == null) return new long[4];
+                if (factory == null) return new long[6];
             }
             var atom = ((AsyncGroupByRecordCursorFactory) factory).getAtom();
-            long[] total = new long[4];
+            long[] total = new long[6];
             for (int slot = -1; slot < workerCount; slot++) {
                 long[] part = ResolvedQueryCompiler.profileCounters(atom.getCompiledUpdater(slot));
                 for (int i = 0; i < total.length; i++) total[i] += part[i];

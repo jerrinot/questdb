@@ -85,6 +85,7 @@ final class NativeCapture {
         private final int group;
         private Throwable allocationFailure;
         private long handle;
+        private long fallback;
 
         Slot(Plan plan, long descriptor) {
             matcher = Pattern.compile(plan.pattern).matcher("");
@@ -95,21 +96,25 @@ final class NativeCapture {
                         FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
                 long free = stub(lookup.findVirtual(Slot.class, "release", MethodType.methodType(void.class, long.class, long.class)),
                         FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
-                long fallback = stub(lookup.findVirtual(Slot.class, "fallback", MethodType.methodType(long.class, long.class, long.class)),
+                fallback = stub(lookup.findVirtual(Slot.class, "fallback", MethodType.methodType(long.class, long.class, long.class)),
                         FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
                 byte[] pattern = plan.pattern.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
                 long address = arena.allocateFrom(ValueLayout.JAVA_BYTE, pattern).address();
                 handle = (long) Bridge.CREATE.invokeExact(address, (long) pattern.length, (long) group, allocate, free);
                 if (allocationFailure != null) throw allocationFailure;
                 if (handle == 0) throw new IllegalStateException("PCRE2 JIT could not prepare admitted capture");
-                Unsafe.putLong(descriptor, handle);
-                Unsafe.putLong(descriptor + 8, fallback);
+                bind(descriptor);
             } catch (Throwable failure) {
                 try { close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
                 if (failure instanceof Error error) throw error;
                 if (failure instanceof RuntimeException error) throw error;
                 throw new IllegalStateException("Could not prepare capture helper", failure);
             }
+        }
+
+        void bind(long descriptor) {
+            Unsafe.putLong(descriptor, handle);
+            Unsafe.putLong(descriptor + 8, fallback);
         }
 
         private long stub(MethodHandle method, FunctionDescriptor descriptor) {

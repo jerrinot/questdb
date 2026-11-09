@@ -45,6 +45,11 @@ class DateCaseFunction extends DateFunction implements CaseFunction {
     }
 
     @Override
+    public CaseFunctionPicker getPicker() {
+        return picker;
+    }
+
+    @Override
     public long getDate(Record rec) {
         return picker.pick(rec).getDate(rec);
     }

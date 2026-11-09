@@ -53,7 +53,7 @@ public class NegIntFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0));
     }
 
-    private static class Func extends IntFunction implements ArithmeticUnaryFunction {
+    public static class Func extends IntFunction implements ArithmeticUnaryFunction {
         final Function arg;
 
         public Func(Function arg) {

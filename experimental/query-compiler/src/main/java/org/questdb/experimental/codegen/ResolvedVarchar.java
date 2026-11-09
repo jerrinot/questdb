@@ -30,6 +30,7 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.griffin.engine.functions.columns.VarcharColumn;
 import io.questdb.griffin.engine.functions.conditional.CaseFunctionFactory;
+import io.questdb.griffin.engine.functions.conditional.CaseFunctionPicker;
 import io.questdb.griffin.engine.functions.conditional.VarcharCaseFunction;
 import io.questdb.griffin.engine.functions.constants.StrConstant;
 import io.questdb.griffin.engine.functions.regex.RegexpReplaceVarcharFunctionFactory;
@@ -38,6 +39,7 @@ import io.questdb.std.Unsafe;
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.IntSupplier;
 
 import static org.questdb.experimental.codegen.Ir.*;
 
@@ -85,17 +87,32 @@ final class ResolvedVarchar {
     }
 
     Binding binding() {
-        return new Binding(numeric.indexes(), numeric.columns(), columns.stream().mapToInt(Integer::intValue).toArray(), literals.toByteArray(), List.copyOf(expressions), captures == null ? List.of() : List.copyOf(captures));
+        return new Binding(numeric.indexes(), numeric.columns(), columns.stream().mapToInt(Integer::intValue).toArray(), literals.toByteArray(), List.copyOf(expressions), captures == null ? List.of() : List.copyOf(captures), numeric.parameters());
     }
 
-    /** Numeric page pointers, then pinned UTF-8 views, then slot-owned literal bytes and helper pointers. */
+    /** Numeric page pointers, UTF-8 views, literals, helper descriptors and cursor constants. */
     record Binding(int[] numericColumns, List<Pipeline.Column> numericInputs, int[] varcharColumns, byte[] literals,
-                   List<Pipeline.FrameScalar> expressions, List<NativeCapture.Plan> captures) {
+                   List<Pipeline.FrameScalar> expressions, List<NativeCapture.Plan> captures, List<IntSupplier> parameters) {
         Binding(int[] numericColumns, List<Pipeline.Column> numericInputs, int[] varcharColumns, byte[] literals) {
-            this(numericColumns, numericInputs, varcharColumns, literals, List.of(), List.of());
+            this(numericColumns, numericInputs, varcharColumns, literals, List.of(), List.of(), List.of());
         }
         long helperOffset() { return (numericColumns.length * 8L + varcharColumns.length * 48L + literals.length + 7) & -8L; }
-        long bytes() { return helperOffset() + (long) captures.size() * NativeCapture.DESCRIPTOR_BYTES; }
+        long parameterOffset() { return helperOffset() + (long) captures.size() * NativeCapture.DESCRIPTOR_BYTES; }
+        long bytes() { return parameterOffset() + parameters.size() * 8L; }
+
+        // Ordinary functions own initialization and dictionary lifetime. Snapshot their resolved
+        // IDs after init(); reopening the cursor refreshes these values.
+        void prepareParameters(long address) {
+            for (int i = 0; i < parameters.size(); i++)
+                Unsafe.putLong(address + i * 8L, parameters.get(i).getAsInt());
+        }
+
+        List<Expr> loadParameters(Builder b, Expr address) {
+            var values = new ArrayList<Expr>(parameters.size());
+            for (int i = 0; i < parameters.size(); i++)
+                values.add(b.let(new Load(MemoryType.I32, at(address, i * 8L))));
+            return values;
+        }
 
         Slot newSlot(long descriptor) { return captures.isEmpty() ? null : new Slot(captures, descriptor + helperOffset()); }
 
@@ -112,6 +129,7 @@ final class ResolvedVarchar {
             }
             long constants = strings + varcharColumns.length * 48L;
             for (int i = 0; i < literals.length; i++) Unsafe.getUnsafe().putByte(constants + i, literals[i]);
+            prepareParameters(descriptor + parameterOffset());
             return true;
         }
 
@@ -141,6 +159,20 @@ final class ResolvedVarchar {
             return new NativeCapture.Expression(argument, plan, index);
         }
         if (function instanceof VarcharCaseFunction conditional
+                && conditional.getPicker() instanceof CaseFunctionPicker.Integral picker) {
+            int count = picker.getBranchCount();
+            if (count > 16 || count > 64 - depth) return null;
+            var branches = new ArrayList<Branch>();
+            for (int i = 0; i < count; i++) {
+                var condition = numeric.switchCondition(picker, i, depth + 1);
+                var value = bind(picker.getValue(i), depth + i + 1);
+                if (condition == null || value == null) return null;
+                branches.add(new Branch(condition, value));
+            }
+            var otherwise = bind(picker.getElseBranch(), depth + count);
+            return otherwise == null ? null : new Conditional(List.copyOf(branches), otherwise);
+        }
+        if (function instanceof VarcharCaseFunction conditional
                 && conditional.getPicker() instanceof CaseFunctionFactory.SearchedCasePicker picker) {
             var branches = new ArrayList<Branch>();
             for (int i = 0; i < picker.getBranchCount(); i++) {
@@ -166,6 +198,10 @@ final class ResolvedVarchar {
                 try { close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); }
                 throw failure;
             }
+        }
+        void bind(long descriptor) {
+            for (int i = 0; i < captures.length; i++)
+                captures[i].bind(descriptor + (long) i * NativeCapture.DESCRIPTOR_BYTES);
         }
         @Override public void close() {
             Throwable failure = null;

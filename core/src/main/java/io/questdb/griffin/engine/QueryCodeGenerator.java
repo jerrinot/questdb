@@ -33,6 +33,7 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.engine.CompiledProjection;
 import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByKernel;
 import io.questdb.griffin.engine.join.CompiledJoin;
 import io.questdb.griffin.engine.join.CompiledAsOfJoin;
@@ -54,7 +55,7 @@ public interface QueryCodeGenerator {
     /** Borrows resolved ASOF inputs and the ordinary map and aggregate layouts during binding. */
     default @Nullable CompiledAsOfJoin compileAsOfJoin(
             CompiledAsOfJoin.Input input, Map layout, Function filter,
-            ColumnTypes values, ObjList<GroupByFunction> functions, MapValue value) {
+            ColumnTypes values, ObjList<GroupByFunction> functions, MapValue value, GroupByAllocator allocator) {
         return null;
     }
 

@@ -25,14 +25,27 @@
 package org.questdb.experimental.codegen;
 
 import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.DefaultCairoConfiguration;
+import io.questdb.cairo.map.Map;
+import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.TimeFrameCursor;
 import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.griffin.engine.QueryCodeGenerator;
+import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.groupby.GroupByAllocator;
+import io.questdb.griffin.engine.join.CompiledAsOfJoin;
 import io.questdb.griffin.engine.join.FilteredAsOfJoinFastRecordCursorFactory;
 import io.questdb.std.ConcurrentAssociativeCache;
 import io.questdb.std.DefaultConcurrentCacheConfiguration;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.ObjList;
 import io.questdb.std.Unsafe;
 import org.junit.After;
 import org.junit.Before;
@@ -313,6 +326,110 @@ public class AsOfSqlTest {
         }
     }
 
+    @Test public void aggregateRegionsEnterAfterJavaFirstRowAndReopen() throws Exception {
+        engine.execute("create table first_row_l as (select * from l limit 48) timestamp(ts)", context);
+        // ASOF aggregation must compose with either filtering path without a compiled forward scan.
+        for (boolean batchFilter : new boolean[]{false, true}) {
+            int[] calls = new int[2];
+            var checked = new QueryCodeGenerator() {
+                @Override public CompiledFilters compileFilters(ColumnTypes inputs, Function filter) {
+                    return batchFilter ? compiler.compileFilters(inputs, filter) : null;
+                }
+                @Override public io.questdb.griffin.engine.groupby.GroupByKernel compile(ColumnTypes inputs,
+                        ColumnTypes values, ObjList<GroupByFunction> functions) {
+                    return compiler.compile(inputs, values, functions);
+                }
+                @Override public CompiledAsOfJoin compileAsOfJoin(CompiledAsOfJoin.Input input, Map layout, Function filter,
+                        ColumnTypes values, ObjList<GroupByFunction> functions, MapValue value, GroupByAllocator allocator) {
+                    assertTrue(functions.getQuick(0) instanceof io.questdb.griffin.engine.functions.groupby.CountLongConstGroupByFunction);
+                    int countOffset = functions.getQuick(0).getValueIndex();
+                    var delegate = compiler.compileAsOfJoin(input, layout, filter, values, functions, value, allocator);
+                    assertNotNull(delegate);
+                    return new CompiledAsOfJoin() {
+                        private boolean prepared;
+                        @Override public CharSequence getName() { return delegate.getName(); }
+                        @Override public long getNativeRows() { return delegate.getNativeRows(); }
+                        @Override public void prepareExecution(MemoryTracker tracker) {
+                            assertFalse(prepared);
+                            delegate.prepareExecution(tracker);
+                            prepared = true;
+                        }
+                        @Override public void clearExecution() { delegate.clearExecution(); prepared = false; }
+                        @Override public void close() { delegate.close(); }
+                        private void check(MapValue state) {
+                            assertTrue("ASOF must prepare each execution", prepared);
+                            // Only this test uses COUNT to observe the Java update.
+                            assertTrue("Java must consume the first row before either native strategy", state.getLong(countOffset) > 0);
+                        }
+                        @Override public void aggregate(PageFrameMemoryRecord master, TimeFrameCursor slave, Map map,
+                                MapValue state, State progress, SqlExecutionCircuitBreaker breaker) {
+                            check(state);
+                            delegate.aggregate(master, slave, map, state, progress, breaker);
+                            if (progress.nextMaster > progress.masterLo) calls[0]++;
+                        }
+                        @Override public void aggregateLookup(PageFrameMemoryRecord master, TimeFrameCursor slave,
+                                MapValue state, State progress, SqlExecutionCircuitBreaker breaker) {
+                            check(state);
+                            delegate.aggregateLookup(master, slave, state, progress, breaker);
+                            if (progress.nextMaster > progress.masterLo) calls[1]++;
+                        }
+                    };
+                }
+            };
+            for (String master : List.of("l", "first_row_l")) {
+                String body = "count(),stddev_pop(b.v),weighted_avg(b.v,a.kl),ksum(b.v),min(b.v),max(b.v) from "
+                        + master + " a asof join (select * from r where v%3=0) b on (kl)";
+                context.setQueryCodeGenerator(null);
+                try (var reference = Demo.compileSql(engine, context, "select /*+ asof_linear(a b) */ " + body, true)) {
+                    context.setQueryCodeGenerator(checked);
+                    try (var candidate = Demo.compileSql(engine, context, "select " + body, true)) {
+                        for (int reopen = 0; reopen < 2; reopen++) {
+                            try (var expected = reference.getCursor(context); var actual = candidate.getCursor(context)) {
+                                assertEquals(aggregateResult(expected, reference), aggregateResult(actual, candidate));
+                            }
+                        }
+                    }
+                } finally { context.setQueryCodeGenerator(null); }
+            }
+            assertTrue("Forward regions must be checked", calls[0] > 0);
+            assertTrue("Lookup regions must be checked", calls[1] > 0);
+        }
+    }
+
+    @Test public void invalidNativeProgressFailsBeforePublicationAndReleasesContext() throws Exception {
+        var artifacts = temporary.newFolder().toPath();
+        Backend corrupt = new Backend() {
+            @Override public String name() { return "corrupt-progress"; }
+            @Override public CompiledKernel compile(Ir.Program program, java.nio.file.Path path) throws java.io.IOException {
+                var code = new LlvmBackend().compile(program, path);
+                return new CompiledKernel((columns, rows, state) -> {
+                    long result = code.run(columns, rows, state);
+                    Unsafe.putLong(columns, Long.MAX_VALUE); // ASOF descriptor's LEFT publication word.
+                    return result;
+                }, code, null, 0);
+            }
+        };
+        context.setQueryCodeGenerator(new QueryCodeGenerator() {
+            @Override public io.questdb.griffin.engine.groupby.GroupByKernel compile(ColumnTypes inputs,
+                    ColumnTypes values, ObjList<GroupByFunction> functions) { return null; }
+            @Override public CompiledAsOfJoin compileAsOfJoin(CompiledAsOfJoin.Input input, Map layout, Function filter,
+                    ColumnTypes values, ObjList<GroupByFunction> functions, MapValue value, GroupByAllocator allocator) {
+                try { return ResolvedAsOfJoin.compile(input, layout, filter, values, functions, value, allocator, corrupt, artifacts); }
+                catch (java.io.IOException failure) { throw new RuntimeException(failure); }
+            }
+        });
+        String sql = "select count(),sum(b.v) from l a asof join (select * from r where v%3=0) b on (kl)";
+        try (var factory = Demo.compileSql(engine, context, sql, true)) {
+            for (int reopen = 0; reopen < 2; reopen++) {
+                try (var cursor = factory.getCursor(context)) {
+                    var failure = assertThrows(IllegalStateException.class, cursor::hasNext);
+                    assertTrue(failure.getMessage().contains("Invalid ASOF aggregate progress"));
+                    assertThrows(IllegalStateException.class, KernelMemory::allocator);
+                }
+            }
+        } finally { context.setQueryCodeGenerator(null); }
+    }
+
     @Test public void aggregateRegionTypedKeysPayloadsAndReopen() throws Exception {
         for (String type : new String[]{"long", "int", "double"}) {
             context.setQueryCodeGenerator(null);
@@ -326,6 +443,279 @@ public class AsOfSqlTest {
         }
         aggregateMatches("sum(b.v),min(b.v),max(b.v),count(b.v),sum(b.v+a.kl),count(*) "
                 + "from l a asof join (select * from r where v-v/3*3=0) b on (kl) tolerance 20s", true);
+    }
+
+    @Test public void aggregateDistinctComposesAcrossTypesStrategiesAndReopen() throws Exception {
+        engine.execute("create table short_distinct_l as (select * from l limit 48) timestamp(ts)",context);
+        for(String master:List.of("l","short_distinct_l")) for(String key:List.of("k","kl","ks")) {
+            String body="count(),count_distinct(b.v),count_distinct(b.k),count_distinct(b.ks),"
+                    +"count_distinct(cast(b.k as ipv4)),count_distinct(a.ks),"
+                    +"count_distinct(case a.ks when 's1' then b.v end),sum(b.v),min(b.v),max(b.v),bit_and(b.v::byte) from "
+                    +master+" a asof join (select ks,v,kl,ts,k from r where v%3=0) b on ("+key+") tolerance 20s";
+            aggregateMatches(body,true);
+        }
+        engine.execute("alter table r add column late long",context);
+        aggregateMatches("count(),count_distinct(b.late),count_distinct(b.v) from l a asof join "
+                +"(select * from r where v%3=0) b on (k)",false);
+        engine.execute("alter table r convert partition to parquet where ts < '1970-01-01T02'",context);
+        aggregateMatches("count(),count_distinct(b.v),count_distinct(b.k),count_distinct(b.ks) from l a asof join "
+                +"(select * from r where v%3=0) b on (ks)",true);
+        engine.execute("truncate table r",context);
+        aggregateMatches("count(),count_distinct(b.v),count_distinct(b.k),count_distinct(b.ks),min(b.v) from l a asof join "
+                +"(select * from r where v%3=0) b on (k)",false);
+    }
+
+    @Test public void aggregateDistinctReleasesMemoryAfterLimitAndReopens() throws Exception {
+        String body = "count(),count_distinct(b.v),count_distinct(b.k),sum(b.v) from l a asof join "
+                + "(select * from r where v%3=0) b on (kl)";
+        String expected;
+        try (var reference = Demo.compileSql(engine, context, "select /*+ asof_linear(a b) */ " + body, true);
+             var cursor = reference.getCursor(context)) {
+            expected = aggregateResult(cursor, reference);
+        }
+        context.setQueryCodeGenerator(compiler);
+        try (var factory = Demo.compileSql(engine, context, "select " + body, true);
+             var tracker = new io.questdb.test.tools.LimitedMemoryTracker(0)) {
+            RecordCursorFactory base = factory;
+            while (!(base instanceof FilteredAsOfJoinFastRecordCursorFactory)) base = base.getBaseFactory();
+            var asof = (FilteredAsOfJoinFastRecordCursorFactory) base;
+            var owner = factory instanceof io.questdb.griffin.engine.QueryProgress ? factory.getBaseFactory() : factory;
+            context.setMemoryTracker(tracker);
+            boolean failedAfterNativeRows = false;
+            for (long limit = 4096; limit <= (1 << 20) && !failedAfterNativeRows; limit *= 2) {
+                tracker.setLimit(limit);
+                try (var cursor = owner.getCursor(context)) {
+                    aggregateResult(cursor, factory);
+                } catch (io.questdb.cairo.CairoException failure) {
+                    assertTrue(failure.isOutOfMemory());
+                    failedAfterNativeRows = asof.getNativeAggregateRows() > 0;
+                }
+                assertEquals(0, tracker.getUsed());
+            }
+            assertTrue("Exercise memory failure after generated processing begins", failedAfterNativeRows);
+            tracker.setLimit(0);
+            try (var cursor = owner.getCursor(context)) {
+                assertEquals(expected, aggregateResult(cursor, factory));
+                cursor.toTop();
+                assertEquals(expected, aggregateResult(cursor, factory));
+            }
+            assertEquals(0, tracker.getUsed());
+        } finally { context.setMemoryTracker(null); context.setQueryCodeGenerator(null); }
+    }
+
+    @Test public void aggregateIntegerDivisionHandlesUnmatchedAndZeroDivisors() throws Exception {
+        engine.execute("create table short_div_l as (select * from l limit 48) timestamp(ts)",context);
+        for(String master:List.of("l","short_div_l")) for(String key:List.of("k","kl","ks")) {
+            aggregateMatches("count(),count(b.v/a.kl),sum(b.v%(a.kl-1)),min(b.v/(a.kl-1)),"
+                    +"max(b.k%(a.k-1)),sum(case a.ks when 's1' then b.v%(-3) end) from "
+                    +master+" a asof join (select ks,v,kl,ts,k from r where v%3=0) b on ("+key+") tolerance 20s",true);
+        }
+    }
+
+    @Test public void aggregateNarrowedPayloadsPreserveUnmatchedNullsAcrossStrategies() throws Exception {
+        engine.execute("create table short_narrow_l as (select * from l limit 48) timestamp(ts)",context);
+        for (String master : List.of("l", "short_narrow_l")) for (String key : List.of("k", "kl", "ks")) {
+            aggregateMatches("count(b.v::byte),min(b.v::byte),max(b.v::byte),bit_and(b.v::byte),"
+                    + "count(b.v::short),bit_or(b.v::short),count(b.v::int),bit_xor(b.v::int),"
+                    + "bit_and(cast(case a.ks when 's1' then b.v end as byte)),count(cast(b.v::int as long)),bit_and(cast(b.v::float as byte)),bit_or(cast(b.v::double as short)),count(cast(b.v::float as int)),max(cast(b.v::double as long)) from "
+                    +master+" a asof join (select ks,v,kl,ts,k from r where v-v/3*3=0) b on ("+key+") tolerance 20s",true);
+        }
+    }
+
+    @Test public void aggregateBitwisePayloadsComposeAcrossWidthsAndStrategies() throws Exception {
+        engine.execute("create table short_bit_l as (select * from l limit 48) timestamp(ts)",context);
+        engine.execute("create table bit_r as (select ts,k,kl,ks,cast(v%127+1 as byte) b,cast(v%32767+1 as short) h,"
+                + "cast(case when v%13=0 then null else v%65535+1 end as int) i,"
+                + "case when v%13=0 then null else v%65535+1 end n from r) timestamp(ts) partition by hour",context);
+        String aggregates="count(),bit_and(b.b),bit_or(b.b),bit_xor(b.b),bit_and(b.h),bit_or(b.h),bit_xor(b.h),"
+                + "bit_and(b.i),bit_or(b.i),bit_xor(b.i),bit_and(b.n),bit_or(b.n),bit_xor(b.n),"
+                + "bit_and(case a.ks when 's1' then b.b else cast(127 as byte) end)";
+        for (String master : List.of("l", "short_bit_l")) for (String key : List.of("k", "kl", "ks")) {
+            aggregateMatches(aggregates+" from "+master+" a asof join (select ks,b,h,i,n,kl,ts,k from bit_r "
+                    + "where k-k/3*3=0) b on ("+key+") tolerance 20s",true);
+        }
+        engine.execute("alter table bit_r add column late byte",context);
+        aggregateMatches("bit_and(b.late),bit_or(b.late),bit_xor(b.late) from l a asof join "
+                + "(select * from bit_r where k-k/3*3=0) b on (k)",false);
+        engine.execute("alter table bit_r convert partition to parquet where ts < '1970-01-01T02'",context);
+        aggregateMatches(aggregates+" from l a asof join (select * from bit_r where k-k/3*3=0) b on (k)",true);
+    }
+
+    @Test public void aggregateIPv4PayloadsUseUnsignedExtremaAcrossStrategies() throws Exception {
+        engine.execute("create table short_ip_l as (select * from l limit 48) timestamp(ts)",context);
+        engine.execute("create table ip_r as (select ts,k,kl,ks,cast(case when v%13=0 then null "
+                + "when v%3=0 then -1 when v%3=1 then -2147483647 else v end as int)::ipv4 ip "
+                + "from r) timestamp(ts) partition by hour",context);
+        String aggregates="count(b.ip),min(b.ip),max(b.ip),count(b.ip-1),min(b.ip-1),max(b.ip-1),"
+                + "count(cast(b.ip as int)),min(case a.ks when 's1' then b.ip end)";
+        for (String master : List.of("l", "short_ip_l")) for (String key : List.of("k", "kl", "ks")) {
+            aggregateMatches(aggregates+" from "+master+" a asof join (select ks,ip,kl,ts,k from ip_r "
+                    + "where k-k/3*3=0) b on ("+key+") tolerance 20s",true);
+        }
+        engine.execute("alter table ip_r add column late ipv4",context);
+        aggregateMatches("count(b.late),min(b.late),max(b.late) from l a asof join "
+                + "(select * from ip_r where k-k/3*3=0) b on (k)",false);
+        engine.execute("alter table ip_r convert partition to parquet where ts < '1970-01-01T02'",context);
+        aggregateMatches(aggregates+" from l a asof join (select * from ip_r where k-k/3*3=0) b on (k)",true);
+    }
+
+    @Test public void aggregateBooleanPayloadsPreserveUnmatchedFalseAcrossStrategies() throws Exception {
+        engine.execute("create table bool_l as (select ts,k,kl,ks,k%5=0 flag from l) timestamp(ts)",context);
+        engine.execute("create table short_bool_l as (select * from bool_l limit 48) timestamp(ts)",context);
+        engine.execute("create table bool_r as (select ts,k,kl,ks,v%7=0 flag from r) timestamp(ts) partition by hour",context);
+        engine.execute("alter table bool_r add column late boolean",context);
+        String aggregates = "count(),bool_and(b.flag),bool_or(b.flag),bool_and(a.flag or b.flag),"
+                + "min(b.flag),max(b.flag),avg(b.flag),sum(cast(b.flag as long)),"
+                + "bool_or(case a.ks when 's1' then b.flag end)";
+        for (String master : List.of("bool_l", "short_bool_l")) {
+            for (String key : List.of("k", "kl", "ks")) {
+                aggregateMatches(aggregates + " from " + master
+                        + " a asof join (select ks,flag,late,kl,ts,k from bool_r where k-k/3*3=0) b on (" + key + ") tolerance 20s",true);
+            }
+        }
+        // A missing physical page retains the ordinary top/conversion fallback.
+        aggregateMatches("bool_and(b.late),bool_or(b.late),avg(b.late) from bool_l a asof join "
+                + "(select * from bool_r where k-k/3*3=0) b on (k)",false);
+        engine.execute("alter table bool_r convert partition to parquet where ts < '1970-01-01T02'",context);
+        aggregateMatches(aggregates + " from bool_l a asof join (select * from bool_r where k-k/3*3=0) b on (k)",true);
+    }
+
+    @Test public void aggregateSymbolConditionsUseBothDictionariesAndStrategies() throws Exception {
+        engine.execute("create table short_l as (select * from l limit 48) timestamp(ts)", context);
+        for (String master : List.of("l", "short_l")) {
+            for (String key : List.of("k", "kl", "ks")) {
+                aggregateMatches("count(case when a.ks='s1' then b.v end),"
+                        + "sum(case b.ks when 's1' then b.v when 's2' then b.v+1 end),"
+                        + "min(case when b.ks in ('s3',null) then b.v end),"
+                        + "max(case when a.ks!='s1' then b.v end),"
+                        + "avg(case when b.ks='s4' then cast(b.v as double) end) from " + master
+                        + " a asof join (select ks,v,kl,ts,k from r where v-v/3*3=0) b on (" + key + ") tolerance 20s", true);
+            }
+        }
+    }
+
+    @Test public void aggregateSymbolParametersRefreshAfterTruncate() throws Exception {
+        String sql = "select count(case when a.ks='new' then b.v end),"
+                + "sum(case b.ks when 'new' then b.v when 's1' then b.v+1 end),"
+                + "min(case when b.ks is null then b.v end) "
+                + "from l a asof join (select * from r where v-v/3*3=0) b on (k)";
+        context.setQueryCodeGenerator(compiler);
+        try (var candidate = Demo.compileSql(engine, context, sql, true)) {
+            RecordCursorFactory base = candidate;
+            while (base != null && !(base instanceof FilteredAsOfJoinFastRecordCursorFactory)) base = base.getBaseFactory();
+            assertNotNull(base);
+            var asof = (FilteredAsOfJoinFastRecordCursorFactory) base;
+            for (int round = 0; round < 2; round++) {
+                context.setQueryCodeGenerator(null);
+                if (round > 0) {
+                    engine.execute("truncate table l", context);
+                    engine.execute("truncate table r", context);
+                    engine.execute("insert into r select cast(x*1000000 as timestamp),cast(x%3 as int),x%3,"
+                            + "cast(case when x%2=0 then 'new' else 's1' end as symbol),'text',x from long_sequence(4096)", context);
+                    engine.execute("insert into l select cast((2048+x)*1000000000 as timestamp_ns),cast(x%3 as int),x%3,"
+                            + "cast(case when x%2=0 then 's1' else 'new' end as symbol) from long_sequence(1024)", context);
+                }
+                try (var ordinary = Demo.compileSql(engine, context, sql, true);
+                     var expected = ordinary.getCursor(context);
+                     var actual = candidate.getCursor(context)) {
+                    assertEquals(aggregateResult(expected, ordinary), aggregateResult(actual, candidate));
+                    assertTrue(asof.getNativeAggregateRows() > 0);
+                }
+            }
+        }
+    }
+
+    @Test public void aggregateFloatPayloadsShareTypedStatesAcrossStrategies() throws Exception {
+        engine.execute("create table short_l as (select * from l limit 48) timestamp(ts)", context);
+        engine.execute("create table floats as (select ts,k,kl,ks,"
+                + "cast(case when v%29=0 then null else (v%31-15)*0.25 end as float) v "
+                + "from r) timestamp(ts) partition by hour", context);
+        for (String master : List.of("l", "short_l")) for (String key : List.of("k", "kl", "ks")) {
+            aggregateMatches("count(b.v),sum(b.v),min(b.v),max(b.v),avg(b.v),sum(-b.v),min(-b.v),avg(-b.v),"
+                    + "sum(b.v+cast(a.kl as float)),avg(b.v/cast(3 as float)),"
+                    + "sum(case when b.ks='s1' then b.v else null::float end) "
+                    + "from " + master + " a asof join (select ks,v,kl,ts,k from floats"
+                    + " where k-k/3*3=0) b on (" + key + ") tolerance 20s", true);
+        }
+    }
+
+    @Test public void aggregateMomentsUseOrdinaryStatesAcrossTypesAndStrategies() throws Exception {
+        engine.execute("create table short_l as (select * from l limit 48) timestamp(ts)", context);
+        int key = 0;
+        for (String type : List.of("byte", "short", "int", "long", "float", "double")) {
+            engine.execute("create table moment_" + type + " as (select ts,k,kl,ks,"
+                    + "cast(case when v%29=0 then null else v%31-15 end as " + type + ") v "
+                    + "from r) timestamp(ts) partition by hour", context);
+            for (String master : List.of("l", "short_l")) {
+                aggregateMatches("count(b.v),sum(cast(b.v as float)%cast(a.kl as float)),sum(cast(b.v as double)%cast(a.kl as double)),nsum(b.v),nsum(b.v+a.kl),weighted_avg(b.v,a.kl),weighted_avg(a.kl,b.v),var_pop(b.v),var_samp(b.v),stddev_pop(b.v),stddev(b.v),"
+                        + "covar_pop(b.v,a.kl),covar_samp(a.kl,b.v),corr(b.v,a.kl),regr_slope(b.v,a.kl),regr_intercept(b.v,a.kl),regr_r2(b.v,a.kl),"
+                        + "var_pop(case when b.ks='s1' then cast(b.v as double) end) from " + master
+                        + " a asof join (select ks,v,kl,ts,k from moment_" + type
+                        + " where k-k/3*3=0) b on (" + List.of("k", "kl", "ks").get(key % 3) + ") tolerance 20s", true);
+            }
+            key++;
+        }
+    }
+
+    @Test public void aggregateNarrowPayloadsKeepUnmatchedZeroAndSignedWidths() throws Exception {
+        engine.execute("create table narrow_l as (select *,cast(kl%256-128 as byte) b,"
+                + "cast(kl*997-32768 as short) h from l) timestamp(ts)", context);
+        engine.execute("create table short_narrow_l as (select * from narrow_l limit 48) timestamp(ts)", context);
+        engine.execute("create table narrow_r as (select ts,k,kl,ks,cast(v%256-128 as byte) b,"
+                + "cast(v%65536-32768 as short) h from r) timestamp(ts) partition by hour", context);
+        String aggregates = "count(b.b),count(b.h),sum(b.b),min(b.b),max(b.b),avg(b.b),"
+                + "sum(b.h),min(b.h),max(b.h),avg(b.h),sum(-b.h),"
+                + "sum(a.b+b.h),sum(a.h+b.b),"
+                + "sum(case when b.ks='s1' then b.h else a.h end)";
+        for (String master : List.of("narrow_l", "short_narrow_l")) {
+            for (String key : List.of("k", "kl", "ks")) {
+                aggregateMatches(aggregates + " from " + master
+                        + " a asof join (select ks,b,h,kl,ts,k from narrow_r where k-k/3*3=0) b on ("
+                        + key + ") tolerance 20s", true);
+            }
+        }
+        engine.execute("alter table narrow_r add column late short", context);
+        aggregateMatches("count(b.late),sum(b.late),min(b.late),max(b.late),avg(b.late) "
+                + "from narrow_l a asof join (select * from narrow_r where k-k/3*3=0) b on (k)", false);
+        engine.execute("alter table narrow_r convert partition to parquet where ts < '1970-01-01T02'", context);
+        aggregateMatches(aggregates + " from narrow_l a asof join "
+                + "(select * from narrow_r where k-k/3*3=0) b on (k)", true);
+    }
+
+    @Test public void aggregateCharactersKeepUnsignedOrderAndUnmatchedNulls() throws Exception {
+        engine.execute("create table short_l as (select * from l limit 48) timestamp(ts)", context);
+        engine.execute("create table char_r as (select ts,k,kl,ks,cast(cast(case when v%29=0 then null "
+                + "when v%7=0 then 0 when v%7=1 then 65535 when v%7=2 then 32768 else v%65536 end as int) as char) c "
+                + "from r) timestamp(ts) partition by hour", context);
+        for (String master : List.of("l", "short_l")) {
+            for (String key : List.of("k", "kl", "ks")) {
+                aggregateMatches("count(b.c),min(b.c),max(b.c),min(case b.ks when 's1' then b.c end),"
+                        + "max(case when b.c>=cast(32768 as char) then b.c end) "
+                        + "from " + master + " a asof join (select ks,c,kl,ts,k from char_r where k-k/3*3=0) b on ("+key+") tolerance 20s", true);
+            }
+        }
+        engine.execute("alter table char_r add column late char",context);
+        aggregateMatches("count(b.late),min(b.late),max(b.late),min(b.c),max(b.c) from l a asof join "
+                + "(select * from char_r where k-k/3*3=0) b on (k)",false);
+        engine.execute("alter table char_r convert partition to parquet where ts<'1970-01-01T02'",context);
+        aggregateMatches("count(b.c),min(b.c),max(b.c) from l a asof join "
+                + "(select * from char_r where k-k/3*3=0) b on (k)",true);
+    }
+
+    @Test public void aggregateTemporalPayloadsKeepUnitsAcrossStrategies() throws Exception {
+        engine.execute("create table short_l as (select * from l limit 48) timestamp(ts)", context);
+        for (String type : List.of("date", "timestamp", "timestamp_ns")) {
+            String table = "temporal_" + type;
+            engine.execute("create table " + table + " as (select ts,k,kl,ks,"
+                    + "cast(case when v%29=0 then null else (v-20000)*1000001 end as " + type + ") v "
+                    + "from r) timestamp(ts) partition by hour", context);
+            for (String master : List.of("l", "short_l")) {
+                aggregateMatches("count(b.v),min(b.v),max(b.v),sum(b.v),avg(b.v),sum(b.v::double),max(b.v::float),"
+                        + "min(case when b.ks='s1' then b.v end) "
+                        + "from " + master + " a asof join (select ks,v,kl,ts,k from " + table
+                        + " where k-k/3*3=0) b on (k) tolerance 20s", true);
+            }
+        }
     }
 
     @Test public void aggregateRegionHistoryParquetColumnTopsAndLimits() throws Exception {
@@ -369,7 +759,7 @@ public class AsOfSqlTest {
     }
 
     @Test public void aggregateRegionCancellationReleasesQueryStateAndReopens() throws Exception {
-        String body = "sum(b.v),min(b.v),max(b.v),count(b.v),sum(b.v+a.kl),count(*) "
+        String body = "sum(b.v),min(b.v),max(b.v),count(b.v),sum(b.v+a.kl),count(*),count_distinct(b.v),count_distinct(b.k) "
                 + "from l a asof join (select * from r where v-v/3*3=0) b on (kl)";
         String expected;
         try (var reference = Demo.compileSql(engine, context, "select /*+ asof_linear(a b) */ " + body, true);
@@ -485,8 +875,12 @@ public class AsOfSqlTest {
             var record = cursor.getRecord();
             for (int i = 0; i < factory.getMetadata().getColumnCount(); i++) {
                 int type = factory.getMetadata().getColumnType(i);
-                if (type == io.questdb.cairo.ColumnType.DOUBLE) result.append(record.getDouble(i));
+                if (type == io.questdb.cairo.ColumnType.BOOLEAN) result.append(record.getBool(i));
+                else if (type == io.questdb.cairo.ColumnType.DOUBLE) result.append(record.getDouble(i));
+                else if (type == io.questdb.cairo.ColumnType.FLOAT) result.append(record.getFloat(i));
                 else if (type == io.questdb.cairo.ColumnType.INT) result.append(record.getInt(i));
+                else if (type == io.questdb.cairo.ColumnType.CHAR) result.append((int) record.getChar(i));
+                else if (type == io.questdb.cairo.ColumnType.IPv4) result.append(record.getIPv4(i));
                 else result.append(record.getLong(i));
                 result.append(',');
             }

@@ -42,13 +42,21 @@ import io.questdb.test.griffin.fuzz.types.ColumnKind;
  * <p>
  * Key slots are {@link FuzzExpr}s of a groupable kind; the aggregate
  * operates on an expression of a kind compatible with the chosen
- * aggregate (numeric for sum/avg, any-non-array for count/first/last/
+ * aggregate (numeric for sums, moments and paired statistics, BOOLEAN for
+ * bool_and/bool_or, any-non-array for count/first/last/
  * min/max/count_distinct/approx_count_distinct). An explicit
  * {@code GROUP BY} clause is emitted on roughly half the queries and
  * either references projection aliases or re-emits the expression,
  * which exercises different parser paths.
  */
 public final class GroupByClause {
+
+    private static final String[] NUMERIC_AGGREGATES = {
+            "sum", "avg", "ksum", "nsum", "var_pop", "var_samp", "stddev_pop", "stddev_samp"
+    };
+    private static final String[] PAIR_AGGREGATES = {
+            "weighted_avg", "covar_pop", "covar_samp", "corr", "regr_slope", "regr_intercept", "regr_r2"
+    };
 
     // The GROUP BY key-kind option list, biased towards the keys real workloads
     // use. The null at index 5 is the identifier slot: pickGroupableKind
@@ -229,26 +237,36 @@ public final class GroupByClause {
     }
 
     private static Aggregate pickAggregate(Rnd rnd, ExpressionGenerator gen) {
-        int pick = rnd.nextInt(7);
+        int pick = rnd.nextInt(9);
         return switch (pick) {
             case 0 -> Aggregate.noArg("count");
             case 1 -> Aggregate.withArg("count", gen.generateAnyKind());
-            case 2 -> Aggregate.withArg(rnd.nextBoolean() ? "sum" : "avg",
+            case 2 -> Aggregate.withArg(NUMERIC_AGGREGATES[rnd.nextInt(NUMERIC_AGGREGATES.length)],
                     gen.generateOfKind(ColumnKind.NUMERIC));
             case 3 -> Aggregate.withArg(rnd.nextBoolean() ? "min" : "max", gen.generateAnyKind());
             case 4 -> Aggregate.withArg(rnd.nextBoolean() ? "first" : "last", gen.generateAnyKind());
             case 5 -> Aggregate.withArg("count_distinct", gen.generateAnyKind());
+            case 6 -> new Aggregate(PAIR_AGGREGATES[rnd.nextInt(PAIR_AGGREGATES.length)],
+                    gen.generateOfKind(ColumnKind.NUMERIC), gen.generateOfKind(ColumnKind.NUMERIC));
+            case 7 -> Aggregate.withArg(rnd.nextBoolean() ? "bool_and" : "bool_or",
+                    gen.generateOfKind(ColumnKind.BOOLEAN));
             default -> Aggregate.withArg("approx_count_distinct", gen.generateAnyKind());
         };
     }
 
     private static final class Aggregate {
         private final FuzzExpr arg;
+        private final FuzzExpr secondArg;
         private final String name;
 
         private Aggregate(String name, FuzzExpr arg) {
+            this(name, arg, null);
+        }
+
+        private Aggregate(String name, FuzzExpr arg, FuzzExpr secondArg) {
             this.name = name;
             this.arg = arg;
+            this.secondArg = secondArg;
         }
 
         static Aggregate noArg(String name) {
@@ -263,6 +281,10 @@ public final class GroupByClause {
             sink.put(name).put('(');
             if (arg != null) {
                 arg.appendSql(sink, ctx);
+            }
+            if (secondArg != null) {
+                sink.put(',');
+                secondArg.appendSql(sink, ctx);
             }
             sink.put(')');
         }

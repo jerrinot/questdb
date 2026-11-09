@@ -8,9 +8,13 @@ SSB serves the same role for joins. Faster joins, including multiway joins, rema
 a goal through reusable contracts and specialization on proven execution properties,
 validated on independent inputs beyond SSB's star schema.
 
-The module also contains standalone physical-plan and handwritten controls. Their
+The test source set contains standalone physical-plan and handwritten controls. Their
 algorithms, scheduling and result materialization can differ from integrated SQL.
 Keep those comparisons distinct.
+
+The [current architecture and correctness risks](ARCHITECTURE.md) describes the
+integrated design, ownership and state contracts, architectural weaknesses and
+proposed improvements. Earlier design documents retain their historical context.
 
 ## SQL integration
 
@@ -26,13 +30,47 @@ try (var factory = engine.select(
 }
 ```
 
-Registration is absent by default. Core exposes `QueryCodeGenerator`; it has no
+The two-argument constructor snapshots planning properties once. To supply explicit
+planning choices, pass a `CompilerOptions` record as its third argument. Deferred
+compilation and filters retain that same snapshot. Backend-lowering/diagnostic
+switches and native library loading retain process scope; defaults are unchanged.
+
+Registration is disabled by default. Core exposes `QueryCodeGenerator`; it has no
 LLVM dependency. The normal planner resolves functions and chooses factories.
 `ResolvedQueryCompiler` binds supported implementations, types and storage layouts.
 Existing metadata COUNT and vector specializations retain their planner gates.
 Eligible static-SYMBOL grouping uses bounded dictionary arrays for integer/DOUBLE
-COUNT/SUM/MIN/MAX/AVG, including vector floating-state and AVG(LONG) 128-bit sum contracts.
+COUNT/SUM/MIN/MAX/AVG and vector KSUM/NSUM, including vector floating-state and
+AVG(LONG) 128-bit sum contracts.
+BIT_AND/OR/XOR cover BYTE/SHORT/INT/LONG across shared aggregate consumers,
+including exact first-row and sentinel-collision semantics.
 Unsupported plans keep ordinary execution.
+
+For HTTP and PGWire, build the optional module and set this in `conf/server.conf`:
+
+```properties
+cairo.sql.llvm.enabled=true
+```
+
+The equivalent environment variable is `QDB_CAIRO_SQL_LLVM_ENABLED=true`. This is
+a startup setting; changing it requires a restart. The engine loads one compiler
+and supplies it to new SQL execution contexts. Existing query factories own native
+code and release it when closed or evicted from the query caches. Missing compiler
+classes or an unavailable LLVM bridge fail startup instead of silently disabling
+the requested compiler. Unsupported SQL still uses ordinary execution.
+
+From the repository root, with the [build dependencies](#build-and-test) installed:
+
+```sh
+mvn -Pquery-compiler-prototype -pl experimental/query-compiler -am \
+  -DskipTests -Djacoco.skip=true install
+experimental/query-compiler/run-server.sh -d /path/to/questdb-root
+```
+
+This launcher runs the ordinary `ServerMain` with the optional module on the
+classpath and native-access flags. It does not override `server.conf`. The normal
+distribution does not bundle LLVM or the experimental module. The existing
+`cairo.sql.jit.mode` setting continues to control ordinary filter JIT separately.
 
 | Responsibility | Code |
 | --- | --- |
@@ -63,6 +101,8 @@ conversions have separate eligibility rules; support for one does not imply all.
 
 `Prepared` owns code; `AggregateSlot` owns reusable descriptors and borrows the
 acquired slot's allocator. Optional partition/ranking kernels compile on first use.
+Execution scratch is released at cursor clear and rebound on reopen; compiled
+code remains reusable. Query-shared maps reset only after workers drain.
 Dictionary arrays own their per-slot state and publish through the query owner's
 `finishScan` hook after workers drain. They borrow the existing slot allocators and
 scratch. Array candidates defer fallback kernels until needed; cursor preparation
@@ -71,8 +111,8 @@ All worker calls must finish before the code owner closes. Native callbacks reco
 allocation/cancellation failures for Java to rethrow; Java exceptions do not
 unwind through native code.
 
-Eligible numeric aggregate subqueries can feed a second keyed COUNT/SUM/MIN/MAX
-without a Java row loop. `ResolvedMapAggregate` evaluates supported projections
+Eligible numeric aggregate subqueries can feed a second aggregation using the
+shared aggregate contracts without a Java row loop. `ResolvedMapAggregate` evaluates supported projections
 and consumes each finalized input map in its existing merge task. Slot-owned
 ordinary maps feed a generated final merge and numeric Top-K; the ordinary result
 cursor retains ownership. Filters and limits between the two aggregations remain
@@ -116,6 +156,14 @@ expressions retain ordinary filtering. Parameterized aggregate filters currently
 produce selection vectors; the experimental map-fused ABI still accepts only
 column pointers. No additional configuration is needed.
 
+Cursor-bound SYMBOL equality and small membership sets also compose inside
+aggregate arguments. Scalar, keyed, captured-input, nested-map and ASOF consumers
+reuse ordinary aggregate states; both ASOF strategies load the same cursor constants.
+Numeric and VARCHAR CASE results accept resolved integral/SYMBOL, FLOAT/DOUBLE,
+DATE, timestamp and IPv4 switches as well as searched branches. Floating switches
+use canonical IEEE keys, preserving distinct signed zeros; timestamp literals
+retain resolution conversion. Constants refresh on reopen, including dictionary resets.
+
 Eligible INT grouping expressions over one static SYMBOL also evaluate once per
 dictionary entry, using the ordinary resolved function for semantics. Generated
 scan/map loops load the result by SYMBOL ID. This supports `length` and literal
@@ -145,8 +193,12 @@ results, not general STRING-valued grouping.
 
 The binders and focused tests are authoritative. Current families include:
 
-- INT/LONG addition, subtraction and multiplication, widening casts, comparisons,
-  boolean predicates and constant membership;
+- INT/LONG addition, subtraction, multiplication, division and remainder, widening casts, comparisons,
+  including row-dependent divisors with ordinary NULL/zero handling;
+  boolean predicates and constant membership; unary minus across BYTE/SHORT/INT/
+  LONG/FLOAT/DOUBLE, preserving narrow overflow, NULLs and floating signed zero;
+  integer narrowing and FLOAT/DOUBLE casts to BYTE/SHORT/INT/LONG preserve wrapping,
+  ordinary range/null checks and rounded floating boundaries;
   resolved constant BETWEEN/NOT BETWEEN on supported integer expressions and direct
   TIMESTAMP/TIMESTAMP_NS columns, preserving reversed bounds, units and NULL semantics;
   static SYMBOL equality/inequality against literals and small IN/NOT IN sets
@@ -159,15 +211,32 @@ The binders and focused tests are authoritative. Current families include:
   starts_with overload or resolved LIKE prefix; STRING overloads remain ordinary;
   searched CASE string values.
 - Direct and computed fixed-width keys, SYMBOL IDs, VARCHAR keys and composite keys
-  using existing map encodings. DOUBLE grouping preserves raw IEEE bits, including
+  using existing map encodings. FLOAT and DOUBLE grouping preserve raw IEEE bits, including
   signed zero and NaN payloads. NULL and empty strings remain distinct. INT keys
   derived from static SYMBOL dictionaries have the eligibility rules above.
 - DOUBLE arithmetic (+, -, *, /), integer-to-DOUBLE widening, tolerance-aware
   comparisons and NULL predicates in scan/filter/aggregate expressions
-- FLOAT inputs widened into the existing DOUBLE expressions and aggregates,
-  including AVG(FLOAT) and explicit FLOAT-to-DOUBLE casts. Captured inputs retain
-  four-byte storage. FLOAT arithmetic, grouping and SUM(FLOAT) retain ordinary
-  execution; FLOAT accumulation has a separate rounding/state contract.
+- IPv4 COUNT/MIN/MAX and scalar/grouped COUNT DISTINCT retain zero as NULL and compare
+  extrema as unsigned addresses. INT casts translate sentinels; CASE and computed
+  group keys use the declared result encoding. Nested consumers, joined payloads
+  and both ASOF strategies reuse the shared operations. ASOF DISTINCT uses the existing
+  scalar owner allocator in forward and lookup regions, including fallback rows.
+- BOOLEAN columns, equality, AND/OR/NOT, predicate values and CASE/SWITCH share
+  ordinary 0/1 numeric getters and explicit casts. BOOL_AND/BOOL_OR retain their
+  BOOLEAN/LONG-count state, short-circuit updates and false empty result;
+  AVG/MIN/MAX retain DOUBLE results. Fixed/variable grouping, nested consumers,
+  dependent-join payloads and both ASOF strategies reuse the shared binding.
+  Missing physical pages retain the existing top/lazy-conversion fallback.
+- FLOAT COUNT/SUM/MIN/MAX and FLOAT-valued CASE use ordinary four-byte state and
+  rounding rules; AVG(FLOAT) keeps DOUBLE sum state. These compose across scalar,
+  keyed, captured-input, nested-map, inner-join and both ASOF aggregate paths.
+  Scalar register promotion preserves every binary32 update. Explicit FLOAT-to-
+  DOUBLE casts and DOUBLE consumers widen inputs; captured rows keep four-byte
+  storage. FLOAT arithmetic (+, -, *, /) preserves per-operation binary32 rounding;
+  numeric-to-FLOAT casts preserve ordinary NULL/range checks and direct integer
+  rounding. F32 is an explicit IR type; loads, selects and stores preserve raw
+  bits without widening. Direct, computed and composite FLOAT grouping keys,
+  including nested consumers and joined payloads, use ordinary map encodings.
 - VARCHAR code-point `length` in numeric aggregate arguments, fixed/composite
   grouping keys and residual predicates, including supported searched CASE values.
   This reuses ordinary numeric aggregates and borrowed frame descriptors. ASCII
@@ -176,8 +245,54 @@ The binders and focused tests are authoritative. Current families include:
   store the computed integer; numeric-only join/finalized-map consumers retain
   ordinary evaluation when they cannot supply a string descriptor.
 - Resolved COUNT (including static SYMBOL, DOUBLE and VARCHAR), integer/DOUBLE SUM/MIN/MAX/AVG,
-  INT/LONG/static-SYMBOL DISTINCT and VARCHAR MIN/MAX
+  INT/LONG/static-SYMBOL/IPv4 DISTINCT and VARCHAR MIN/MAX
   implementations. Supported overloads depend on the selected map/update path.
+- Scalar COUNT DISTINCT over INT/LONG/static SYMBOL/IPv4 shares existing worker
+  allocators and ordinary sets, including inline singleton values and pointer
+  adoption during merge. It composes with the other scalar aggregates and
+  expressions; memory limits, cancellation and reopening use existing query
+  ownership. The scalar path does not use the keyed deferred DISTINCT protocol.
+- FLOAT/DOUBLE remainder uses typed FREM, preserving Java zero, infinity and
+  subnormal behavior across existing expression consumers. Native implementations
+  may call libm; arithmetic admission is not a claim of vector acceleration.
+- CHAR COUNT/MIN/MAX, grouping, CASE and comparisons use unsigned 16-bit values
+  with zero NULL across scans, nested aggregation, inner joins and both ASOF
+  strategies. Numeric CHAR parsing and standalone CHAR result projection retain
+  ordinary execution.
+- Row KSUM/NSUM preserve ordinary compensated state and ordered updates across
+  BYTE through DOUBLE, scalar/keyed/nested aggregation, inner joins and ASOF.
+  NSUM finalizes sum plus correction after merge. Static-SYMBOL vector KSUM/NSUM
+  use their distinct Rosti recurrences and ordinary wrap-up, including first-state
+  adoption, infinities and missing-key-page fallback.
+- WEIGHTED_AVG uses the ordinary two-DOUBLE state with separate first/next updates.
+  Existing group insertion and scalar/join freshness flags preserve signed zero,
+  invalid first pairs and cancelling weights without extra state fields. Captured
+  batches, compact input replay, dictionary arrays and nested consumers share the
+  same contract; first partial states are adopted before subsequent merges.
+- CORR and REGR_SLOPE/REGR_INTERCEPT/REGR_R2 share ordinary six-cell bivariate
+  state across BYTE through DOUBLE, expression arguments and existing scalar,
+  keyed, nested, dependent-join and ASOF consumers. Distinct ordinary count-product
+  conversion and finalization rules are preserved; statistical freshness comes
+  from group creation, not a count-value sentinel.
+- COVAR_POP/COVAR_SAMP preserve pairwise finite-input filtering, ordinary state and
+  count conversion over BYTE through DOUBLE. Both arguments may be expressions or
+  values from different join inputs; scalar/keyed, nested-map, dependent-join and
+  both ASOF consumers reuse the same binding.
+- VAR_POP/VAR_SAMP/VARIANCE and STDDEV_POP/STDDEV_SAMP/STDDEV use the ordinary
+  Welford update and Chan merge state across BYTE/SHORT/INT/LONG/FLOAT/DOUBLE.
+  Scalar, keyed, nested-map, dependent-join and both ASOF consumers share the
+  same binding and finalize after merging. Square root is a shared IR primitive;
+  this does not add standalone SQL sqrt() expression admission.
+- DATE/TIMESTAMP/TIMESTAMP_NS COUNT/MIN/MAX preserve ordinary raw state and result
+  units through scalar, keyed, static-SYMBOL vector, nested-map, inner-join and
+  ASOF consumers. Raw-unit LONG/FLOAT/DOUBLE getters also admit numeric aggregates
+  and explicit casts, converting temporal NULL to floating NaN. Temporal getters and safe casts preserve truncation toward zero
+  and wrapping DATE multiplication. Checked microsecond-to-nanosecond conversions
+  retain ordinary execution. Direct designated-timestamp extrema retain the
+  ordinary frame-endpoint shortcut.
+- Nested generated map consumers support outer AVG over INT/LONG/SHORT/FLOAT/
+  DOUBLE values. Worker maps merge sum/count states before the existing finalizer
+  publishes results; ranking and shared cursor readers use those finalized values.
 - Anchored single-capture `regexp_replace` on the ordinary ASCII-byte function,
   composed with supported VARCHAR group keys and aggregate arguments. The admitted
   language has concatenation, ASCII classes, greedy character repeats and optional
@@ -192,14 +307,14 @@ The binders and focused tests are authoritative. Current families include:
   materialization and unsupported inputs retain their selected-row fallback.
 - INT/LONG projection, final COUNT reduction, SHORT/INT/LONG/DOUBLE full sort and
   Top-K, and positive LIMIT/OFFSET selection over supported generated results.
-  Standalone DOUBLE projection stays ordinary: the tested batch bridge adds
-  marshalling work and does not improve the complete query. DOUBLE expressions
+  Standalone FLOAT/DOUBLE projection stays ordinary: the tested batch bridge adds
+  marshalling work and does not improve the complete query. Floating expressions
   inside admitted aggregate/filter/map-consumer kernels are generated.
 - Finalized fixed-key maps feed generated outer aggregation through exact numeric
   readers and static SYMBOL IDs, including finalized DOUBLE AVG and typed projections.
   Existing worker slots execute the consumer; ordinary functions retain symbol
-  dictionary ownership. Variable source keys, intervening filters/limits and outer
-  aggregates requiring finalization retain ordinary execution.
+  dictionary ownership. Variable source keys, intervening filters/limits and allocating outer aggregates
+  retain ordinary execution. Outer AVG uses the existing finalization boundary.
 - Ordered frame-prefix admission for forward filtered scans with finite nonnegative
   LIMIT advice. Native VARCHAR selection stops each frame after K matches; the
   existing ordered collector applies the remaining global budget.
@@ -207,7 +322,8 @@ The binders and focused tests are authoritative. Current families include:
   admission, worker-result merge, survivor heap packing, compaction/final sorting
   and final LIMIT prefix selection in the existing EncodedTopKBuffer. EXPLAIN uses
   `compiledTopK`; execution counters and result checks establish actual coverage.
-- INT, full-width LONG, DATE, both timestamp units, static-SYMBOL and composite fixed-width inner-join probe pipelines
+- BOOLEAN/BYTE/SHORT/CHAR/INT/LONG/FLOAT/DOUBLE/IPv4, DATE, both timestamp units,
+  static-SYMBOL and composite fixed-width inner-join probe pipelines
   with supported COUNT and integer/DOUBLE SUM/MIN/MAX/AVG, post-join
   predicates, fixed-width grouping, single VARCHAR keys and mixed VARCHAR/composite
   grouping. They borrow the existing frozen join;
@@ -217,7 +333,10 @@ The binders and focused tests are authoritative. Current families include:
   query-memory bounds govern conversion; displaced hash storage is released. Java and
   generated probes share this lookup. Sparse/composite keys retain hashing.
   Conversion copies occupied keys and their existing compressed heads directly;
-  it does not hash each key again. Nanosecond timestamps currently retain OrderedMap.
+  it does not hash each key again. Nanosecond timestamps and the newly admitted primitive keys retain OrderedMap.
+  FLOAT/DOUBLE equality uses raw stored bits; CHAR key bytes are unsigned SQL values
+  but sign-extended consistently for membership hashing. CHAR value expressions and
+  grouping use unsigned values and zero NULL through the shared lowering.
   An already-admitted fixed-width payload copy may co-locate duplicate-row headers
   and payload, then release the old heap. Logical handles and duplicate order stay
   unchanged. Temporary query-memory headroom must cover the copy; Parquet and
@@ -231,16 +350,16 @@ The binders and focused tests are authoritative. Current families include:
   predicates compose across probe/build inputs without embedding IDs in cached code.
   Numeric searched CASE reuses resolved/casted branches through shared scalar IR,
   including nested first-match selection and typed NULLs. Only total, pure branch
-  expressions qualify. The existing aggregate type limits still apply; BYTE/SHORT
-  and FLOAT results may need widening casts for a complete aggregate combination.
-  Small integral/static-SYMBOL SWITCH expressions reuse the ordinary picker's
+  expressions qualify. Aggregate arguments use their resolved typed getter contracts.
+  Small numeric/static-SYMBOL/temporal SWITCH expressions reuse the ordinary picker's
   resolved branches, including missing symbols and cursor reinitialization. Up to
   16 branches lower to shared conditional IR; larger switches retain ordinary
-  lookup. Floating-point and temporal SWITCH selectors remain outside this binding.
+  lookup. Floating selectors use canonical bit keys; temporal literals preserve
+  their declared resolution, and CHAR/IPv4 retain their typed NULL encodings.
   Constant temporal BETWEEN ranges use the same DATE conversion and timestamp-unit
   rules as the resolved ordinary function, including wrapped DATE conversions.
-  Cursor-bound SYMBOL conditions are wired into joins and filters; single-table
-  aggregate argument bindings still lack these parameter cells.
+  Cursor-bound SYMBOL conditions also compose inside single-table aggregate
+  arguments, including captured-input replay and nested-map consumers.
   VARCHAR values from either side use the shared frame expression binding and decoder;
   COUNT(VARCHAR), code-point LENGTH and supported searched CASE compose with the same
   numeric aggregate updates. Group keys use the existing UnorderedVarcharMap or
@@ -260,8 +379,12 @@ The binders and focused tests are authoritative. Current families include:
   Large compact copies share the existing Linux advisory huge-page hint with
   UnorderedVarcharMap. Allocation accounting stays unchanged; kernel policy decides
   whether to use large pages. Other platforms keep their ordinary allocation.
-  Outer joins and general join-to-DISTINCT
-  remain outside this binding.
+  DISTINCT over INT/LONG/static SYMBOL/IPv4 shares the ordinary slot allocators
+  across generated and fallback updates. DISTINCT cardinality drives the existing
+  sharding policy even when there are few groups; ordinary merge retains source
+  allocators until pointer adoption and output complete. This also admits these
+  aggregates to ordinary fused joins. Generated outer joins and allocating VARCHAR
+  DISTINCT remain outside this binding.
 - The join kernel accepts independent typed builds and dependent inner-join chains
   and branches. Keys can read the scan or earlier joined payloads, including composite
   keys from multiple inputs. Dependent lookups execute inside their producer's duplicate
@@ -273,7 +396,7 @@ The binders and focused tests are authoritative. Current families include:
   This is a storage-risk guard, not a full cost model. Reorientation retains every equality, including
   cyclic constraints, while input compilation keeps its original bind-inference order.
   Base row counts bound build sizes; they do not estimate filtered cost or fanout.
-  Build-only child membership can be transferred to INT/LONG/SYMBOL and composite
+  Build-only child membership can be transferred to the same primitive and composite
   producer keys before scanning, using existing probes and dictionary views. Compact keys use
   a bitmap; sparse keys use QuestDB's split-block Bloom layout. Exact joins retain
   duplicate multiplicity. Preparation requires known amortizable probe work and
@@ -375,7 +498,7 @@ The binders and focused tests are authoritative. Current families include:
   These are partial generated pipelines. The ordinary filter-only path still lacks
   the fused path's adaptive bypass for filters that reject few rows.
   The typed dependency extension has correctness validation; controlled performance
-  measurements remain pending. See [the implementation plan](DEPENDENT_JOIN_FILTER_PLAN.md).
+  measurements remain pending. See [the implementation plan](archive/DEPENDENT_JOIN_FILTER_PLAN.md).
 
 Integer MIN/MAX accepts LONG, INT and SHORT inputs and preserves the ordinary
 8-byte LONG or 4-byte INT state. Generated ordering normalizes SHORT/INT/LONG/DOUBLE results into signed 64-bit
@@ -469,6 +592,12 @@ for AsmJit/C. They do not select LLVM's optimization pipeline. Library paths can
 be overridden with `questdb.codegen.asmjit.library` and
 `questdb.codegen.llvm.library`.
 
+With the existing `query.codegen.profile` control, the resolved SQL runner also
+reports `adaptive-plain-batches` and `adaptive-staged-batches`. These count actual
+choices at admitted adaptive map invocations, including exploration, and are read
+after workers drain. Learning remains per compiled kernel and worker thread across
+cursor executions; the counters do not imply that the winner was reset.
+
 ## Build and test
 
 Requires JDK 25, Maven, CMake 3.22+, a C++17 compiler, `cc`, LLVM 21.1 development
@@ -496,6 +625,54 @@ mvn -Pquery-compiler-prototype -pl experimental/query-compiler -am \
 
 ## Runners and controls
 
+Standalone runners live in `src/test/java`; build through `test-compile` (or `test`)
+before using them. The `run-*.sh` launchers include `target/test-classes`. Production
+SQL integration uses `target/classes` without the harnesses.
+
+`bench/run.py` retains the dependent-join/RTABench query harness in source control.
+It selects permitted physical cores, records binary hashes and host/resource
+metadata, consumes the complete result, and profiles the configured measured
+executions. Use `--warmups 0` to include first use in perf; the summary median
+describes that configured slice, not proof of steady state. JVM/engine startup
+and generator registration precede the query timers; SQL compilation is separate
+and lazy native compilation is inside
+execution. It does not drop caches. For example:
+
+```sh
+python3 experimental/query-compiler/bench/run.py llvm \
+  --db /path/to/database-root --query /path/to/query.sql --out /path/to/new-output
+```
+
+Use `java` for the current core without the generator; `stock` requires an explicit
+`--core /path/to/stock.jar`. `--core`, `--compiler` and `--native` also select frozen
+builds. Default runs are ten initial executions and five measured executions on
+eight physical cores; `--cpus` specifies an explicit allowed CPU list. All results
+still need comparison with an independent oracle or ordinary SQL. `load` executes
+a fixture SQL file only into a new database root. `bench/fixtures` contains the
+compact 500M-row join control and its independent arithmetic oracle; the same
+fixture is used on hosts with different memory capacities.
+
+Compile `bench/fixtures/oracle.cpp` with `c++ -O3` and save its stdout. After a
+fixture run, `bench/validate.py OUTPUT ORACLE` checks every response, including
+warmups, and retains one response plus hashes of the others. An optional third
+argument selects the equivalent `high`, `small` or `all` result shape for typed
+versions of the fixture. The oracle's `--hot 10` and `--hot 1000` modes describe
+the corresponding 90% and 99.9% hot-key data distributions, not the default loader.
+
+The harness-only `--java-join` preserves an admitted parallel plan but declines
+native join updates and skips their unused preparation. `--no-group-cache` and
+`--lookahead` isolate existing generated mechanisms. These are diagnostic
+counterfactuals, not user-facing engine settings. Forcing lookahead retains group
+prefetch admission and selects the first available matching variant; it does not
+force every policy onto group prefetch. The Java-join control can still execute
+generated filters. Native row counters and chooser
+telemetry accompany the plans. Destination-cache admission is captured after
+preparation, before cursor cleanup frees it. Neither a plan label nor a native
+call alone proves that a query was generated. Counter collection follows the base-factory chain and
+is not an exhaustive audit of branched plans. The harness inspects current private chooser fields
+and intentionally fails if their contract changes.
+
+
 The ASOF experiment runs inside the ordinary adaptive join. Its filtered forward
 and ordinary lookup regions can consume bounded master spans and update the
 existing unkeyed aggregate state through LLVM. Lookup fuses timestamp positioning,
@@ -503,8 +680,8 @@ descending predicate/key search and aggregate updates across multiple probes,
 within the current master/RHS frames and the owner's 64-probe observation window.
 Frame crossing, indexed/memoized lookup and strategy transitions stay with Java;
 an unfinished native probe has no aggregate effect and resumes there. Both regions
-reuse the existing scalar aggregate lowering, including SUM/MIN/MAX/COUNT/AVG with
-supported INT/LONG/DOUBLE inputs, rather than a separate aggregate implementation.
+reuse the shared aggregate lowering described above, including supported numeric,
+statistical, compensated and DISTINCT families and their typed getter contracts.
 
 A single same-type INT/LONG/SYMBOL key admits these regions. Without a supported
 aggregate consumer, generated descending lookup still runs after the first Java
@@ -535,7 +712,7 @@ Use `stock` instead of `llvm` for the baseline. `long`/`symbol`, `arith256` and
 `arith_all` vary key representation and selectivity; no compiler admission depends
 on these workload names. The runner checks the complete aggregate result, includes
 cursor open/close in elapsed time, and reports compilation, CPU time, I/O and faults.
-See [ASOF_SELECTION_PLAN.md](ASOF_SELECTION_PLAN.md) for ownership and remaining
+See [ASOF_SELECTION_PLAN.md](archive/ASOF_SELECTION_PLAN.md) for ownership and remaining
 admission boundaries, and [PROGRESS.md](PROGRESS.md) for measured evidence.
 
 Run existing Griffin tests against stock execution or LLVM after building the core
@@ -547,7 +724,7 @@ mvn -Pquery-compiler-prototype -pl experimental/query-compiler -am \
 JAVA_TOOL_OPTIONS='-Dfuzz.s0=1 -Dfuzz.s1=2' \
   experimental/query-compiler/run-griffin-tests.sh llvm \
   'io.questdb.test.cairo.fuzz.ParallelGroupByFuzzTest#testParallelKSumMergeFuzz'
-JAVA_TOOL_OPTIONS='-Dfuzz.s0=123456789 -Dfuzz.s1=987654321 -Dquestdb.fuzz.queries=1000' \
+JAVA_TOOL_OPTIONS='-Dfuzz.s0=314159265 -Dfuzz.s1=271828182 -Dquestdb.fuzz.queries=5000' \
   experimental/query-compiler/run-griffin-tests.sh llvm \
   'io.questdb.test.griffin.fuzz.QueryFuzzTest#testQueryFuzz'
 ```
@@ -569,7 +746,9 @@ zero; direct Java aggregate/map unit tests remain Java tests.
 When the query fuzzer has a compiler installed, it also runs an explicit stock arm
 with that hook unset, at the same filter-JIT mode. It retains the existing result,
 exception, floating comparison and cursor checks. Existing JIT/storage/bind/fused
-axes and fault injection remain enabled. The compiler axis reports successful
+axes and fault injection remain enabled. Aggregate generation includes compensated
+sums, moments, paired statistics, weighted averages and Boolean reductions.
+The compiler axis reports successful
 comparisons that actually invoked native code and fails on zero coverage. Exact
 plan assertions in other suites are retained; a changed plan is a failure to review,
 not a reason to discard result or lifecycle assertions.
@@ -606,11 +785,11 @@ compiled through LLVM. These references support restricted fixture shapes:
 
 - [HandwrittenCountSum](src/main/java/org/questdb/experimental/codegen/HandwrittenCountSum.java)
   retains the integrated slot/runtime boundary and rejects incompatible bindings.
-- [CountSumPaths](src/main/java/org/questdb/experimental/codegen/CountSumPaths.java)
+- [CountSumPaths](src/test/java/org/questdb/experimental/codegen/CountSumPaths.java)
   compares Rosti-based hashing with range discovery plus direct-array aggregation.
   Its native threads/allocations lack engine cancellation and query memory tracking;
   discovery is included in execution time. It is not an SQL backend.
-- [DuckDbComparison](src/main/java/org/questdb/experimental/codegen/DuckDbComparison.java)
+- [DuckDbComparison](src/test/java/org/questdb/experimental/codegen/DuckDbComparison.java)
   uses a separately supplied DuckDB JDBC JAR, reports its version/settings and
   validates results against QuestDB. Add the JAR to `QUERY_CODEGEN_CORE_CLASSPATH`.
 
@@ -643,8 +822,10 @@ Run them individually and inspect each runner's arguments before using existing
 data. Keep only meaningful findings in [PROGRESS.md](PROGRESS.md); detailed prior
 entries remain in Git history, without a separate result archive.
 
-[FOUNDATIONS_PLAN.md](FOUNDATIONS_PLAN.md#immediate-sequence-maintainability) holds
-current work and refactoring guardrails. [TODO.md](TODO.md) holds deferred problems.
-[AGGREGATE_DESIGN.md](AGGREGATE_DESIGN.md) and [PIPELINE_DESIGN.md](PIPELINE_DESIGN.md)
+[ARCHITECTURE.md](ARCHITECTURE.md#recommended-architectural-sequence) holds the current
+refactoring decisions and guardrails. [TODO.md](TODO.md) holds open problems.
+[FOUNDATIONS_PLAN.md](archive/FOUNDATIONS_PLAN.md#immediate-sequence-maintainability)
+retains the earlier implementation sequence.
+[AGGREGATE_DESIGN.md](archive/AGGREGATE_DESIGN.md) and [PIPELINE_DESIGN.md](archive/PIPELINE_DESIGN.md)
 record design proposals, contracts and experiments; proposals are not implemented
 features. The shared aggregate-definition generator remains outside cleanup.

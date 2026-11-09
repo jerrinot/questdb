@@ -51,7 +51,7 @@ public class CastTimestampToLongFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0));
     }
 
-    private static class Func extends AbstractCastToLongFunction implements MonotonicTimestampFunction {
+    public static class Func extends AbstractCastToLongFunction implements MonotonicTimestampFunction {
         public Func(Function arg) {
             super(arg);
         }

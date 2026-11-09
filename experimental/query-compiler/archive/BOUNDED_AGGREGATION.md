@@ -1,5 +1,8 @@
 # Bounded local aggregation experiment
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 The measured large VARCHAR grouping case moves about 49 GB/query and reaches the
 same ~63 GB/s controller ceiling as STREAM. Generated code removes instructions,
 but unbounded worker shard maps still create large random working sets. The experiment changes that data flow. The default admits nonallocating fixed-width

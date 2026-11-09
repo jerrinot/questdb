@@ -1,5 +1,8 @@
 # Compiler experiment plan: own the parallel program
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 Active sequence as of 2026-11-02: [whole-query experiments and goals](WHOLE_QUERY_PLAN.md).
 The dated sequence below remains historical evidence and design context.
 
@@ -11,7 +14,7 @@ original dates; current work is tracked in TODO.md and PROGRESS.md.
 Updated 2026-10-28 against committed checkpoint `9df4de643d`. The immediate work
 is the maintainability sequence below, before further operator expansion. E0 has
 500M-row measurements, and E1's first adaptive partial-record representation and
-E3's first bounded filter stage are implemented; see [PROGRESS.md](PROGRESS.md).
+E3's first bounded filter stage are implemented; see [PROGRESS.md](../PROGRESS.md).
 Older timings below still require a fresh matched control before another
 optimization claim. Research and its limitations are in
 [PIPELINE_DESIGN.md](PIPELINE_DESIGN.md#literature-reassessment-2026-10-27).
@@ -92,7 +95,7 @@ and interrupted timing runs are excluded. Before making a broader claim, resume
 controlled final-build measurements, including cross-cache placement, skew and
 other architectures. The checkpoint is committed; the following maintainability
 work is planned and does not resume performance experiments or profiling.
-See [PROGRESS.md](PROGRESS.md).
+See [PROGRESS.md](../PROGRESS.md).
 
 ## Immediate sequence: maintainability
 
@@ -212,9 +215,9 @@ This removes unnecessary compiler allocations without a measured timing claim.
 
 ## Minimum compiler contract, introduced by experiments
 
-Extend existing [PlanCompiler](src/main/java/org/questdb/experimental/codegen/PlanCompiler.java)
-and [ScanPlan](src/main/java/org/questdb/experimental/codegen/ScanPlan.java) concepts
-through the integrated [ResolvedQueryCompiler](src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java)
+Extend existing [PlanCompiler](../src/test/java/org/questdb/experimental/codegen/PlanCompiler.java)
+and [ScanPlan](../src/main/java/org/questdb/experimental/codegen/ScanPlan.java) concepts
+through the integrated [ResolvedQueryCompiler](../src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java)
 hooks. The standalone phase planner already exists; a second executor or a wholesale
 MLIR migration is not a prerequisite. Add only facts used by the active experiment:
 
@@ -257,14 +260,14 @@ cardinality to the implementation. Consume every result. Use a tiny-domain contr
 only after the principal case is understood.
 
 Compare clean stock, same-checkout Java, current LLVM and the independent
-[HandwrittenCountSum](src/main/java/org/questdb/experimental/codegen/HandwrittenCountSum.java)
+[HandwrittenCountSum](../src/main/java/org/questdb/experimental/codegen/HandwrittenCountSum.java)
 loop through the same integrated execution boundary where supported. Verify that
 map type, growth policy, batching, null semantics and worker placement match;
 otherwise report a phase comparison, not a compiler-quality ratio. Reuse
-[ResolvedBatchMatrix](src/main/java/org/questdb/experimental/codegen/ResolvedBatchMatrix.java)
+[ResolvedBatchMatrix](../src/test/java/org/questdb/experimental/codegen/ResolvedBatchMatrix.java)
 and its profile handshake.
 
-The existing [CountSumPaths](src/main/java/org/questdb/experimental/codegen/CountSumPaths.java)
+The existing [CountSumPaths](../src/test/java/org/questdb/experimental/codegen/CountSumPaths.java)
 Rosti/direct-array reference is a second, algorithm-level control. It has a separate
 native scheduler and restricted input support. Its timing cannot establish an
 integrated engine win. Include discovery, initialization and output in its own
@@ -305,7 +308,7 @@ Fresh 500M-row comparisons: dispersed 2.553 -> 1.752s; alternating low/high doma
 1.675 -> 1.319s; tiny-domain reversed-order medians 0.480 / 0.479s. All results
 match clean-stock oracles. Fourteen focused checks cover multiple key widths,
 selective filters, mixed formats, misleading prefixes, cancellation, reuse and
-both worker modes across the three backends. Details are in [PROGRESS.md](PROGRESS.md).
+both worker modes across the three backends. Details are in [PROGRESS.md](../PROGRESS.md).
 
 The automatic policy is now part of the experimental compiler for eligible
 bounded fixed-width aggregates. Narrow COUNT/SUM controls also pass: with the
@@ -329,12 +332,12 @@ Start with fixed-width COUNT/SUM and unchanged ownership/scheduling. First compa
 current LLVM with matched handwritten code on the existing map. Then prototype a
 compiler-owned layout with the same hash/probe algorithm and load policy. Only
 then compare a tagged/control-byte probe algorithm, using the existing
-[Rosti primitives](../../core/src/main/c/share/rosti.h) as the semantic/algorithm
+[Rosti primitives](../../../core/src/main/c/share/rosti.h) as the semantic/algorithm
 reference. Keeping these steps separate distinguishes layout gains from SIMD/probe
 gains. Key width, null representation and aggregate fields specialize the layout;
 SQL text, known fixture ranges and query numbers never do.
 
-[AggregateUpdates](src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java)
+[AggregateUpdates](../src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java)
 currently binds concrete map offsets. Separate its logical field requirements from
 field placement for this slice. Allocation, memory limits and cancellation stay
 with existing owners. A generated final reader must expose the same SQL values.
@@ -371,11 +374,11 @@ sequential alternatives, not a combined rewrite:
 1. **Partition-resident entries with a bounded lookup directory.** Allocate new
    partial states directly in the existing partition pages, so directory reset
    does not copy every state out of a local map. This changes the copy boundary in
-   [QuestPartitions](src/main/java/org/questdb/experimental/codegen/QuestPartitions.java).
+   [QuestPartitions](../src/main/java/org/questdb/experimental/codegen/QuestPartitions.java).
    Preserve local combining; measure duplicate partial groups and final merge.
    A bounded directory does not bound all pages or prevent O(input rows) state.
 2. **Shared group identification with local combining.** Generalize the existing
-   [SharedVarcharMaps](src/main/java/org/questdb/experimental/codegen/SharedVarcharMaps.java)
+   [SharedVarcharMaps](../src/main/java/org/questdb/experimental/codegen/SharedVarcharMaps.java)
    / QuestSharedVarchar experiment to fixed-width COUNT/SUM, only after matching its
    narrow COUNT control. Compare ticket assignment separately from counter storage
    and combining. Reuse worker slots, shards and allocators; include dynamic growth.
@@ -422,9 +425,9 @@ from 1.22–1.25s to 1.09–1.11s, with lower directory-load latency and cycles 
 more instructions. The 500M-row single-key control is neutral; twelve focused
 checks pass. This extends the access-schedule experiment to a pipeline breaker,
 without new ownership, map algorithms or tuning switches. See the measured scope
-and rejected first-row initialization experiment in [PROGRESS.md](PROGRESS.md).
+and rejected first-row initialization experiment in [PROGRESS.md](../PROGRESS.md).
 
-Use the retained [FilterFusionExperiment](src/main/java/org/questdb/experimental/codegen/FilterFusionExperiment.java)
+Use the retained [FilterFusionExperiment](../src/test/java/org/questdb/experimental/codegen/FilterFusionExperiment.java)
 as the starting point. Hold the state implementation fixed. Compare whole-frame
 selection, existing fused masks and bounded staged selection. Then, separately,
 issue aggregate-input loads/prefetches during the existing key-preparation stage
@@ -564,7 +567,7 @@ must pass before expanding coverage claims; see PROGRESS.md.
 compatible consumers than by making each independent operator slightly faster.
 
 Begin with an actual grouped-DISTINCT family already supported by
-[DeferredDistinct](src/main/java/org/questdb/experimental/codegen/DeferredDistinct.java)
+[DeferredDistinct](../src/main/java/org/questdb/experimental/codegen/DeferredDistinct.java)
 and AggregateUpdates. Audit what expression/hash/state sharing already happens.
 Then prototype one compatible partition/dedup stream shared by outer grouping and
 distinct-state processing, or by multiple DISTINCT consumers with proven identical
@@ -648,8 +651,8 @@ new user setting until an experiment demonstrates the need.
 Extend the measured compilation stages to further families: binding/IR, SSA, text emission/copy,
 parse/verify, optimization, code emission/linking, and mutex wait. Record both CPU
 and elapsed time, instruction/block counts and emitted bytes. Current
-[AdaptiveKernel](src/main/java/org/questdb/experimental/codegen/AdaptiveKernel.java)
-compiles alternatives eagerly; [KernelCache](src/main/java/org/questdb/experimental/codegen/KernelCache.java)
+[AdaptiveKernel](../src/main/java/org/questdb/experimental/codegen/AdaptiveKernel.java)
+compiles alternatives eagerly; [KernelCache](../src/test/java/org/questdb/experimental/codegen/KernelCache.java)
 is explicitly serial-use. They are not an existing concurrent tiering system.
 
 Run the same IR/state through AsmJit-only, LLVM-only and AsmJit→LLVM at safe joined
@@ -865,7 +868,7 @@ headroom, stop polishing it and move to the next bet. Implement the minimum
 integration needed to find out; delete failed experimental code when its finding
 has been recorded.
 
-Keep a short breakthrough/rejection entry in [PROGRESS.md](PROGRESS.md) and update
+Keep a short breakthrough/rejection entry in [PROGRESS.md](../PROGRESS.md) and update
 this plan's next action. Temporary profiles, object files and raw counters remain
 outside the checkout, with reproduction commands and an evidence path in the log.
 No new result archive, generic experiment platform or permanent tuning surface.

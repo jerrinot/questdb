@@ -186,13 +186,13 @@ public class RepeatedAggregateTest {
                         else function.computeNext(source, sample, i);
                     }
                     function.merge(expected, source);
-                    code.merge(source, actual);
+                    code.merge(source, actual, null, io.questdb.cairo.sql.SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER);
                     assertEquals(Double.doubleToLongBits(expected.getDouble(0)), Double.doubleToLongBits(actual.getDouble(0)));
                     assertEquals(Double.doubleToLongBits(expected.getDouble(1)), Double.doubleToLongBits(actual.getDouble(1)));
                     assertEquals(expected.getLong(2), actual.getLong(2));
                     copied.putDouble(1, 99.0);
                     copied.setNew(true);
-                    code.merge(source, copied);
+                    code.merge(source, copied, null, io.questdb.cairo.sql.SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER);
                     for (int i = 0; i < 3; i++) assertEquals(source.getLong(i), copied.getLong(i));
                 }
             }

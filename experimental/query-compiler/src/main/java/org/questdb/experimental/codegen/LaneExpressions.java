@@ -38,6 +38,9 @@ final class LaneExpressions {
             case Binary b -> { verify(b.left()); verify(b.right()); }
             case Select s -> { verify(s.condition()); verify(s.yes()); verify(s.no()); }
             case ToDouble c -> verify(c.value());
+            case ToInteger c -> verify(c.value());
+            case ToFloat c -> verify(c.value());
+            case Sqrt c -> verify(c.value());
             case BitCast c -> verify(c.value());
             case Load l -> {
                 if (l.width() == MemoryType.ADDRESS) reject();
@@ -66,7 +69,10 @@ final class LaneExpressions {
             case Binary b -> new Binary(b.op(), mapLoads(b.left(), mapper), mapLoads(b.right(), mapper));
             case Select s -> new Select(mapLoads(s.condition(), mapper), mapLoads(s.yes(), mapper), mapLoads(s.no(), mapper));
             case ToDouble c -> new ToDouble(mapLoads(c.value(), mapper));
-            case BitCast c -> new BitCast(mapLoads(c.value(), mapper));
+            case ToInteger c -> new ToInteger(mapLoads(c.value(), mapper), c.bits());
+            case ToFloat c -> new ToFloat(mapLoads(c.value(), mapper));
+            case Sqrt c -> new Sqrt(mapLoads(c.value(), mapper));
+            case BitCast c -> new BitCast(mapLoads(c.value(), mapper), c.type());
             case Var v -> v;
             case Literal l -> l;
             default -> throw new IllegalArgumentException("Not a lane expression: " + e);

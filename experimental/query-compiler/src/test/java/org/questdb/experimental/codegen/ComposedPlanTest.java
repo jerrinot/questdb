@@ -64,6 +64,9 @@ public class ComposedPlanTest {
         var filter=new PhysicalPlan.Filter(scan("l"),new SqlCompare(Ir.Op.GE,value,new Constant(0)));
         var project=new PhysicalPlan.Project(filter,List.of(new Add(value,new Constant(5)),key),List.of("amount","key"));
         assertMatches(project,"select v+5,k from l where v>=0",1);
+        var negated = new PhysicalPlan.Project(filter.input(), List.of(new Negate(value, ColumnType.LONG),
+                new Negate(key, ColumnType.INT)), List.of("amount", "key"));
+        assertMatches(negated, "select -v,-k from l", 1);
         assertMatches(new PhysicalPlan.Filter(project,new SqlCompare(Ir.Op.LT,project.columns().getFirst(),new Constant(0))),
                 "select v+5,k from l where v>=0 and v+5<0",1);
     }

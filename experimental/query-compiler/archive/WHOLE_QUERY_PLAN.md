@@ -1,5 +1,8 @@
 # Whole-query compiler experiments
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 2026-11-05. Active targets and experiments; the measured checkpoint is below.
 This sequence supersedes the remaining local-loop sequence in TODO.md and the dated
 execution order in FOUNDATIONS_PLAN.md. Retain their evidence and semantic contracts.
@@ -55,7 +58,7 @@ SYMBOL, mixed COUNT/SUM/MIN/MAX/AVG, grouping and observed duplicates. Sparse/co
 keys retain hashing. One/sixteen-core controls test different worker/cache placements;
 they do not establish a second-machine result. Temporary copies must fit the query
 budget, displaced storage is released, and Parquet retains the existing layout.
-See the November 6 entry in [PROGRESS.md](PROGRESS.md) for current numbers and limits.
+See the November 6 entry in [PROGRESS.md](../PROGRESS.md) for current numbers and limits.
 No ClickBench/SSB score or strict generated-operator coverage was refreshed.
 
 The strongest remaining external-control gap is the random composite-key root join.
@@ -82,8 +85,8 @@ whole-query gain. A correlated control regressed **52.0 -> 93.5ms**: 99.8% of bu
 keys survived, but none of the actual probe keys did. Generated objects were identical;
 instructions/input rose **17.6 -> 53.6**, with nearly unchanged controller traffic.
 This is a failed preparation policy, not a new optimizer or a refreshed benchmark score.
-See the November 5 entry in [PROGRESS.md](PROGRESS.md) and the current experiment's
-[measurements](target/preparation-choice/analysis.json).
+See the November 5 entry in [PROGRESS.md](../PROGRESS.md) and the current experiment's
+[measurements](../target/preparation-choice/analysis.json).
 
 Conditional probe sampling was subsequently prototyped at the pinned-frame boundary.
 It correctly distinguishes the correlated cases across typed keys and mixed aggregates.
@@ -114,7 +117,7 @@ on actual overlap; this is not a blanket padding gain. Before adding a coupled c
 test reuse of existing scalar-state promotion for eligible join reductions, preserving
 mixed aggregates, duplicate traversal and cancellation. Inspect actual stores and price
 register pressure; grouped or allocating states are outside that initial experiment.
-See [the control measurements](target/scalar-state-control/analysis.json).
+See [the control measurements](../target/scalar-state-control/analysis.json).
 
 Wall/thread CPU traces confirm preemption affects observations, but a join-only CPU-clock
 trial did not improve execution repeatably. Other `runBatch` callers include parallel
@@ -132,9 +135,9 @@ Require the combined decision to beat the current chooser and fixed alternatives
 sampling/preparation/compilation costs, including small builds, rare rejection, clustered
 inputs, duplicate fan-out, typed keys and worker-count changes. Samples guide optional
 work; they never establish SQL truth. Do not add a statistics framework on these results.
-See the conditional-sampling and state-isolation entries in [PROGRESS.md](PROGRESS.md),
-[sampling measurements](target/preparation-choice/probe-analysis.json), and
-[chooser audit](target/preparation-choice/choice-analysis.json).
+See the conditional-sampling and state-isolation entries in [PROGRESS.md](../PROGRESS.md),
+[sampling measurements](../target/preparation-choice/probe-analysis.json), and
+[chooser audit](../target/preparation-choice/choice-analysis.json).
 
 Latest SSB control, 2026-11-03: installed LLVM sums **2.690s** against freshly rerun
 uncompressed DuckDB **2.252s** across all 13 queries, 600M rows/eight physical cores,
@@ -145,7 +148,7 @@ checks pass. Largest absolute gaps: Q4.1, Q2.1, Q3.4. Q4.1 spends ~437ms in prob
 aggregation, ~7ms building and <1ms merging. All SSB queries use SUM, so the recent
 COUNT-forest folding does not apply. Strict full generation remains **0/13**.
 Stock was not rerun; the historical checkpoints below retain their original scope.
-See [current SSB comparison](target/ssb-current.md).
+See [current SSB comparison](../target/ssb-current.md).
 
 Execution checkpoint, 2026-11-02: **W0 complete; first W1 predicate boundary closed.**
 Fresh four-way SSB sums: 240.925s stock, 197.933s current LLVM-off, 4.829s frozen LLVM
@@ -162,7 +165,7 @@ coverage remains 34 full / 4 partial / 5 ordinary. Five original 500M-row H2O co
 also pass complete output validation. Q1.2 gains track instructions **51.2 -> 6.4**
 and branch misses **0.97 -> 0.13** per input row with nearly unchanged memory traffic.
 LLVM compile cost grows about 31ms; first-request latency still improves.
-See [whole-workload evidence and limits](target/whole-query.md).
+See [whole-workload evidence and limits](../target/whole-query.md).
 
 Initial W2 experiment: **static shared bitmap policy rejected**. Pooling distinct-key
 storage and guarding construction with known probe counts improves the all-13 SSB sum
@@ -171,14 +174,14 @@ storage and guarding construction with known probe counts improves the all-13 SS
 construction regression, but application cost still depends on execution resources.
 The existing chooser loses its old membership option when that representation changes.
 No production source or bytecode was changed; these gains do not advance retained goals.
-See [runtime-filter evidence](target/runtime-filter-economics.md).
+See [runtime-filter evidence](../target/runtime-filter-economics.md).
 
 Retained W2 successor: **preserve both membership representations** in the existing
 frame chooser, sharing its two compiled loops. The full B1/current pair improves
 **3.327 -> 2.867s**, geomean **1.154x**, and Q3.4 returns to baseline. Two balanced
 500M-row control passes show selective gains without repeatable regressions above the
 retention threshold. Installed classes pass 52 focused checks. No additional operator
-coverage or new policy constants. See [representation-choice evidence](target/runtime-filter-choice.md).
+coverage or new policy constants. See [representation-choice evidence](../target/runtime-filter-choice.md).
 
 Fresh cumulative cycle score: **4.764 -> 2.823s**, geomean **1.640x** over frozen B0,
 with **six/13** queries above 1.5x. Strict generation remains **0/13**. The former
@@ -201,8 +204,8 @@ repeated failed lookups; bounded exact dependency links now share successful loo
 results too. All-match INT/LONG/SYMBOL gain another 1.49/1.73/1.59x, including
 preparation, with mixed LONG+SYMBOL composite controls gaining 1.46-1.57x.
 No-match input still pays ~1.8ms of unnecessary preparation (+2% across six pairs).
-See [membership transfer](target/join-dependency-filter.md) for the previous
-all-match variance and [cached dependency evidence](target/join-dependency-links.md)
+See [membership transfer](../target/join-dependency-filter.md) for the previous
+all-match variance and [cached dependency evidence](../target/join-dependency-links.md)
 for that checkpoint. COUNT now folds unobserved duplicate leaves using the existing
 chain-count algorithm without destroying ordinary links. Two-leaf typed branches
 gain 1.64-2.11x; three-leaf controls gain 2.91-3.52x, with grouped COUNT gaining 1.70x.
@@ -210,23 +213,23 @@ The next slice folds closed COUNT forests, including producer duplicates, throug
 cached heads and the existing heap recurrence. Typed branches gain another 2.76-2.99x;
 a deeper mixed-type forest gains 3.83x. Observed build values and mixed-source keys
 retain ordinary processing. Compilation and no-match first requests still have costs.
-See [leaf evidence](target/join-multiplicities.md) and [subtree evidence](target/join-subtrees.md).
+See [leaf evidence](../target/join-multiplicities.md) and [subtree evidence](../target/join-subtrees.md).
 Query-tracker peaks omit filter row-ID lists; complete memory accounting is open.
 
 Checked against the checkout, not inferred from historical feature lists:
 
 | Fact | Consequence / existing code to extend |
 | --- | --- |
-| The integrated compiler enters through separate core hooks. Standalone dependency and scan planning already exists. | Extend [QueryCodeGenerator](../../core/src/main/java/io/questdb/griffin/engine/QueryCodeGenerator.java), [ResolvedQueryCompiler](src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java), existing candidate/metadata and ScanPlan as needed. Do not build another SQL resolver or executor. |
-| `analyseMultiway` accepts typed/composite independent joins and dependent inner joins in the existing optimizer order. | [HashJoinGroupByCandidate](../../core/src/main/java/io/questdb/griffin/HashJoinGroupByCandidate.java) retains source identity and later key dependencies before pruning payloads. This does not introduce a new join-order optimizer. |
-| Compiled key indexes address the scan followed by earlier build payloads; typed lookup borrows existing tables/map views. | [CompiledJoin](../../core/src/main/java/io/questdb/griffin/engine/join/CompiledJoin.java) and [ResolvedJoinKernel](src/main/java/org/questdb/experimental/codegen/ResolvedJoinKernel.java) lower dependent probes inside producer duplicate loops. LONG remains full-width; SYMBOL retains its source dictionary. |
-| Generated joins now reuse ordinary SYMBOL translation and staged-key storage. | Reuse [SymbolKeyTranslator](../../core/src/main/java/io/questdb/griffin/engine/join/SymbolKeyTranslator.java), [MapHashJoinBuild](../../core/src/main/java/io/questdb/griffin/engine/join/MapHashJoinBuild.java) and HashJoinBuildContext. SYMBOL IDs from different dictionaries are not directly comparable. |
-| Builds expose exact row/key counts and size after freeze; INT bounds are published, wider bounds can be obtained by a bounded key scan. | [FrozenHashJoinBuild](../../core/src/main/java/io/questdb/griffin/engine/join/FrozenHashJoinBuild.java) supplies execution facts. They cannot retrospectively justify an earlier build-orientation decision. |
-| Single-join interval orientation already has an execution-time choice; its counts ignore residual row filters. | Extend or reuse [HashJoinGroupByBuildChoiceRecordCursorFactory](../../core/src/main/java/io/questdb/griffin/engine/table/HashJoinGroupByBuildChoiceRecordCursorFactory.java). Unknown is not zero; interval counts are upper bounds after filtering. |
-| Join atoms own existing build/probe/merge phases and phase timers. | [AsyncHashJoinGroupByAtom](../../core/src/main/java/io/questdb/griffin/engine/table/AsyncHashJoinGroupByAtom.java) is the existing owner/barrier, not grounds for a new scheduler. Its CompiledJoin updater does not expose the aggregate compiler's generated merge/ranking interface. |
-| Finalized-map aggregation, generated aggregate merge and numeric ranking already exist. | Reuse [ResolvedMapAggregate](src/main/java/org/questdb/experimental/codegen/ResolvedMapAggregate.java), [AggregateUpdates](src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java), GroupByKernel and ResolvedAggregateKernel. Their state/read contracts constrain reuse after joins. |
+| The integrated compiler enters through separate core hooks. Standalone dependency and scan planning already exists. | Extend [QueryCodeGenerator](../../../core/src/main/java/io/questdb/griffin/engine/QueryCodeGenerator.java), [ResolvedQueryCompiler](../src/main/java/org/questdb/experimental/codegen/ResolvedQueryCompiler.java), existing candidate/metadata and ScanPlan as needed. Do not build another SQL resolver or executor. |
+| `analyseMultiway` accepts typed/composite independent joins and dependent inner joins in the existing optimizer order. | [HashJoinGroupByCandidate](../../../core/src/main/java/io/questdb/griffin/HashJoinGroupByCandidate.java) retains source identity and later key dependencies before pruning payloads. This does not introduce a new join-order optimizer. |
+| Compiled key indexes address the scan followed by earlier build payloads; typed lookup borrows existing tables/map views. | [CompiledJoin](../../../core/src/main/java/io/questdb/griffin/engine/join/CompiledJoin.java) and [ResolvedJoinKernel](../src/main/java/org/questdb/experimental/codegen/ResolvedJoinKernel.java) lower dependent probes inside producer duplicate loops. LONG remains full-width; SYMBOL retains its source dictionary. |
+| Generated joins now reuse ordinary SYMBOL translation and staged-key storage. | Reuse [SymbolKeyTranslator](../../../core/src/main/java/io/questdb/griffin/engine/join/SymbolKeyTranslator.java), [MapHashJoinBuild](../../../core/src/main/java/io/questdb/griffin/engine/join/MapHashJoinBuild.java) and HashJoinBuildContext. SYMBOL IDs from different dictionaries are not directly comparable. |
+| Builds expose exact row/key counts and size after freeze; INT bounds are published, wider bounds can be obtained by a bounded key scan. | [FrozenHashJoinBuild](../../../core/src/main/java/io/questdb/griffin/engine/join/FrozenHashJoinBuild.java) supplies execution facts. They cannot retrospectively justify an earlier build-orientation decision. |
+| Single-join interval orientation already has an execution-time choice; its counts ignore residual row filters. | Extend or reuse [HashJoinGroupByBuildChoiceRecordCursorFactory](../../../core/src/main/java/io/questdb/griffin/engine/table/HashJoinGroupByBuildChoiceRecordCursorFactory.java). Unknown is not zero; interval counts are upper bounds after filtering. |
+| Join atoms own existing build/probe/merge phases and phase timers. | [AsyncHashJoinGroupByAtom](../../../core/src/main/java/io/questdb/griffin/engine/table/AsyncHashJoinGroupByAtom.java) is the existing owner/barrier, not grounds for a new scheduler. Its CompiledJoin updater does not expose the aggregate compiler's generated merge/ranking interface. |
+| Finalized-map aggregation, generated aggregate merge and numeric ranking already exist. | Reuse [ResolvedMapAggregate](../src/main/java/org/questdb/experimental/codegen/ResolvedMapAggregate.java), [AggregateUpdates](../src/main/java/org/questdb/experimental/codegen/AggregateUpdates.java), GroupByKernel and ResolvedAggregateKernel. Their state/read contracts constrain reuse after joins. |
 | Single-join COUNT replaces duplicate chains with multiplicities. Generated multiway COUNT can fold unobserved leaves and closed build forests. | `FrozenHashJoinBuild.copyKeyRowCounts` / `sumKeyRowWeights` reuse HashJoinRowHeap's backward-link recurrence; `ResolvedJoinKernel` proves source eligibility, `JoinDependencyFilter` prepares weights transactionally, and `AggregateUpdates` uses the existing COUNT state. Observed build values still require ordinary processing. |
-| Alternatives are eagerly compiled; feedback is thread-local within a compiled kernel. LLVM compilation is serialized in the native bridge. | [AdaptiveKernel](src/main/java/org/questdb/experimental/codegen/AdaptiveKernel.java) and [llvm_backend.cpp](src/main/c/llvm_backend.cpp) require measured compile economics. No assumption that background tiering is cheap or immediately safe. |
+| Alternatives are eagerly compiled; feedback is thread-local within a compiled kernel. LLVM compilation is serialized in the native bridge. | [AdaptiveKernel](../src/main/java/org/questdb/experimental/codegen/AdaptiveKernel.java) and [llvm_backend.cpp](../src/main/c/llvm_backend.cpp) require measured compile economics. No assumption that background tiering is cheap or immediately safe. |
 
 The November 2 checkpoints above supersede the October 30 ClickBench snapshot and
 the pre-fusion SSB suite for their respective workloads. Preserve frozen B0 when
@@ -261,8 +264,8 @@ Typed probing now covers INT, full-width LONG, translated SYMBOL and fixed compo
 through the existing builds/maps/workers. Independent and dependent joins share the
 typed contract. Dependent 500M-row controls improve 12.2-24.2x versus the previous
 ordinary plans, including parallel admission; generated execution is 1.49-3.18x faster
-than the same fused Java plan. See [dependency evidence](target/join-dependencies.md)
-and [typed controls](target/join-generalization.md). These are not new SSB/ClickBench scores.
+than the same fused Java plan. See [dependency evidence](../target/join-dependencies.md)
+and [typed controls](../target/join-generalization.md). These are not new SSB/ClickBench scores.
 Generated build/merge/order and broader work elimination remain open. Selective
 prejoining wins with construction included, but all-match materialization loses;
 next test build-side pruning and bounded dependency reuse before adding operators.
@@ -429,7 +432,7 @@ Three 500M-row process pairs on each INT/LONG/SYMBOL branch give SUM 2.86-3.21x 
 AVG 2.52-2.67x over the frozen COUNT-capable compiler. Exact-state/SQL controls cover
 NULLs, sentinel overflow, signed zero, nonfinite values and rounding-sensitive order.
 Small no-match/ordinary-AVG costs and larger compilation/code size remain explicit;
-see [evidence](target/join-repeated-inputs.md).
+see [evidence](../target/join-repeated-inputs.md).
 
 W3 is not complete. Observed build inputs retain ordinary expansion except for legal
 unobserved suffixes; DISTINCT, outer joins and functional-dependency rewrites still

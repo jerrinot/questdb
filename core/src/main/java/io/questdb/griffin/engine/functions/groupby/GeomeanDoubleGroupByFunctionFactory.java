@@ -28,9 +28,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.constants.DoubleConstant;
 import io.questdb.std.IntList;
-import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
 import io.questdb.std.Transient;
 
@@ -55,17 +53,6 @@ public class GeomeanDoubleGroupByFunctionFactory implements FunctionFactory {
             SqlExecutionContext sqlExecutionContext
     ) {
         final Function arg = args.getQuick(0);
-
-        // If argument is constant, return constant directly
-        // geomean(c) = c for any positive constant c
-        if (arg.isConstant()) {
-            final double value = arg.getDouble(null);
-            if (Numbers.isNull(value) || value <= 0) {
-                return DoubleConstant.NULL;
-            }
-            return new DoubleConstant(value);
-        }
-
         return new GeomeanDoubleGroupByFunction(arg);
     }
 }

@@ -90,7 +90,10 @@ final class SsaProgram {
             case Allocate a -> new Allocate(map(a.bytes(), leaf));
             case Reallocate r -> new Reallocate(map(r.address(), leaf), map(r.oldBytes(), leaf), map(r.newBytes(), leaf));
             case ToDouble c -> new ToDouble(map(c.value(), leaf));
-            case BitCast c -> new BitCast(map(c.value(), leaf));
+            case ToInteger c -> new ToInteger(map(c.value(), leaf), c.bits());
+            case ToFloat c -> new ToFloat(map(c.value(), leaf));
+            case Sqrt c -> new Sqrt(map(c.value(), leaf));
+            case BitCast c -> new BitCast(map(c.value(), leaf), c.type());
             case VectorMask m -> new VectorMask(m.lanes(), map(m.predicate(), leaf));
             case PopulationCount z -> new PopulationCount(map(z.value(), leaf));
             case TrailingZeros z -> new TrailingZeros(map(z.value(), leaf));
@@ -267,7 +270,10 @@ final class SsaProgram {
                 case Allocate a -> new Allocate(emit(a.bytes()));
                 case Reallocate r -> new Reallocate(emit(r.address()), emit(r.oldBytes()), emit(r.newBytes()));
                 case ToDouble c -> new ToDouble(emit(c.value()));
-                case BitCast c -> new BitCast(emit(c.value()));
+                case ToInteger c -> new ToInteger(emit(c.value()), c.bits());
+                case ToFloat c -> new ToFloat(emit(c.value()));
+                case Sqrt c -> new Sqrt(emit(c.value()));
+                case BitCast c -> new BitCast(emit(c.value()), c.type());
                 // Keep the lane region intact. Extracting its loads here would turn
                 // them into scalar, eager reads outside the vector operation.
                 case VectorMask m -> new VectorMask(m.lanes(), map(m.predicate(), e -> Objects.requireNonNull(values.get((Var) e))));

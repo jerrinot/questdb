@@ -95,11 +95,11 @@ final class ResolvedAsOfScan implements CompiledAsOfScan {
             if (raw != encoded && !(raw == ColumnType.SYMBOL && encoded == ColumnType.INT)) return null;
             rawTypes.add(raw);
         }
-        var key = QuestFixedKey.bind(inputs, rawTypes, columns, null, layout);
+        var key = QuestFixedKey.bind(new ResolvedInputs(inputs, backend.options()), rawTypes, columns, null, layout);
         if (key == null) return null;
         var probe = QuestMapProbe.fixed(key, rawTypes.getColumnCount() == 1 ? rawTypes.getColumnType(0) : -1,
                 layout instanceof OrderedMap);
-        var filter = ResolvedFilter.bind(inputs, function);
+        var filter = ResolvedFilter.bind(inputs, function, backend.options());
         if (filter == null) return null;
         CompiledKernel code = null;
         try {

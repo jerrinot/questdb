@@ -68,6 +68,10 @@ public final class KernelMemory implements AutoCloseable {
         return new KernelMemory(null, checkpoint, false, false);
     }
 
+    static KernelMemory reusable(GroupByAllocator allocator, Runnable checkpoint) {
+        return new KernelMemory(allocator, checkpoint, false, false);
+    }
+
     void enter(SqlExecutionCircuitBreaker breaker) {
         if (bound) throw new IllegalStateException("Native allocation scope is already bound");
         previous = CURRENT.get();

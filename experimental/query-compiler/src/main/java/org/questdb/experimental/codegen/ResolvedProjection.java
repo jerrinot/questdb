@@ -73,7 +73,7 @@ final class ResolvedProjection implements CompiledProjection {
     static ResolvedProjection compile(ColumnTypes types, int offset, ObjList<Function> functions,
                                       Backend backend, Path artifacts) throws IOException {
         if (functions.size() > 64) return null;
-        ResolvedInputs inputs = new ResolvedInputs(types, offset);
+        ResolvedInputs inputs = new ResolvedInputs(types, offset, backend.options());
         var expressions = new ArrayList<Pipeline.Scalar>();
         var outputTypes = new ArrayList<Integer>();
         int[] outputs = new int[functions.size()];
@@ -86,7 +86,7 @@ final class ResolvedProjection implements CompiledProjection {
                 if (column.getColumnIndex() < offset) return null;
                 continue;
             }
-            if (function.getType() == ColumnType.DOUBLE) return null;
+            if (function.getType() == ColumnType.DOUBLE || function.getType() == ColumnType.FLOAT || function.getType() == ColumnType.CHAR) return null;
             Pipeline.Scalar expression = inputs.scalar(function, function.getType());
             if (expression == null) return null;
             outputs[i] = expressions.size();
@@ -94,6 +94,9 @@ final class ResolvedProjection implements CompiledProjection {
             outputTypes.add(function.getType());
         }
         if (expressions.isEmpty()) return null;
+        for (Pipeline.Column column : inputs.columns()) {
+            if (column.width().resultType == Type.F64 || column.width().resultType == Type.F32) return null;
+        }
         Builder b = new Builder();
         Var row = b.let(i64(0));
         b.loop(binary(Op.LT, row, Ir.ROWS), loop -> {
@@ -131,11 +134,14 @@ final class ResolvedProjection implements CompiledProjection {
         for (int i = 0; i < indexes.length; i++) {
             int column = indexes[i];
             long value = switch (columns.get(i).columnType()) {
+                case ColumnType.BOOLEAN -> record.getBool(column) ? 1 : 0;
                 case ColumnType.BYTE -> record.getByte(column);
                 case ColumnType.SHORT -> record.getShort(column);
+                case ColumnType.CHAR -> record.getChar(column);
                 case ColumnType.INT -> record.getInt(column);
                 case ColumnType.IPv4 -> record.getIPv4(column);
                 case ColumnType.LONG -> record.getLong(column);
+                case ColumnType.DATE -> record.getDate(column);
                 case ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> record.getTimestamp(column);
                 default -> throw new IllegalStateException("Unsupported projection input");
             };

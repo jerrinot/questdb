@@ -132,16 +132,12 @@ public class HashJoinGroupByAggregatesTest extends AbstractCairoTest {
                                 // No parallel merge.
                                 "isOrdered(" + side + ".l)", "haversine_dist_deg(" + side + ".d, " + side + ".d, " + side + ".ts)",
                                 // Per-group state outside the map value.
-                                "count_distinct(" + side + ".i)", "approx_count_distinct(" + side + ".l)",
+                                "count_distinct(" + side + ".s::VARCHAR)", "approx_count_distinct(" + side + ".l)",
                                 "string_agg(" + side + ".s::STRING, ',')", "string_distinct_agg(" + side + ".s, ',')",
                                 "approx_percentile(" + side + ".d + 6, 0.5)", "approx_percentile(" + side + ".l + 100, 0.5)",
                                 "approx_median(" + side + ".d + 6)", "mode(" + side + ".b)", "mode(" + side + ".d)",
                                 "min(" + side + ".s::STRING)", "max(" + side + ".s::VARCHAR)",
-                                "array_agg(" + side + ".d)",
-                                // Admitted classes over argument types outside their registry entries.
-                                "sum(" + side + ".y)", "avg(" + side + ".y)", "min(" + side + ".y)", "max(" + side + ".y)",
-                                "avg(" + side + ".b)", "min(" + side + ".b)", "max(" + side + ".b)",
-                                "avg(" + side + ".f)", "count(" + side + ".ts)", "count(" + side + ".i::SHORT)"
+                                "array_agg(" + side + ".d)"
                         }) {
                             assertDifferential("SELECT " + aggregate + from, context, false);
                             assertDifferential("SELECT r.g rg, p.g pg, " + aggregate + from + " ORDER BY rg, pg", context, false);
@@ -166,6 +162,39 @@ public class HashJoinGroupByAggregatesTest extends AbstractCairoTest {
                     }
                 }
             }
+        });
+    }
+
+    @Test
+    public void testNumericGetterConversionsMatchOrdinaryPlans() throws Exception {
+        assertMemoryLeak(() -> {
+            TestWorkerPool pool = new TestWorkerPool(4);
+            TestUtils.execute(pool, (db, compiler, ctx) -> {
+                createTables(db, ctx);
+                ObjList<String> aggregates = new ObjList<>();
+                for (String side : new String[]{"r", "p"}) {
+                    for (String column : new String[]{"y", "h", "i", "l", "f", "d", "dt", "t"}) {
+                        for (String function : new String[]{"var_pop", "var_samp", "stddev_pop", "stddev"}) {
+                            aggregates.add(function + "(" + side + "." + column + ")");
+                        }
+                    }
+                    for (String function : new String[]{"sum", "avg", "min", "max"}) {
+                        aggregates.add(function + "(" + side + ".y)");
+                    }
+                    for (String function : new String[]{"avg", "min", "max", "bool_and", "bool_or"}) {
+                        aggregates.add(function + "(" + side + ".b)");
+                    }
+                    aggregates.add("count(" + side + ".i::SHORT)");
+                    for (String column : new String[]{"dt", "t"}) {
+                        aggregates.add("sum(" + side + "." + column + ")");
+                        aggregates.add("avg(" + side + "." + column + ")");
+                    }
+                }
+                try (SqlExecutionContextImpl context = context(db, 4)) {
+                    context.changePageFrameSizes(1, 4);
+                    assertChunks(aggregates, JOINS, context, new ObjHashSet<>());
+                }
+            }, configuration, LOG);
         });
     }
 
@@ -224,7 +253,7 @@ public class HashJoinGroupByAggregatesTest extends AbstractCairoTest {
             sink.add("max(" + decimal + ")");
             sink.add("count(" + decimal + ")");
         }
-        for (String column : new String[]{"d", "i", "l", "h"}) {
+        for (String column : new String[]{"d", "f", "i", "l", "h"}) {
             sink.add("avg(" + x + column + ")");
         }
         for (String column : new String[]{"d", "f", "i", "l", "h"}) {
@@ -245,9 +274,12 @@ public class HashJoinGroupByAggregatesTest extends AbstractCairoTest {
         }
         sink.add("bool_and(" + x + "b)");
         sink.add("bool_or(" + x + "b)");
-        for (String argument : new String[]{"d", "f", "i", "l", "s", "i::IPv4", "l::LONG256", "s::STRING", "s::VARCHAR",
+        for (String argument : new String[]{"d", "f", "i", "l", "dt", "t", "ns", "ts", "s", "i::IPv4", "l::LONG256", "s::STRING", "s::VARCHAR",
                 "l::GEOHASH(5b)", "l::GEOHASH(10b)", "l::GEOHASH(20b)", "l::GEOHASH(40b)"}) {
             sink.add("count(" + x + argument + ")");
+        }
+        for (String argument : new String[]{"i", "l", "s", "i::IPv4"}) {
+            sink.add("count_distinct(" + x + argument + ")");
         }
         sink.add("count(to_uuid(" + x + "l, " + x + "i))");
         for (String function : new String[]{"stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop",

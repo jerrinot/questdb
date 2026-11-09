@@ -91,7 +91,7 @@ public class SwitchFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testIntegralMapSentinelIsAValidBranch() throws Exception {
-        for (String type : new String[]{"byte", "short", "int", "long", "date"}) {
+        for (String type : new String[]{"byte", "short", "int", "long", "date", "timestamp", "timestamp_ns"}) {
             assertQuery("select switch(cast(x-3 as " + type + "),cast(-1 as " + type
                     + "),11,cast(0 as " + type + "),22,33) v from long_sequence(5)")
                     .expectSize()

@@ -2911,6 +2911,19 @@ public class PropServerConfigurationTest {
     }
 
     @Test
+    public void testSqlLlvmEnabled() throws Exception {
+        Properties properties = new Properties();
+        Assert.assertFalse(newPropServerConfiguration(properties).getCairoConfiguration().isSqlLlvmEnabled());
+        properties.setProperty("cairo.sql.llvm.enabled", "true");
+        var configuration = newPropServerConfiguration(properties).getCairoConfiguration();
+        Assert.assertTrue(configuration.isSqlLlvmEnabled());
+        Assert.assertTrue(new CairoConfigurationWrapper(configuration).isSqlLlvmEnabled());
+        var overridden = newPropServerConfiguration(root, properties,
+                Map.of("QDB_CAIRO_SQL_LLVM_ENABLED", "false"), new BuildInformationHolder());
+        Assert.assertFalse(overridden.getCairoConfiguration().isSqlLlvmEnabled());
+    }
+
+    @Test
     public void testValidAllowedVolumePaths0() throws Exception {
         File volumeA = temp.newFolder("volumeA");
         File volumeB = temp.newFolder("volumeB");

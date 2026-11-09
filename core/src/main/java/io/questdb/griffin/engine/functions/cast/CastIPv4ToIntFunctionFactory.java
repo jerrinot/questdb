@@ -45,7 +45,7 @@ public class CastIPv4ToIntFunctionFactory implements FunctionFactory {
         return new CastIPv4ToIntFunction(args.getQuick(0));
     }
 
-    private static class CastIPv4ToIntFunction extends AbstractCastToIntFunction {
+    public static class CastIPv4ToIntFunction extends AbstractCastToIntFunction {
 
         public CastIPv4ToIntFunction(Function arg) {
             super(arg);

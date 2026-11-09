@@ -47,7 +47,7 @@ public class NegLongFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0));
     }
 
-    private static class Func extends LongFunction implements ArithmeticUnaryFunction {
+    public static class Func extends LongFunction implements ArithmeticUnaryFunction {
         final Function arg;
 
         public Func(Function arg) {

@@ -181,9 +181,10 @@ public class BoolAndGroupByFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testBoolAndConstantTrue() throws Exception {
-        // Constant folding: bool_and(true) = true
+        // A nonempty aggregate of true values is true.
         assertQuery("select bool_and(true) from tab")
                 .ddl("create table tab as (select x from long_sequence(5))")
+                .noRandomAccess()
                 .expectSize()
                 .returns("""
                         bool_and
@@ -193,9 +194,10 @@ public class BoolAndGroupByFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testBoolAndConstantFalse() throws Exception {
-        // Constant folding: bool_and(false) = false
+        // A nonempty aggregate of false values is false.
         assertQuery("select bool_and(false) from tab")
                 .ddl("create table tab as (select x from long_sequence(5))")
+                .noRandomAccess()
                 .expectSize()
                 .returns("""
                         bool_and

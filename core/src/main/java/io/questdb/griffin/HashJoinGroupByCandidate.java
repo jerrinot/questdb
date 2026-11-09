@@ -563,8 +563,10 @@ public final class HashJoinGroupByCandidate {
                 if (keys == null || keys.size() == 0) return null;
                 for (int k = 0; k < keys.size(); k++) {
                     int type = keys.getProbeType(k);
-                    if (type != keys.getBuildType(k) || (type != ColumnType.INT && type != ColumnType.LONG
-                            && type != ColumnType.SYMBOL && type != ColumnType.DATE && !ColumnType.isTimestamp(type))) return null;
+                    int width = ColumnType.sizeOf(type);
+                    // The backend validates its supported fixed-width encodings before this
+                    // candidate replaces the ordinary plan.
+                    if (type != keys.getBuildType(k) || width < 1 || width > Long.BYTES) return null;
                     int source = keys.getProbeSource(k);
                     if (source != probe) {
                         IntList required = analyzer.requiredColumnsBySource.getQuick(source);

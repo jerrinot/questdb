@@ -50,6 +50,7 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.QueryCodeGenerator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.table.CompiledFilterBatch;
 import io.questdb.griffin.engine.table.SelectedRecordCursorFactory;
@@ -209,12 +210,12 @@ public final class FilteredAsOfJoinFastRecordCursorFactory extends AsOfJoinDense
         }
     }
 
-    public boolean bindAggregate(ColumnTypes inputs, IntList columns, ColumnTypes values, ObjList<GroupByFunction> functions, MapValue value) {
+    public boolean bindAggregate(ColumnTypes inputs, IntList columns, ColumnTypes values, ObjList<GroupByFunction> functions, MapValue value, GroupByAllocator allocator) {
         if (codeGenerator != null && filterStable) {
             CompiledAsOfJoin.Input input = new CompiledAsOfJoin.Input(joinInput.master(), joinInput.slave(),
                     joinInput.masterKey(), joinInput.slaveKey(), joinInput.slaveProjection(), joinInput.tolerance(), inputs, columns);
             compiledJoin = codeGenerator.compileAsOfJoin(input,
-                    ((FilteredAsOfJoinKeyedFastRecordCursor) cursor).getForwardMap(), scalarFilter, values, functions, value);
+                    ((FilteredAsOfJoinKeyedFastRecordCursor) cursor).getForwardMap(), scalarFilter, values, functions, value, allocator);
         }
         return compiledJoin != null;
     }

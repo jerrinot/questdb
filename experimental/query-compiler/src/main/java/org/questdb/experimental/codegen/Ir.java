@@ -44,11 +44,11 @@ public final class Ir {
     private Ir() {
     }
 
-    public enum Type { I64, BOOL, ADDRESS, F64 }
+    public enum Type { I64, BOOL, ADDRESS, F64, F32 }
 
-    /** Narrow loads widen; narrow stores round/truncate back to the storage width. */
+    /** Integer loads widen to I64; floating loads retain their storage precision. */
     public enum MemoryType {
-        I8(1, Type.I64), I16(2, Type.I64), I32(4, Type.I64), I64(8, Type.I64), F32(4, Type.F64), F64(8, Type.F64), ADDRESS(8, Type.ADDRESS);
+        I8(1, Type.I64), I16(2, Type.I64), I32(4, Type.I64), I64(8, Type.I64), F32(4, Type.F32), F64(8, Type.F64), ADDRESS(8, Type.ADDRESS);
 
         public final int bytes;
         public final Type resultType;
@@ -59,9 +59,9 @@ public final class Ir {
         }
     }
 
-    public enum Op { ADD, SUB, MUL, AND, XOR, USHR, EQ, NE, LT, GE, BOTH, EITHER, FADD, FSUB, FMUL, FDIV, SDIV, FEQ, FNE, FLT, FGE }
+    public enum Op { ADD, SUB, MUL, AND, XOR, USHR, EQ, NE, LT, GE, BOTH, EITHER, FADD, FSUB, FMUL, FDIV, SDIV, FEQ, FNE, FLT, FGE, OR, FREM }
 
-    public sealed interface Expr permits Var, Literal, Binary, Load, Gather, Offset, Select, Allocate, Reallocate, NativeCall, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, BitCast, AtomicLoad, CompareExchange, AtomicAdd {
+    public sealed interface Expr permits Var, Literal, Binary, Load, Gather, Offset, Select, Allocate, Reallocate, NativeCall, VectorMask, TrailingZeros, PopulationCount, SelectRows, ToDouble, ToFloat, ToInteger, Sqrt, BitCast, AtomicLoad, CompareExchange, AtomicAdd {
         Type type();
     }
 
@@ -103,19 +103,50 @@ public final class Ir {
         @Override public Type type() { return Type.I64; }
     }
 
-    /** Signed integer to IEEE double, with Java's round-to-nearest conversion. */
+    /** Widen binary32 or convert a signed integer to IEEE double using Java's rounding. */
     public record ToDouble(Expr value) implements Expr {
-        public ToDouble { require(value, Type.I64); }
+        public ToDouble {
+            if (value.type() != Type.I64 && value.type() != Type.F32)
+                throw new IllegalArgumentException("DOUBLE conversion requires I64 or F32");
+        }
         @Override public Type type() { return Type.F64; }
     }
 
-    /** Preserve all 64 bits, including NaN payloads and signed zero. */
-    public record BitCast(Expr value) implements Expr {
-        public BitCast {
+    /** Convert directly to IEEE binary32; routing LONG through DOUBLE can double-round. */
+    public record ToFloat(Expr value) implements Expr {
+        public ToFloat {
             if (value.type() != Type.I64 && value.type() != Type.F64)
-                throw new IllegalArgumentException("Bit cast requires I64 or F64");
+                throw new IllegalArgumentException("FLOAT conversion requires I64 or F64");
         }
-        @Override public Type type() { return value.type() == Type.I64 ? Type.F64 : Type.I64; }
+        @Override public Type type() { return Type.F32; }
+    }
+
+    /** Java numeric conversion: truncate toward zero, saturate, and convert NaN to zero.
+     * The result is signed I64; a 32-bit conversion sign-extends its saturated INT.
+     * SQL range checks and NULL semantics belong to the resolved expression.
+     */
+    public record ToInteger(Expr value, int bits) implements Expr {
+        public ToInteger {
+            if (value.type() != Type.F32 && value.type() != Type.F64 || bits != 32 && bits != 64)
+                throw new IllegalArgumentException("Floating input and 32/64-bit integer result required");
+        }
+        @Override public Type type() { return Type.I64; }
+    }
+
+    /** IEEE square root, including signed zero, subnormals and NaN for negative inputs. */
+    public record Sqrt(Expr value) implements Expr {
+        public Sqrt { require(value, Type.F64); }
+        @Override public Type type() { return Type.F64; }
+    }
+
+    /** Reinterpret IEEE bits. F32 uses the low 32 bits of I64 and sign-extends on return. */
+    public record BitCast(Expr value, Type type) implements Expr {
+        public BitCast(Expr value) { this(value, value.type() == Type.I64 ? Type.F64 : Type.I64); }
+        public BitCast {
+            if (!(value.type() == Type.I64 && (type == Type.F64 || type == Type.F32)
+                    || type == Type.I64 && (value.type() == Type.F64 || value.type() == Type.F32)))
+                throw new IllegalArgumentException("Bit cast requires I64 and a floating type");
+        }
     }
 
     public record TrailingZeros(Expr value) implements Expr {
@@ -143,7 +174,7 @@ public final class Ir {
     public record Literal(long value, Type type) implements Expr {
         public Literal {
             if (type == null || (type == Type.BOOL && value != 0 && value != 1)
-                    || (type == Type.ADDRESS && value != 0)) {
+                    || (type == Type.ADDRESS && value != 0) || (type == Type.F32 && value != (int) value)) {
                 throw new IllegalArgumentException("Invalid typed literal");
             }
         }
@@ -152,16 +183,20 @@ public final class Ir {
     public record Binary(Op op, Expr left, Expr right) implements Expr {
         public Binary {
             require(right, left.type());
-            // Positive compile-time divisors exclude division by zero and MIN/-1.
-            // This is an integer primitive, not SQL's nullable division operator.
-            if (op == Op.SDIV && (!(right instanceof Literal divisor) || divisor.value() <= 0)) {
-                throw new IllegalArgumentException("Signed division requires a positive literal divisor");
+            // Like a load's address, division operands must be valid: nonzero divisor
+            // and no MIN/-1 overflow. SQL lowering sanitizes NULL/zero operands before
+            // this primitive, including lanes evaluated outside a selection mask.
+            if (op == Op.SDIV && right instanceof Literal divisor && divisor.value() == 0) {
+                throw new IllegalArgumentException("Signed division requires a nonzero divisor");
             }
             switch (op) {
                 case EQ, NE -> {
-                    if (left.type() == Type.F64) throw new IllegalArgumentException("Use IEEE floating comparison operations");
+                    if (left.type() == Type.F64 || left.type() == Type.F32) throw new IllegalArgumentException("Use IEEE floating comparison operations");
                 }
-                case FADD, FSUB, FMUL, FDIV, FEQ, FNE, FLT, FGE -> require(left, Type.F64);
+                case FADD, FSUB, FMUL, FDIV, FREM, FEQ, FNE, FLT, FGE -> {
+                    if (left.type() != Type.F32 && left.type() != Type.F64)
+                        throw new IllegalArgumentException("Floating operands required");
+                }
                 case BOTH, EITHER -> require(left, Type.BOOL);
                 default -> require(left, Type.I64);
             }
@@ -171,7 +206,7 @@ public final class Ir {
         public Type type() {
             return switch (op) {
                 case EQ, NE, LT, GE, BOTH, EITHER, FEQ, FNE, FLT, FGE -> Type.BOOL;
-                case FADD, FSUB, FMUL, FDIV -> Type.F64;
+                case FADD, FSUB, FMUL, FDIV, FREM -> left.type();
                 default -> Type.I64;
             };
         }
@@ -395,7 +430,7 @@ public final class Ir {
         public void poll() { statements.add(new Poll()); }
         public void call(Helper helper, List<Expr> arguments) { statements.add(new Call(helper, arguments)); }
         public void prefetch(Expr address, boolean write) {
-            if (!Boolean.getBoolean("query.codegen.disablePrefetchHints")) statements.add(new Prefetch(address, write));
+            if (CompilerOptions.PROCESS.prefetchHints()) statements.add(new Prefetch(address, write));
         }
 
         private Block nested(Consumer<Builder> emit) {
@@ -407,6 +442,7 @@ public final class Ir {
 
     public static Expr binary(Op op, Expr left, Expr right) { return new Binary(op, left, right); }
     public static Expr i64(long value) { return new Literal(value, Type.I64); }
+    public static Expr f32(float value) { return new Literal(Float.floatToRawIntBits(value), Type.F32); }
     public static Expr f64(double value) { return new Literal(Double.doubleToRawLongBits(value), Type.F64); }
     public static Expr bool(boolean value) { return new Literal(value ? 1 : 0, Type.BOOL); }
     public static Expr nil() { return new Literal(0, Type.ADDRESS); }
@@ -448,6 +484,9 @@ public final class Ir {
             case Allocate a -> collectReads(a.bytes(), reads);
             case Reallocate r -> { collectReads(r.address(), reads); collectReads(r.oldBytes(), reads); collectReads(r.newBytes(), reads); }
             case ToDouble c -> collectReads(c.value(), reads);
+            case ToInteger c -> collectReads(c.value(), reads);
+            case ToFloat c -> collectReads(c.value(), reads);
+            case Sqrt c -> collectReads(c.value(), reads);
             case BitCast c -> collectReads(c.value(), reads);
             case VectorMask m -> collectReads(m.predicate(), reads);
             case SelectRows s -> { collectReads(s.mask(), reads); collectReads(s.base(), reads); collectReads(s.destination(), reads); }
@@ -524,6 +563,9 @@ public final class Ir {
             case Allocate a -> verify(a.bytes(), scope);
             case Reallocate r -> { verify(r.address(), scope); verify(r.oldBytes(), scope); verify(r.newBytes(), scope); }
             case ToDouble c -> verify(c.value(), scope);
+            case ToInteger c -> verify(c.value(), scope);
+            case ToFloat c -> verify(c.value(), scope);
+            case Sqrt c -> verify(c.value(), scope);
             case BitCast c -> verify(c.value(), scope);
             case VectorMask m -> verify(m.predicate(), scope);
             case PopulationCount z -> verify(z.value(), scope);

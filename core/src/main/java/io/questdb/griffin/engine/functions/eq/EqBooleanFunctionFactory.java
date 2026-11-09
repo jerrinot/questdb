@@ -52,7 +52,7 @@ public class EqBooleanFunctionFactory implements FunctionFactory {
         return new EqBooleanFunctionFactory.Func(args.getQuick(0), args.getQuick(1));
     }
 
-    private static class Func extends AbstractEqBinaryFunction {
+    public static class Func extends AbstractEqBinaryFunction {
         public Func(Function left, Function right) {
             super(left, right);
         }

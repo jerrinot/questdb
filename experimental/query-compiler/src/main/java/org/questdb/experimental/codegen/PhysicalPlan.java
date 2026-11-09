@@ -78,7 +78,22 @@ public sealed interface PhysicalPlan permits PhysicalPlan.Scan, PhysicalPlan.Fil
             return List.copyOf(result);
         }
     }
-    private static int type(Scalar scalar){return scalar instanceof Column c?c.columnType():scalar instanceof FloatingConstant || scalar instanceof ToFloating || scalar instanceof Divide?ColumnType.DOUBLE:scalar instanceof IPv4Subtract?ColumnType.IPv4:scalar instanceof Add a?a.columnType():scalar instanceof Subtract s?s.columnType():scalar instanceof Multiply m?m.columnType():ColumnType.LONG;}
+    private static int type(Scalar scalar) {
+        return scalar instanceof Column c ? c.columnType()
+                : scalar instanceof FloatingConstant c ? c.columnType()
+                : scalar instanceof ToFloating c ? c.columnType()
+                : scalar instanceof FloatCast ? ColumnType.FLOAT
+                : scalar instanceof FloatingIntegerCast c ? c.columnType()
+                : scalar instanceof IntegerCast c ? c.columnType()
+                : scalar instanceof IPv4Cast c ? c.columnType()
+                : scalar instanceof Negate n ? n.columnType()
+                : scalar instanceof Divide d ? d.columnType()
+                : scalar instanceof Remainder r ? r.columnType()
+                : scalar instanceof IPv4Subtract ? ColumnType.IPv4
+                : scalar instanceof Add a ? a.columnType()
+                : scalar instanceof Subtract s ? s.columnType()
+                : scalar instanceof Multiply m ? m.columnType() : ColumnType.LONG;
+    }
     private static void checkColumns(List<Column> columns) {
         if(columns.isEmpty())throw new IllegalArgumentException("Scan needs a row source");
         for(int i=0;i<columns.size();i++)if(columns.get(i).index()!=i)throw new IllegalArgumentException("Non-consecutive column index");

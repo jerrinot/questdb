@@ -1,5 +1,8 @@
 # Integrating compiled aggregates with QuestDB
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 Status: proposed design, grounded in the checkout at `8da4e347f96563dc4e9d13916e00177e2af708f9`
 and the uncommitted `experimental/query-compiler` prototype. Source inspection and
 the small executable contract checks below were performed on 2026-10-25. Proposed
@@ -18,7 +21,7 @@ sharding and aggregate-merge algorithms over the existing prototype table ABI.
 It reuses the core allocator factory and slot locks. Its executor/frame barrier,
 outer table and lack of map pre-sizing remain explicit integration differences;
 it is not yet the production asynchronous runtime. See the [parallel prototype
-implementation](src/main/java/org/questdb/experimental/codegen/ParallelGroupBy.java) and the progress log. Future changes must
+implementation](../src/test/java/org/questdb/experimental/codegen/ParallelGroupBy.java) and the progress log. Future changes must
 start from the Java algorithms and an executable Java oracle, not invent a second
 merge/allocation strategy.
 

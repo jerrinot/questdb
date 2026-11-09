@@ -1,5 +1,8 @@
 # Generated string negation and ordered filter LIMIT
 
+Historical plan. The maintained design and open work are in [ARCHITECTURE](../ARCHITECTURE.md)
+and [TODO](../TODO.md); this document records its original context.
+
 Status: milestones 1–3 implemented and correctness-checked, 2026-10-28.
 Milestone 4 (full-data qualification and controlled performance) remains pending.
 Query numbers use the local zero-based Q0–Q42 convention.
@@ -62,10 +65,10 @@ result nor full-data requalification.
 
 ## 1. Close Q22: negate existing string predicates
 
-**Code boundary.** [ResolvedFilter.bind](src/main/java/org/questdb/experimental/codegen/ResolvedFilter.java)
+**Code boundary.** [ResolvedFilter.bind](../src/main/java/org/questdb/experimental/codegen/ResolvedFilter.java)
 flattens top-level AND, emits VARCHAR NULL/short literal-contains leaves, and sends
 other leaves to ResolvedInputs. That numeric binder handles NOT recursively but
-cannot bind its VARCHAR child. [NotFunctionFactory](../../core/src/main/java/io/questdb/griffin/engine/functions/bool/NotFunctionFactory.java)
+cannot bind its VARCHAR child. [NotFunctionFactory](../../../core/src/main/java/io/questdb/griffin/engine/functions/bool/NotFunctionFactory.java)
 returns `!arg.getBool(record)`; the admitted contains function returns false on
 NULL. Therefore its negation returns true on NULL. Preserve the actual resolved
 functions, rather than importing a different SQL NULL convention.
@@ -106,15 +109,15 @@ full-data coverage count. Preserve tied-Top-K validation from the existing audit
 ## 2. Close Q23/Q24: generated frame admission in the ordered collector
 
 **Existing algorithm to retain.**
-[AsyncJitFilteredRecordCursorFactory](../../core/src/main/java/io/questdb/griffin/engine/table/AsyncJitFilteredRecordCursorFactory.java)
+[AsyncJitFilteredRecordCursorFactory](../../../core/src/main/java/io/questdb/griffin/engine/table/AsyncJitFilteredRecordCursorFactory.java)
 evaluates LIMIT on cursor open and dispatches frame filters through PageFrameSequence.
 Workers produce ordered frame-local row IDs; the owner consumes frames in scan
-order. [AsyncFilteredRecordCursor](../../core/src/main/java/io/questdb/griffin/engine/table/AsyncFilteredRecordCursor.java)
+order. [AsyncFilteredRecordCursor](../../../core/src/main/java/io/questdb/griffin/engine/table/AsyncFilteredRecordCursor.java)
 currently enforces LIMIT through rowsRemaining in hasNext/checkLimit, skipRows and
 calculateSize. The planner already obtains EventTime order from the scan: neither
 query requires sorting. SelectedRecord only maps Q24's output columns.
 
-The existing [QuestRowLimit](src/main/java/org/questdb/experimental/codegen/QuestRowLimit.java)
+The existing [QuestRowLimit](../src/main/java/org/questdb/experimental/codegen/QuestRowLimit.java)
 enumerates map entries or sorted row-ID pairs. It is not a borrowed frame-prefix
 operator. Do not route these scans through map descriptors, a materializing LIMIT
 wrapper, a new scheduler or a copied list of complete query results.

@@ -60,7 +60,7 @@ final class ResolvedAsOfLookup implements CompiledAsOfLookup {
         int type = inputs.getColumnType(key);
         if (!function.isStableWithinExecution()
                 || type != ColumnType.INT && type != ColumnType.LONG && type != ColumnType.SYMBOL) return null;
-        var filter = ResolvedFilter.bind(inputs, function);
+        var filter = ResolvedFilter.bind(inputs, function, backend.options());
         if (filter == null) return null;
         try {
             return new ResolvedAsOfLookup(filter, key, timestamp, type, scale, finite, backend, artifacts);
