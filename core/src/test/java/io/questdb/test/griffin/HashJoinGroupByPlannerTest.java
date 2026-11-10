@@ -336,16 +336,20 @@ public class HashJoinGroupByPlannerTest extends AbstractCairoTest {
     @Test
     public void testCachedOuterJoinStopsPresizingOnceItsBuildTableOutgrowsTheProbe() throws Exception {
         assertMemoryLeak(() -> {
+            // The ten keys lie 1_000 apart, so the build keeps its key table rather than a lookup
+            // array of every key in their range. A payload copy would free the presized row heap,
+            // so copies stay off.
+            setProperty(PropertyKey.CAIRO_SQL_PARALLEL_HASH_JOIN_GROUPBY_PAYLOAD_COPY_MAX_SIZE, 0);
             execute("CREATE TABLE pa (k INT, v DOUBLE)");
             execute("CREATE TABLE pb (k INT, v DOUBLE)");
-            execute("INSERT INTO pa SELECT (x % 10)::INT, x FROM long_sequence(1_000)");
+            execute("INSERT INTO pa SELECT ((x % 10) * 1_000)::INT, x FROM long_sequence(1_000)");
             for (String sql : new String[]{
                     "SELECT count(*) n, sum(pb.v) v FROM pa LEFT JOIN pb ON pa.k = pb.k",
                     "SELECT count(*) n, sum(pb.v) v FROM pb RIGHT JOIN pa ON pa.k = pb.k"
             }) {
                 final boolean isRight = sql.contains("RIGHT JOIN");
                 execute("TRUNCATE TABLE pb");
-                execute("INSERT INTO pb SELECT (x % 10)::INT, x FROM long_sequence(500)");
+                execute("INSERT INTO pb SELECT ((x % 10) * 1_000)::INT, x FROM long_sequence(500)");
                 try (SqlExecutionContextImpl context = enabledContext()) {
                     // Both joins build pb. It has fewer rows than pa, so the build sizes its key table by
                     // its rows: 1_024 slots for 500 rows over ten keys.
@@ -353,7 +357,7 @@ public class HashJoinGroupByPlannerTest extends AbstractCairoTest {
                     try (RecordCursorFactory factory = engine.select(sql, context)) {
                         Assert.assertEquals(sql, 500, builtRows(factory, context));
                         // Twice the rows of pa keep the presized key table of a reused factory.
-                        execute("INSERT INTO pb SELECT (x % 10)::INT, x FROM long_sequence(1_500)");
+                        execute("INSERT INTO pb SELECT ((x % 10) * 1_000)::INT, x FROM long_sequence(1_500)");
                         try (RecordCursor cursor = factory.getCursor(context)) {
                             Assert.assertTrue(cursor.hasNext());
                             Assert.assertEquals(sql, 4_096 * 8 + 2_000 * 16, fused(factory).getAtom().getFrozenBuild().getSizeInBytes());
@@ -362,7 +366,7 @@ public class HashJoinGroupByPlannerTest extends AbstractCairoTest {
                         // pb, the table before the join, holds more rows than pa. The LEFT join keeps
                         // building pb.
                         assertDifferential(sql, context, !isRight);
-                        execute("INSERT INTO pb VALUES (1, 1)");
+                        execute("INSERT INTO pb VALUES (1_000, 1)");
                         try {
                             builtRows(factory, context);
                             Assert.fail(sql + ": a factory that presizes for the larger table must ask for a recompile");
@@ -771,7 +775,7 @@ public class HashJoinGroupByPlannerTest extends AbstractCairoTest {
                 for (String sql : new String[]{
                         "select first(r.energy_kwh), last(r.energy_kwh)" + JOINS[0],
                         "select arg_min(r.energy_kwh, r.plant_id), arg_max(r.energy_kwh, r.plant_id)" + JOINS[0],
-                        "select count(distinct p.country)" + JOINS[1],
+                        "select count(distinct p.country::varchar)" + JOINS[1],
                         "select mode(r.energy_kwh), approx_percentile(r.energy_kwh, 0.5)" + JOINS[2],
                         "select p.country, first(r.energy_kwh), last(r.energy_kwh)" + JOINS[0] + " order by country",
                         "select p.country, sum(r.plant_id), mode(r.energy_kwh)" + JOINS[0] + " order by country",
@@ -789,6 +793,9 @@ public class HashJoinGroupByPlannerTest extends AbstractCairoTest {
                 // A second equality is a key, not a residual predicate, so the pair stages a
                 // composite key instead of keeping the ordinary plan.
                 assertDifferential(SELECT + JOINS[0] + " and r.energy_kwh=p.installed_kwp order by country,yr,mo", context, true);
+                // count_distinct of a SYMBOL build column fuses, also over the NULL build values that
+                // the probe rows without a match produce.
+                assertDifferential("select count(distinct p.country)" + JOINS[1], context, true);
             }
         });
     }
@@ -1966,21 +1973,38 @@ public class HashJoinGroupByPlannerTest extends AbstractCairoTest {
     @Test
     public void testBuildPresizesOnlyFromExactCounts() throws Exception {
         assertMemoryLeak(() -> {
-            // pb has twice the rows of pa and the same ten keys in each key column. pa spreads its
-            // 1_000 rows over four days, 250 a day.
-            execute("CREATE TABLE pa (k INT, l LONG, s SYMBOL, v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-            execute("CREATE TABLE pb (k INT, l LONG, s SYMBOL, v DOUBLE)");
+            // pb has twice the rows of pa and the same keys in each key column: ten in k, l and d, 100
+            // in s. pa spreads its 1_000 rows over four days, 250 a day. A build whose keys fill a
+            // narrow range, with at least 32 probe rows per key, replaces its key table with a lookup
+            // array, which hides the presized table. The ten keys of k and l lie 1_000 apart, and s
+            // has more keys than one per 32 probe rows, so they keep the table; d's keys 0 to 9 do not.
+            execute("CREATE TABLE pa (k INT, l LONG, s SYMBOL, d INT, v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("CREATE TABLE pb (k INT, l LONG, s SYMBOL, d INT, v DOUBLE)");
             execute("""
-                    INSERT INTO pa SELECT (x % 10)::INT, x % 10, 'S' || (x % 10), x,
+                    INSERT INTO pa SELECT ((x % 10) * 1_000)::INT, (x % 10) * 1_000, 'S' || (x % 100), (x % 10)::INT, x,
                         timestamp_sequence('2020-01-01', 345_600_000L)
                     FROM long_sequence(1_000)
                     """);
-            execute("INSERT INTO pb SELECT (x % 10)::INT, x % 10, 'S' || (x % 10), x FROM long_sequence(2_000)");
+            execute("""
+                    INSERT INTO pb SELECT ((x % 10) * 1_000)::INT, (x % 10) * 1_000, 'S' || (x % 100), (x % 10)::INT, x
+                    FROM long_sequence(2_000)
+                    """);
             // A build row is an eight-byte link plus, when the build has payload columns, the eight-byte
             // id of its row: 8 bytes with no payload, 16 with any. The INT layout's key table takes eight bytes a slot and starts at 64
             // slots; a table presized for N keys takes the next power of two of 2N slots. The row
             // heap grows by doubling from 64 bytes unless an exact row count presizes it.
             try (SqlExecutionContextImpl context = enabledContext()) {
+                // d's ten keys from 0 to 9 replace the key table with a lookup array of one four-byte
+                // head per key in their range.
+                assertBuildSize("SELECT count(*) n, sum(pb.v) v FROM pa JOIN pb ON pa.d = pb.d",
+                        1_000, 10, 10 * Integer.BYTES + 1_000 * 8, context);
+                // A payload copy moves the row headers in with the copied DOUBLE and frees the row
+                // heap, so the build holds its key table alone: 2_048 slots for 1_000 rows.
+                final String copied = "SELECT count(*) n, sum(pa.v) v FROM pb LEFT JOIN pa ON pa.k = pb.k";
+                assertPayloadCopy(copied, true, context);
+                assertBuildSize(copied, 1_000, 10, 2_048 * 8, context);
+                // The rest reads the presized row heap, which a copy would free.
+                setProperty(PropertyKey.CAIRO_SQL_PARALLEL_HASH_JOIN_GROUPBY_PAYLOAD_COPY_MAX_SIZE, 0);
                 for (boolean isParallelFilter : new boolean[]{true, false}) {
                     context.setParallelFilterEnabled(isParallelFilter);
                     // An unfiltered build with no more rows than its probe sizes both by its rows:
@@ -2009,10 +2033,10 @@ public class HashJoinGroupByPlannerTest extends AbstractCairoTest {
                         assertDifferential(filtered, context, false);
                         assertDifferential(filteredInterval, context, false);
                     }
-                    // A SYMBOL key holds at most the build dictionary's ten keys and the null key:
-                    // 22 slots round up to 32, below the initial 64.
+                    // A SYMBOL key holds at most the build dictionary's 100 keys and the null key:
+                    // 202 slots round up to 256, not the 2_048 slots of the build's 1_000 rows.
                     assertBuildSize("SELECT count(*) n, sum(pb.v) v FROM pa JOIN pb ON pa.s = pb.s",
-                            1_000, 10, 64 * 8 + 1_000 * 8, context);
+                            1_000, 100, 256 * 8 + 1_000 * 8, context);
                     // A LONG key takes an Unordered8Map, 16 bytes an entry plus one for the zero
                     // key, at a 0.7 load factor: 128 entries initially, 2_048 for 1_000 keys.
                     assertBuildSize("SELECT count(*) n, sum(pa.v) v FROM pb LEFT JOIN pa ON pa.l = pb.l",

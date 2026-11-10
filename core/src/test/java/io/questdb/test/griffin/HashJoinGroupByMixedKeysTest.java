@@ -521,6 +521,9 @@ public class HashJoinGroupByMixedKeysTest extends AbstractCairoTest {
             sink.add("count(" + x + argument + ")");
         }
         sink.add("count(to_uuid(" + x + "l, " + x + "i))");
+        for (String argument : new String[]{"i", "l", "s", "i::IPv4"}) {
+            sink.add("count_distinct(" + x + argument + ")");
+        }
         for (String function : new String[]{"stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop",
                 "skewness", "skewness_samp", "skewness_pop", "kurtosis", "kurtosis_samp", "kurtosis_pop"}) {
             sink.add(function + "(" + x + "d)");

@@ -488,16 +488,16 @@ public class HashJoinGroupByQualificationTest extends AbstractCairoTest {
                 }) {
                     assertDifferential(sql, context, false);
                 }
-                // The build copies its payload into a row heap, so a variable-size build column
-                // keeps the ordinary plan while a fixed-size one of any width fuses.
+                // The build copies a fixed-size payload of any width into a row heap and reads a
+                // VARCHAR payload from its pinned frames, so both fuse, while a STRING, BINARY or
+                // ARRAY build column keeps the ordinary plan.
                 for (String type : new String[]{"string", "varchar", "binary", "double[]",
                         "uuid", "long256", "decimal(10,2)", "geohash(8b)", "ipv4"}) {
-                    boolean isFixedSize = !type.equals("string") && !type.equals("varchar")
-                            && !type.equals("binary") && !type.equals("double[]");
+                    boolean isSupported = !type.equals("string") && !type.equals("binary") && !type.equals("double[]");
                     execute("alter table p add column unsupported " + type);
                     String value = type.equals("double[]") ? "dim_length(p.unsupported, 1)" : "p.unsupported";
                     assertDifferential("select count(*) from r left join p on r.id=p.id where " + value + " = null",
-                            context, isFixedSize);
+                            context, isSupported);
                     // An unreferenced unsupported column does not disable otherwise eligible execution.
                     assertDifferential("select " + AGGREGATES + JOINS[1], context, true);
                     execute("alter table p drop column unsupported");

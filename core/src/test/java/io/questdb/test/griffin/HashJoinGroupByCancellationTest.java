@@ -230,7 +230,9 @@ public class HashJoinGroupByCancellationTest extends AbstractCairoTest {
     // A parallel build over Parquet frames decodes them in its frame tasks and in its payload copy
     // round, and charges what it decodes to the query, as the probe does. Raising a per-query limit
     // until the query fits fails it at allocations of the build, of the steps between the build and
-    // the probe, and of the probe and the merge, and each failure leaves nothing charged.
+    // the probe, and of the probe and the merge, and each failure leaves nothing charged. The 100
+    // keys, more than one per 32 probe rows, keep the build's key tables: a lookup array would
+    // release them before the copy and the probe allocate, which would then always fit.
     @Test
     public void testParallelBuildMemoryLimitsAtEveryStepOverParquetAndReuse() throws Exception {
         HashJoinBuildMode.PARALLEL.applyProperties(node1.getConfigurationOverrides());
@@ -240,7 +242,7 @@ public class HashJoinGroupByCancellationTest extends AbstractCairoTest {
                     SqlExecutionContextImpl context = context(db, 4);
                     LimitedMemoryTracker tracker = new LimitedMemoryTracker(Long.MAX_VALUE)
             ) {
-                createTables(db, context);
+                createTables(db, context, 100);
                 db.execute("ALTER TABLE r CONVERT PARTITION TO PARQUET WHERE ts >= 0", context);
                 db.execute("ALTER TABLE b CONVERT PARTITION TO PARQUET WHERE ts >= 0", context);
                 context.changePageFrameSizes(100, 100);
@@ -574,18 +576,23 @@ public class HashJoinGroupByCancellationTest extends AbstractCairoTest {
     // so every probe row matches ten build rows. Frames of 100 rows make 1,000 pairs a probe frame,
     // ten times the reducers' pair budget between breaker checks, which is one page frame.
     private static void createTables(CairoEngine db, SqlExecutionContextImpl context) throws Exception {
+        createTables(db, context, 20);
+    }
+
+    // r holds 2_000 rows and b 200, and each key column of both holds the same keyCount keys.
+    private static void createTables(CairoEngine db, SqlExecutionContextImpl context, int keyCount) throws Exception {
         db.execute("""
                 CREATE TABLE r AS (
-                    SELECT (x % 20)::INT k, (x % 20)::LONG l, ('s' || (x % 20))::SYMBOL s, (x % 5)::INT g, x::DOUBLE v,
+                    SELECT (x %% %d)::INT k, (x %% %d)::LONG l, ('s' || (x %% %d))::SYMBOL s, (x %% 5)::INT g, x::DOUBLE v,
                         timestamp_sequence('2020-01-01', 60_000_000) ts
                     FROM long_sequence(2_000)
-                ) TIMESTAMP(ts) PARTITION BY DAY""", context);
+                ) TIMESTAMP(ts) PARTITION BY DAY""".formatted(keyCount, keyCount, keyCount), context);
         db.execute("""
                 CREATE TABLE b AS (
-                    SELECT (x % 20)::INT k, (x % 20)::LONG l, ('s' || (x % 20))::SYMBOL s, x * 0.5 w,
+                    SELECT (x %% %d)::INT k, (x %% %d)::LONG l, ('s' || (x %% %d))::SYMBOL s, x * 0.5 w,
                         timestamp_sequence('2020-01-01', 600_000_000) ts
                     FROM long_sequence(200)
-                ) TIMESTAMP(ts) PARTITION BY DAY""", context);
+                ) TIMESTAMP(ts) PARTITION BY DAY""".formatted(keyCount, keyCount, keyCount), context);
     }
 
     private static String expectedRows(CairoEngine db, String sql, SqlExecutionContextImpl context) throws Exception {

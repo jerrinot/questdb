@@ -59,8 +59,9 @@ public class HashJoinGroupByColumnTypesTest extends AbstractCairoTest {
             "ip", "u", "l256", "g1", "g3", "g6", "g8",
             "dec8", "dec16", "dec32", "dec64", "dec128", "dec256"
     };
-    // Variable-size types, which the row heap cannot copy, so only the probe may carry them outside
-    // the build's filters.
+    // Variable-size types that the probe reads straight off its page frames. Outside the build's
+    // filters, the build reads a VARCHAR payload from its pinned frames, while the row heap cannot
+    // copy a STRING one.
     private static final String[] PROBE_ONLY_COLUMNS = {"vc", "str"};
 
     private final HashJoinBuildMode buildMode;
@@ -131,20 +132,18 @@ public class HashJoinGroupByColumnTypesTest extends AbstractCairoTest {
             insertRows();
             try (SqlExecutionContextImpl context = context(engine, 4)) {
                 context.changePageFrameSizes(1, 8);
-                for (String column : new String[]{"vc", "str", "bin", "arr"}) {
-                    // The row heap cannot copy a variable-size payload, so the shape keeps the
-                    // ordinary plan rather than failing the query.
+                for (String column : new String[]{"str", "bin", "arr"}) {
+                    // The row heap cannot copy a STRING, BINARY or ARRAY payload, so the shape keeps
+                    // the ordinary plan rather than failing the query. A VARCHAR payload fuses; see
+                    // testVarcharBuildColumnsOutsideBuildFiltersFuse().
                     assertDifferential("SELECT b." + column + " k, count(*) n FROM p LEFT JOIN b ON p.id=b.id",
                             context, false);
                 }
-                for (String predicate : new String[]{"b.vc IS NOT NULL", "b.str IS NOT NULL",
-                        "b.bin IS NOT NULL", "array_sum(b.arr) > 0.5"}) {
+                for (String predicate : new String[]{"b.str IS NOT NULL", "b.bin IS NOT NULL", "array_sum(b.arr) > 0.5"}) {
                     assertDifferential("SELECT count(*) n FROM p LEFT JOIN b ON p.id=b.id WHERE " + predicate,
                             context, false);
                 }
-                for (String column : PROBE_ONLY_COLUMNS) {
-                    assertDifferential("SELECT count(b." + column + ") n FROM p LEFT JOIN b ON p.id=b.id", context, false);
-                }
+                assertDifferential("SELECT count(b.str) n FROM p LEFT JOIN b ON p.id=b.id", context, false);
             }
         });
     }
@@ -381,38 +380,49 @@ public class HashJoinGroupByColumnTypesTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testVarcharBuildColumnsOutsideBuildFiltersFuse() throws Exception {
+        assertMemoryLeak(() -> {
+            createTables();
+            insertRows();
+            try (SqlExecutionContextImpl context = context(engine, 4)) {
+                context.changePageFrameSizes(1, 8);
+                // The build reads a VARCHAR payload from its pinned frames, so a VARCHAR build column
+                // fuses wherever the joined record reads it: a grouping key, an aggregate argument,
+                // an expression inside one, and a post-join filter. b holds no more rows than p, so
+                // the regular expression of the LEFT join's ON condition on b alone fuses too.
+                for (String sql : new String[]{
+                        "SELECT b.vc k, count(*) n FROM p LEFT JOIN b ON p.id = b.id ORDER BY k",
+                        "SELECT b.vc k, count(*) n FROM p JOIN b ON p.id = b.id WHERE b.vc ~ 'a' ORDER BY k",
+                        "SELECT count(b.vc) n FROM p LEFT JOIN b ON p.id = b.id",
+                        "SELECT sum(length(b.vc)) n FROM p JOIN b ON p.id = b.id WHERE b.vc ~ 'a'",
+                        "SELECT count(b.vc) n FROM p LEFT JOIN b ON p.id = b.id AND b.vc ~ 'a'",
+                        "SELECT count(*) n FROM p LEFT JOIN b ON p.id = b.id WHERE b.vc IS NOT NULL",
+                        "SELECT count(*) n FROM p LEFT JOIN b ON p.id = b.id WHERE b.vc ~ 'a'"
+                }) {
+                    assertDifferential(sql, context, true);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testVariableSizeBuildColumnsOutsideBuildFiltersKeepTheOrdinaryPlan() throws Exception {
         assertMemoryLeak(() -> {
             createTables();
             insertRows();
             try (SqlExecutionContextImpl context = context(engine, 4)) {
                 context.changePageFrameSizes(1, 8);
-                // A build filter over a variable-size column qualifies, but the same column read
-                // anywhere on the joined record would be a payload the row heap cannot copy: an
-                // aggregate argument, an expression inside one, a post-join filter, or an ON
-                // condition that reads the probe too.
+                // A build filter over a STRING column qualifies, but the same column read anywhere
+                // on the joined record would be a payload the row heap cannot copy: an aggregate
+                // argument, an expression inside one, a post-join filter, or an ON condition that
+                // reads the probe too.
                 assertAgainstOrdinaryPlan("SELECT count(b.str) n FROM p JOIN b ON p.id = b.id WHERE b.str = 'sa'", context);
-                assertAgainstOrdinaryPlan("SELECT sum(length(b.vc)) n FROM p JOIN b ON p.id = b.id WHERE b.vc ~ 'a'", context);
-                assertAgainstOrdinaryPlan("SELECT count(b.vc) n FROM p LEFT JOIN b ON p.id = b.id AND b.vc ~ 'a'", context);
-                assertAgainstOrdinaryPlan("SELECT count(*) n FROM p LEFT JOIN b ON p.id = b.id WHERE b.vc ~ 'a'", context);
+                assertAgainstOrdinaryPlan("SELECT sum(length(b.str)) n FROM p JOIN b ON p.id = b.id WHERE b.str ~ 'a'", context);
+                assertAgainstOrdinaryPlan("SELECT count(b.str) n FROM p LEFT JOIN b ON p.id = b.id AND b.str ~ 'a'", context);
+                assertAgainstOrdinaryPlan("SELECT count(*) n FROM p LEFT JOIN b ON p.id = b.id WHERE b.str ~ 'a'", context);
                 assertAgainstOrdinaryPlan("SELECT count(*) n FROM p LEFT JOIN b ON p.id = b.id AND b.str = 'sa' "
                         + "WHERE b.str IS NULL", context);
-                assertAgainstOrdinaryPlan("SELECT count(*) n FROM p LEFT JOIN b ON p.id = b.id AND b.vc <> p.vc", context);
-                // A grouping key over the build column reads it on the joined record too.
-                context.setParallelHashJoinGroupByEnabled(false);
-                final String expected;
-                try {
-                    expected = TestUtils.printSqlToString(engine, context,
-                            "SELECT b.vc k, count(*) n FROM p JOIN b ON p.id = b.id WHERE b.vc ~ 'a' ORDER BY k", sink);
-                } finally {
-                    context.setParallelHashJoinGroupByEnabled(true);
-                }
-                assertQuery("SELECT b.vc k, count(*) n FROM p JOIN b ON p.id = b.id WHERE b.vc ~ 'a' ORDER BY k")
-                        .withContext(context)
-                        .noLeakCheck()
-                        .expectSize()
-                        .withPlanNotContaining("Hash Join Group By")
-                        .returns(expected);
+                assertAgainstOrdinaryPlan("SELECT count(*) n FROM p LEFT JOIN b ON p.id = b.id AND b.str <> p.str", context);
             }
         });
     }

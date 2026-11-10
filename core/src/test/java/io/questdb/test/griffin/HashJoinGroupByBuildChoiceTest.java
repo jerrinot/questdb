@@ -112,6 +112,10 @@ public class HashJoinGroupByBuildChoiceTest extends AbstractCairoTest {
                         assertChoice(select + join + " WHERE r.reading_ts < '2020-01-01T03:00'" + order, context, true, 3);
                     }
                 }
+                // The build reads a VARCHAR payload from its pinned frames, so r's VARCHAR label
+                // does not pin the build to p: 4 interval rows against p's 8 build r.
+                assertChoice("SELECT count(r.label) labels, count(*) n FROM r JOIN p ON r.plant_id = p.plant_id"
+                        + " WHERE r.reading_ts >= '2020-01-01' AND r.reading_ts < '2020-01-01T04:00'", context, true, 4);
             }
         });
     }
@@ -313,8 +317,8 @@ public class HashJoinGroupByBuildChoiceTest extends AbstractCairoTest {
                 // the rows that the ordinary plan hashes.
                 assertChoice(SCALAR + " FROM r LEFT JOIN p ON r.plant_id = p.plant_id" + interval, context, false, -1);
                 assertDifferential(SCALAR + " FROM p RIGHT JOIN r ON r.plant_id = p.plant_id" + interval, context, false);
-                // A VARCHAR column reaches the aggregate only from the probe, so r cannot be the build.
-                assertChoice("SELECT count(r.label) labels, count(*) n FROM r JOIN p ON r.plant_id = p.plant_id" + interval,
+                // A STRING column reaches the aggregate only from the probe, so r cannot be the build.
+                assertChoice("SELECT count(r.note) notes, count(*) n FROM r JOIN p ON r.plant_id = p.plant_id" + interval,
                         context, false, -1);
                 // A SYMBOL key translates every distinct key the probe reads, so probing p costs
                 // about what building it does. r's dictionary starts at P1 and p's at P0, so the two
@@ -524,14 +528,15 @@ public class HashJoinGroupByBuildChoiceTest extends AbstractCairoTest {
     private void createTables() throws Exception {
         execute("""
                 CREATE TABLE r (
-                    plant_id INT, reading_ts TIMESTAMP, energy_kwh DOUBLE, irradiance_wm2 DOUBLE, s SYMBOL, label VARCHAR
+                    plant_id INT, reading_ts TIMESTAMP, energy_kwh DOUBLE, irradiance_wm2 DOUBLE, s SYMBOL, label VARCHAR,
+                    note STRING
                 ) TIMESTAMP(reading_ts) PARTITION BY DAY
                 """);
         execute("CREATE TABLE p (plant_id INT, country SYMBOL, installed_kwp DOUBLE, s SYMBOL)");
         execute("""
                 INSERT INTO r
                 SELECT (x % 8)::INT, '2020-01-01'::TIMESTAMP + (x - 1) * 3_600_000_000L, x::DOUBLE, (x * 10)::DOUBLE,
-                    'P' || (x % 8), 'L' || (x % 8)
+                    'P' || (x % 8), 'L' || (x % 8), 'N' || (x % 8)
                 FROM long_sequence(96)
                 """);
         execute("""

@@ -31,7 +31,6 @@ import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.SqlExecutionContextImpl;
-import io.questdb.griffin.engine.table.AsyncFilterContext;
 import io.questdb.griffin.engine.table.AsyncHashJoinGroupByAtom;
 import io.questdb.mp.WorkerPoolMode;
 import io.questdb.std.ObjList;
@@ -43,8 +42,6 @@ import org.jetbrains.annotations.Nullable;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
-
-import java.lang.reflect.Field;
 
 import static io.questdb.test.griffin.HashJoinGroupByQualificationTest.context;
 import static io.questdb.test.griffin.HashJoinGroupByQualificationTest.fused;
@@ -173,19 +170,20 @@ public class HashJoinGroupByWorkerFilterTest extends AbstractCairoTest {
         }
     }
 
-    // The atom exposes neither the filter context of the build scan nor the ON filter copies.
-    private static void assertWorkerFilterCopies(String label, AsyncHashJoinGroupByAtom atom, boolean isOuter) throws Exception {
-        final AsyncFilterContext buildFilterContext = (AsyncFilterContext) field(atom, "buildFilterContext");
+    private static void assertWorkerFilterCopies(String label, AsyncHashJoinGroupByAtom atom, boolean isOuter) {
         final ObjList<Function> scanCopies = new ObjList<>();
         for (int i = 0; i < WORKER_COUNT; i++) {
-            scanCopies.add(buildFilterContext.getFilter(i));
+            scanCopies.add(atom.getBuildFilter(i));
         }
-        assertDistinctCopies(label, buildFilterContext.getFilter(-1), scanCopies);
+        assertDistinctCopies(label, atom.getBuildFilter(-1), scanCopies);
         if (isOuter) {
-            @SuppressWarnings("unchecked") final ObjList<Function> onCopies = (ObjList<Function>) field(atom, "workerBuildOnFilters");
-            assertDistinctCopies(label, (Function) field(atom, "buildOnFilter"), onCopies);
+            final ObjList<Function> onCopies = new ObjList<>();
+            for (int i = 0; i < WORKER_COUNT; i++) {
+                onCopies.add(atom.getBuildOnFilter(i));
+            }
+            assertDistinctCopies(label, atom.getBuildOnFilter(-1), onCopies);
         } else {
-            Assert.assertNull(label, field(atom, "buildOnFilter"));
+            Assert.assertNull(label, atom.getBuildOnFilter(-1));
         }
     }
 
@@ -217,12 +215,6 @@ public class HashJoinGroupByWorkerFilterTest extends AbstractCairoTest {
                     FROM long_sequence(2_400)
                 )
                 """, context);
-    }
-
-    private static Object field(Object target, String name) throws Exception {
-        final Field field = target.getClass().getDeclaredField(name);
-        field.setAccessible(true);
-        return field.get(target);
     }
 
     private void assertWorkerFilters(@Nullable WorkerPoolMode mode, String[] queries, boolean isOuter) throws Exception {

@@ -204,6 +204,15 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
     }
 
     /**
+     * The build scan's filter of a slot: the owner's at -1 and a worker's from 0, or null when the
+     * build scan has no filter.
+     */
+    @TestOnly
+    public Function getBuildFilter(int slot) {
+        return builds.getQuick(0).getBuildFilter(slot);
+    }
+
+    /**
      * Page frames of the open cursor's build input, zero until the cursor builds.
      */
     @TestOnly
@@ -218,6 +227,15 @@ public final class AsyncHashJoinGroupByAtom implements StatefulAtom, PerWorkerLo
     @TestOnly
     public long getBuildKeyStagerSizeInBytes() {
         return builds.getQuick(0).getBuildKeyStagerSizeInBytes();
+    }
+
+    /**
+     * An outer join's ON filter on the build alone, of a slot: the owner's at -1, and a worker's
+     * copy from 0, or the owner's when the workers share it. Null when the join has no such filter.
+     */
+    @TestOnly
+    public Function getBuildOnFilter(int slot) {
+        return builds.getQuick(0).getBuildOnFilter(slot);
     }
 
     /**

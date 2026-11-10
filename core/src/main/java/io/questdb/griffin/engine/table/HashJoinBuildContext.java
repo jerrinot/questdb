@@ -318,6 +318,15 @@ public final class HashJoinBuildContext implements QuietCloseable {
     }
 
     /**
+     * The build scan's filter of a slot: the owner's at -1 and a worker's from 0, or null when the
+     * build scan has no filter.
+     */
+    @TestOnly
+    public Function getBuildFilter(int slot) {
+        return buildFilterContext.getFilter(slot);
+    }
+
+    /**
      * Page frames of the open cursor's build input, zero until the cursor builds.
      */
     @TestOnly
@@ -339,6 +348,15 @@ public final class HashJoinBuildContext implements QuietCloseable {
             }
         }
         return size;
+    }
+
+    /**
+     * An outer join's ON filter on the build alone, of a slot: the owner's at -1, and a worker's
+     * copy from 0, or the owner's when the workers share it. Null when the join has no such filter.
+     */
+    @TestOnly
+    public Function getBuildOnFilter(int slot) {
+        return slot < 0 || workerBuildOnFilters == null ? buildOnFilter : workerBuildOnFilters.get(slot);
     }
 
     /**
