@@ -25,6 +25,12 @@
 package org.questdb.experimental.codegen;
 
 import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.FunctionDescriptor;
+import java.lang.foreign.Linker;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandle;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -50,6 +56,7 @@ final class CacheSizing {
     }
 
     private static List<Cache> discover(int targetLevel) {
+        if (System.getProperty("os.name").equals("Mac OS X")) return discoverDarwin(targetLevel);
         try {
             BitSet allowed = null;
             for (String line : Files.readAllLines(Path.of("/proc/self/status"))) {
@@ -89,6 +96,52 @@ final class CacheSizing {
         } catch (IOException | IllegalArgumentException | SecurityException unavailable) {
             return List.of();
         }
+    }
+
+    /**
+     * macOS has neither sysfs nor a CPU affinity mask. sysctl describes one cache
+     * shape per performance level; a scheduler may place workers on any level.
+     */
+    private static List<Cache> discoverDarwin(int targetLevel) {
+        try (Arena arena = Arena.ofConfined()) {
+            Linker linker = Linker.nativeLinker();
+            MethodHandle sysctl = linker.downcallHandle(linker.defaultLookup().find("sysctlbyname").orElseThrow(),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+            long levels = sysctl(sysctl, arena, "hw.nperflevels");
+            var result = new ArrayList<Cache>();
+            // Intel hosts and older releases report no performance levels.
+            for (int i = 0; i < Math.max(1, levels); i++) {
+                String prefix = levels > 0 ? "hw.perflevel" + i + "." : "hw.";
+                long bytes = 0, processors = 0;
+                for (int level = targetLevel == 0 ? 3 : targetLevel; level >= 2 && bytes <= 0; level--) {
+                    if (targetLevel != 0 && level != targetLevel) break;
+                    bytes = sysctl(sysctl, arena, prefix + "l" + level + "cachesize");
+                    // Without levels, hw.cacheconfig[n] counts the logical CPUs sharing level n.
+                    processors = levels > 0 ? sysctl(sysctl, arena, prefix + "cpusperl" + level)
+                            : sysctl(sysctl, arena, "hw.cacheconfig", level);
+                }
+                if (bytes <= 0 || processors <= 0 || processors > Integer.MAX_VALUE) return List.of();
+                result.add(new Cache(bytes, (int) processors));
+            }
+            return List.copyOf(result);
+        } catch (Throwable unavailable) {
+            if (unavailable instanceof Error error && !(unavailable instanceof LinkageError)) throw error;
+            return List.of();
+        }
+    }
+
+    private static long sysctl(MethodHandle sysctl, Arena arena, String name) throws Throwable { return sysctl(sysctl, arena, name, 0); }
+
+    /** Element of an integer sysctl; 0 when the name, element or integer width is absent. */
+    private static long sysctl(MethodHandle sysctl, Arena arena, String name, int index) throws Throwable {
+        MemorySegment value = arena.allocate(ValueLayout.JAVA_LONG, 16), size = arena.allocate(ValueLayout.JAVA_LONG);
+        size.set(ValueLayout.JAVA_LONG, 0, value.byteSize());
+        if ((int) sysctl.invokeExact(arena.allocateFrom(name), value, size, MemorySegment.NULL, 0L) != 0) return 0;
+        long bytes = size.get(ValueLayout.JAVA_LONG, 0);
+        // Scalars are 4 or 8 bytes wide; arrays such as hw.cacheconfig hold 8-byte elements.
+        if (bytes == 4 && index == 0) return value.get(ValueLayout.JAVA_INT, 0);
+        return bytes % 8 == 0 && index < bytes / 8 ? value.getAtIndex(ValueLayout.JAVA_LONG, index) : 0;
     }
 
     private static String read(Path directory, String name) throws IOException {

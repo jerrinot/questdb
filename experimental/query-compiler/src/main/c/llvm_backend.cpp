@@ -87,6 +87,9 @@ struct Engine {
                 for (const auto& [symbol, size] : object::computeSymbolSizes(**parsed)) {
                     auto name = symbol.getName();
                     if (!name) return name.takeError();
+                    // Object symbols carry the platform's global prefix: '_' in Mach-O, none in ELF.
+                    if (char prefix = jit->getDataLayout().getGlobalPrefix(); prefix && name->starts_with(StringRef(&prefix, 1)))
+                        *name = name->drop_front();
                     if (!name->starts_with("questdb_kernel_")) continue;
                     profileSizes[name->str()] = size;
                     std::error_code error;

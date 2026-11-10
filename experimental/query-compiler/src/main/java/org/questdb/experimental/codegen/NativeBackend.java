@@ -27,7 +27,6 @@ package org.questdb.experimental.codegen;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.SymbolLookup;
-import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -57,8 +56,10 @@ public final class NativeBackend implements Backend {
     public CompiledKernel compile(Program program, Path artifactRoot) throws IOException {
         long start = System.nanoTime();
         var prepared = IrOptimizer.prepare(PortableVectorLowering.lower(HelperInlining.expand(program)), lowering);
-        if (!System.getProperty("os.name").equals("Linux") || ValueLayout.ADDRESS.byteSize() != 8) {
-            throw new IOException("The native prototype currently supports 64-bit Linux");
+        try {
+            LlvmBackend.checkPlatform();
+        } catch (IOException unsupported) {
+            throw new IOException("The native prototype currently supports 64-bit Linux and macOS");
         }
         Files.createDirectories(artifactRoot);
         Path directory = Files.createTempDirectory(artifactRoot, "native-").toAbsolutePath();

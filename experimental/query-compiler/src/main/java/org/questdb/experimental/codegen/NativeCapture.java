@@ -257,10 +257,9 @@ final class NativeCapture {
         static final MemorySegment MATCH;
         static {
             try {
-                Path classes = Path.of(LlvmBackend.class.getProtectionDomain().getCodeSource().getLocation().toURI());
                 Path llvm = Path.of(System.getProperty("questdb.codegen.llvm.library",
-                        classes.getParent().resolve("native/libquery_codegen_llvm.so").toString())).toAbsolutePath();
-                var lookup = SymbolLookup.libraryLookup(llvm.resolveSibling("libquery_codegen_regex.so"), Arena.global());
+                        LlvmBackend.bridgeLibrary("query_codegen_llvm").toString())).toAbsolutePath();
+                var lookup = SymbolLookup.libraryLookup(llvm.resolveSibling(System.mapLibraryName("query_codegen_regex")), Arena.global());
                 var linker = Linker.nativeLinker();
                 CREATE = linker.downcallHandle(lookup.find("query_capture_create").orElseThrow(), FunctionDescriptor.of(
                         ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));

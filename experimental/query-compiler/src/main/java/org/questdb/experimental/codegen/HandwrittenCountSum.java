@@ -87,7 +87,8 @@ final class HandwrittenCountSum implements QueryCodeGenerator {
                 + "\n#define HINTS " + (CompilerOptions.PROCESS.prefetchHints() ? 1 : 0)
                 + "\n" + Files.readString(source));
         // -O2 selects frontend attributes without optnone; LLVM passes run only in our existing JIT.
-        List<String> command = List.of("clang-21", "-std=c11", "-O2", "-Xclang", "-disable-llvm-passes",
+        // Debian suffixes the versioned frontend; Homebrew's keg-only llvm@21 needs an explicit path.
+        List<String> command = List.of(System.getProperty("questdb.codegen.clang", "clang-21"), "-std=c11", "-O2", "-Xclang", "-disable-llvm-passes",
                 "-march=native", "-fwrapv", "-S", "-emit-llvm", "-Wall", "-Wextra", "-Werror",
                 "-Wno-unused-function", input.toString(), "-o", output.toString());
         Files.writeString(directory.resolve("command.txt"), String.join("\n", command) + "\n");

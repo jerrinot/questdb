@@ -62,8 +62,9 @@ final class CountSumPaths {
         Path directory = Files.createTempDirectory(artifacts, "count-sum-paths-").toAbsolutePath();
         Path library = directory.resolve("query.so"), log = directory.resolve("clang.log");
         Path jdk = Path.of(System.getProperty("java.home"));
-        var command = List.of("clang++-21", "-O3", "-march=native", "-fwrapv", "-std=c++20", "-pthread", "-shared", "-fPIC",
-                "-I" + jdk.resolve("include"), "-I" + jdk.resolve("include/linux"),
+        boolean isDarwin = System.getProperty("os.name").equals("Mac OS X");
+        var command = List.of(System.getProperty("questdb.codegen.clangxx", "clang++-21"), "-O3", "-march=native", "-fwrapv", "-std=c++20", "-pthread", "-shared", "-fPIC",
+                "-I" + jdk.resolve("include"), "-I" + jdk.resolve(isDarwin ? "include/darwin" : "include/linux"),
                 "-I" + module.getParent().getParent().resolve("core/src/main/c/share"),
                 module.resolve("src/main/c/count_sum_paths.cpp").toString(), "-o", library.toString());
         Files.writeString(directory.resolve("command.txt"), String.join("\n", command));

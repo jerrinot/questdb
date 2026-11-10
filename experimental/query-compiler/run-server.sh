@@ -3,7 +3,9 @@ set -euo pipefail
 module_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$module_dir/../.." && pwd)
 
-if [[ ! -f "$module_dir/target/classes/org/questdb/experimental/codegen/ResolvedQueryCompiler.class" || ! -f "$module_dir/target/native/libquery_codegen_llvm.so" ]]; then
+library_suffix=so
+[[ "$(uname -s)" == Darwin ]] && library_suffix=dylib
+if [[ ! -f "$module_dir/target/classes/org/questdb/experimental/codegen/ResolvedQueryCompiler.class" || ! -f "$module_dir/target/native/libquery_codegen_llvm.$library_suffix" ]]; then
     echo "Build with: mvn -Pquery-compiler-prototype -pl experimental/query-compiler -am -DskipTests -Djacoco.skip=true install" >&2
     exit 1
 fi

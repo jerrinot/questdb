@@ -602,9 +602,10 @@ cursor executions; the counters do not imply that the winner was reset.
 
 Requires JDK 25, Maven, CMake 3.22+, a C++17 compiler, `cc`, LLVM 21.1 development
 files/shared library, pkg-config and PCRE2 development files with JIT support (tested with 10.46).
-The current build is exercised on Linux x86-64. Native
+The current build is exercised on Linux x86-64; the LLVM and C backends also run
+on arm64 macOS. Native
 bridges build through the module's Maven lifecycle; AsmJit uses the pin in
-`core/CMakeLists.txt`. LLVM and PCRE2 belong only to this optional module. The capture
+`core/CMakeLists.txt` and builds only on x86-64. LLVM and PCRE2 belong only to this optional module. The capture
 bridge lives beside the LLVM bridge; it adds no dependency to ordinary QuestDB.
 
 From the repository root:
@@ -613,6 +614,20 @@ From the repository root:
 mvn -q -pl core -am -DskipTests -Djacoco.skip=true install
 mvn -f experimental/query-compiler/pom.xml test
 ```
+
+On macOS, install the dependencies with `brew install llvm@21 pcre2 cmake pkg-config`.
+`build-native.sh` locates the keg-only `llvm@21` through `brew --prefix`; an explicit
+`CMAKE_PREFIX_PATH` or `LLVM_DIR` takes precedence. The bridges are
+`libquery_codegen_*.dylib` and link Homebrew's `libLLVM.dylib` by absolute path.
+The handwritten references run a versioned clang that Homebrew does not put on
+`PATH`: pass `-Dquestdb.codegen.clang=$(brew --prefix llvm@21)/bin/clang-21` and
+`-Dquestdb.codegen.clangxx=$(brew --prefix llvm@21)/bin/clang++`. `bench/run.py`
+and the `/proc` counters in the matrix runners remain Linux-only.
+
+This branch changes `core/src/main/c` without rebuilding the committed
+`libquestdb` binaries. Build the core native library locally first (see the
+repository's CLAUDE.md); `Os` prefers the resulting `bin-local` copy. Without it,
+generated and ordinary Rosti results disagree in `ResolvedSymbolAggregateTest`.
 
 For focused work, select existing tests with `-Dtest=ClassName` on the second
 command. The optional reactor profile is:

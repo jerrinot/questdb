@@ -400,7 +400,7 @@ public class ScanStageTest {
     }
     private static void write(MemoryType type,long p,long v){var u=Unsafe.getUnsafe();switch(type){case I8->u.putByte(p,(byte)v);case I16->u.putShort(p,(short)v);case I32->u.putInt(p,(int)v);case I64->u.putLong(p,v);default->throw new AssertionError();}}
 
-    /** Linux guard page detects an actual over-read, including SIMD tails. */
+    /** Guard page detects an actual over-read, including SIMD tails. */
     static final class GuardedPage implements AutoCloseable {
         static final Linker LINKER=Linker.nativeLinker();
         static MethodHandle function(String name,FunctionDescriptor fd){return LINKER.downcallHandle(LINKER.defaultLookup().find(name).orElseThrow(),fd);}
@@ -415,7 +415,8 @@ public class ScanStageTest {
             if(bytes<0)throw new IllegalArgumentException();
             long readable=Math.max(page,(bytes+page-1)/page*page);
             mappingBytes=readable+page*2;
-            mapping=(MemorySegment)MMAP.invokeExact(MemorySegment.NULL,mappingBytes,3,0x22,-1,0L);
+            // MAP_PRIVATE is 2 on both hosts; MAP_ANONYMOUS is 0x20 on Linux and 0x1000 on macOS.
+            mapping=(MemorySegment)MMAP.invokeExact(MemorySegment.NULL,mappingBytes,3,System.getProperty("os.name").equals("Mac OS X")?0x1002:0x22,-1,0L);
             if(mapping.address()==-1)throw new IllegalStateException("mmap failed");
             address=mapping.address()+page+(atEnd?readable-bytes:0);
             if((int)PROTECT.invokeExact(mapping,page,0)!=0 || (int)PROTECT.invokeExact(MemorySegment.ofAddress(mapping.address()+page+readable),page,0)!=0){close();throw new IllegalStateException("mprotect failed");}

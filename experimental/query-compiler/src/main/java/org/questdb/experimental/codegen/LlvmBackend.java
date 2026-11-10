@@ -61,8 +61,15 @@ public final class LlvmBackend implements Backend {
     }
 
     static void checkPlatform() throws IOException {
-        if (!System.getProperty("os.name").equals("Linux") || ValueLayout.ADDRESS.byteSize() != 8)
-            throw new IOException("The experimental LLVM backend requires 64-bit Linux");
+        String os = System.getProperty("os.name");
+        if (!(os.equals("Linux") || os.equals("Mac OS X")) || ValueLayout.ADDRESS.byteSize() != 8)
+            throw new IOException("The experimental LLVM backend requires 64-bit Linux or macOS");
+    }
+
+    /** Sibling bridge beside the module classes: lib*.so on Linux, lib*.dylib on macOS. */
+    static Path bridgeLibrary(String name) throws java.net.URISyntaxException {
+        Path classes = Path.of(LlvmBackend.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        return classes.getParent().resolve("native").resolve(System.mapLibraryName(name));
     }
 
     /** Shares optimization, JIT, callbacks and ownership with the handwritten C reference. */
@@ -111,9 +118,8 @@ public final class LlvmBackend implements Backend {
         static final MethodHandle COMPILE, RELEASE, LIVE;
         static {
             try {
-                Path classes = Path.of(LlvmBackend.class.getProtectionDomain().getCodeSource().getLocation().toURI());
                 Path library = Path.of(System.getProperty("questdb.codegen.llvm.library",
-                        classes.getParent().resolve("native/libquery_codegen_llvm.so").toString())).toAbsolutePath();
+                        bridgeLibrary("query_codegen_llvm").toString())).toAbsolutePath();
                 var lookup = SymbolLookup.libraryLookup(library, Arena.global()); var linker = Linker.nativeLinker();
                 COMPILE = linker.downcallHandle(lookup.find("query_llvm_compile").orElseThrow(), FunctionDescriptor.of(
                         ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
