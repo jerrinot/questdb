@@ -40,10 +40,13 @@ public class VectorMaskTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
     private final Backend backend;
     public VectorMaskTest(String name, Backend backend) { this.backend = backend; }
-    @Parameterized.Parameters(name="{0}") public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm0",new LlvmBackend(0)},new Object[]{"llvm1",new LlvmBackend(1)},
-                new Object[]{"llvm2",new LlvmBackend(2)},new Object[]{"llvm3",new LlvmBackend(3)},
-                new Object[]{"c",new NativeBackend()},new Object[]{"asmjit",new AsmJitBackend()});
+    @Parameterized.Parameters(name = "{0}")
+    public static List<Object[]> parameters() {
+        return List.of(
+                new Object[]{"llvm0",new LlvmBackend(0)},
+                new Object[]{"llvm1",new LlvmBackend(1)},
+                new Object[]{"llvm2",new LlvmBackend(2)},
+                new Object[]{"llvm3",new LlvmBackend(3)});
     }
     @Test public void widthsLaneOrderAndMaskTails() throws Exception {
         for (MemoryType width : new MemoryType[]{MemoryType.I8,MemoryType.I16,MemoryType.I32,MemoryType.I64}) {
@@ -159,8 +162,6 @@ public class VectorMaskTest {
         Builder b=new Builder();Expr read=new VectorMask(64,ne(new Load(MemoryType.I8,COLUMNS),i64(0)));
         Var before=b.let(read);b.store(MemoryType.I8,at(COLUMNS,63),i64(1));Var after=b.let(read);
         b.store(STATE,before);b.store(at(STATE,8),after);b.exit(0);
-        var graph=SsaProgram.lower(new Program(b.block()));SsaOptimizer.optimize(graph);SsaOptimizer.verify(graph);
-        assertTrue(graph.blocks.stream().flatMap(x->x.code.stream()).anyMatch(s->SsaOptimizer.effect(s)==SsaOptimizer.Effect.READ));
         try(var kernel=backend.compile(new Program(b.block()),temporary.getRoot().toPath());Arena arena=Arena.ofConfined()) {
             long data=arena.allocate(64,8).address(),out=arena.allocate(16,8).address();
             assertEquals(0,kernel.run(data,64,out));assertEquals(0,Unsafe.getUnsafe().getLong(out));assertEquals(Long.MIN_VALUE,Unsafe.getUnsafe().getLong(out+8));
@@ -191,14 +192,11 @@ public class VectorMaskTest {
         Builder b = new Builder();
         int[] widths = {1, 7, 8, 9, 63, 64};
         for (int i = 0; i < widths.length; i++) {
-            // Deliberately unused result: neither optimizer may discard the stores.
+            // Deliberately unused result: optimization must preserve the stores.
             b.let(new SelectRows(widths[i], load(COLUMNS), i64(Long.MAX_VALUE - 31), at(STATE, i * 65L * 8)));
         }
         b.exit(0);
         var program = new Program(b.block());
-        var graph = SsaProgram.lower(program); SsaOptimizer.optimize(graph); SsaOptimizer.verify(graph);
-        assertEquals(widths.length, graph.blocks.stream().flatMap(block -> block.code.stream())
-                .filter(s -> SsaOptimizer.effect(s) == SsaOptimizer.Effect.WRITE).count());
         try (var kernel = backend.compile(program, temporary.getRoot().toPath()); var arena = Arena.ofConfined()) {
             long input = arena.allocate(8, 8).address(), output = arena.allocate(widths.length * 65L * 8, 8).address();
             for (long mask : new long[]{0, -1, Long.MIN_VALUE, 1, 0x5555555555555555L, 0x8123456789abcdefL}) {

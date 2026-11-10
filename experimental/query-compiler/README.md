@@ -32,8 +32,8 @@ try (var factory = engine.select(
 
 The two-argument constructor snapshots planning properties once. To supply explicit
 planning choices, pass a `CompilerOptions` record as its third argument. Deferred
-compilation and filters retain that same snapshot. Backend-lowering/diagnostic
-switches and native library loading retain process scope; defaults are unchanged.
+compilation and filters retain that same snapshot. Instrumentation, prefetch hints
+and native library loading retain process scope.
 
 Registration is disabled by default. Core exposes `QueryCodeGenerator`; it has no
 LLVM dependency. The normal planner resolves functions and chooses factories.
@@ -563,34 +563,23 @@ Filter/aggregate fusion is a separate harness experiment exposed by
 turn it on. The standalone adaptive scan alternatives are also distinct from the
 integrated aggregation path.
 
-## Backends and generated-code inspection
+## LLVM backend and generated-code inspection
 
-All backends consume the typed IR. There is no JVM execution backend.
+`LlvmBackend` consumes the typed IR, lowers it to verified SSA and LLVM text,
+then uses in-process optimization and ORC LLJIT. O2 is the default; levels 0–3
+are supported. LLVM is the module's only compiler backend.
 
-| Backend | Compilation |
-| --- | --- |
-| `LlvmBackend` | Verified SSA → LLVM text → in-process optimization and ORC LLJIT; O2 by default, levels 0–3 supported |
-| `AsmJitBackend` | Optimized IR → register/label stream → in-process AsmJit Compiler; Linux x86-64 |
-| `NativeBackend` | IR → C → `cc` shared library; `NativeBackend("clang")` selects another compiler |
+Java passes LLVM text once during compilation. Execution passes column/state
+addresses and row counts through FFM; no text crosses that boundary per row.
+The native bridge selects the host CPU, retains an engine per optimization level
+and releases query code through ORC resource trackers.
 
-LLVM bypasses the prototype scalar/SSA optimizer and uses LLVM's passes. Java
-passes LLVM text once during compilation. Execution passes column/state addresses
-and row counts through FFM; no text crosses that boundary per row. The native
-bridge selects the host CPU, retains an engine per optimization level and releases
-query code through ORC resource trackers.
-
-`new LlvmBackend(2, true)` writes input SSA, LLVM text and optimized LLVM text.
-`new AsmJitBackend(true)` writes IR and the instruction stream. Both disable dumps
-by default. For native profiling, create a writable directory and set
-`QUERY_CODEGEN_PROFILE_DIR` before JVM startup: LLVM writes optimized IR and object
-files with `questdb_kernel_*` symbols plus a perf map. See
+`new LlvmBackend(2, true)` writes input SSA, LLVM text and optimized LLVM text;
+dumps are disabled by default. For native profiling, create a writable directory
+and set `QUERY_CODEGEN_PROFILE_DIR` before JVM startup: LLVM writes optimized IR
+and object files with `questdb_kernel_*` symbols plus a perf map. See
 [llvm_backend.cpp](src/main/c/llvm_backend.cpp) for registration and lifetime details.
-
-Existing compiler controls include `questdb.codegen.ssa`,
-`questdb.codegen.disableSsaOptimization` and `questdb.codegen.disableOptimization`
-for AsmJit/C. They do not select LLVM's optimization pipeline. Library paths can
-be overridden with `questdb.codegen.asmjit.library` and
-`questdb.codegen.llvm.library`.
+The bridge library path can be overridden with `questdb.codegen.llvm.library`.
 
 With the existing `query.codegen.profile` control, the resolved SQL runner also
 reports `adaptive-plain-batches` and `adaptive-staged-batches`. These count actual
@@ -602,11 +591,10 @@ cursor executions; the counters do not imply that the winner was reset.
 
 Requires JDK 25, Maven, CMake 3.22+, a C++17 compiler, `cc`, LLVM 21.1 development
 files/shared library, pkg-config and PCRE2 development files with JIT support (tested with 10.46).
-The current build is exercised on Linux x86-64; the LLVM and C backends also run
-on arm64 macOS. Native
-bridges build through the module's Maven lifecycle; AsmJit uses the pin in
-`core/CMakeLists.txt` and builds only on x86-64. LLVM and PCRE2 belong only to this optional module. The capture
-bridge lives beside the LLVM bridge; it adds no dependency to ordinary QuestDB.
+The current build is exercised on Linux x86-64 and arm64 macOS. Native bridges
+build through the module's Maven lifecycle. LLVM and PCRE2 belong only to this
+optional module. The capture bridge lives beside the LLVM bridge; it adds no
+dependency to ordinary QuestDB.
 
 From the repository root:
 
@@ -792,7 +780,7 @@ placement for the machine under test rather than copying an affinity mask.
 | `run-scan.sh --resolved-three-way` | Ordinary, integrated and standalone execution; scheduling/layouts differ |
 | `run-scan.sh`, `run-parallel.sh` | Standalone scan strategies and parallel aggregation |
 | `run-compiler.sh` | Fresh compilation and first execution of composed physical plans |
-| `run-matrix.sh`, `run-demo.sh`, `run-real-data.sh` | Backend/algorithm controls; small fixtures establish correctness, not large-scale performance |
+| `run-matrix.sh`, `run-demo.sh`, `run-real-data.sh` | Algorithm and LLVM compilation controls; small fixtures establish correctness, not large-scale performance |
 
 The SQL runner also accepts `native-hash`, `native-auto` and `duckdb` controls.
 `query.codegen.handwritten=true` selects the same-algorithm COUNT/SUM C reference
@@ -817,7 +805,7 @@ eligibility rules.
 ## Standalone physical plans
 
 `Pipeline`, `PhysicalPlan`, `PlanCompiler`, `CompiledPlan`, `CompiledGroupBy` and
-`ParallelGroupBy` remain controls for composition, backend and algorithm experiments.
+`ParallelGroupBy` remain controls for composition, LLVM compilation and algorithm experiments.
 `CompilerDemo` shows scan/filter/project/join/aggregate composition. These executors
 use prototype state/output representations and can materialize boxed Java rows;
 their totals are not equivalent to ordinary SQL frontend or server workloads.

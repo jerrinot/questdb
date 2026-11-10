@@ -29,8 +29,6 @@ import io.questdb.std.Numbers;
 import io.questdb.std.Unsafe;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
 import java.lang.foreign.Arena;
 import java.util.List;
@@ -38,15 +36,9 @@ import java.util.List;
 import static org.junit.Assert.*;
 import static org.questdb.experimental.codegen.Ir.*;
 
-@RunWith(Parameterized.class)
 public class FloatingIrTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
-    public FloatingIrTest(String name, Backend backend) { this.backend = backend; }
-    @Parameterized.Parameters(name = "{0}") public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm", new LlvmBackend()}, new Object[]{"asmjit", new AsmJitBackend()},
-                new Object[]{"c", new NativeBackend()});
-    }
+    private final Backend backend = new LlvmBackend();
 
     @Test public void floatingRemainderMatchesJavaForConstantsScalarsAndLanes() throws Throwable {
         double[] edges={Double.NaN,Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY,-0.0,0,

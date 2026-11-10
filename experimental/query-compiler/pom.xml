@@ -28,7 +28,7 @@
     <parent>
         <groupId>org.questdb</groupId>
         <artifactId>questdb-parent</artifactId>
-        <version>10.1.1-SNAPSHOT</version>
+        <version>10.2.1-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
     <artifactId>query-compiler-prototype</artifactId>
@@ -79,7 +79,7 @@
                 <version>3.5.0</version>
                 <executions>
                     <execution>
-                        <id>build-asmjit-bridge</id>
+                        <id>build-native-bridges</id>
                         <phase>generate-resources</phase>
                         <goals><goal>exec</goal></goals>
                         <configuration>

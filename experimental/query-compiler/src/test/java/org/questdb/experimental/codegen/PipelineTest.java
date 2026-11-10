@@ -36,8 +36,6 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -46,20 +44,12 @@ import java.util.List;
 import static org.junit.Assert.*;
 import static org.questdb.experimental.codegen.Pipeline.*;
 
-@RunWith(Parameterized.class)
 public class PipelineTest {
     @Rule
     public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
+    private final Backend backend = new LlvmBackend(2);
     private CairoEngine engine;
     private SqlExecutionContextImpl context;
-
-    public PipelineTest(String name, Backend backend) { this.backend = backend; }
-
-    @Parameterized.Parameters(name = "{0}")
-    public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm", new LlvmBackend(2)}, new Object[]{"native", new NativeBackend()}, new Object[]{"asmjit", new AsmJitBackend()});
-    }
 
     @Before
     public void setUp() throws Exception {

@@ -28,11 +28,9 @@ package org.questdb.experimental.codegen;
 public record CompilerOptions(boolean expressions, Boolean bounded, Integer localCapacity, int prefetchRows,
                               boolean sharedVarchar, boolean orderedPipeline, boolean largeTopK) {
     static final CompilerOptions DEFAULT = fromSystemProperties();
-    // These controls affect backend lowering or JVM-wide diagnostics and retain process scope.
+    // These controls affect instrumentation and prefetch hints and retain process scope.
     static final Process PROCESS = new Process(Boolean.getBoolean("query.codegen.profile"),
-            Boolean.getBoolean("query.codegen.probeCounters"), !Boolean.getBoolean("query.codegen.disablePrefetchHints"),
-            !Boolean.getBoolean("questdb.codegen.disableOptimization"), Boolean.getBoolean("questdb.codegen.ssa"),
-            !Boolean.getBoolean("questdb.codegen.disableSsaOptimization"));
+            Boolean.getBoolean("query.codegen.probeCounters"), !Boolean.getBoolean("query.codegen.disablePrefetchHints"));
 
     public CompilerOptions {
         if (prefetchRows < 0 || prefetchRows > 1024 || (prefetchRows & (prefetchRows - 1)) != 0)
@@ -66,10 +64,5 @@ public record CompilerOptions(boolean expressions, Boolean bounded, Integer loca
         return new CompilerOptions(expressions, bounded, localCapacity, rows, sharedVarchar, orderedPipeline, largeTopK);
     }
 
-    record Process(boolean profile, boolean probeCounters, boolean prefetchHints,
-                   boolean optimize, boolean ssa, boolean optimizeSsa) {
-        Process withSsa(boolean enabled) {
-            return new Process(profile, probeCounters, prefetchHints, optimize, enabled, optimizeSsa);
-        }
-    }
+    record Process(boolean profile, boolean probeCounters, boolean prefetchHints) { }
 }

@@ -195,4 +195,13 @@ public class LlvmBackendTest {
             assertEquals(4, kernel.run(0, 0, 0)); // No KernelMemory binding: poll fails, the null store stays unreachable.
         }
     }
+    @Test public void lazyExpressionsAndLifetime()throws Exception {
+        long before=LlvmBackend.liveFunctions();Builder b=new Builder();
+        b.when(binary(Op.BOTH,bool(false),eq(load(nil()),i64(0))),fail->fail.exit(99));
+        b.when(binary(Op.EITHER,bool(true),eq(load(nil()),i64(0))),pass->pass.exit(42));b.exit(1);
+        var kernel=new LlvmBackend().compile(new Program(b.block()),temporary.getRoot().toPath());
+        assertEquals(before+1,LlvmBackend.liveFunctions());assertEquals(42,kernel.run(0,0,0));
+        kernel.close();kernel.close();assertEquals(before,LlvmBackend.liveFunctions());
+        assertThrows(IllegalStateException.class,()->kernel.run(0,0,0));
+    }
 }

@@ -29,22 +29,15 @@ import io.questdb.std.Unsafe;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 import java.lang.foreign.Arena;
 import java.util.List;
 import java.util.Random;
 import static org.junit.Assert.*;
 import static org.questdb.experimental.codegen.Ir.*;
 
-@RunWith(Parameterized.class)
 public class OptimizerBackendTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
-    public OptimizerBackendTest(String name, Backend backend) { this.backend = backend; }
-    @Parameterized.Parameters(name="{0}") public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm", new LlvmBackend(2)}, new Object[]{"native", new NativeBackend()}, new Object[]{"asmjit", new AsmJitBackend()});
-    }
+    private final Backend backend = new LlvmBackend(2);
 
     @Test public void preservesCopiesAcrossWritesBranchesAndLoopBackedges() throws Exception {
         Builder b = new Builder();

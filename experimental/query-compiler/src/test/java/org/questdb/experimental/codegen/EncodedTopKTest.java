@@ -36,22 +36,15 @@ import io.questdb.std.str.Utf8Sequence;
 import io.questdb.std.str.Utf8String;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
-import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.*;
 
-@RunWith(Parameterized.class)
 public class EncodedTopKTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
-    public EncodedTopKTest(String name, Backend backend) { this.backend = backend; }
-    @Parameterized.Parameters(name = "{0}") public static List<Object[]> parameters() { return List.of(
-            new Object[]{"llvm", new LlvmBackend(2)}, new Object[]{"c", new NativeBackend()}, new Object[]{"asmjit", new AsmJitBackend()}); }
+    private final Backend backend = new LlvmBackend(2);
 
     @Test public void mergeAndCompactionMatchStockBuffers() throws Exception {
         long memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);

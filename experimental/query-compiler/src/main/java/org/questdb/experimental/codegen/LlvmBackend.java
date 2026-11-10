@@ -47,8 +47,8 @@ public final class LlvmBackend implements Backend {
     @Override public CompiledKernel compile(Ir.Program program, Path artifacts) throws IOException {
         long started = System.nanoTime();
         checkPlatform();
-        // Preserve SSA. Our scalar passes and out-of-SSA lowering are deliberately bypassed.
-        var graph = SsaProgram.lower(program); SsaOptimizer.verify(graph);
+        // Preserve SSA for LLVM optimization and machine-code lowering.
+        var graph = SsaProgram.lower(program); SsaVerifier.verify(graph);
         String source = LlvmEmitter.emit(graph);
         Path directory = null;
         if (dump) {

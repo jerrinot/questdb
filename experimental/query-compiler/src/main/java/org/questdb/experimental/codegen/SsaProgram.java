@@ -28,7 +28,7 @@ import java.util.*;
 import java.util.function.UnaryOperator;
 import static org.questdb.experimental.codegen.Ir.*;
 
-/** Typed SSA between operator lowering and either backend. Control flow and phi edges are explicit. */
+/** Typed SSA between operator lowering and LLVM emission. Control flow and phi edges are explicit. */
 final class SsaProgram {
     sealed interface End permits Jump, Branch, Exit { }
     record Jump(int target) implements End { }
@@ -46,10 +46,7 @@ final class SsaProgram {
         End end;
         BasicBlock(int id) { this.id = id; }
     }
-    record Loop(int header, int preheader, Set<Integer> members) { }
     final List<BasicBlock> blocks = new ArrayList<>();
-    final List<Loop> loops = new ArrayList<>();
-    final List<Integer> layout = new ArrayList<>();
     int nextValue = 3;
     List<Var> parameters = List.of(COLUMNS, ROWS, STATE);
 
@@ -137,115 +134,10 @@ final class SsaProgram {
         return out.toString();
     }
 
-    /** Out-of-SSA uses edge-local parallel copies. Snapshot every input before overwriting any phi. */
-    List<BasicBlock> executableBlocks() {
-        rematerializeCheapValues();
-        aliases = SsaLiveness.coalesce(this);
-        List<BasicBlock> output = new ArrayList<>();
-        List<BasicBlock> edges = new ArrayList<>();
-        nextEdge = blocks.size();
-        Map<Var, Integer> uses = new HashMap<>(), useBlocks = new HashMap<>();
-        for (BasicBlock b : blocks) {
-            UnaryOperator<Expr> count = e -> {
-                Var v = (Var) e; uses.merge(v, 1, Integer::sum); useBlocks.put(v, b.id); return e;
-            };
-            for (Phi p : b.phis) for (Expr value : p.inputs.values()) map(value, e -> {
-                uses.merge((Var) e, 1, Integer::sum); useBlocks.put((Var) e, -1); return e;
-            });
-            for (Statement s : b.code) map(s, count);
-            map(b.end, count);
-        }
-        for (int blockId : layout) {
-            BasicBlock original = blocks.get(blockId);
-            BasicBlock b = new BasicBlock(original.id);
-            Map<Var, Expr> trees = new HashMap<>();
-            UnaryOperator<Expr> inline = e -> trees.getOrDefault((Var) e, e);
-            for (Statement s : original.code) {
-                Statement rewritten = map(s, inline);
-                // Fold single-use pure values locally for instruction selection, without undoing loop motion.
-                if (rewritten instanceof Define d && SsaOptimizer.effect(s) == SsaOptimizer.Effect.PURE
-                        && uses.getOrDefault(d.variable(), 0) == 1 && useBlocks.get(d.variable()) == b.id)
-                    trees.put(d.variable(), d.value());
-                else b.code.add(rewritten);
-            }
-            b.end = switch (map(original.end, inline)) {
-                case Jump j -> { copies(original.id, j.target(), b); yield j; }
-                case Branch c -> new Branch(c.condition(), edge(original.id, c.yes(), edges), edge(original.id, c.no(), edges));
-                case Exit e -> e;
-            };
-            output.add(b);
-            output.addAll(edges); edges.clear();
-        }
-        // Keep a return last for the native wire verifier; execution always follows explicit edges.
-        output.sort(Comparator.comparingInt(b -> b.end instanceof Exit ? 1 : 0));
-        for (BasicBlock b : output) {
-            b.code.replaceAll(s -> switch (s) {
-                case Define d -> new Define(alias(d.variable()), map(d.value(), e -> alias((Var)e)));
-                case Assign a -> new Assign(alias(a.variable()), map(a.value(), e -> alias((Var)e)));
-                default -> map(s, e -> alias((Var)e));
-            });
-            b.code.removeIf(s -> s instanceof Assign a && a.variable().equals(a.value()));
-            b.end = map(b.end, e -> alias((Var)e));
-        }
-        Map<Integer, Integer> redirects = new HashMap<>();
-        for (BasicBlock b : output) if (b.id != 0 && b.code.isEmpty() && b.end instanceof Jump j && b.id != j.target()) redirects.put(b.id, j.target());
-        // Do not rewrite cycles of empty blocks; they still represent nontermination.
-        java.util.function.IntUnaryOperator destination = id -> {
-            Set<Integer> seen = new HashSet<>(); int next = id;
-            while (redirects.containsKey(next)) { if (!seen.add(next)) return id; next = redirects.get(next); }
-            return next;
-        };
-        for (BasicBlock b : output) b.end = switch (b.end) {
-            case Jump j -> new Jump(destination.applyAsInt(j.target()));
-            case Branch c -> new Branch(c.condition(), destination.applyAsInt(c.yes()), destination.applyAsInt(c.no()));
-            case Exit e -> e;
-        };
-        output.removeIf(b -> b.id != destination.applyAsInt(b.id));
-        return output;
-    }
-    private Map<Var, Var> aliases = Map.of();
-    private Var alias(Var v) { return aliases.getOrDefault(v, v); }
-    private void rematerializeCheapValues() {
-        Map<Var, Expr> cheap = new HashMap<>();
-        for (BasicBlock b : blocks) for (Statement s : b.code)
-            if (s instanceof Define d && (d.value() instanceof Offset o && o.bytes() instanceof Literal
-                    || d.value() instanceof Binary x && switch (x.op()) { case EQ, NE, LT, GE -> true; default -> false; }))
-                cheap.put(d.variable(), d.value());
-        UnaryOperator<Expr> replace = new UnaryOperator<>() {
-            public Expr apply(Expr e) { return cheap.containsKey(e) ? map(cheap.get(e), this) : e; }
-        };
-        for (BasicBlock b : blocks) {
-            b.code.removeIf(s -> s instanceof Define d && cheap.containsKey(d.variable()));
-            b.code.replaceAll(s -> map(s, replace));
-            b.end = map(b.end, replace);
-            for (Phi p : b.phis) p.inputs.replaceAll((edge, value) -> map(value, replace));
-        }
-    }
-    private int nextEdge;
-    private int edge(int source, int target, List<BasicBlock> edges) {
-        if (blocks.get(target).phis.isEmpty()) return target;
-        BasicBlock edge = new BasicBlock(nextEdge++);
-        copies(source, target, edge);
-        if (edge.code.isEmpty()) return target;
-        edge.end = new Jump(target); edges.add(edge);
-        return edge.id;
-    }
-    private void copies(int source, int target, BasicBlock edge) {
-        List<Assign> writes = new ArrayList<>();
-        for (Phi p : blocks.get(target).phis) {
-            Expr input = Objects.requireNonNull(p.inputs.get(source), "Missing phi predecessor");
-            if (input instanceof Var v && alias(v).equals(alias(p.result))) continue;
-            Var temp = fresh(input.type());
-            edge.code.add(new Define(temp, input));
-            writes.add(new Assign(p.result, temp));
-        }
-        edge.code.addAll(writes);
-    }
-
     private final class Translator {
         BasicBlock current;
         Map<Var, Expr> values = new HashMap<>();
-        void enter(BasicBlock b) { current = b; layout.add(b.id); }
+        void enter(BasicBlock b) { current = b; }
         void translate(Block input) {
             enter(block());
             for (Var p : parameters) values.put(p, p);
@@ -359,9 +251,6 @@ final class SsaProgram {
                 current.end = new Jump(header.id);
                 for (var entry : carried.entrySet()) entry.getValue().inputs.put(current.id, values.get(entry.getKey()));
             }
-            Set<Integer> members = new HashSet<>();
-            for (int id = header.id; id < blocks.size(); id++) if (id != exit.id) members.add(id);
-            loops.add(new Loop(header.id, before.id, Set.copyOf(members)));
             values = headValues; enter(exit);
         }
     }

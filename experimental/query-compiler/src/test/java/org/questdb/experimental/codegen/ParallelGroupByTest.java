@@ -35,8 +35,6 @@ import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -49,20 +47,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.Assert.*;
 import static org.questdb.experimental.codegen.Pipeline.*;
 
-@RunWith(Parameterized.class)
 public class ParallelGroupByTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
+    private final Backend backend = new LlvmBackend(2);
     private CairoEngine engine;
     private SqlExecutionContextImpl context;
     private final Column k = new Column(0, "k", ColumnType.INT);
     private final Column v = new Column(1, "v", ColumnType.LONG);
 
-    public ParallelGroupByTest(String name, Backend backend) { this.backend = backend; }
-    @Parameterized.Parameters(name = "{0}") public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm", new LlvmBackend(2)}, new Object[]{"c", new NativeBackend()},
-                new Object[]{"asmjit", new AsmJitBackend()});
-    }
     @Before public void setUp() throws Exception {
         var config = new DefaultCairoConfiguration(temporary.newFolder("db").toString());
         engine = new CairoEngine(config);

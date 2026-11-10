@@ -35,8 +35,6 @@ import io.questdb.std.Unsafe;
 import io.questdb.std.Vect;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
 import java.lang.foreign.Arena;
 import java.util.List;
@@ -44,13 +42,9 @@ import java.util.Random;
 
 import static org.junit.Assert.*;
 
-@RunWith(Parameterized.class)
 public class EncodedSortTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
-    public EncodedSortTest(String name, Backend backend) { this.backend = backend; }
-    @Parameterized.Parameters(name = "{0}") public static List<Object[]> parameters() { return List.of(
-            new Object[]{"llvm", new LlvmBackend(2)}, new Object[]{"c", new NativeBackend()}, new Object[]{"asmjit", new AsmJitBackend()}); }
+    private final Backend backend = new LlvmBackend(2);
 
     @Test public void normalizedVariableKeysMatchStockAcrossDistributions() throws Throwable {
         var config = new DefaultCairoConfiguration(temporary.getRoot().getAbsolutePath());

@@ -29,8 +29,6 @@ import io.questdb.cairo.ColumnType;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.ValueLayout;
@@ -40,18 +38,10 @@ import java.util.List;
 import static org.junit.Assert.*;
 import static org.questdb.experimental.codegen.Ir.*;
 
-@RunWith(Parameterized.class)
 public class BackendTest {
     @Rule
     public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
-
-    public BackendTest(String name, Backend backend) { this.backend = backend; }
-
-    @Parameterized.Parameters(name = "{0}")
-    public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm", new LlvmBackend(2, true)}, new Object[]{"native", new NativeBackend()}, new Object[]{"asmjit", new AsmJitBackend(true)});
-    }
+    private final Backend backend = new LlvmBackend(2, true);
 
     @Test
     public void fixedSizeCopiesPreserveExactUnalignedRanges() throws Exception {

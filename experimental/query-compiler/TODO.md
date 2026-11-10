@@ -410,7 +410,7 @@ Temporary evidence: `/tmp/query-topk`, `/tmp/query-optimal`, `/tmp/query-map-pro
 - [x] Three500M-row fixtures exercise8.39M uniform/skewed groups and16 groups,
   both orders/capacity classes, exact selected aggregates and rank multisets.
   The unchanged default threshold is5M groups. Focused SQL checks cover forced
-  ordinary getter fallback, cancellation/draining and reopening on all backends
+  ordinary getter fallback, cancellation/draining and reopening with LLVM
   and both worker modes. Candidate Java is a separate performance control.
   Q13's scan/merge remain the larger opportunity; even removing its serial Top-K
   entirely only approaches the1.5x stock target. Do not tune thresholds to this query.
@@ -673,7 +673,7 @@ mixed/Parquet input. No new configuration switch.
   kernel still widens I32 to I64 before vector comparison (optimized LLVM and
   llc output inspected). This is a code-generation lead, not proof that widening
   explains the whole instruction delta. Validate it independently across widths,
-  backends and CPUs before changing vector lowering; keep full-query comparisons.
+  LLVM optimization levels and CPUs before changing vector lowering; keep full-query comparisons.
 - [x] Bind COUNT(symbol) and keyed COUNT DISTINCT(symbol) through the ordinary aggregate
   contracts, preserving NULL semantics, dictionary scope and worker merge. Reuse
   bounded symbol-domain arrays where admitted; do not create a separate symbol

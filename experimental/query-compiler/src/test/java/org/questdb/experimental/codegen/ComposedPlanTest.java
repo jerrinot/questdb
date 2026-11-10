@@ -31,24 +31,19 @@ import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.*;
 import static org.junit.Assert.*;
 import static org.questdb.experimental.codegen.Pipeline.*;
 
-@RunWith(Parameterized.class)
 public class ComposedPlanTest {
     @Rule public TemporaryFolder temporary=new TemporaryFolder();
-    private final Backend backend;
+    private final Backend backend = new LlvmBackend(2);
     private CairoEngine engine;
     private SqlExecutionContextImpl context;
     private final Column key=new Column(0,"k",ColumnType.INT),value=new Column(1,"v",ColumnType.LONG);
-    public ComposedPlanTest(String name,Backend backend){this.backend=backend;}
-    @Parameterized.Parameters(name="{0}") public static List<Object[]> parameters(){return List.of(
-            new Object[]{"llvm", new LlvmBackend(2)}, new Object[]{"native",new NativeBackend()},new Object[]{"asmjit",new AsmJitBackend(true)});}
+
     @Before public void setUp()throws Exception {
         var config=new DefaultCairoConfiguration(temporary.newFolder("db").toString());
         engine=new CairoEngine(config);context=new SqlExecutionContextImpl(engine,1).with(

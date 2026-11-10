@@ -74,15 +74,11 @@ public final class WorkloadMatrix {
         try(var scalar=Demo.compileSql(engine,context,s.sql(),false);
             var normal=Demo.compileSql(engine,context,s.sql(),true);
             var control=s.control()==null?null:CompiledGroupBy.withKernels(engine,context,"input",p,s.control(),s.finish());
-            var nativeQuery=CompiledGroupBy.compile(engine,context,"input",p,new NativeBackend(),ARTIFACTS);
-            var asmjit=CompiledGroupBy.compile(engine,context,"input",p,new AsmJitBackend(),ARTIFACTS);
             var llvm=CompiledGroupBy.compile(engine,context,"input",p,new LlvmBackend(),ARTIFACTS)) {
             var expected=Demo.readSql(scalar,context,p.keys().size());
             var runs=new ArrayList<>(List.of(
                     new Run("scalar",t->Demo.readSql(scalar,context,p.keys().size(),t)),
                     new Run("normal",t->Demo.readSql(normal,context,p.keys().size(),t)),
-                    new Run("native",t->nativeQuery.execute(context,CompiledGroupBy.Options.DEFAULT,t)),
-                    new Run("asmjit",t->asmjit.execute(context,CompiledGroupBy.Options.DEFAULT,t)),
                     new Run("llvm-o2",t->llvm.execute(context,CompiledGroupBy.Options.DEFAULT,t))));
             if(control!=null)runs.add(new Run("control",t->control.execute(context,CompiledGroupBy.Options.DEFAULT,t)));
             double[][] elapsed=new double[runs.size()][repetitions];
@@ -107,8 +103,8 @@ public final class WorkloadMatrix {
                     pairs=0;for(var row:expected)pairs+=row.values().get(a);break;
                 }
             }
-            System.out.println(String.format(Locale.ROOT,"%n%s: input rows=%d; output groups=%d; non-null distinct pairs=%s; warmups=%d; compile native=%.1f ms AsmJit=%.3f ms LLVM-O2=%.3f ms",
-                    s.name(),inputRows,expected.size(),pairs<0?"n/a":Long.toString(pairs),warmups,nativeQuery.compilationNanos()/1e6,asmjit.compilationNanos()/1e6,llvm.compilationNanos()/1e6));
+            System.out.println(String.format(Locale.ROOT,"%n%s: input rows=%d; output groups=%d; non-null distinct pairs=%s; warmups=%d; compile LLVM-O2=%.3f ms",
+                    s.name(),inputRows,expected.size(),pairs<0?"n/a":Long.toString(pairs),warmups,llvm.compilationNanos()/1e6));
             for(int i=0;i<runs.size();i++) {
                 Arrays.sort(elapsed[i]);
                 System.out.printf(Locale.ROOT,"  %-7s median %8.3f ms [%.3f, %.3f]; first %.3f; peak %s; grows %d%n",

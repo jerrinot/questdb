@@ -34,29 +34,20 @@ import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
 import java.util.List;
 
 import static org.junit.Assert.*;
 
-@RunWith(Parameterized.class)
 public class MapAggregateTypeTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
+    private final Backend backend = new LlvmBackend();
     private CompilerOptions options = CompilerOptions.DEFAULT.withLocalCapacity(64);
     private CairoEngine engine;
     private SqlExecutionContextImpl context;
     private WorkerPool pool;
     private ResolvedQueryCompiler compiler;
     private long memory;
-
-    public MapAggregateTypeTest(String name, Backend backend) { this.backend = backend; }
-    @Parameterized.Parameters(name = "{0}") public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm", new LlvmBackend()}, new Object[]{"asmjit", new AsmJitBackend()},
-                new Object[]{"c", new NativeBackend()});
-    }
 
     @Before public void setUp() throws Exception {
         memory = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_JIT);

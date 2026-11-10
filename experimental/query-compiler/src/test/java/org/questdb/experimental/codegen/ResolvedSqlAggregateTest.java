@@ -81,12 +81,7 @@ public class ResolvedSqlAggregateTest {
     public static List<Object[]> parameters() {
         return List.of(
                 new Object[]{"llvm-legacy", new LlvmBackend(), WorkerPoolMode.LEGACY},
-                new Object[]{"asmjit-legacy", new AsmJitBackend(), WorkerPoolMode.LEGACY},
-                new Object[]{"c-legacy", new NativeBackend(), WorkerPoolMode.LEGACY},
-                new Object[]{"llvm-fiber", new LlvmBackend(), WorkerPoolMode.FIBER_HOST},
-                new Object[]{"asmjit-fiber", new AsmJitBackend(), WorkerPoolMode.FIBER_HOST},
-                new Object[]{"c-fiber", new NativeBackend(), WorkerPoolMode.FIBER_HOST}
-        );
+                new Object[]{"llvm-fiber", new LlvmBackend(), WorkerPoolMode.FIBER_HOST});
     }
 
     private void configure(CompilerOptions options) throws java.io.IOException {

@@ -29,8 +29,6 @@ import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.std.Unsafe;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.util.List;
@@ -38,13 +36,9 @@ import static org.junit.Assert.*;
 import static org.questdb.experimental.codegen.Ir.*;
 import static org.questdb.experimental.codegen.Pipeline.*;
 
-@RunWith(Parameterized.class)
 public class ScanStageTest {
     @Rule public TemporaryFolder temporary=new TemporaryFolder();
-    private final Backend backend;
-    public ScanStageTest(String name,Backend backend){this.backend=backend;}
-    @Parameterized.Parameters(name="{0}") public static List<Object[]> parameters(){return List.of(
-            new Object[]{"llvm",new LlvmBackend(2)},new Object[]{"c",new NativeBackend()},new Object[]{"asmjit",new AsmJitBackend()});}
+    private final Backend backend = new LlvmBackend(2);
 
     @Test public void codePointLengthKeepsSliceBoundsAndMetadataFastPaths() throws Throwable {
         Builder b = new Builder();

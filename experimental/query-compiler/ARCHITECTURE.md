@@ -71,9 +71,7 @@ flowchart TD
     Plan --> IR[Structured typed IR]
     IR --> SSA[SSA verification]
     SSA --> LLVM[LLVM IR, optimization and ORC LLJIT]
-    IR --> Other[C and AsmJit backends]
     LLVM --> Code[Owned native code handles]
-    Other --> Code
     Code --> Runtime[Existing cursors, frame workers, maps and allocators]
     Runtime --> Result[Ordinary result cursor]
 ```
@@ -105,9 +103,8 @@ flowchart TD
    Integer loads widen to I64; lowering preserves narrow SQL semantics where
    required. [LlvmBackend](src/main/java/org/questdb/experimental/codegen/LlvmBackend.java)
    lowers to verified SSA and LLVM text, then invokes the in-process bridge and
-   ORC LLJIT. LLVM owns optimization, O2 by default; it bypasses the prototype's
-   scalar optimization passes. The C and AsmJit backends share a separate path
-   through `HelperInlining`, `PortableVectorLowering` and `IrOptimizer`.
+   ORC LLJIT. LLVM owns optimization, O2 by default. `SsaVerifier` checks the
+   shared SSA representation before emission; there is no separate scalar optimizer.
 5. **Invoke native code over borrowed storage.**
    [NativeCalls](src/main/java/org/questdb/experimental/codegen/NativeCalls.java)
    uses FFM to pass column/descriptor addresses, row counts and state addresses.
@@ -273,8 +270,7 @@ compiles it only under `-Dquery.codegen.sharedVarchar=true`, and only for
 slot cleared the execution-wide map binding. The regression now has a direct
 test: clearing and reopening scratch must leave the shared binding active. The
 existing SQL test covers growth, ordinary fallback, failure, memory limits and
-owner clear/reopen across LLVM, C and AsmJit. The default path does not enable this
-algorithm control.
+owner clear/reopen with LLVM. The default path does not enable this algorithm control.
 
 **Remaining direction.** Preserve owner-only shared initialization/reset and
 slot-local cleanup. Further changes must keep complete descriptor rebinding,
@@ -488,27 +484,25 @@ call's check and its fallback before mutation.
 Third, replace the `QueryCodeGenerator` overload chains with one request record
 per family. None of these adds per-row dispatch.
 
-### 10. Every IR extension pays for three backends
+### 10. One compiler backend
 
-**Evidence.** LLVM is the measured SQL backend. `AsmJitBackend` and
-`NativeBackend` (C) lower through `HelperInlining`, `PortableVectorLowering` and
-`IrOptimizer`, which the LLVM path does not use; AsmJit also needs
-`asmjit_backend.cpp`. The uncommitted typed-value work changes 11 IR and backend
-files (+287/-98 lines), including about 100 changed lines in `asmjit_backend.cpp`
-and 53 in `IrOptimizer`. PROGRESS records that tests run on the C and AsmJit
-variants, but not which defects those variants alone detected.
+**Implemented.** LLVM is the sole compiler backend. The experimental C and AsmJit
+backends, their helper/vector lowering, custom optimizer, source emitter,
+instruction protocol and SSA destruction have been removed. SSA construction and
+verification remain shared by the LLVM scalar, vector and helper emitters.
 
-**Consequence.** Each new IR operation or type needs three implementations and
-their tests, and the non-LLVM paths can become the reason to defer a change. They
-also supply differential evidence when a miscompilation is backend-specific.
+**Reason.** The alternatives required parallel implementations of IR semantics and
+platform support. They provided potential differential coverage, but the retained
+progress log did not identify defects detected uniquely by those backends. Their
+maintenance cost no longer justifies full IR parity.
+Archived [compilation experiments](archive/FOUNDATIONS_PLAN.md) did find lower
+AsmJit preparation latency; no automatic tiering policy was retained. That
+historical evidence remains available if compilation latency warrants revisiting.
 
-**Decision.** Retain current IR parity for C and AsmJit as differential controls.
-A new IR operation must lower correctly in all three backends or have explicit
-backend admission before execution; silent partial parity is not allowed. This
-keeps existing parameterized tests useful without claiming that three matching
-backends prove SQL semantics. Retiring or narrowing a backend needs evidence of
-maintenance cost versus unique defects detected, which this cleanup does not
-supply. LLVM remains the integrated performance target.
+IR execution checks now run on LLVM. SQL comparisons against ordinary QuestDB,
+aggregate-state checks, worker/type variations and lifecycle tests remain.
+Handwritten C performance references compile independently of the removed C
+backend. QuestDB's ordinary filter JIT is outside this change.
 
 ### 11. Global switches and execution-spanning adaptive state select mechanisms
 
@@ -520,9 +514,8 @@ consumers and deferred kernels. Direct aggregate bindings also retain it when
 preparing later filters. Tests supply options instead of mutating these global
 planning properties. No switch or default was added.
 
-Backend-lowering and diagnostic controls (`profile`, `probeCounters`, prefetch
-hints and C/AsmJit optimizer/SSA switches) have a separate immutable process
-snapshot. Native library paths remain process-loader inputs. Treating these as
+Instrumentation and prefetch controls (`profile`, `probeCounters`, prefetch
+hints) have a separate immutable process snapshot. Native library paths remain process-loader inputs. Treating these as
 independent per-query choices would misrepresent the existing library and static
 diagnostic lifetimes; this is a deliberate refinement of the original proposal.
 
@@ -544,9 +537,8 @@ launch scripts include `target/test-classes`; normal integration needs only
 production classes and native libraries. No new module or source-set plugin was
 introduced.
 
-The C/AsmJit backends remain in production scope as declared above. `PhysicalPlan`
-still belongs with `ScanPlan.from`, and `HandwrittenCountSum` remains because the
-aggregate binding directly exposes its reference compilation. They are concrete
+`PhysicalPlan` still belongs with `ScanPlan.from`, and `HandwrittenCountSum` remains
+because the aggregate binding directly exposes its reference compilation. They are concrete
 remaining dependencies, rather than executor classes accidentally left behind.
 Shared-type refactors still need harness compilation checks.
 
@@ -557,8 +549,8 @@ existing design history, not copies of benchmark results.
 ## Validation strengths and remaining blind spots
 
 Existing validation includes exact aggregate-state tests, mixed Java/native
-updates, SQL differential tests, multiple backends, fault/reopen checks and the
-ordinary query fuzzer with an additional compiler axis. The recent generalization
+updates, SQL differential tests, LLVM optimization-level checks, fault/reopen checks
+and the ordinary query fuzzer with an additional compiler axis. The recent generalization
 run is recorded in PROGRESS; its counts are not a proof of complete coverage.
 
 Five limitations matter architecturally:
@@ -607,9 +599,9 @@ The implementation order reflected risk removed per unit of work:
    publication positions, including corruption/failure/reopen checks.
 5. **Complete:** immutable planning/process option snapshots; standalone harnesses
    moved to the existing test source set; historical plans archived.
-6. **Decided:** retain C/AsmJit parity and per-kernel adaptive learning as described
-   above. Keep the current optional SPI and opt-in compiled test runner for this
-   prototype. Capability-object grouping and default core CI integration remain
+6. **Implemented:** LLVM is the sole compiler backend. Retain per-kernel adaptive
+   learning as described above. Keep the current optional SPI and opt-in compiled
+   test runner for this prototype. Capability-object grouping and default core CI integration remain
    open work, not completed implementation.
 
 The SPI decision avoids a second representation of capability combinations while
@@ -631,15 +623,15 @@ supported state families, adding an aggregate should not require editing first-r
 logic in each scan/join consumer. Clearing one worker slot should not reset shared
 execution state. A core change that breaks the compiled call order or mutates
 before declining should fail a module test, and default CI as well if it gains a
-compiled path. A new IR operation should have a stated set of backends that must
-implement it. Existing ABI, result and lifecycle tests must still pass, and
+compiled path. A new IR operation needs LLVM lowering and semantic execution
+checks. Existing ABI, result and lifecycle tests must still pass, and
 generated hot loops should acquire no unnecessary branches, allocation or dispatch.
 Small deliberate fault mutations can check that the relevant tests detect the
 mistakes these changes are intended to prevent.
 
 Retain the useful foundations: ordinary function resolution, real map layouts,
 existing scheduling and allocators, conservative admission, multiple physical
-strategies, typed IR, and backend controls within a declared scope. Improve the
+strategies, typed IR, and LLVM compilation controls. Improve the
 boundaries around them one at a time. Architectural cleanup should reduce
 opportunities for mistakes while preserving the mechanisms responsible for
 performance.

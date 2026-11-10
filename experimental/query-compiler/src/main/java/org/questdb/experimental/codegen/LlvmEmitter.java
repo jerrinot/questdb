@@ -46,7 +46,7 @@ final class LlvmEmitter {
         collectHelpers(graph, helpers);
         for (Helper helper : helpers.values()) {
             SsaProgram body = SsaProgram.lower(helper);
-            SsaOptimizer.verify(body);
+            SsaVerifier.verify(body);
             source.append(new LlvmEmitter(declarations).module(body, helper.name(), true));
         }
         return String.join("\n", declarations) + "\n" + source;

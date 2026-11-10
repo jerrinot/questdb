@@ -72,7 +72,7 @@ public class SqlCompositionStressTest {
         context = QueryCodegenTestSupport.configure(new SqlExecutionContextImpl(engine, 2).with(
                 config.getFactoryProvider().getSecurityContextFactory().getRootContext(),
                 new BindVariableServiceImpl(config), null, -1, null));
-        runner = new QueryRunner(engine, context, true, false, true, true, new ObjList<>(), null);
+        runner = new QueryRunner(engine, context, true, false, true, null, true, new ObjList<>(), null);
         engine.execute("create table f as (select x id,cast(case when x%19=0 then null else x%31-15 end as int) i,"
                 + "case when x%17=0 then null else 4503599627370496+(x%31)*4294967297 end l,"
                 + "case when x%13=0 then null else (x%127-63)/8.0 end d,"

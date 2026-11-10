@@ -91,22 +91,18 @@ public final class Demo {
             try (var baseline = compileSql(engine, context, workload.sql(), false);
                  var normal = compileSql(engine, context, workload.sql(), true);
                  var handwritten = CompiledGroupBy.withKernels(engine, context, "input", pipeline, workload.scan(), workload.finish());
-                 var nativeQuery = CompiledGroupBy.compile(engine, context, "input", pipeline, new NativeBackend(), artifacts);
                  var llvm = CompiledGroupBy.compile(engine, context, "input", pipeline, new LlvmBackend(), artifacts);
                  var nestedHand = nested == null ? null : CompiledGroupBy.withKernels(engine, context, "input", nested,
                          HandwrittenKernels.nestedDistinct(configuration.getCountDistinctCapacity(), configuration.getCountDistinctLoadFactor()), null);
-                 var nestedNative = nested == null ? null : CompiledGroupBy.compile(engine, context, "input", nested, new NativeBackend(), artifacts);
                  var nestedLlvm = nested == null ? null : CompiledGroupBy.compile(engine, context, "input", nested, new LlvmBackend(), artifacts)) {
                 List<CompiledGroupBy.ResultRow> expected = readSql(baseline, context, 1);
                 List<Case> cases = new ArrayList<>(List.of(
                         new Case("questdb-scalar", t -> readSql(baseline, context, 1, t)),
                         new Case("questdb-normal", t -> readSql(normal, context, 1, t)),
                         new Case("handwritten-java", t -> handwritten.execute(context, groupCapacity, pairCapacity, t)),
-                        new Case("generated-native", t -> nativeQuery.execute(context, groupCapacity, pairCapacity, t)),
                         new Case("llvm-o2", t -> llvm.execute(context, groupCapacity, pairCapacity, t))));
                 if (nested != null) {
                     cases.add(new Case("nested-handwritten", t -> nestedHand.execute(context, groupCapacity, groupCapacity, t)));
-                    cases.add(new Case("nested-native", t -> nestedNative.execute(context, groupCapacity, groupCapacity, t)));
                     cases.add(new Case("nested-llvm-o2", t -> nestedLlvm.execute(context, groupCapacity, groupCapacity, t)));
                 }
                 double[][] elapsed = new double[cases.size()][repetitions];
@@ -155,10 +151,8 @@ public final class Demo {
                 System.out.println("Execution includes allocation, scan, aggregation, result copying and sorting; compilation is separate.");
                 System.out.println("Phases: build=allocation/scan/aggregation, copy=output materialization, sort=canonical result sorting, release=cleanup.");
                 System.out.println("Without canonical sort = each total sample minus its sort phase; still includes copying and cleanup. No SQL ORDER BY is requested.");
-                System.out.printf(Locale.ROOT, "Native compile/load: %.3f ms%n", nativeQuery.compilationNanos() / 1e6);
                 System.out.printf(Locale.ROOT, "LLVM-O2 compile/load: %.3f ms%n", llvm.compilationNanos() / 1e6);
                 if (nested != null) {
-                    System.out.printf(Locale.ROOT, "Nested native compile/load: %.3f ms%n", nestedNative.compilationNanos() / 1e6);
                     System.out.printf(Locale.ROOT, "Nested LLVM-O2 compile/load: %.3f ms%n", nestedLlvm.compilationNanos() / 1e6);
                 }
                 for (int i = 0; i < cases.size(); i++) {

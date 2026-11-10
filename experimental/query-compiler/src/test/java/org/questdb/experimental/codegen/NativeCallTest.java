@@ -94,21 +94,17 @@ public class NativeCallTest {
             Builder nested = new Builder();
             nested.exit(new NativeCall(function, List.of(STATE, load(STATE), new NativeCall(function, args),
                     i64(0), i64(0), i64(0), i64(0), i64(0))));
-            var controls = CompilerOptions.PROCESS;
-            for (Backend backend : List.of(new LlvmBackend(),
-                    new AsmJitBackend(false, controls.withSsa(false)), new AsmJitBackend(false, controls.withSsa(true)),
-                    new NativeBackend("cc", controls.withSsa(false)), new NativeBackend("cc", controls.withSsa(true)))) {
-                try (var kernel = backend.compile(program, temporary.newFolder().toPath())) {
+            Backend backend = new LlvmBackend();
+            try (var kernel = backend.compile(program, temporary.newFolder().toPath())) {
+                Unsafe.putLong(data, 10);
+                Unsafe.getUnsafe().putDouble(data + 8, 1.25);
+                assertEquals(590, kernel.run(0, 0, data));
+                assertEquals(290, Unsafe.getLong(data));
+                assertEquals(1.75, Unsafe.getUnsafe().getDouble(data + 16), 0);
+                try (var ordered = backend.compile(new Program(nested.block()), temporary.newFolder().toPath())) {
                     Unsafe.putLong(data, 10);
-                    Unsafe.getUnsafe().putDouble(data + 8, 1.25);
-                    assertEquals(590, kernel.run(0, 0, data));
-                    assertEquals(290, Unsafe.getLong(data));
-                    assertEquals(1.75, Unsafe.getUnsafe().getDouble(data + 16), 0);
-                    try (var ordered = backend.compile(new Program(nested.block()), temporary.newFolder().toPath())) {
-                        Unsafe.putLong(data, 10);
-                        assertEquals(460, ordered.run(0, 0, data));
-                        assertEquals(460, Unsafe.getLong(data));
-                    }
+                    assertEquals(460, ordered.run(0, 0, data));
+                    assertEquals(460, Unsafe.getLong(data));
                 }
             }
         }

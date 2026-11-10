@@ -47,7 +47,7 @@ public final class CompilerDemo {
                 engine.execute("create table facts as (select cast(x%1021 as int) k,case when x%19=0 then null else x%1009 end amount,x%1777 customer from long_sequence("+rows+"))",context);
                 engine.execute("create table dim as (select cast(x%257 as int) k,x%11 category from long_sequence(700))",context);
                 System.out.println("One thread; every measured query compiles fresh code and executes it once; no query-code cache.");
-                var backends=List.<Backend>of(new AsmJitBackend(),new NativeBackend(),new LlvmBackend(1),new LlvmBackend(2));
+                var backends=List.<Backend>of(new LlvmBackend(1),new LlvmBackend(2));
                 for(var scenario:cases())measure(engine,context,scenario,backends,repetitions,rows);
             }
         }finally{LogFactory.haltInstance();WorkloadMatrix.clearDirectory(directory);}

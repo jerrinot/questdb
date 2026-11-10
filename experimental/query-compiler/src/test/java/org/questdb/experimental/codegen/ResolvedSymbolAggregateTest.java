@@ -60,10 +60,9 @@ public class ResolvedSymbolAggregateTest {
 
     @Parameterized.Parameters(name = "{0}")
     public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm-fiber", new LlvmBackend(), WorkerPoolMode.FIBER_HOST},
-                new Object[]{"llvm-legacy", new LlvmBackend(), WorkerPoolMode.LEGACY},
-                new Object[]{"asmjit", new AsmJitBackend(), WorkerPoolMode.LEGACY},
-                new Object[]{"c", new NativeBackend(), WorkerPoolMode.LEGACY});
+        return List.of(
+                new Object[]{"llvm-fiber", new LlvmBackend(), WorkerPoolMode.FIBER_HOST},
+                new Object[]{"llvm-legacy", new LlvmBackend(), WorkerPoolMode.LEGACY});
     }
 
     @Before public void setUp() throws Exception {

@@ -33,28 +33,16 @@ import io.questdb.std.Vect;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
 import java.lang.foreign.Arena;
-import java.util.List;
 import java.util.Random;
 
 import static org.junit.Assert.*;
 import static org.questdb.experimental.codegen.Ir.*;
 
-@RunWith(Parameterized.class)
 public class PartitionPagesTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
-
-    public PartitionPagesTest(String name, Backend backend) { this.backend = backend; }
-
-    @Parameterized.Parameters(name = "{0}")
-    public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm", new LlvmBackend()}, new Object[]{"asmjit", new AsmJitBackend()},
-                new Object[]{"c", new NativeBackend()});
-    }
+    private final Backend backend = new LlvmBackend();
 
     @Test
     public void inlineMapScanPreservesCursorOrderAndSourceAcrossOccupancies() throws Exception {

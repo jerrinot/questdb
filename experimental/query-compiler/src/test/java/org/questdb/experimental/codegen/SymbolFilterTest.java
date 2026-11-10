@@ -40,31 +40,21 @@ import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.*;
 
-@RunWith(Parameterized.class)
 public class SymbolFilterTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
-    private final Backend backend;
+    private final Backend backend = new LlvmBackend();
     private final AtomicInteger compilations = new AtomicInteger();
     private CairoEngine engine;
     private SqlExecutionContextImpl context;
     private WorkerPool pool;
     private ResolvedQueryCompiler compiler;
     private long memory;
-
-    public SymbolFilterTest(String name, Backend backend) { this.backend = backend; }
-
-    @Parameterized.Parameters(name = "{0}")
-    public static List<Object[]> parameters() {
-        return List.of(new Object[]{"llvm", new LlvmBackend()}, new Object[]{"asmjit", new AsmJitBackend()}, new Object[]{"c", new NativeBackend()});
-    }
 
     @Before
     public void setUp() throws Exception {

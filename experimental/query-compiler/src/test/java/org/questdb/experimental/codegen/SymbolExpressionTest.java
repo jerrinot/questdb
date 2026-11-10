@@ -64,9 +64,7 @@ public class SymbolExpressionTest {
     public static List<Object[]> parameters() {
         return List.of(
                 new Object[]{"llvm-legacy", new LlvmBackend(), io.questdb.mp.WorkerPoolMode.LEGACY},
-                new Object[]{"llvm-fiber", new LlvmBackend(), io.questdb.mp.WorkerPoolMode.FIBER_HOST},
-                new Object[]{"asmjit", new AsmJitBackend(), io.questdb.mp.WorkerPoolMode.LEGACY},
-                new Object[]{"c", new NativeBackend(), io.questdb.mp.WorkerPoolMode.LEGACY});
+                new Object[]{"llvm-fiber", new LlvmBackend(), io.questdb.mp.WorkerPoolMode.FIBER_HOST});
     }
 
     @Before public void setUp() throws Exception {

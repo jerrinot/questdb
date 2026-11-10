@@ -62,11 +62,10 @@ public class NestedMergeTest {
     }
     @Parameterized.Parameters(name="{0}") public static List<Object[]> parameters() {
         var cases = new java.util.ArrayList<Object[]>();
-        for (var backend : List.of(new LlvmBackend(), new NativeBackend(), new AsmJitBackend())) {
-            cases.add(new Object[]{backend.getClass().getSimpleName() + "-long", backend, ColumnType.LONG});
-            cases.add(new Object[]{backend.getClass().getSimpleName() + "-int", backend, ColumnType.INT});
-            cases.add(new Object[]{backend.getClass().getSimpleName() + "-symbol", backend, ColumnType.SYMBOL});
-        }
+        var backend = new LlvmBackend();
+        cases.add(new Object[]{backend.getClass().getSimpleName() + "-long", backend, ColumnType.LONG});
+        cases.add(new Object[]{backend.getClass().getSimpleName() + "-int", backend, ColumnType.INT});
+        cases.add(new Object[]{backend.getClass().getSimpleName() + "-symbol", backend, ColumnType.SYMBOL});
         return cases;
     }
 

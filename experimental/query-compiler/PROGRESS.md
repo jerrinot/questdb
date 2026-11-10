@@ -7,6 +7,22 @@ Detailed earlier entries remain in Git history; raw evidence stays at its existi
 location rather than being copied into another archive. Links under `target/`
 refer to local, Git-ignored experiment artifacts.
 
+## 2026-11-10 — Retire the experimental C and AsmJit backends
+
+LLVM is now the sole compiler backend. Removed the alternative emitters, native
+instruction bridge, helper/vector lowering, custom optimizers, SSA destruction
+and three obsolete compiler switches: 2,162 fewer main-source lines. SSA
+construction and verification remain; LLVM emission and optimization are unchanged.
+Tests retain worker/type/optimization-level coverage and ordinary SQL oracles.
+Handwritten performance references and QuestDB's ordinary filter JIT remain.
+Archived fast-compilation experiments are preserved as historical evidence.
+
+A fresh module compilation and all 705 module checks pass. The existing composition
+stress case also passes with LLVM enabled: 66 SQL cases, 56 exercising generated
+code, 14,337 native calls. The current-core build exposed a stale QueryRunner
+constructor call after the master merge; the fixture now supplies the optional
+map-page override argument. No wall-clock performance claim accompanies this cleanup.
+
 ## 2026-11-09 — Retry policy: a real cost, no general default
 
 Literature-informed scratch controls compare frame-reset backoff, retained learning
