@@ -154,7 +154,7 @@ public final class ResolvedAggregateKernel {
 
     // Scratch rows hold source row, key and candidate address. OrderedMap also retains
     // the hash and candidate slot before any packed key bytes.
-    // Each native invocation rebuilds scratch before consumption, including after heap growth.
+    // Copy-only VARCHAR retries retain scratch; growth retries rebuild all candidates.
     static long prefetchScratch(QuestMapProbe probe) {
         return probe.controlBytes() + (long) GroupByMapFragment.NUM_SHARDS * probe.viewBytes();
     }
@@ -164,24 +164,31 @@ public final class ResolvedAggregateKernel {
                                       QuestMapProbe probe, long valueBytes, int batchRows, int localCapacity,
                                       ScanPlan filter, List<Var> filterAddresses, Var accepted, boolean stagedDistinct) {
         boolean stagedState = stagedDistinct || (probe.varchar() && updates.updates().stream().anyMatch(Update::allocates));
+        boolean staged = probe.orderedNative();
+        Var resumeEnd = probe.varchar() && probe.mutable() ? b.let(load(at(STATE, VarcharKey.BATCH_END))) : null;
+        // Only NEED_COPY below republishes a continuation. Growth, errors and completion
+        // leave it invalid, so no candidate address can survive a map relocation.
+        if (resumeEnd != null) b.store(at(STATE, VarcharKey.BATCH_END), i64(0));
         Var batches = b.let(i64(0));
         b.loop(binary(Op.LT, index, ROWS), batch -> {
-            checkLocalBound(batch, probe, index, localCapacity);
-            reserveBatch(batch, probe, index, batchEnd);
             batch.when(eq(binary(Op.AND, batches, i64(1024 / batchRows - 1)), i64(0)), Builder::poll);
             batch.assign(batches, add(batches, i64(1)));
-            Var limit = batch.let(new Select(binary(Op.LT, add(index, i64(batchRows)), batchEnd),
-                    add(index, i64(batchRows)), batchEnd));
-            if (probe.variable()) { batch.store(at(STATE, VariableKey.STAGING_USED), i64(0)); batch.store(at(STATE, RESUME_ROW), index); }
+            Var limit = batch.let(i64(0));
             Var batchStart = filter != null ? batch.let(index) : null;
-            Var mask = filter != null ? ScanLowering.mask(filter, batch, filterAddresses, batchStart, limit, batchRows) : null;
-            Var remaining = filter != null ? batch.let(mask) : null;
-            Var position = batch.let(index);
+            Var remaining = filter != null ? batch.let(i64(0)) : null;
             Var scratch = batch.let(at(STATE, prefetchScratch(probe)));
-            boolean staged = probe.orderedNative();
+            Builder prepareBatch = batch.fork();
+            checkLocalBound(prepareBatch, probe, index, localCapacity);
+            reserveBatch(prepareBatch, probe, index, batchEnd);
+            prepareBatch.assign(limit, new Select(binary(Op.LT, add(index, i64(batchRows)), batchEnd),
+                    add(index, i64(batchRows)), batchEnd));
+            if (probe.variable()) { prepareBatch.store(at(STATE, VariableKey.STAGING_USED), i64(0)); prepareBatch.store(at(STATE, RESUME_ROW), index); }
+            Var mask = filter != null ? ScanLowering.mask(filter, prepareBatch, filterAddresses, batchStart, limit, batchRows) : null;
+            if (filter != null) prepareBatch.assign(remaining, mask);
+            Var position = prepareBatch.let(index);
             int keyOffset = probe.orderedNative() ? 40 : 24;
             if (staged) {
-                batch.loop(filter == null ? binary(Op.LT, position, limit) : ne(remaining, i64(0)), stage -> {
+                prepareBatch.loop(filter == null ? binary(Op.LT, position, limit) : ne(remaining, i64(0)), stage -> {
                     if (filter != null) stage.assign(position, add(batchStart, new TrailingZeros(remaining)));
                     Var row = stage.let(position);
                     if (filter == null) stage.when(ne(rowIds, nil()), filtered -> filtered.assign(row,
@@ -195,11 +202,11 @@ public final class ResolvedAggregateKernel {
                     stage.assign(position, add(position, i64(1)));
                     if (filter != null) stage.assign(remaining, binary(Op.AND, remaining, binary(Op.SUB, remaining, i64(1))));
                 });
-                batch.assign(position, index);
-                if (filter != null) batch.assign(remaining, mask);
-                batch.assign(scratch, at(STATE, prefetchScratch(probe)));
+                prepareBatch.assign(position, index);
+                if (filter != null) prepareBatch.assign(remaining, mask);
+                prepareBatch.assign(scratch, at(STATE, prefetchScratch(probe)));
             }
-            batch.loop(filter == null ? binary(Op.LT, position, limit) : ne(remaining, i64(0)), prepare -> {
+            prepareBatch.loop(filter == null ? binary(Op.LT, position, limit) : ne(remaining, i64(0)), prepare -> {
                 if (filter != null) prepare.assign(position, add(batchStart, new TrailingZeros(remaining)));
                 Var row = prepare.let(staged ? load(scratch) : position);
                 if (!staged && filter == null) prepare.when(ne(rowIds, nil()), filtered -> filtered.assign(row,
@@ -224,10 +231,10 @@ public final class ResolvedAggregateKernel {
                 // Only hints cross stages: consumption reloads all mutable pointers after growth.
                 for (int phase = 0, phases = stagedDistinct ? 2 : 1; phase < phases; phase++) {
                     boolean headers = stagedDistinct && phase == 0;
-                    batch.assign(position, index);
-                    if (filter != null) batch.assign(remaining, mask);
-                    batch.assign(scratch, at(STATE, prefetchScratch(probe)));
-                    batch.loop(filter == null ? binary(Op.LT, position, limit) : ne(remaining, i64(0)), hints -> {
+                    prepareBatch.assign(position, index);
+                    if (filter != null) prepareBatch.assign(remaining, mask);
+                    prepareBatch.assign(scratch, at(STATE, prefetchScratch(probe)));
+                    prepareBatch.loop(filter == null ? binary(Op.LT, position, limit) : ne(remaining, i64(0)), hints -> {
                         if (filter != null) hints.assign(position, add(batchStart, new TrailingZeros(remaining)));
                         Var row = hints.let(load(scratch));
                         Var entry = hints.let(new Load(MemoryType.ADDRESS, at(scratch, 16)));
@@ -250,18 +257,36 @@ public final class ResolvedAggregateKernel {
                     });
                 }
             }
-            batch.assign(scratch, at(STATE, prefetchScratch(probe)));
-            if (filter != null) batch.assign(remaining, mask);
+            prepareBatch.assign(scratch, at(STATE, prefetchScratch(probe)));
+            if (filter != null) prepareBatch.assign(remaining, mask);
+            if (resumeEnd == null) {
+                batch.append(prepareBatch.block());
+            } else {
+                batch.when(eq(resumeEnd, i64(0)), fresh -> fresh.append(prepareBatch.block()));
+                batch.when(ne(resumeEnd, i64(0)), resume -> {
+                    resume.assign(limit, resumeEnd);
+                    resume.assign(batchEnd, load(at(STATE, VarcharKey.BATCH_CAPACITY_END)));
+                    resume.assign(scratch, new Load(MemoryType.ADDRESS, at(STATE, VarcharKey.BATCH_SCRATCH)));
+                    if (filter != null) {
+                        resume.assign(batchStart, load(at(STATE, VarcharKey.BATCH_START)));
+                        resume.assign(remaining, load(at(STATE, VarcharKey.BATCH_MASK)));
+                    }
+                    resume.assign(resumeEnd, i64(0));
+                });
+            }
             batch.loop(filter == null ? binary(Op.LT, index, limit) : ne(remaining, i64(0)), consume -> {
                 if (filter != null) consume.assign(index, add(batchStart, new TrailingZeros(remaining)));
                 Var row = consume.let(load(scratch));
                 Var key = consume.let(new Load(probe.stagedKeyType(), at(scratch, 8)));
                 Var entry = consume.let(new Load(MemoryType.ADDRESS, at(scratch, 16)));
                 Var first = updates.firstRowFlag(consume);
+                Builder lookup = consume.fork();
                 Var destination = staged
-                        ? probe.finishOrdered(consume, key, entry, consume.let(load(at(scratch, 24))),
-                                consume.let(load(at(scratch, 32))), index, updates.initializer(first))
-                        : probe.finish(consume, key, entry, index, updates.initializer(first));
+                        ? probe.finishOrdered(lookup, key, entry, lookup.let(load(at(scratch, 24))),
+                                lookup.let(load(at(scratch, 32))), index, updates.initializer(first))
+                        : probe.finish(lookup, key, entry, index, updates.initializer(first));
+                consume.append(resumeEnd == null ? lookup.block()
+                        : saveCopyBatch(lookup.block(), limit, batchEnd, scratch, batchStart, remaining));
                 updates.emitFrame(consume, row, addresses, destination, cardinalityAddress, first);
                 consume.assign(scratch, at(scratch, probe.prefetchRowBytes()));
                 consume.assign(index, add(index, i64(1)));
@@ -272,6 +297,27 @@ public final class ResolvedAggregateKernel {
             });
             if (filter != null) batch.assign(index, limit);
         });
+    }
+
+    /** Save only before the uncommitted row's copy request, never on the hot hit path. */
+    private static Block saveCopyBatch(Block block, Var limit, Var capacityEnd, Var scratch, Var start, Var remaining) {
+        var statements = new ArrayList<Statement>();
+        for (Statement statement : block.statements()) {
+            if (statement instanceof Return exit && exit.value().equals(i64(NEED_COPY))) {
+                statements.add(new Store(at(STATE, VarcharKey.BATCH_END), limit));
+                statements.add(new Store(at(STATE, VarcharKey.BATCH_CAPACITY_END), capacityEnd));
+                statements.add(new Store(MemoryType.ADDRESS, at(STATE, VarcharKey.BATCH_SCRATCH), scratch));
+                if (start != null) {
+                    statements.add(new Store(at(STATE, VarcharKey.BATCH_START), start));
+                    statements.add(new Store(at(STATE, VarcharKey.BATCH_MASK), remaining));
+                }
+            }
+            statements.add(statement instanceof If branch
+                    ? new If(branch.condition(), saveCopyBatch(branch.body(), limit, capacityEnd, scratch, start, remaining))
+                    : statement instanceof While loop
+                    ? new While(loop.condition(), saveCopyBatch(loop.body(), limit, capacityEnd, scratch, start, remaining)) : statement);
+        }
+        return new Block(statements);
     }
 
     private static void checkLocalBound(Builder b, QuestMapProbe probe, Var index, int capacity) {

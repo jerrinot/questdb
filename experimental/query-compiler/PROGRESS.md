@@ -7,6 +7,28 @@ Detailed earlier entries remain in Git history; raw evidence stays at its existi
 location rather than being copied into another archive. Links under `target/`
 refer to local, Git-ignored experiment artifacts.
 
+## 2026-11-11 — Preserve VARCHAR lookahead across key copies
+
+Generated aggregation now retains its prepared batch across `NEED_COPY`, using
+40 bytes in existing slot scratch. Copying preserves map addresses and input
+lifetimes; growth and new invocation chains invalidate the continuation. The
+existing allocator, 32-row batch and aggregate implementations are unchanged.
+
+On the 99,997,497-row Parquet ClickBench copy, eight physical cores and balanced
+fresh processes (10 warmups + 5 measured), Q05 falls **531–536 → 336–338 ms**,
+Q12 **555–556 → 345–351 ms**, Q13 **672–675 → 550–561 ms**, and Q33
+**2.862–2.866 → 2.048–2.051 s**. Q05 instructions fall **53.19 → 19.08 billion**
+and cycles **21.89 → 13.41 billion** per query; fresh same-branch Java is 370 ms.
+Compilation is separate, and Java still wins Q05's compile-plus-first-use boundary.
+
+All 43 queries pass; summed warm medians fall **18.61 → 16.39 s**, with about 75%
+of the saving in the two URL-grouping variants. **40 focused tests and 1,455 result
+validations pass.** Numeric controls retain their performance; a short filter/limit
+case remains noisy. Native-storage Q05 is about 2% slower by wall time with nearly
+unchanged cycles and lower effective clock; retain that qualification. The original
+table is unchanged. This establishes reduced software work, not a specific hardware
+bottleneck or cross-machine gain. [Evidence](target/parquet-copy-resume-20261111/REPORT.md).
+
 ## 2026-11-10 — Retire the experimental C and AsmJit backends
 
 LLVM is now the sole compiler backend. Removed the alternative emitters, native

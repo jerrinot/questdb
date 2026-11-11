@@ -1296,7 +1296,11 @@ public final class AggregateSlot implements GroupByKernel.Updater {
         }
         long state = stateAddress;
         long position = begin;
-        if (prepared.probe.varchar()) Unsafe.putLong(state + VarcharKey.COPIED_ROW, -1);
+        if (prepared.probe.varchar()) {
+            Unsafe.putLong(state + VarcharKey.COPIED_ROW, -1);
+            // Scratch belongs to this input frame and this selected kernel only.
+            Unsafe.putLong(state + VarcharKey.BATCH_END, 0);
+        }
         if (prepared.probe.variable()) Unsafe.putLong(state + VariableKey.SOURCE_OFFSET, 0);
         while (position < rows) {
             if (inputPartitionRemaining > 0 && update && kernel == prepared.mapCode) {

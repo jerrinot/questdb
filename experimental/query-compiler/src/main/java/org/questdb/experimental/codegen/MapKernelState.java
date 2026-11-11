@@ -27,15 +27,17 @@ package org.questdb.experimental.codegen;
 /**
  * Slot-owned control block shared by Java and generated map kernels. Offsets are
  * bytes relative to STATE; every field is a 64-bit word. NativeMapView descriptors
- * follow the selected key layout's control block, then invocation-local prefetch scratch.
+ * follow the selected key layout's control block, then slot-owned prefetch scratch.
  *
  * Scan and merge callers supply START_ROW. Join probes keep their own iteration
  * state and share the miss fields and map views. A resumable exit publishes
  * RESUME_ROW in the caller's input coordinates, before updating that row's
  * aggregates. The caller services the request, refreshes any invalidated map
  * views, and retries there.
- * Prefetched candidates and staged keys are rebuilt on retry. Return zero means
- * completion; other values outside the requests below are failures, not retries.
+ * A VARCHAR scan may retain its prepared batch across NEED_COPY, which does not
+ * move map entries or release the input frame. Other retries rebuild scratch.
+ * Return zero means completion; other values outside the requests below are failures,
+ * not retries.
  * Ownership of maps, key storage and allocation remains with the caller.
  */
 final class MapKernelState {
@@ -73,7 +75,13 @@ final class MapKernelState {
         static final int COPY_BYTES = 72;
         /** Row whose copy is available; -1 until copied, and again after insertion. */
         static final int COPIED_ROW = 80;
-        static final int CONTROL_BYTES = 88;
+        /** Nonzero only when a scan left a prepared batch on NEED_COPY. */
+        static final int BATCH_END = 88;
+        static final int BATCH_SCRATCH = 96;
+        static final int BATCH_CAPACITY_END = 104;
+        static final int BATCH_START = 112;
+        static final int BATCH_MASK = 120;
+        static final int CONTROL_BYTES = 128;
 
         private VarcharKey() {
         }

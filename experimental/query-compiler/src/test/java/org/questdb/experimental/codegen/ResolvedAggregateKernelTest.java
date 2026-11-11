@@ -30,6 +30,7 @@ import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.DefaultCairoConfiguration;
 import io.questdb.cairo.map.Map;
+import io.questdb.cairo.map.UnorderedVarcharMap;
 import io.questdb.cairo.sql.AtomicBooleanCircuitBreaker;
 import io.questdb.cairo.sql.PageFrameFilteredMemoryRecord;
 import io.questdb.cairo.sql.PageFrameMemoryRecord;
@@ -50,6 +51,8 @@ import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.ObjList;
 import io.questdb.std.Unsafe;
+import io.questdb.std.str.Utf8String;
+import io.questdb.test.tools.TestUtils;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -336,6 +339,96 @@ public class ResolvedAggregateKernelTest {
             slot.prepareParameters();
             assertTrue("Worker scratch reopen must not reset shared execution", code.sharedMaps.isActive());
         }
+    }
+
+    @Test
+    public void failedVarcharKeyCopyPublishesPartialStateAndSlotCanBeReused() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            var functions = new ObjList<GroupByFunction>();
+            functions.add(new CountLongConstGroupByFunction());
+            functions.add(new SumLongGroupByFunction(LongColumn.newInstance(1)));
+            var types = new ArrayColumnTypes();
+            for (int i = 0; i < functions.size(); i++) functions.getQuick(i).initValueTypes(types);
+            var failure = new IllegalStateException("injected VARCHAR key copy failure");
+            try (var map = new UnorderedVarcharMap(types, 16, 0.7, 16, 64, 1 << 20) {
+                int copies;
+                @Override public long copyNativeKey(long source, int size) {
+                    if (++copies == 3) throw failure;
+                    return super.copyNativeKey(source, size);
+                }
+            };
+                 var ordinary = new UnorderedVarcharMap(types, 16, 0.7, 16, 64, 1 << 20);
+                 var code = ResolvedAggregateKernel.bind(new ArrayColumnTypes().add(ColumnType.VARCHAR).add(ColumnType.LONG),
+                         types, functions, QuestMapProbe.bind(0, ColumnType.VARCHAR, map),
+                         CompilerOptions.DEFAULT.withPrefetchRows(32)).compile(backend, temporary.newFolder().toPath());
+                 var slot = code.newSlot(); var arena = Arena.ofConfined()) {
+                for (int pass = 0; pass < 3; pass++) {
+                    map.clear();
+                    ordinary.clear();
+                    int rows = pass == 0 ? 5 : pass == 1 ? 9 : 3;
+                    long aux = arena.allocate(16L * rows, 8).address();
+                    long values = arena.allocate(8L * rows, 8).address();
+                    var keys = new ObjList<Utf8String>();
+                    for (int row = 0; row < rows; row++) {
+                        var key = new Utf8String("frame-" + pass + "-key-" + row % 4);
+                        keys.add(key);
+                        long data = arena.allocate(key.size(), 1).address();
+                        for (int i = 0; i < key.size(); i++) Unsafe.getUnsafe().putByte(data + i, key.byteAt(i));
+                        Unsafe.putInt(aux + 16L * row, key.size() << 4 | 2);
+                        Unsafe.putLong(aux + 16L * row + 8, data);
+                        Unsafe.putLong(values + 8L * row, pass * 100L + row);
+                    }
+                    var record = new PageFrameMemoryRecord() {
+                        @Override public long getPageAddress(int column) { return values; }
+                        @Override public long getLong(int column) { return Unsafe.getLong(values + 8L * rowIndex); }
+                        @Override public boolean writeNativeVarcharView(int column, long address) {
+                            // Borrowed slice-format keys, as in a decoded Parquet frame.
+                            Unsafe.putLong(address, aux);
+                            Unsafe.putLong(address + 8, 0);
+                            Unsafe.putLong(address + 16, 16L * rows);
+                            Unsafe.putLong(address + 24, 0);
+                            Unsafe.putLong(address + 32, 1);
+                            Unsafe.putLong(address + 40, 0);
+                            return true;
+                        }
+                    };
+                    int copiesBefore = map.copies;
+                    if (pass == 0) {
+                        assertSame(failure, assertThrows(IllegalStateException.class, () -> slot.updateMap(record, rows, 0,
+                                map, 32, io.questdb.cairo.sql.SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER)));
+                        assertEquals("Failure must occur while servicing the third NEED_COPY", 3, map.copies);
+                    } else {
+                        // Keep the slot's scratch: a new frame must invalidate the failed batch itself.
+                        assertTrue(slot.updateMap(record, rows, 0, map, 32,
+                                io.questdb.cairo.sql.SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER));
+                        assertEquals(Math.min(rows, 4), map.copies - copiesBefore);
+                    }
+                    assertThrows(IllegalStateException.class, KernelMemory::allocator);
+                    for (int row = 0, end = pass == 0 ? 2 : rows; row < end; row++) {
+                        var key = ordinary.withKey();
+                        key.putVarchar(keys.getQuick(row));
+                        var value = key.createValue();
+                        record.setRowIndex(row);
+                        for (int i = 0; i < functions.size(); i++) {
+                            if (value.isNew()) functions.getQuick(i).computeFirst(value, record, row);
+                            else functions.getQuick(i).computeNext(value, record, row);
+                        }
+                    }
+                    assertEquals(ordinary.size(), map.size());
+                    try (var cursor = ordinary.getCursor()) {
+                        while (cursor.hasNext()) {
+                            var expected = cursor.getRecord();
+                            var key = map.withKey();
+                            key.putVarchar(expected.getVarcharA(2));
+                            var actual = key.findValue();
+                            assertNotNull(actual);
+                            assertEquals(expected.getLong(0), actual.getLong(0));
+                            assertEquals(expected.getLong(1), actual.getLong(1));
+                        }
+                    }
+                }
+            }
+        });
     }
 
     @Test

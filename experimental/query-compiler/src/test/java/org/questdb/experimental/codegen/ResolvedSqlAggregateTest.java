@@ -822,6 +822,31 @@ public class ResolvedSqlAggregateTest {
     }
 
     @Test
+    public void parquetVarcharCopyRetriesPreserveBatchesAcrossGrowthAndReuse() throws Exception {
+        mapEntrySize = 64;
+        // More keys than the initial maps can hold; duplicates, holes and a short final batch.
+        engine.execute("create table copies as (select cast(case when x%13=0 then null when x%17=0 then '' "
+                + "when x%2=0 then 'shared-prefix-abcdefghijkl-'||cast(x%5003 as string) "
+                + "else 'žluťoučký-中-'||cast(x%5003 as string) end as varchar) k,"
+                + "case when x%7=0 then null else x-10000 end v,cast(x%37 as double) d,"
+                + "timestamp_sequence('2024-01-01',10000000L) ts from long_sequence(20003)) "
+                + "timestamp(ts) partition by day bypass wal", context);
+        // The active Jan 03 partition stays native to exercise the decoded-to-stable frame transition.
+        engine.execute("alter table copies convert partition to parquet list '2024-01-01','2024-01-02'", context);
+        String sql = "select k,count(),sum(v),min(v),max(v),sum(d),count_distinct(v) from copies group by k";
+        for (int threshold : new int[]{2, Integer.MAX_VALUE}) {
+            shardingThreshold = threshold;
+            long before = compiler.mapRows.get();
+            assertMatches(sql, true);
+            assertEquals(lastPlan, 40006, compiler.mapRows.get() - before);
+            before = compiler.mapRows.get();
+            assertMatches("select k,count() from copies where k is not null group by k", true);
+            assertEquals(lastPlan, 2L * (20003 - 20003 / 13), compiler.mapRows.get() - before);
+        }
+        assertEquals(0, engine.getBusyReaderCount());
+    }
+
+    @Test
     public void varcharColumnTopsAndLazyConversionsAreSafe() throws Exception {
         mapEntrySize = 32;
         engine.execute("create table strings as (select x v,timestamp_sequence('2024-01-01',3600000000L) ts "
